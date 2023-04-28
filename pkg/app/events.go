@@ -11,18 +11,22 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 
-	kubevirtclientset "kubevirt.io/client-go/kubecli"
+	kubevirtV1 "kubevirt.io/api/core/v1"
+	"kubevirt.io/client-go/kubecli"
 )
 
-func watchEvents(kubevirt_clientset *kubevirtclientset.Clientset, k8s_clientset *kubernetes.Clientset) {
+func watchEvents(kubevirt_kubecli kubecli.KubevirtClient, k8s_clientset *kubernetes.Clientset) {
 	log.Infof("(watchEvents) start watching the vm events ..")
 
 	// do the eventwatch stuff for configmaps so we can detect new clusters
-	watchlistVirtualMachines := cache.NewListWatchFromClient(k8s_clientset.CoreV1().RESTClient(), "virtualmachines", corev1.NamespaceAll, fields.Everything())
+	//watchlistVirtualMachines := cache.NewListWatchFromClient(k8s_clientset.CoreV1().RESTClient(), "virtualmachines", corev1.NamespaceAll, fields.Everything())
+	watchlistVirtualMachines := cache.NewListWatchFromClient(kubevirt_kubecli.RestClient(), "virtualmachines", corev1.NamespaceAll, fields.Everything())
+
+	//bla := kubevirt_kubecli.VirtualMachine(corev1.NamespaceAll)
 
 	_, controllerVirtualMachines := cache.NewInformer(
 		watchlistVirtualMachines,
-		&kubevirtclientset.VirtualMachine{},
+		&kubevirtV1.VirtualMachine{},
 		0,
 		cache.ResourceEventHandlerFuncs{
 			AddFunc: func(obj interface{}) {

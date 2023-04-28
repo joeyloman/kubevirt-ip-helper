@@ -13,7 +13,7 @@ import (
 	"github.com/joeyloman/kubevirt-ipam-dhcpd/pkg/file"
 	log "github.com/sirupsen/logrus"
 
-	kubevirtclientset "kubevirt.io/client-go/kubecli"
+	"kubevirt.io/client-go/kubecli"
 )
 
 // https://github.com/kubevirt/client-go/blob/v0.59.0/examples/listvms/list-vms.go
@@ -62,10 +62,10 @@ func main() {
 	}
 
 	// create the kubefip clientset
-	kubevirt_clientset, err := kubevirtclientset.NewForConfig(config)
+	kubevirt_kubecli, err := kubecli.GetKubevirtClientFromRESTConfig(config)
 	if err != nil {
 		panic(err.Error())
 	}
 
-	app.Run(kubevirt_clientset, k8s_clientset)
+	app.Run(kubevirt_kubecli, k8s_clientset)
 }
