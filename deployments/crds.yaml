@@ -1,0 +1,73 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: ipreservations.kubestuff.k8s.binbash.org
+spec:
+  group: kubestuff.k8s.binbash.org
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                vmname:
+                  type: string
+                  pattern: '^[\w-]+$'
+                ipreservations:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      ipaddress:
+                        type: string
+                        pattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$'
+                      macaddress: 
+                        type: string
+                        pattern: '^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$'
+                      networkname: 
+                        type: string
+                        pattern: '^[\w\/-]+$'
+  scope: Cluster
+  names:
+    plural: ipreservations
+    singular: ipreservation
+    kind: IPReservation
+    shortNames:
+      - ipres
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: dhcppools.kubestuff.k8s.binbash.org
+spec:
+  group: kubestuff.k8s.binbash.org
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                cidr:
+                  type: string
+                  pattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])/\d{1,2}$'
+                networkname:
+                  type: string
+                  pattern: '^[\w\/-]+$'
+  scope: Cluster
+  names:
+    plural: dhcppools
+    singular: dhcppool
+    kind: DHCPPool
+    shortNames:
+      - dhcppool
+      - dhcppools

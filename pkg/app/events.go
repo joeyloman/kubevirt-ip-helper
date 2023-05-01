@@ -15,14 +15,21 @@ import (
 	"kubevirt.io/client-go/kubecli"
 )
 
+func getNetworkDetails(vm *kubevirtV1.VirtualMachine) {
+	for _, nic := range vm.Spec.Template.Spec.Domain.Devices.Interfaces {
+		for _, net := range vm.Spec.Template.Spec.Networks {
+			if nic.Name == net.Name {
+				log.Infof("(getNetworkDetails) VIRTUAL MACHINE name=%s, networkname=%s, macaddress=%s", vm.ObjectMeta.Name, net.Multus.NetworkName, nic.MacAddress)
+			}
+		}
+	}
+}
+
 func watchEvents(kubevirt_kubecli kubecli.KubevirtClient, k8s_clientset *kubernetes.Clientset) {
 	log.Infof("(watchEvents) start watching the vm events ..")
 
 	// do the eventwatch stuff for configmaps so we can detect new clusters
-	//watchlistVirtualMachines := cache.NewListWatchFromClient(k8s_clientset.CoreV1().RESTClient(), "virtualmachines", corev1.NamespaceAll, fields.Everything())
 	watchlistVirtualMachines := cache.NewListWatchFromClient(kubevirt_kubecli.RestClient(), "virtualmachines", corev1.NamespaceAll, fields.Everything())
-
-	//bla := kubevirt_kubecli.VirtualMachine(corev1.NamespaceAll)
 
 	_, controllerVirtualMachines := cache.NewInformer(
 		watchlistVirtualMachines,
@@ -31,17 +38,20 @@ func watchEvents(kubevirt_kubecli kubecli.KubevirtClient, k8s_clientset *kuberne
 		cache.ResourceEventHandlerFuncs{
 			AddFunc: func(obj interface{}) {
 				log.Infof("(watchVirtualMachineEvents) entering the eventwatch AddFunc ..")
-				log.Infof("(watchVirtualMachineEvents) add VM obj: [%+v]", obj)
-
+				//log.Infof("(watchVirtualMachineEvents) add VM obj: [%+v]", obj)
+				getNetworkDetails(obj.(*kubevirtV1.VirtualMachine))
 			},
 			DeleteFunc: func(obj interface{}) {
 				log.Infof("(watchVirtualMachineEvents) entering the eventwatch DeleteFunc ..")
-				log.Infof("(watchVirtualMachineEvents) delete VM obj: [%+v]", obj)
+				//log.Infof("(watchVirtualMachineEvents) delete VM obj: [%+v]", obj)
+				getNetworkDetails(obj.(*kubevirtV1.VirtualMachine))
 
 			},
 			UpdateFunc: func(oldObj, newObj interface{}) {
 				log.Infof("(watchVirtualMachineEvents) entering the eventwatch UpdateFunc ..")
-				log.Infof("(watchVirtualMachineEvents) update VM old obj: [%+v] / new obj:", oldObj, newObj)
+				//log.Infof("(watchVirtualMachineEvents) update VM old obj: [%+v] / new obj: [%+v]", oldObj, newObj)
+				getNetworkDetails(oldObj.(*kubevirtV1.VirtualMachine))
+				getNetworkDetails(newObj.(*kubevirtV1.VirtualMachine))
 			},
 		},
 	)

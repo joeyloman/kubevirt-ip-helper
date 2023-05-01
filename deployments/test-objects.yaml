@@ -1,0 +1,29 @@
+apiVersion: kubestuff.k8s.binbash.org/v1
+kind: DHCPPool
+metadata:
+  name: public-vlan1
+spec:
+  cidr: 10.135.10.192/26
+  networkname: harvester-public/public-vlan-1
+---
+apiVersion: kubestuff.k8s.binbash.org/v1
+kind: DHCPPool
+metadata:
+  name: public-vlan2
+spec:
+  cidr: 10.135.20.192/26
+  networkname: harvester-public/public-vlan-2
+---
+apiVersion: kubestuff.k8s.binbash.org/v1
+kind: IPReservation
+metadata:
+  name: test-vm1
+spec:
+  vmname: test-vm1
+  ipreservations:
+    - ipaddress: 10.135.10.195
+      macaddress: 12:8b:a8:8c:da:11
+      networkname: harvester-public/public-vlan-1
+    - ipaddress: 10.135.20.201
+      macaddress: aa:8b:a8:8c:da:cc
+      networkname: harvester-public/public-vlan-2
