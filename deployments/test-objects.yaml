@@ -1,20 +1,20 @@
-apiVersion: kubestuff.k8s.binbash.org/v1
-kind: DHCPPool
+apiVersion: kubevirtiphelper.k8s.binbash.org/v1
+kind: IPPool
 metadata:
   name: public-vlan1
 spec:
   cidr: 10.135.10.192/26
   networkname: harvester-public/public-vlan-1
 ---
-apiVersion: kubestuff.k8s.binbash.org/v1
-kind: DHCPPool
+apiVersion: kubevirtiphelper.k8s.binbash.org/v1
+kind: IPPool
 metadata:
   name: public-vlan2
 spec:
   cidr: 10.135.20.192/26
   networkname: harvester-public/public-vlan-2
 ---
-apiVersion: kubestuff.k8s.binbash.org/v1
+apiVersion: kubevirtiphelper.k8s.binbash.org/v1
 kind: IPReservation
 metadata:
   name: test-vm1

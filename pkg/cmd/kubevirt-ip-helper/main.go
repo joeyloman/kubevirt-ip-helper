@@ -9,8 +9,8 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 
-	"github.com/joeyloman/kubevirt-ipam-dhcpd/pkg/app"
-	"github.com/joeyloman/kubevirt-ipam-dhcpd/pkg/file"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/app"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/file"
 	log "github.com/sirupsen/logrus"
 
 	"kubevirt.io/client-go/kubecli"
@@ -18,7 +18,7 @@ import (
 
 // https://github.com/kubevirt/client-go/blob/v0.59.0/examples/listvms/list-vms.go
 
-var progname string = "harvester-ipam-dhcpd"
+var progname string = "kubevirt-ip-helper"
 
 func init() {
 	// Log as JSON instead of the default ASCII formatter.

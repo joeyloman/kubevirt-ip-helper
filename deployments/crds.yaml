@@ -1,9 +1,9 @@
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
-  name: ipreservations.kubestuff.k8s.binbash.org
+  name: ipreservations.kubevirtiphelper.k8s.binbash.org
 spec:
-  group: kubestuff.k8s.binbash.org
+  group: kubevirtiphelper.k8s.binbash.org
   versions:
     - name: v1
       served: true
@@ -43,9 +43,9 @@ spec:
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
-  name: dhcppools.kubestuff.k8s.binbash.org
+  name: ippools.kubevirtiphelper.k8s.binbash.org
 spec:
-  group: kubestuff.k8s.binbash.org
+  group: kubevirtiphelper.k8s.binbash.org
   versions:
     - name: v1
       served: true
@@ -65,9 +65,9 @@ spec:
                   pattern: '^[\w\/-]+$'
   scope: Cluster
   names:
-    plural: dhcppools
-    singular: dhcppool
-    kind: DHCPPool
+    plural: ippools
+    singular: ippool
+    kind: IPPool
     shortNames:
-      - dhcppool
-      - dhcppools
+      - ippool
+      - ippools

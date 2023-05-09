@@ -1,4 +1,4 @@
-module github.com/joeyloman/kubevirt-ipam-dhcpd
+module github.com/joeyloman/kubevirt-ip-helper
 
 go 1.20
 
