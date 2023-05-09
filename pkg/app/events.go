@@ -13,20 +13,118 @@ import (
 
 	kubevirtV1 "kubevirt.io/api/core/v1"
 	"kubevirt.io/client-go/kubecli"
+
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/kubevirtiphelper"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/vm"
+
+	kviphv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
+	kviphclientset "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/clientset/versioned"
 )
 
-func getNetworkDetails(vm *kubevirtV1.VirtualMachine) {
-	for _, nic := range vm.Spec.Template.Spec.Domain.Devices.Interfaces {
-		for _, net := range vm.Spec.Template.Spec.Networks {
-			if nic.Name == net.Name {
-				log.Infof("(getNetworkDetails) VIRTUAL MACHINE name=%s, networkname=%s, macaddress=%s", vm.ObjectMeta.Name, net.Multus.NetworkName, nic.MacAddress)
-			}
-		}
-	}
-}
+func watchEvents(kubevirt_kubecli kubecli.KubevirtClient, kviph_clientset *kviphclientset.Clientset, k8s_clientset *kubernetes.Clientset) {
+	var watchEventTimeout int = 30 // in seconds (skip all events for the first 30 secs)
 
-func watchEvents(kubevirt_kubecli kubecli.KubevirtClient, k8s_clientset *kubernetes.Clientset) {
-	log.Infof("(watchEvents) start watching the vm events ..")
+	log.Infof("(watchEvents) start watching the ippool, ipreservation and vm events ..")
+
+	// toggle watchEventsActivated after 10 secs
+	var watchEventsActivated bool = false
+	time.AfterFunc(time.Duration(watchEventTimeout)*time.Second, func() { watchEventsActivated = true })
+
+	// do the eventwatch stuff for ippools
+	watchlistIPPools := cache.NewListWatchFromClient(kviph_clientset.KubevirtiphelperV1().RESTClient(), "ippools", corev1.NamespaceAll,
+		fields.Everything())
+
+	_, controllerIPPools := cache.NewInformer(
+		watchlistIPPools,
+		&kviphv1.IPPool{},
+		0,
+		cache.ResourceEventHandlerFuncs{
+			AddFunc: func(obj interface{}) {
+				log.Debugf("(watchIPPoolEvents) entering the eventwatch AddFunc ..")
+
+				if watchEventsActivated {
+					// allocate the new IPPool
+					if err := kubevirtiphelper.AllocateIPPool(obj.(*kviphv1.IPPool), kviph_clientset); err != nil {
+						log.Errorf("(watchIPPoolEvents) error allocating ippool: %s", err.Error())
+					}
+				} else {
+					log.Debugf("(watchIPPoolEvents) not activated yet, object action not executed")
+				}
+			},
+			DeleteFunc: func(obj interface{}) {
+				log.Debugf("(watchIPPoolEvents) entering the eventwatch DeleteFunc ..")
+
+				if watchEventsActivated {
+					// remove the IPPool
+					if err := kubevirtiphelper.RemoveIPPool(obj.(*kviphv1.IPPool), kviph_clientset); err != nil {
+						log.Errorf("(watchIPPoolEvents) error removing ippool: %s", err.Error())
+					}
+				} else {
+					log.Debugf("(watchIPPoolEvents) not activated yet, object action not executed")
+				}
+			},
+			UpdateFunc: func(oldObj, newObj interface{}) {
+				log.Debugf("(watchIPPoolEvents) entering the eventwatch UpdateFunc ..")
+
+				if watchEventsActivated {
+					// update the IPPool
+					if err := kubevirtiphelper.UpdateIPPool(oldObj.(*kviphv1.IPPool), newObj.(*kviphv1.IPPool), kviph_clientset); err != nil {
+						log.Errorf("(watchIPPoolEvents) error removing ippool: %s", err.Error())
+					}
+				} else {
+					log.Debugf("(watchIPPoolEvents) not activated yet, object action not executed")
+				}
+			},
+		},
+	)
+
+	// do the eventwatch stuff for ipreservations
+	watchlistIPReservations := cache.NewListWatchFromClient(kviph_clientset.KubevirtiphelperV1().RESTClient(), "ipreservations", corev1.NamespaceAll,
+		fields.Everything())
+
+	_, controllerIPReservations := cache.NewInformer(
+		watchlistIPReservations,
+		&kviphv1.IPReservation{},
+		0,
+		cache.ResourceEventHandlerFuncs{
+			AddFunc: func(obj interface{}) {
+				log.Debugf("(watchIPReservationEvents) entering the eventwatch AddFunc ..")
+
+				if watchEventsActivated {
+					// allocate the new IPReservation
+					if err := kubevirtiphelper.AllocateIPReservation(obj.(*kviphv1.IPReservation), kviph_clientset); err != nil {
+						log.Errorf("(watchIPReservationEvents) error allocating ipreservation: %s", err.Error())
+					}
+				} else {
+					log.Debugf("(watchIPReservationEvents) not activated yet, object action not executed")
+				}
+			},
+			DeleteFunc: func(obj interface{}) {
+				log.Debugf("(watchIPReservationEvents) entering the eventwatch DeleteFunc ..")
+
+				if watchEventsActivated {
+					// remove the IPReservation
+					if err := kubevirtiphelper.RemoveIPReservation(obj.(*kviphv1.IPReservation), kviph_clientset); err != nil {
+						log.Errorf("(watchIPReservationEvents) error removing ipreservation: %s", err.Error())
+					}
+				} else {
+					log.Debugf("(watchIPReservationEvents) not activated yet, object action not executed")
+				}
+			},
+			UpdateFunc: func(oldObj, newObj interface{}) {
+				log.Debugf("(watchIPReservationEvents) entering the eventwatch UpdateFunc ..")
+
+				if watchEventsActivated {
+					// update the IPReservation
+					if err := kubevirtiphelper.UpdateIPReservation(oldObj.(*kviphv1.IPReservation), newObj.(*kviphv1.IPReservation), kviph_clientset); err != nil {
+						log.Errorf("(watchIPReservationEvents) error removing ipreservation: %s", err.Error())
+					}
+				} else {
+					log.Debugf("(watchIPReservationEvents) not activated yet, object action not executed")
+				}
+			},
+		},
+	)
 
 	// do the eventwatch stuff for configmaps so we can detect new clusters
 	watchlistVirtualMachines := cache.NewListWatchFromClient(kubevirt_kubecli.RestClient(), "virtualmachines", corev1.NamespaceAll, fields.Everything())
@@ -39,25 +137,27 @@ func watchEvents(kubevirt_kubecli kubecli.KubevirtClient, k8s_clientset *kuberne
 			AddFunc: func(obj interface{}) {
 				log.Infof("(watchVirtualMachineEvents) entering the eventwatch AddFunc ..")
 				//log.Infof("(watchVirtualMachineEvents) add VM obj: [%+v]", obj)
-				getNetworkDetails(obj.(*kubevirtV1.VirtualMachine))
+				vm.GetNetworkDetails(obj.(*kubevirtV1.VirtualMachine))
 			},
 			DeleteFunc: func(obj interface{}) {
 				log.Infof("(watchVirtualMachineEvents) entering the eventwatch DeleteFunc ..")
 				//log.Infof("(watchVirtualMachineEvents) delete VM obj: [%+v]", obj)
-				getNetworkDetails(obj.(*kubevirtV1.VirtualMachine))
+				vm.GetNetworkDetails(obj.(*kubevirtV1.VirtualMachine))
 
 			},
 			UpdateFunc: func(oldObj, newObj interface{}) {
 				log.Infof("(watchVirtualMachineEvents) entering the eventwatch UpdateFunc ..")
 				//log.Infof("(watchVirtualMachineEvents) update VM old obj: [%+v] / new obj: [%+v]", oldObj, newObj)
-				getNetworkDetails(oldObj.(*kubevirtV1.VirtualMachine))
-				getNetworkDetails(newObj.(*kubevirtV1.VirtualMachine))
+				vm.GetNetworkDetails(oldObj.(*kubevirtV1.VirtualMachine))
+				vm.GetNetworkDetails(newObj.(*kubevirtV1.VirtualMachine))
 			},
 		},
 	)
 
 	stop := make(chan struct{})
 	defer close(stop)
+	go controllerIPPools.Run(stop)
+	go controllerIPReservations.Run(stop)
 	go controllerVirtualMachines.Run(stop)
 
 	for {

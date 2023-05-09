@@ -11,6 +11,9 @@ import (
 
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/app"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/file"
+
+	kviphclientset "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/clientset/versioned"
+
 	log "github.com/sirupsen/logrus"
 
 	"kubevirt.io/client-go/kubecli"
@@ -62,10 +65,16 @@ func main() {
 	}
 
 	// create the kubefip clientset
+	kviph_clientset, err := kviphclientset.NewForConfig(config)
+	if err != nil {
+		panic(err.Error())
+	}
+
+	// create the kubefip clientset
 	kubevirt_kubecli, err := kubecli.GetKubevirtClientFromRESTConfig(config)
 	if err != nil {
 		panic(err.Error())
 	}
 
-	app.Run(kubevirt_kubecli, k8s_clientset)
+	app.Run(kubevirt_kubecli, kviph_clientset, k8s_clientset)
 }
