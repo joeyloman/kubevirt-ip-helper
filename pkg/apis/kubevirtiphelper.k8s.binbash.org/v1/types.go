@@ -53,8 +53,17 @@ type IPPool struct {
 }
 
 type IPPoolSpec struct {
-	CIDR        string `json:"cidr,omitempty"`
-	NetworkName string `json:"networkname,omitempty"`
+	Subnet      string   `json:"subnet,omitempty"`
+	Pool        []Pool   `json:"pool,omitempty"`
+	Router      string   `json:"router,omitempty"`
+	DNS         []string `json:"dns,omitempty"`
+	NetworkName string   `json:"networkname,omitempty"`
+}
+
+type Pool struct {
+	Start   string   `json:"start,omitempty"`
+	End     string   `json:"end,omitempty"`
+	Exclude []string `json:"exclude,omitempty"`
 }
 
 type IPPoolStatus struct {
