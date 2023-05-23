@@ -26,8 +26,8 @@ import (
 type Interface interface {
 	// IPPools returns a IPPoolInformer.
 	IPPools() IPPoolInformer
-	// IPReservations returns a IPReservationInformer.
-	IPReservations() IPReservationInformer
+	// VirtualMachineNetworkConfigs returns a VirtualMachineNetworkConfigInformer.
+	VirtualMachineNetworkConfigs() VirtualMachineNetworkConfigInformer
 }
 
 type version struct {
@@ -46,7 +46,7 @@ func (v *version) IPPools() IPPoolInformer {
 	return &iPPoolInformer{factory: v.factory, tweakListOptions: v.tweakListOptions}
 }
 
-// IPReservations returns a IPReservationInformer.
-func (v *version) IPReservations() IPReservationInformer {
-	return &iPReservationInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
+// VirtualMachineNetworkConfigs returns a VirtualMachineNetworkConfigInformer.
+func (v *version) VirtualMachineNetworkConfigs() VirtualMachineNetworkConfigInformer {
+	return &virtualMachineNetworkConfigInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
 }

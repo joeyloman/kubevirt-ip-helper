@@ -27,7 +27,7 @@ import (
 type KubevirtiphelperV1Interface interface {
 	RESTClient() rest.Interface
 	IPPoolsGetter
-	IPReservationsGetter
+	VirtualMachineNetworkConfigsGetter
 }
 
 // KubevirtiphelperV1Client is used to interact with features provided by the kubevirtiphelper.k8s.binbash.org group.
@@ -39,8 +39,8 @@ func (c *KubevirtiphelperV1Client) IPPools() IPPoolInterface {
 	return newIPPools(c)
 }
 
-func (c *KubevirtiphelperV1Client) IPReservations(namespace string) IPReservationInterface {
-	return newIPReservations(c, namespace)
+func (c *KubevirtiphelperV1Client) VirtualMachineNetworkConfigs(namespace string) VirtualMachineNetworkConfigInterface {
+	return newVirtualMachineNetworkConfigs(c, namespace)
 }
 
 // NewForConfig creates a new KubevirtiphelperV1Client for the given config.

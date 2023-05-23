@@ -55,8 +55,8 @@ func (f *sharedInformerFactory) ForResource(resource schema.GroupVersionResource
 	// Group=kubevirtiphelper.k8s.binbash.org, Version=v1
 	case v1.SchemeGroupVersion.WithResource("ippools"):
 		return &genericInformer{resource: resource.GroupResource(), informer: f.Kubevirtiphelper().V1().IPPools().Informer()}, nil
-	case v1.SchemeGroupVersion.WithResource("ipreservations"):
-		return &genericInformer{resource: resource.GroupResource(), informer: f.Kubevirtiphelper().V1().IPReservations().Informer()}, nil
+	case v1.SchemeGroupVersion.WithResource("virtualmachinenetworkconfigs"):
+		return &genericInformer{resource: resource.GroupResource(), informer: f.Kubevirtiphelper().V1().VirtualMachineNetworkConfigs().Informer()}, nil
 
 	}
 

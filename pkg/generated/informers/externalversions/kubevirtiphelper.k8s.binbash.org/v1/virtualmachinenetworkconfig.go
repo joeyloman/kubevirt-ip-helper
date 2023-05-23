@@ -32,59 +32,59 @@ import (
 	cache "k8s.io/client-go/tools/cache"
 )
 
-// IPReservationInformer provides access to a shared informer and lister for
-// IPReservations.
-type IPReservationInformer interface {
+// VirtualMachineNetworkConfigInformer provides access to a shared informer and lister for
+// VirtualMachineNetworkConfigs.
+type VirtualMachineNetworkConfigInformer interface {
 	Informer() cache.SharedIndexInformer
-	Lister() v1.IPReservationLister
+	Lister() v1.VirtualMachineNetworkConfigLister
 }
 
-type iPReservationInformer struct {
+type virtualMachineNetworkConfigInformer struct {
 	factory          internalinterfaces.SharedInformerFactory
 	tweakListOptions internalinterfaces.TweakListOptionsFunc
 	namespace        string
 }
 
-// NewIPReservationInformer constructs a new informer for IPReservation type.
+// NewVirtualMachineNetworkConfigInformer constructs a new informer for VirtualMachineNetworkConfig type.
 // Always prefer using an informer factory to get a shared informer instead of getting an independent
 // one. This reduces memory footprint and number of connections to the server.
-func NewIPReservationInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers cache.Indexers) cache.SharedIndexInformer {
-	return NewFilteredIPReservationInformer(client, namespace, resyncPeriod, indexers, nil)
+func NewVirtualMachineNetworkConfigInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers cache.Indexers) cache.SharedIndexInformer {
+	return NewFilteredVirtualMachineNetworkConfigInformer(client, namespace, resyncPeriod, indexers, nil)
 }
 
-// NewFilteredIPReservationInformer constructs a new informer for IPReservation type.
+// NewFilteredVirtualMachineNetworkConfigInformer constructs a new informer for VirtualMachineNetworkConfig type.
 // Always prefer using an informer factory to get a shared informer instead of getting an independent
 // one. This reduces memory footprint and number of connections to the server.
-func NewFilteredIPReservationInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers cache.Indexers, tweakListOptions internalinterfaces.TweakListOptionsFunc) cache.SharedIndexInformer {
+func NewFilteredVirtualMachineNetworkConfigInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers cache.Indexers, tweakListOptions internalinterfaces.TweakListOptionsFunc) cache.SharedIndexInformer {
 	return cache.NewSharedIndexInformer(
 		&cache.ListWatch{
 			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
 				if tweakListOptions != nil {
 					tweakListOptions(&options)
 				}
-				return client.KubevirtiphelperV1().IPReservations(namespace).List(context.TODO(), options)
+				return client.KubevirtiphelperV1().VirtualMachineNetworkConfigs(namespace).List(context.TODO(), options)
 			},
 			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
 				if tweakListOptions != nil {
 					tweakListOptions(&options)
 				}
-				return client.KubevirtiphelperV1().IPReservations(namespace).Watch(context.TODO(), options)
+				return client.KubevirtiphelperV1().VirtualMachineNetworkConfigs(namespace).Watch(context.TODO(), options)
 			},
 		},
-		&kubevirtiphelperk8sbinbashorgv1.IPReservation{},
+		&kubevirtiphelperk8sbinbashorgv1.VirtualMachineNetworkConfig{},
 		resyncPeriod,
 		indexers,
 	)
 }
 
-func (f *iPReservationInformer) defaultInformer(client versioned.Interface, resyncPeriod time.Duration) cache.SharedIndexInformer {
-	return NewFilteredIPReservationInformer(client, f.namespace, resyncPeriod, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc}, f.tweakListOptions)
+func (f *virtualMachineNetworkConfigInformer) defaultInformer(client versioned.Interface, resyncPeriod time.Duration) cache.SharedIndexInformer {
+	return NewFilteredVirtualMachineNetworkConfigInformer(client, f.namespace, resyncPeriod, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc}, f.tweakListOptions)
 }
 
-func (f *iPReservationInformer) Informer() cache.SharedIndexInformer {
-	return f.factory.InformerFor(&kubevirtiphelperk8sbinbashorgv1.IPReservation{}, f.defaultInformer)
+func (f *virtualMachineNetworkConfigInformer) Informer() cache.SharedIndexInformer {
+	return f.factory.InformerFor(&kubevirtiphelperk8sbinbashorgv1.VirtualMachineNetworkConfig{}, f.defaultInformer)
 }
 
-func (f *iPReservationInformer) Lister() v1.IPReservationLister {
-	return v1.NewIPReservationLister(f.Informer().GetIndexer())
+func (f *virtualMachineNetworkConfigInformer) Lister() v1.VirtualMachineNetworkConfigLister {
+	return v1.NewVirtualMachineNetworkConfigLister(f.Informer().GetIndexer())
 }

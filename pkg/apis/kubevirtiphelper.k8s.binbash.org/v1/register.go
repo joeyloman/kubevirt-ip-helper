@@ -34,8 +34,8 @@ func Resource(resource string) schema.GroupResource {
 func addKnownTypes(scheme *runtime.Scheme) error {
 	scheme.AddKnownTypes(
 		SchemeGroupVersion,
-		&IPReservation{},
-		&IPReservationList{},
+		&VirtualMachineNetworkConfig{},
+		&VirtualMachineNetworkConfigList{},
 	)
 
 	scheme.AddKnownTypes(

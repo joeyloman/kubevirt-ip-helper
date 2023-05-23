@@ -7,37 +7,37 @@ import (
 // +genclient
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
-type IPReservation struct {
+type VirtualMachineNetworkConfig struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	Spec   IPReservationSpec   `json:"spec,omitempty"`
-	Status IPReservationStatus `json:"status,omitempty"`
+	Spec   VirtualMachineNetworkConfigSpec   `json:"spec,omitempty"`
+	Status VirtualMachineNetworkConfigStatus `json:"status,omitempty"`
 }
 
-type IPReservationSpec struct {
-	VMName         string           `json:"vmname,omitempty"`
-	IPReservations []IPReservations `json:"ipreservations,omitempty"`
+type VirtualMachineNetworkConfigSpec struct {
+	VMName                       string                         `json:"vmname,omitempty"`
+	VirtualMachineNetworkConfigs []VirtualMachineNetworkConfigs `json:"virtualmachinenetworkconfigs,omitempty"`
 }
 
-type IPReservations struct {
+type VirtualMachineNetworkConfigs struct {
 	IPAddress   string `json:"ipaddress,omitempty"`
 	MACAddress  string `json:"macaddress,omitempty"`
 	NetworkName string `json:"networkname,omitempty"`
 }
 
-type IPReservationStatus struct {
+type VirtualMachineNetworkConfigStatus struct {
 	Name string
 }
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
-type IPReservationList struct {
+type VirtualMachineNetworkConfigList struct {
 	metav1.TypeMeta `json:",inline"`
 	// Standard list metadata.
 	metav1.ListMeta `json:"metadata,omitempty"`
 	// List of Fips.
-	Items []IPReservation `json:"items"`
+	Items []VirtualMachineNetworkConfig `json:"items"`
 }
 
 // +genclient
@@ -54,7 +54,7 @@ type IPPool struct {
 
 type IPPoolSpec struct {
 	Subnet      string   `json:"subnet,omitempty"`
-	Pool        []Pool   `json:"pool,omitempty"`
+	Pool        Pool     `json:"pool,omitempty"`
 	Router      string   `json:"router,omitempty"`
 	DNS         []string `json:"dns,omitempty"`
 	NetworkName string   `json:"networkname,omitempty"`

@@ -22,10 +22,10 @@ package v1
 // IPPoolLister.
 type IPPoolListerExpansion interface{}
 
-// IPReservationListerExpansion allows custom methods to be added to
-// IPReservationLister.
-type IPReservationListerExpansion interface{}
+// VirtualMachineNetworkConfigListerExpansion allows custom methods to be added to
+// VirtualMachineNetworkConfigLister.
+type VirtualMachineNetworkConfigListerExpansion interface{}
 
-// IPReservationNamespaceListerExpansion allows custom methods to be added to
-// IPReservationNamespaceLister.
-type IPReservationNamespaceListerExpansion interface{}
+// VirtualMachineNetworkConfigNamespaceListerExpansion allows custom methods to be added to
+// VirtualMachineNetworkConfigNamespaceLister.
+type VirtualMachineNetworkConfigNamespaceListerExpansion interface{}

@@ -20,4 +20,4 @@ package v1
 
 type IPPoolExpansion interface{}
 
-type IPReservationExpansion interface{}
+type VirtualMachineNetworkConfigExpansion interface{}

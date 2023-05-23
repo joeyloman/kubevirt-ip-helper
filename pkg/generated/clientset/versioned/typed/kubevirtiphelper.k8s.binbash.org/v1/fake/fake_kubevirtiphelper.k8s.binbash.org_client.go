@@ -32,8 +32,8 @@ func (c *FakeKubevirtiphelperV1) IPPools() v1.IPPoolInterface {
 	return &FakeIPPools{c}
 }
 
-func (c *FakeKubevirtiphelperV1) IPReservations(namespace string) v1.IPReservationInterface {
-	return &FakeIPReservations{c, namespace}
+func (c *FakeKubevirtiphelperV1) VirtualMachineNetworkConfigs(namespace string) v1.VirtualMachineNetworkConfigInterface {
+	return &FakeVirtualMachineNetworkConfigs{c, namespace}
 }
 
 // RESTClient returns a RESTClient that is used to communicate
