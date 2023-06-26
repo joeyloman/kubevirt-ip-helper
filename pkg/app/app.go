@@ -1,20 +1,58 @@
 package app
 
 import (
-	// log "github.com/sirupsen/logrus"
+	"os"
+	"path/filepath"
+	"time"
 
-	kviphclientset "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/clientset/versioned"
+	log "github.com/sirupsen/logrus"
 
-	"k8s.io/client-go/kubernetes"
+	"context"
 
-	"kubevirt.io/client-go/kubecli"
-	//dhcpd "github.com/joeyloman/kubevirt-ip-helper/dhcpd"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/controller/ippool"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/controller/vm"
 )
 
-func Run(kubevirt_kubecli kubecli.KubevirtClient, kviph_clientset *kviphclientset.Clientset, k8s_clientset *kubernetes.Clientset) {
-	// start the dhcpd service
-	//go dhcpd.DhcpdRun()
+type EventListeners struct {
+	ctx                 context.Context
+	vmEventListener     *vm.EventListener
+	ippoolEventListener *ippool.EventListener
+}
 
-	// start watching the vmi events
-	watchEvents(kubevirt_kubecli, kviph_clientset, k8s_clientset)
+func NewEventListeners(ctx context.Context) *EventListeners {
+	log.Infof("(app.NewEventListeners) start")
+
+	return &EventListeners{
+		ctx: ctx,
+	}
+}
+
+func (e *EventListeners) Run(ctx context.Context) {
+	log.Infof("(app.Run) start")
+
+	// TODO: flag parse
+
+	// temp
+	homedir := os.Getenv("HOME")
+	kubeconfig_file := filepath.Join(homedir, ".kube", "config")
+
+	e.vmEventListener = vm.NewEventListener(ctx, kubeconfig_file, "", nil, nil)
+	if err := e.vmEventListener.Init(); err != nil {
+		handleErr(err)
+	}
+	go e.vmEventListener.Listener()
+
+	e.ippoolEventListener = ippool.NewEventListener(ctx, kubeconfig_file, "", nil, nil)
+	if err := e.ippoolEventListener.Init(); err != nil {
+		handleErr(err)
+	}
+	go e.ippoolEventListener.Listener()
+
+	for {
+		time.Sleep(time.Second)
+	}
+}
+
+func handleErr(err error) {
+	log.Errorf("(app.handleErr) %s", err.Error())
 }

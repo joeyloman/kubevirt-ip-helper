@@ -1,0 +1,114 @@
+package ippool
+
+import (
+	"context"
+
+	log "github.com/sirupsen/logrus"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/util/workqueue"
+
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
+
+	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
+	kihclientset "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/clientset/versioned"
+)
+
+const (
+	ADD    = "add"
+	UPDATE = "update"
+	DELETE = "delete"
+)
+
+type EventListener struct {
+	ctx            context.Context
+	kubeConfig     string
+	kubeContext    string
+	kubeRestConfig *rest.Config
+	kihClientset   *kihclientset.Clientset
+}
+
+type Event struct {
+	key    string
+	action string
+}
+
+func NewEventListener(ctx context.Context, kubeConfig string, kubeContext string, kubeRestConfig *rest.Config, kihClientset *kihclientset.Clientset) *EventListener {
+	log.Infof("(ippool.NewEventListener) start")
+
+	return &EventListener{
+		ctx:            ctx,
+		kubeConfig:     kubeConfig,
+		kubeContext:    kubeContext,
+		kubeRestConfig: kubeRestConfig,
+		kihClientset:   kihClientset,
+	}
+}
+
+func (e *EventListener) Init() (err error) {
+	log.Infof("(ippool.Init) start")
+
+	e.kubeRestConfig, err = e.getKubeConfig()
+	if err != nil {
+		return
+	}
+
+	e.kihClientset, err = kihclientset.NewForConfig(e.kubeRestConfig)
+	if err != nil {
+		return
+	}
+
+	return
+}
+
+func (e *EventListener) getKubeConfig() (config *rest.Config, err error) {
+	log.Infof("(ippool.getKubeConfig) start")
+
+	if e.kubeConfig == "" {
+		return rest.InClusterConfig()
+	}
+
+	return clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+		&clientcmd.ClientConfigLoadingRules{ExplicitPath: e.kubeConfig},
+		&clientcmd.ConfigOverrides{ClusterInfo: clientcmdapi.Cluster{}, CurrentContext: e.kubeContext},
+	).ClientConfig()
+}
+
+func (e *EventListener) Listener() (err error) {
+	log.Infof("(ippool.Listener) start")
+
+	vmWatcher := cache.NewListWatchFromClient(e.kihClientset.KubevirtiphelperV1().RESTClient(), "ippools", corev1.NamespaceAll, fields.Everything())
+
+	queue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
+
+	indexer, informer := cache.NewIndexerInformer(vmWatcher, &kihv1.IPPool{}, 0, cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			key, err := cache.MetaNamespaceKeyFunc(obj)
+			if err == nil {
+				queue.Add(Event{key: key, action: ADD})
+			}
+		},
+		UpdateFunc: func(old interface{}, new interface{}) {
+			key, err := cache.MetaNamespaceKeyFunc(new)
+			if err == nil {
+				queue.Add(Event{key: key, action: UPDATE})
+			}
+		},
+		DeleteFunc: func(obj interface{}) {
+			key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
+			if err == nil {
+				queue.Add(Event{key: key, action: DELETE})
+			}
+		},
+	}, cache.Indexers{})
+
+	controller := NewController(queue, indexer, informer)
+	stop := make(chan struct{})
+	defer close(stop)
+	go controller.Run(1, stop)
+
+	select {}
+}

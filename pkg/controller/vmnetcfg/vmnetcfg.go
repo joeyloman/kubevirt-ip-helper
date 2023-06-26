@@ -1,4 +1,4 @@
-package kubevirtiphelper
+package vmnetcfg
 
 import (
 	kviphv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"

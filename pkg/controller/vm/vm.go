@@ -6,7 +6,7 @@ import (
 	kubevirtV1 "kubevirt.io/api/core/v1"
 )
 
-func GetNetworkDetails(vm *kubevirtV1.VirtualMachine) {
+func getNetworkDetails(vm *kubevirtV1.VirtualMachine) {
 	for _, nic := range vm.Spec.Template.Spec.Domain.Devices.Interfaces {
 		for _, net := range vm.Spec.Template.Spec.Networks {
 			if nic.Name == net.Name {

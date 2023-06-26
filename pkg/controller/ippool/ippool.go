@@ -1,4 +1,4 @@
-package kubevirtiphelper
+package ippool
 
 import (
 	kviphv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
@@ -7,7 +7,7 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-func AllocateIPPool(pool *kviphv1.IPPool, clientset *kviphclientset.Clientset) error {
+func allocateIPPool(pool *kviphv1.IPPool, clientset *kviphclientset.Clientset) error {
 	var err error
 
 	log.Tracef("(AllocateIPPool) poolobj added: [%+v]\n", pool)
@@ -15,7 +15,7 @@ func AllocateIPPool(pool *kviphv1.IPPool, clientset *kviphclientset.Clientset) e
 	return err
 }
 
-func RemoveIPPool(pool *kviphv1.IPPool, clientset *kviphclientset.Clientset) error {
+func removeIPPool(pool *kviphv1.IPPool, clientset *kviphclientset.Clientset) error {
 	var err error
 
 	log.Tracef("(RemoveIPPool) poolobj removed: [%+v]\n", pool)
@@ -23,7 +23,7 @@ func RemoveIPPool(pool *kviphv1.IPPool, clientset *kviphclientset.Clientset) err
 	return err
 }
 
-func UpdateIPPool(oldPool *kviphv1.IPPool, newPool *kviphv1.IPPool, clientset *kviphclientset.Clientset) error {
+func updateIPPool(oldPool *kviphv1.IPPool, newPool *kviphv1.IPPool, clientset *kviphclientset.Clientset) error {
 	var err error
 
 	log.Tracef("(UpdateIPPool) poolobj updated: oldPool [%+v] / newPool [%+v]\n", oldPool, newPool)
