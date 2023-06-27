@@ -3,18 +3,19 @@ kind: IPPool
 metadata:
   name: public-vlan1
 spec:
-  serverip: 10.135.10.9
-  subnet: 10.135.10.0/24
-  pool:
-    start: 10.135.10.10
-    end: 10.135.10.200
-    exclude:
-      - 10.135.10.150
-      - 10.135.10.151
-  router: 10.135.10.1
-  dns:
-    - 8.8.8.8
-    - 4.4.4.4
+  ipv4config:
+    serverip: 10.135.10.9
+    subnet: 10.135.10.0/24
+    pool:
+      start: 10.135.10.10
+      end: 10.135.10.200
+      exclude:
+        - 10.135.10.150
+        - 10.135.10.151
+    router: 10.135.10.1
+    dns:
+      - 8.8.8.8
+      - 4.4.4.4
   networkname: harvester-public/public-vlan-1
 ---
 apiVersion: kubevirtiphelper.k8s.binbash.org/v1
@@ -22,18 +23,19 @@ kind: IPPool
 metadata:
   name: public-vlan2
 spec:
-  serverip: 10.135.20.9
-  subnet: 10.135.20.0/24
-  pool:
-    start: 10.135.20.10
-    end: 10.135.20.200
-    exclude:
-      - 10.135.20.150
-      - 10.135.20.151
-  router: 10.135.20.1
-  dns:
-    - 8.8.8.8
-    - 4.4.4.4
+  ipv4config:
+    serverip: 10.135.20.9
+    subnet: 10.135.20.0/24
+    pool:
+      start: 10.135.20.10
+      end: 10.135.20.200
+      exclude:
+        - 10.135.20.150
+        - 10.135.20.151
+    router: 10.135.20.1
+    dns:
+      - 8.8.8.8
+      - 4.4.4.4
   networkname: harvester-public/public-vlan-2
 ---
 apiVersion: kubevirtiphelper.k8s.binbash.org/v1
