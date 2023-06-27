@@ -1,4 +1,4 @@
-package ippool
+package vmnetcfg
 
 import (
 	"time"
@@ -14,30 +14,30 @@ import (
 )
 
 type Controller struct {
-	indexer     cache.Indexer
-	queue       workqueue.RateLimitingInterface
-	informer    cache.Controller
-	ipPoolCache *map[string]kihv1.IPPool
+	indexer       cache.Indexer
+	queue         workqueue.RateLimitingInterface
+	informer      cache.Controller
+	vmNetCfgCache *map[string]kihv1.VirtualMachineNetworkConfig
 }
 
 func NewController(
 	queue workqueue.RateLimitingInterface,
 	indexer cache.Indexer,
 	informer cache.Controller,
-	ipPoolCache *map[string]kihv1.IPPool,
+	vmNetCfgCache *map[string]kihv1.VirtualMachineNetworkConfig,
 ) *Controller {
-	log.Infof("(ippool.NewController) start")
+	log.Infof("(vmnetcfg.NewController) start")
 
 	return &Controller{
-		informer:    informer,
-		indexer:     indexer,
-		queue:       queue,
-		ipPoolCache: ipPoolCache,
+		informer:      informer,
+		indexer:       indexer,
+		queue:         queue,
+		vmNetCfgCache: vmNetCfgCache,
 	}
 }
 
 func (c *Controller) processNextItem() bool {
-	log.Infof("(ippool.processNextItem) start")
+	log.Infof("(vmnetcfg.processNextItem) start")
 
 	event, quit := c.queue.Get()
 	if quit {
@@ -53,39 +53,39 @@ func (c *Controller) processNextItem() bool {
 }
 
 func (c *Controller) sync(event Event) (err error) {
-	log.Infof("(ippool.sync) start")
+	log.Infof("(vmnetcfg.sync) start")
 
 	obj, exists, err := c.indexer.GetByKey(event.key)
 	if err != nil {
-		log.Errorf("(ippool.sync) fetching object with key %s from store failed with %v", event.key, err)
+		log.Errorf("(vmnetcfg.sync) fetching object with key %s from store failed with %v", event.key, err)
 
 		return
 	}
 
 	if !exists && event.action != DELETE {
-		log.Infof("(ippool.sync) IPPool %s does not exist anymore", event.key)
+		log.Infof("(vmnetcfg.sync) VirtualMachineNetworkConfig %s does not exist anymore", event.key)
 
 		return
 	}
 
 	switch event.action {
 	case ADD:
-		log.Infof("(ippool.sync) event sync for IPPool %s", obj.(*kihv1.IPPool).GetName())
-		log.Infof("(ippool.sync) add action found!")
+		log.Infof("(vmnetcfg.sync) event sync for VirtualMachineNetworkConfig %s", obj.(*kihv1.VirtualMachineNetworkConfig).GetName())
+		log.Infof("(vmnetcfg.sync) add action found!")
 		// if err := allocateIPPool(obj.(*kihv1.IPPool), kviph_clientset); err != nil {
 		// 	log.Errorf("(watchIPPoolEvents) error allocating ippool: %s", err.Error())
 		// }
 	case UPDATE:
-		log.Infof("(ippool.sync) update action found!")
+		log.Infof("(vmnetcfg.sync) update action found!")
 	case DELETE:
-		log.Infof("(ippool.sync) delete action found!")
+		log.Infof("(vmnetcfg.sync) delete action found!")
 	}
 
 	return
 }
 
 func (c *Controller) handleErr(err error, key interface{}) {
-	log.Infof("(ippool.handleErr) start")
+	log.Infof("(vmnetcfg.handleErr) start")
 
 	if err == nil {
 		c.queue.Forget(key)
@@ -94,7 +94,7 @@ func (c *Controller) handleErr(err error, key interface{}) {
 	}
 
 	if c.queue.NumRequeues(key) < 5 {
-		log.Errorf("(ippool.handleErr) syncing IPPool %v: %v", key, err)
+		log.Errorf("(vmnetcfg.handleErr) syncing VirtualMachineNetworkConfig %v: %v", key, err)
 
 		c.queue.AddRateLimited(key)
 
@@ -103,18 +103,18 @@ func (c *Controller) handleErr(err error, key interface{}) {
 
 	c.queue.Forget(key)
 
-	log.Infof("(ippool.handleErr) dropping IPPool %q out of the queue: %v", key, err)
+	log.Infof("(vmnetcfg.handleErr) dropping VirtualMachineNetworkConfig %q out of the queue: %v", key, err)
 }
 
 func (c *Controller) Run(workers int, stopCh chan struct{}) {
 	defer runtime.HandleCrash()
 
 	defer c.queue.ShutDown()
-	log.Infof("(ippool.Run) starting IPPool controller")
+	log.Infof("(vmnetcfg.Run) starting VirtualMachineNetworkConfig controller")
 
 	go c.informer.Run(stopCh)
 	if !cache.WaitForCacheSync(stopCh, c.informer.HasSynced) {
-		log.Errorf("(ippool.Run) timed out waiting for caches to sync")
+		log.Errorf("(vmnetcfg.Run) timed out waiting for caches to sync")
 
 		return
 	}
@@ -124,11 +124,11 @@ func (c *Controller) Run(workers int, stopCh chan struct{}) {
 	}
 
 	<-stopCh
-	log.Infof("(ippool.Run) stopping IPPool controller")
+	log.Infof("(vmnetcfg.Run) stopping VirtualMachineNetworkConfig controller")
 }
 
 func (c *Controller) runWorker() {
-	log.Infof("(ippool.runWorker) start")
+	log.Infof("(vmnetcfg.runWorker) start")
 
 	for c.processNextItem() {
 	}

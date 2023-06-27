@@ -11,21 +11,30 @@ import (
 	"k8s.io/client-go/util/workqueue"
 
 	kubevirtv1 "kubevirt.io/api/core/v1"
+
+	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
 )
 
 type Controller struct {
-	indexer  cache.Indexer
-	queue    workqueue.RateLimitingInterface
-	informer cache.Controller
+	indexer       cache.Indexer
+	queue         workqueue.RateLimitingInterface
+	informer      cache.Controller
+	vmNetCfgCache *map[string]kihv1.VirtualMachineNetworkConfig
 }
 
-func NewController(queue workqueue.RateLimitingInterface, indexer cache.Indexer, informer cache.Controller) *Controller {
+func NewController(
+	queue workqueue.RateLimitingInterface,
+	indexer cache.Indexer,
+	informer cache.Controller,
+	vmNetCfgCache *map[string]kihv1.VirtualMachineNetworkConfig,
+) *Controller {
 	log.Infof("(vm.NewController) start")
 
 	return &Controller{
-		informer: informer,
-		indexer:  indexer,
-		queue:    queue,
+		informer:      informer,
+		indexer:       indexer,
+		queue:         queue,
+		vmNetCfgCache: vmNetCfgCache,
 	}
 }
 
@@ -45,33 +54,41 @@ func (c *Controller) processNextItem() bool {
 	return true
 }
 
-func (c *Controller) sync(event Event) error {
+func (c *Controller) sync(event Event) (err error) {
 	log.Infof("(vm.sync) start")
 
 	obj, exists, err := c.indexer.GetByKey(event.key)
 	if err != nil {
 		log.Errorf("(vm.sync) fetching object with key %s from store failed with %v", event.key, err)
 
-		return err
+		return
 	}
 
-	if exists {
-		log.Infof("(vm.sync) event sync for VM %s", obj.(*kubevirtv1.VirtualMachine).GetName())
-
-		switch event.action {
-		case ADD:
-			log.Infof("(vm.sync) add action found!")
-			getNetworkDetails(obj.(*kubevirtv1.VirtualMachine))
-		case UPDATE:
-			log.Infof("(vm.sync) update action found!")
-		case DELETE:
-			log.Infof("(vm.sync) delete action found!")
-		}
-	} else {
+	if !exists && event.action != DELETE {
 		log.Infof("(vm.sync) VM %s does not exist anymore", event.key)
+
+		return
 	}
 
-	return nil
+	//log.Infof("(vm.sync) event sync for VirtualMachine %s", obj.(*kubevirtv1.VirtualMachine).GetName())
+	log.Infof("(vm.sync) processing event for VirtualMachine [%s/%s]", event.namespace, event.vmname)
+
+	switch event.action {
+	case ADD:
+		log.Infof("(vm.sync) add action found!")
+		getNetworkDetails(obj.(*kubevirtv1.VirtualMachine), c.vmNetCfgCache)
+		tempPrintRegisteredVMs(c.vmNetCfgCache)
+	case UPDATE:
+		log.Infof("(vm.sync) update action found!")
+		getNetworkDetails(obj.(*kubevirtv1.VirtualMachine), c.vmNetCfgCache)
+		tempPrintRegisteredVMs(c.vmNetCfgCache)
+	case DELETE:
+		log.Infof("(vm.sync) delete action found!")
+		// delete VirtualMachineNetworkConfig object -> match objectmeta.namespace and spec.vmname
+		tempPrintRegisteredVMs(c.vmNetCfgCache)
+	}
+
+	return
 }
 
 func (c *Controller) handleErr(err error, key interface{}) {

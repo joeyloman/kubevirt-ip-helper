@@ -1,4 +1,4 @@
-package ippool
+package vmnetcfg
 
 import (
 	"context"
@@ -25,7 +25,7 @@ const (
 
 type EventListener struct {
 	ctx            context.Context
-	ipPoolCache    *map[string]kihv1.IPPool
+	vmNetCfgCache  *map[string]kihv1.VirtualMachineNetworkConfig
 	kubeConfig     string
 	kubeContext    string
 	kubeRestConfig *rest.Config
@@ -39,17 +39,17 @@ type Event struct {
 
 func NewEventListener(
 	ctx context.Context,
-	ipPoolCache *map[string]kihv1.IPPool,
+	vmNetCfgCache *map[string]kihv1.VirtualMachineNetworkConfig,
 	kubeConfig string,
 	kubeContext string,
 	kubeRestConfig *rest.Config,
 	kihClientset *kihclientset.Clientset,
 ) *EventListener {
-	log.Infof("(ippool.NewEventListener) start")
+	log.Infof("(vmnetcfg.NewEventListener) start")
 
 	return &EventListener{
 		ctx:            ctx,
-		ipPoolCache:    ipPoolCache,
+		vmNetCfgCache:  vmNetCfgCache,
 		kubeConfig:     kubeConfig,
 		kubeContext:    kubeContext,
 		kubeRestConfig: kubeRestConfig,
@@ -58,7 +58,7 @@ func NewEventListener(
 }
 
 func (e *EventListener) Init() (err error) {
-	log.Infof("(ippool.Init) start")
+	log.Infof("(vmnetcfg.Init) start")
 
 	e.kubeRestConfig, err = e.getKubeConfig()
 	if err != nil {
@@ -74,7 +74,7 @@ func (e *EventListener) Init() (err error) {
 }
 
 func (e *EventListener) getKubeConfig() (config *rest.Config, err error) {
-	log.Infof("(ippool.getKubeConfig) start")
+	log.Infof("(vmnetcfg.getKubeConfig) start")
 
 	if e.kubeConfig == "" {
 		return rest.InClusterConfig()
@@ -87,13 +87,13 @@ func (e *EventListener) getKubeConfig() (config *rest.Config, err error) {
 }
 
 func (e *EventListener) Listener() (err error) {
-	log.Infof("(ippool.Listener) start")
+	log.Infof("(vmnetcfg.Listener) start")
 
-	vmWatcher := cache.NewListWatchFromClient(e.kihClientset.KubevirtiphelperV1().RESTClient(), "ippools", corev1.NamespaceAll, fields.Everything())
+	vmWatcher := cache.NewListWatchFromClient(e.kihClientset.KubevirtiphelperV1().RESTClient(), "virtualmachinenetworkconfigs", corev1.NamespaceAll, fields.Everything())
 
 	queue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
 
-	indexer, informer := cache.NewIndexerInformer(vmWatcher, &kihv1.IPPool{}, 0, cache.ResourceEventHandlerFuncs{
+	indexer, informer := cache.NewIndexerInformer(vmWatcher, &kihv1.VirtualMachineNetworkConfig{}, 0, cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			key, err := cache.MetaNamespaceKeyFunc(obj)
 			if err == nil {
@@ -123,7 +123,7 @@ func (e *EventListener) Listener() (err error) {
 		},
 	}, cache.Indexers{})
 
-	controller := NewController(queue, indexer, informer, e.ipPoolCache)
+	controller := NewController(queue, indexer, informer, e.vmNetCfgCache)
 	stop := make(chan struct{})
 	defer close(stop)
 	go controller.Run(1, stop)

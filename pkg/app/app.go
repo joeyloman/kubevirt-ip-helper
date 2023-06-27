@@ -11,23 +11,29 @@ import (
 
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/controller/ippool"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/controller/vm"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/controller/vmnetcfg"
+
+	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
 )
 
-type EventListeners struct {
-	ctx                 context.Context
-	vmEventListener     *vm.EventListener
-	ippoolEventListener *ippool.EventListener
+type handler struct {
+	ctx                   context.Context
+	ipPoolCache           map[string]kihv1.IPPool
+	vmNetCfgCache         map[string]kihv1.VirtualMachineNetworkConfig
+	ippoolEventListener   *ippool.EventListener
+	vmnetcfgEventListener *vmnetcfg.EventListener
+	vmEventListener       *vm.EventListener
 }
 
-func NewEventListeners(ctx context.Context) *EventListeners {
+func Register(ctx context.Context) *handler {
 	log.Infof("(app.NewEventListeners) start")
 
-	return &EventListeners{
+	return &handler{
 		ctx: ctx,
 	}
 }
 
-func (e *EventListeners) Run(ctx context.Context) {
+func (h *handler) Run(ctx context.Context) {
 	log.Infof("(app.Run) start")
 
 	// TODO: flag parse
@@ -36,18 +42,32 @@ func (e *EventListeners) Run(ctx context.Context) {
 	homedir := os.Getenv("HOME")
 	kubeconfig_file := filepath.Join(homedir, ".kube", "config")
 
-	e.vmEventListener = vm.NewEventListener(ctx, kubeconfig_file, "", nil, nil)
-	if err := e.vmEventListener.Init(); err != nil {
+	// initialize the pool and vm network config caches
+	h.ipPoolCache = make(map[string]kihv1.IPPool)
+	h.vmNetCfgCache = make(map[string]kihv1.VirtualMachineNetworkConfig)
+
+	// initialize the ippoolEventListener handler
+	h.ippoolEventListener = ippool.NewEventListener(ctx, &h.ipPoolCache, kubeconfig_file, "", nil, nil)
+	if err := h.ippoolEventListener.Init(); err != nil {
 		handleErr(err)
 	}
-	go e.vmEventListener.Listener()
+	go h.ippoolEventListener.Listener()
 
-	e.ippoolEventListener = ippool.NewEventListener(ctx, kubeconfig_file, "", nil, nil)
-	if err := e.ippoolEventListener.Init(); err != nil {
+	// initialize the vmnetcfgEventListener handler
+	h.vmnetcfgEventListener = vmnetcfg.NewEventListener(ctx, &h.vmNetCfgCache, kubeconfig_file, "", nil, nil)
+	if err := h.vmnetcfgEventListener.Init(); err != nil {
 		handleErr(err)
 	}
-	go e.ippoolEventListener.Listener()
+	go h.vmnetcfgEventListener.Listener()
 
+	// initialize the vmEventListener handler
+	h.vmEventListener = vm.NewEventListener(ctx, &h.vmNetCfgCache, kubeconfig_file, "", nil, nil)
+	if err := h.vmEventListener.Init(); err != nil {
+		handleErr(err)
+	}
+	go h.vmEventListener.Listener()
+
+	// TODO: replace with DHCP service
 	for {
 		time.Sleep(time.Second)
 	}

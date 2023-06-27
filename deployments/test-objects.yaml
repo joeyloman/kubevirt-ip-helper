@@ -42,6 +42,7 @@ apiVersion: kubevirtiphelper.k8s.binbash.org/v1
 kind: VirtualMachineNetworkConfig
 metadata:
   name: test-vm1
+  namespace: default
 spec:
   vmname: test-vm1
   netcfg:

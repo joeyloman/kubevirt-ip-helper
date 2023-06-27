@@ -33,7 +33,7 @@ func main() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	rootApp := app.NewEventListeners(ctx)
+	mainApp := app.Register(ctx)
 
 	go func() {
 		<-sig
@@ -41,6 +41,6 @@ func main() {
 		os.Exit(1)
 	}()
 
-	rootApp.Run(ctx)
+	mainApp.Run(ctx)
 	cancel()
 }
