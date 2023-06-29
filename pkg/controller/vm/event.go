@@ -26,7 +26,7 @@ const (
 	DELETE = "delete"
 )
 
-type EventListener struct {
+type EventHandler struct {
 	ctx            context.Context
 	vmNetCfgCache  map[string]kihv1.VirtualMachineNetworkConfig
 	kubeConfig     string
@@ -43,7 +43,7 @@ type Event struct {
 	namespace string
 }
 
-func NewEventListener(
+func NewEventHandler(
 	ctx context.Context,
 	vmNetCfgCache map[string]kihv1.VirtualMachineNetworkConfig,
 	kubeConfig string,
@@ -51,10 +51,10 @@ func NewEventListener(
 	kubeRestConfig *rest.Config,
 	kihClientset *kihclientset.Clientset,
 	kcli kubecli.KubevirtClient,
-) *EventListener {
-	log.Infof("(vm.NewEventListener) start")
+) *EventHandler {
+	log.Infof("(vm.NewEventHandler) start")
 
-	return &EventListener{
+	return &EventHandler{
 		ctx:            ctx,
 		vmNetCfgCache:  vmNetCfgCache,
 		kubeConfig:     kubeConfig,
@@ -65,7 +65,7 @@ func NewEventListener(
 	}
 }
 
-func (e *EventListener) Init() (err error) {
+func (e *EventHandler) Init() (err error) {
 	log.Infof("(vm.Init) start")
 
 	e.kubeRestConfig, err = e.getKubeConfig()
@@ -86,7 +86,7 @@ func (e *EventListener) Init() (err error) {
 	return
 }
 
-func (e *EventListener) getKubeConfig() (config *rest.Config, err error) {
+func (e *EventHandler) getKubeConfig() (config *rest.Config, err error) {
 	log.Infof("(vm.getKubeConfig) start")
 
 	if e.kubeConfig == "" {
@@ -99,7 +99,7 @@ func (e *EventListener) getKubeConfig() (config *rest.Config, err error) {
 	).ClientConfig()
 }
 
-func (e *EventListener) Listener() (err error) {
+func (e *EventHandler) EventListener() (err error) {
 	log.Infof("(vm.Listener) start")
 
 	vmWatcher := cache.NewListWatchFromClient(e.kcli.RestClient(), "virtualmachines", corev1.NamespaceAll, fields.Everything())

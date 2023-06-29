@@ -14,6 +14,31 @@ import (
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
 )
 
+// func (c *Controller) checkVirtualMachineNetworkingDetails(vm *kubevirtV1.VirtualMachine) (err error) {
+// 	log.Infof("(vm.checkVirtualMachineNetworkingDetails) checking VirtualMachine object")
+
+// 	for _, nic := range vm.Spec.Template.Spec.Domain.Devices.Interfaces {
+// 		for _, net := range vm.Spec.Template.Spec.Networks {
+// 			if nic.Name == net.Name {
+// 				if net.Multus == nil {
+// 					log.Warnf("(vm.createVirtualMachineNetworkConfig) unsupported network type found!")
+// 				} else if nic.MacAddress == "" {
+// 					log.Errorf("(vm.createVirtualMachineNetworkConfig) no mac address found for vm [%s/%s]",
+// 						vm.ObjectMeta.Namespace, vm.ObjectMeta.Name)
+// 				} else if net.Multus.NetworkName == "" {
+// 					log.Errorf("(vm.createVirtualMachineNetworkConfig) no networkname found for vm [%s/%s]",
+// 						vm.ObjectMeta.Namespace, vm.ObjectMeta.Name)
+// 				} else {
+// 					// TODO: lookup networkname in IPPools cache
+// 					// TODO: lookup macaddress in hwAddr cache
+// 				}
+// 			}
+// 		}
+// 	}
+
+// 	return
+// }
+
 func (c *Controller) createVirtualMachineNetworkConfigObject(vm *kubevirtV1.VirtualMachine) (err error) {
 	var netCfgs []kihv1.VirtualMachineNetworkConfigs
 
@@ -36,9 +61,12 @@ func (c *Controller) createVirtualMachineNetworkConfigObject(vm *kubevirtV1.Virt
 					log.Errorf("(vm.createVirtualMachineNetworkConfig) no networkname found for vm [%s/%s]",
 						vm.ObjectMeta.Namespace, vm.ObjectMeta.Name)
 				} else {
+					// if one of the mac addresses already exists, do not create the vmnetcfg object
+					// if one of the networks do not exists, do not create the vmnetcfg object
 					netCfg := kihv1.VirtualMachineNetworkConfigs{}
 					netCfg.MACAddress = nic.MacAddress
 					netCfg.NetworkName = net.Multus.NetworkName
+
 					netCfgs = append(netCfgs, netCfg)
 				}
 			}
@@ -54,9 +82,6 @@ func (c *Controller) createVirtualMachineNetworkConfigObject(vm *kubevirtV1.Virt
 
 	newVmNetCfg.Spec.VirtualMachineNetworkConfigs = netCfgs
 
-	// TODO: remove
-	log.Infof("(vm.createVirtualMachineNetworkConfig) returning: %+v", newVmNetCfg)
-
 	vmNetCfgObj, err := c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs(newVmNetCfg.Namespace).Create(context.TODO(), &newVmNetCfg, metav1.CreateOptions{})
 	if err != nil {
 		log.Errorf("(vm.createVirtualMachineNetworkConfig) cannot create VirtualMachineNetworkConfig object for vm [%s/%s]: %s",
@@ -68,56 +93,66 @@ func (c *Controller) createVirtualMachineNetworkConfigObject(vm *kubevirtV1.Virt
 	log.Infof("(vm.createVirtualMachineNetworkConfig) succesfully created vmnetcfg object [%s/%s] for vm [%s/%s]",
 		vmNetCfgObj.ObjectMeta.Namespace, vmNetCfgObj.ObjectMeta.Name, vm.ObjectMeta.Namespace, vm.ObjectMeta.Name)
 
-	// TODO: create the VirtualMachineNetworkConfig object
-	// err := vmnetcfg.CreateVirtualMachineNetworkConfigObject(newVmNetCfg)
-	// if err != nil {
-	// 	return
-	// }
+	return
+}
+
+func (c *Controller) updateVirtualMachineNetworkConfigObject(vm *kubevirtV1.VirtualMachine) (err error) {
+	log.Infof("(vm.updateVirtualMachineNetworkConfigObject) updating vmnetcfg object")
 
 	return
 }
 
-func getNetworkDetails(vm *kubevirtV1.VirtualMachine, vmNetCfgCache map[string]kihv1.VirtualMachineNetworkConfig) {
-	for _, nic := range vm.Spec.Template.Spec.Domain.Devices.Interfaces {
-		for _, net := range vm.Spec.Template.Spec.Networks {
-			if nic.Name == net.Name && net.Multus != nil {
-				log.Infof("(getNetworkDetails) VIRTUAL MACHINE name=%s, networkname=%s, macaddress=%s",
-					vm.ObjectMeta.Name, net.Multus.NetworkName, nic.MacAddress)
+func (c *Controller) deleteVirtualMachineNetworkConfigObject(vm *kubevirtV1.VirtualMachine) (err error) {
+	log.Infof("(vm.deleteVirtualMachineNetworkConfigObject) deleting vmnetcfg object")
 
-				// TODO: check if the mac address already exists in ???
+	c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs(vm.ObjectMeta.Namespace).Delete(context.TODO(), vm.ObjectMeta.Name, metav1.DeleteOptions{})
+	// if err != nil {
+	// 	log.Errorf("(vm.deleteVirtualMachineNetworkConfigObject) cannot delete VirtualMachineNetworkConfig object for vm [%s/%s]: %s",
+	// 		vm.ObjectMeta.Namespace, vm.ObjectMeta.Name, err.Error())
 
-				// TODO: check if the networkname is in the IPPools cache
+	// 	return
+	// }
 
-				// DHCP example
-				vmNetCfgObj := kihv1.VirtualMachineNetworkConfig{}
-				vmNetCfgObj.Spec.VMName = vm.ObjectMeta.Name
+	log.Infof("(vm.createVirtualMachineNetworkConfig) succesfully deleted vmnetcfg object [%s/%s] for vm [%s/%s]",
+		vm.ObjectMeta.Namespace, vm.ObjectMeta.Name, vm.ObjectMeta.Namespace, vm.ObjectMeta.Name)
 
-				var VirtualMachineNetworkConfig1 []kihv1.VirtualMachineNetworkConfigs
-
-				vmObj := kihv1.VirtualMachineNetworkConfigs{}
-				//vmObj.IPAddress = "192.168.10.20"
-				vmObj.MACAddress = nic.MacAddress
-				vmObj.NetworkName = net.Multus.NetworkName
-
-				VirtualMachineNetworkConfig1 = append(VirtualMachineNetworkConfig1, vmObj)
-				vmNetCfgObj.Spec.VirtualMachineNetworkConfigs = VirtualMachineNetworkConfig1
-				//(*vmNetCfgCache)[nic.MacAddress] = vmNetCfgObj
-				vmNetCfgCache[nic.MacAddress] = vmNetCfgObj
-			}
-		}
-	}
+	return
 }
 
-func tempPrintRegisteredVMs(vmNetCfgCache map[string]kihv1.VirtualMachineNetworkConfig) {
-	//for mac, res := range *vmNetCfgCache {
-	for mac, res := range vmNetCfgCache {
-		for i := 0; i < len(res.Spec.VirtualMachineNetworkConfigs); i++ {
-			log.Printf("VM in vmNetCfgCache: key=%s, ip=%s, hwaddr=%s, netname=%s",
-				mac,
-				res.Spec.VirtualMachineNetworkConfigs[i].IPAddress,
-				res.Spec.VirtualMachineNetworkConfigs[i].MACAddress,
-				res.Spec.VirtualMachineNetworkConfigs[i].NetworkName,
-			)
-		}
-	}
-}
+// func tempPrintRegisteredVMs(vmNetCfgCache map[string]kihv1.VirtualMachineNetworkConfig) {
+// 	//for mac, res := range *vmNetCfgCache {
+// 	for mac, res := range vmNetCfgCache {
+// 		for i := 0; i < len(res.Spec.VirtualMachineNetworkConfigs); i++ {
+// 			log.Printf("VM in vmNetCfgCache: key=%s, ip=%s, hwaddr=%s, netname=%s",
+// 				mac,
+// 				res.Spec.VirtualMachineNetworkConfigs[i].IPAddress,
+// 				res.Spec.VirtualMachineNetworkConfigs[i].MACAddress,
+// 				res.Spec.VirtualMachineNetworkConfigs[i].NetworkName,
+// 			)
+// 		}
+// 	}
+// }
+
+// if nic.Name == net.Name && net.Multus != nil {
+// 	log.Infof("(getNetworkDetails) VIRTUAL MACHINE name=%s, networkname=%s, macaddress=%s",
+// 		vm.ObjectMeta.Name, net.Multus.NetworkName, nic.MacAddress)
+
+// 	// TODO: check if the mac address already exists in ???
+
+// 	// TODO: check if the networkname is in the IPPools cache
+
+// 	// DHCP example
+// 	vmNetCfgObj := kihv1.VirtualMachineNetworkConfig{}
+// 	vmNetCfgObj.Spec.VMName = vm.ObjectMeta.Name
+
+// 	var VirtualMachineNetworkConfig1 []kihv1.VirtualMachineNetworkConfigs
+
+// 	vmObj := kihv1.VirtualMachineNetworkConfigs{}
+// 	//vmObj.IPAddress = "192.168.10.20"
+// 	vmObj.MACAddress = nic.MacAddress
+// 	vmObj.NetworkName = net.Multus.NetworkName
+
+// 	VirtualMachineNetworkConfig1 = append(VirtualMachineNetworkConfig1, vmObj)
+// 	vmNetCfgObj.Spec.VirtualMachineNetworkConfigs = VirtualMachineNetworkConfig1
+// 	//(*vmNetCfgCache)[nic.MacAddress] = vmNetCfgObj
+// 	vmNetCfgCache[nic.MacAddress] = vmNetCfgObj

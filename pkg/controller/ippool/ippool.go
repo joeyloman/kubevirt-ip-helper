@@ -3,15 +3,14 @@ package ippool
 import (
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
 	kviphclientset "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/clientset/versioned"
-	goipam "github.com/metal-stack/go-ipam"
 
 	log "github.com/sirupsen/logrus"
 )
 
-func registerIPPool(pool *kihv1.IPPool, ipPoolCache map[string]kihv1.IPPool, ipam *goipam.Ipamer) (err error) {
+func (c *Controller) registerIPPool(pool *kihv1.IPPool) (err error) {
 	log.Tracef("(ippool.registerIPPool) poolobj added: [%+v]\n", pool)
 
-	ipPoolCache[pool.Spec.IPv4Config.Subnet] = *pool
+	c.ipPoolCache[pool.Spec.IPv4Config.Subnet] = *pool
 
 	// TODO: add to ipam
 

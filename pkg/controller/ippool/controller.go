@@ -79,7 +79,7 @@ func (c *Controller) sync(event Event) (err error) {
 	switch event.action {
 	case ADD:
 		log.Infof("(ippool.sync) add action found!")
-		err := registerIPPool(obj.(*kihv1.IPPool), c.ipPoolCache, c.ipam)
+		err := c.registerIPPool(obj.(*kihv1.IPPool))
 		if err != nil {
 			log.Errorf("(ippool.sync) failed to allocate new pool for %s: %s", obj.(*kihv1.IPPool).GetName(), err.Error())
 		}

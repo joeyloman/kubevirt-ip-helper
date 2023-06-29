@@ -25,7 +25,7 @@ const (
 	DELETE = "delete"
 )
 
-type EventListener struct {
+type EventHandler struct {
 	ctx            context.Context
 	ipam           *goipam.Ipamer
 	ipPoolCache    map[string]kihv1.IPPool
@@ -40,7 +40,7 @@ type Event struct {
 	action string
 }
 
-func NewEventListener(
+func NewEventHandler(
 	ctx context.Context,
 	ipam *goipam.Ipamer,
 	ipPoolCache map[string]kihv1.IPPool,
@@ -48,10 +48,10 @@ func NewEventListener(
 	kubeContext string,
 	kubeRestConfig *rest.Config,
 	kihClientset *kihclientset.Clientset,
-) *EventListener {
-	log.Infof("(ippool.NewEventListener) start")
+) *EventHandler {
+	log.Infof("(ippool.NewEventHandler) start")
 
-	return &EventListener{
+	return &EventHandler{
 		ctx:            ctx,
 		ipam:           ipam,
 		ipPoolCache:    ipPoolCache,
@@ -62,7 +62,7 @@ func NewEventListener(
 	}
 }
 
-func (e *EventListener) Init() (err error) {
+func (e *EventHandler) Init() (err error) {
 	log.Infof("(ippool.Init) start")
 
 	e.kubeRestConfig, err = e.getKubeConfig()
@@ -78,7 +78,7 @@ func (e *EventListener) Init() (err error) {
 	return
 }
 
-func (e *EventListener) getKubeConfig() (config *rest.Config, err error) {
+func (e *EventHandler) getKubeConfig() (config *rest.Config, err error) {
 	log.Infof("(ippool.getKubeConfig) start")
 
 	if e.kubeConfig == "" {
@@ -91,8 +91,8 @@ func (e *EventListener) getKubeConfig() (config *rest.Config, err error) {
 	).ClientConfig()
 }
 
-func (e *EventListener) Listener() (err error) {
-	log.Infof("(ippool.Listener) start")
+func (e *EventHandler) EventListener() (err error) {
+	log.Infof("(ippool.EventListener) start")
 
 	vmWatcher := cache.NewListWatchFromClient(e.kihClientset.KubevirtiphelperV1().RESTClient(), "ippools", corev1.NamespaceAll, fields.Everything())
 

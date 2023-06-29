@@ -80,6 +80,12 @@ func (c *Controller) sync(event Event) (err error) {
 	switch event.action {
 	case ADD:
 		log.Infof("(vm.sync) add action found!")
+
+		// err := c.checkVirtualMachineNetworkingDetails(obj.(*kubevirtv1.VirtualMachine))
+		// if err != nil {
+		// 	log.Errorf("(vm.sync) %s", err)
+		// }
+
 		err := c.createVirtualMachineNetworkConfigObject(obj.(*kubevirtv1.VirtualMachine))
 		if err != nil {
 			log.Errorf("(vm.sync) %s", err)
@@ -88,10 +94,27 @@ func (c *Controller) sync(event Event) (err error) {
 		// tempPrintRegisteredVMs(c.vmNetCfgCache)
 	case UPDATE:
 		log.Infof("(vm.sync) update action found!")
+
+		err := c.updateVirtualMachineNetworkConfigObject(obj.(*kubevirtv1.VirtualMachine))
+		if err != nil {
+			log.Errorf("(vm.sync) %s", err)
+		}
+
+		// if one of the networks do not exists, do not update the vmnetcfg object
+		// if one of the mac addresses do not exists, update the vmnetcfg object
+
 		// getNetworkDetails(obj.(*kubevirtv1.VirtualMachine), c.vmNetCfgCache)
 		// tempPrintRegisteredVMs(c.vmNetCfgCache)
 	case DELETE:
 		log.Infof("(vm.sync) delete action found!")
+
+		err := c.deleteVirtualMachineNetworkConfigObject(obj.(*kubevirtv1.VirtualMachine))
+		if err != nil {
+			log.Errorf("(vm.sync) %s", err)
+		}
+
+		// remove the vmnetcfg object
+
 		// delete VirtualMachineNetworkConfig object -> match objectmeta.namespace and spec.vmname
 		// tempPrintRegisteredVMs(c.vmNetCfgCache)
 	}
