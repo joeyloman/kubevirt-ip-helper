@@ -17,6 +17,7 @@ import (
 	"kubevirt.io/client-go/kubecli"
 
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
+	kihclientset "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/clientset/versioned"
 )
 
 const (
@@ -27,10 +28,11 @@ const (
 
 type EventListener struct {
 	ctx            context.Context
-	vmNetCfgCache  *map[string]kihv1.VirtualMachineNetworkConfig
+	vmNetCfgCache  map[string]kihv1.VirtualMachineNetworkConfig
 	kubeConfig     string
 	kubeContext    string
 	kubeRestConfig *rest.Config
+	kihClientset   *kihclientset.Clientset
 	kcli           kubecli.KubevirtClient
 }
 
@@ -43,10 +45,11 @@ type Event struct {
 
 func NewEventListener(
 	ctx context.Context,
-	vmNetCfgCache *map[string]kihv1.VirtualMachineNetworkConfig,
+	vmNetCfgCache map[string]kihv1.VirtualMachineNetworkConfig,
 	kubeConfig string,
 	kubeContext string,
 	kubeRestConfig *rest.Config,
+	kihClientset *kihclientset.Clientset,
 	kcli kubecli.KubevirtClient,
 ) *EventListener {
 	log.Infof("(vm.NewEventListener) start")
@@ -57,6 +60,7 @@ func NewEventListener(
 		kubeConfig:     kubeConfig,
 		kubeContext:    kubeContext,
 		kubeRestConfig: kubeRestConfig,
+		kihClientset:   kihClientset,
 		kcli:           kcli,
 	}
 }
@@ -65,6 +69,11 @@ func (e *EventListener) Init() (err error) {
 	log.Infof("(vm.Init) start")
 
 	e.kubeRestConfig, err = e.getKubeConfig()
+	if err != nil {
+		return
+	}
+
+	e.kihClientset, err = kihclientset.NewForConfig(e.kubeRestConfig)
 	if err != nil {
 		return
 	}
@@ -133,7 +142,7 @@ func (e *EventListener) Listener() (err error) {
 		},
 	}, cache.Indexers{})
 
-	controller := NewController(queue, indexer, informer, e.vmNetCfgCache)
+	controller := NewController(queue, indexer, informer, e.vmNetCfgCache, e.kihClientset)
 	stop := make(chan struct{})
 	defer close(stop)
 	go controller.Run(1, stop)

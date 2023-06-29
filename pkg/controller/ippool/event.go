@@ -3,8 +3,10 @@ package ippool
 import (
 	"context"
 
+	goipam "github.com/metal-stack/go-ipam"
 	log "github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
+
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
@@ -25,7 +27,8 @@ const (
 
 type EventListener struct {
 	ctx            context.Context
-	ipPoolCache    *map[string]kihv1.IPPool
+	ipam           *goipam.Ipamer
+	ipPoolCache    map[string]kihv1.IPPool
 	kubeConfig     string
 	kubeContext    string
 	kubeRestConfig *rest.Config
@@ -39,7 +42,8 @@ type Event struct {
 
 func NewEventListener(
 	ctx context.Context,
-	ipPoolCache *map[string]kihv1.IPPool,
+	ipam *goipam.Ipamer,
+	ipPoolCache map[string]kihv1.IPPool,
 	kubeConfig string,
 	kubeContext string,
 	kubeRestConfig *rest.Config,
@@ -49,6 +53,7 @@ func NewEventListener(
 
 	return &EventListener{
 		ctx:            ctx,
+		ipam:           ipam,
 		ipPoolCache:    ipPoolCache,
 		kubeConfig:     kubeConfig,
 		kubeContext:    kubeContext,
@@ -123,7 +128,7 @@ func (e *EventListener) Listener() (err error) {
 		},
 	}, cache.Indexers{})
 
-	controller := NewController(queue, indexer, informer, e.ipPoolCache)
+	controller := NewController(queue, indexer, informer, e.ipPoolCache, e.ipam, e.kihClientset)
 	stop := make(chan struct{})
 	defer close(stop)
 	go controller.Run(1, stop)

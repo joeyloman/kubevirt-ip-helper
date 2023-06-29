@@ -13,20 +13,23 @@ import (
 	kubevirtv1 "kubevirt.io/api/core/v1"
 
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
+	kihclientset "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/clientset/versioned"
 )
 
 type Controller struct {
 	indexer       cache.Indexer
 	queue         workqueue.RateLimitingInterface
 	informer      cache.Controller
-	vmNetCfgCache *map[string]kihv1.VirtualMachineNetworkConfig
+	vmNetCfgCache map[string]kihv1.VirtualMachineNetworkConfig
+	kihClientset  *kihclientset.Clientset
 }
 
 func NewController(
 	queue workqueue.RateLimitingInterface,
 	indexer cache.Indexer,
 	informer cache.Controller,
-	vmNetCfgCache *map[string]kihv1.VirtualMachineNetworkConfig,
+	vmNetCfgCache map[string]kihv1.VirtualMachineNetworkConfig,
+	kihClientset *kihclientset.Clientset,
 ) *Controller {
 	log.Infof("(vm.NewController) start")
 
@@ -35,6 +38,7 @@ func NewController(
 		indexer:       indexer,
 		queue:         queue,
 		vmNetCfgCache: vmNetCfgCache,
+		kihClientset:  kihClientset,
 	}
 }
 
@@ -76,16 +80,20 @@ func (c *Controller) sync(event Event) (err error) {
 	switch event.action {
 	case ADD:
 		log.Infof("(vm.sync) add action found!")
-		getNetworkDetails(obj.(*kubevirtv1.VirtualMachine), c.vmNetCfgCache)
-		tempPrintRegisteredVMs(c.vmNetCfgCache)
+		err := c.createVirtualMachineNetworkConfigObject(obj.(*kubevirtv1.VirtualMachine))
+		if err != nil {
+			log.Errorf("(vm.sync) %s", err)
+		}
+		// getNetworkDetails(obj.(*kubevirtv1.VirtualMachine), c.vmNetCfgCache)
+		// tempPrintRegisteredVMs(c.vmNetCfgCache)
 	case UPDATE:
 		log.Infof("(vm.sync) update action found!")
-		getNetworkDetails(obj.(*kubevirtv1.VirtualMachine), c.vmNetCfgCache)
-		tempPrintRegisteredVMs(c.vmNetCfgCache)
+		// getNetworkDetails(obj.(*kubevirtv1.VirtualMachine), c.vmNetCfgCache)
+		// tempPrintRegisteredVMs(c.vmNetCfgCache)
 	case DELETE:
 		log.Infof("(vm.sync) delete action found!")
 		// delete VirtualMachineNetworkConfig object -> match objectmeta.namespace and spec.vmname
-		tempPrintRegisteredVMs(c.vmNetCfgCache)
+		// tempPrintRegisteredVMs(c.vmNetCfgCache)
 	}
 
 	return

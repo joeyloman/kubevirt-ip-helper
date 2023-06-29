@@ -3,6 +3,7 @@ package ippool
 import (
 	"time"
 
+	goipam "github.com/metal-stack/go-ipam"
 	log "github.com/sirupsen/logrus"
 
 	"k8s.io/apimachinery/pkg/util/runtime"
@@ -11,28 +12,35 @@ import (
 	"k8s.io/client-go/util/workqueue"
 
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
+	kihclientset "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/clientset/versioned"
 )
 
 type Controller struct {
-	indexer     cache.Indexer
-	queue       workqueue.RateLimitingInterface
-	informer    cache.Controller
-	ipPoolCache *map[string]kihv1.IPPool
+	indexer      cache.Indexer
+	queue        workqueue.RateLimitingInterface
+	informer     cache.Controller
+	ipPoolCache  map[string]kihv1.IPPool
+	ipam         *goipam.Ipamer
+	kihClientset *kihclientset.Clientset
 }
 
 func NewController(
 	queue workqueue.RateLimitingInterface,
 	indexer cache.Indexer,
 	informer cache.Controller,
-	ipPoolCache *map[string]kihv1.IPPool,
+	ipPoolCache map[string]kihv1.IPPool,
+	ipam *goipam.Ipamer,
+	kihClientset *kihclientset.Clientset,
 ) *Controller {
 	log.Infof("(ippool.NewController) start")
 
 	return &Controller{
-		informer:    informer,
-		indexer:     indexer,
-		queue:       queue,
-		ipPoolCache: ipPoolCache,
+		informer:     informer,
+		indexer:      indexer,
+		queue:        queue,
+		ipPoolCache:  ipPoolCache,
+		ipam:         ipam,
+		kihClientset: kihClientset,
 	}
 }
 
@@ -70,11 +78,12 @@ func (c *Controller) sync(event Event) (err error) {
 
 	switch event.action {
 	case ADD:
-		log.Infof("(ippool.sync) event sync for IPPool %s", obj.(*kihv1.IPPool).GetName())
 		log.Infof("(ippool.sync) add action found!")
-		// if err := allocateIPPool(obj.(*kihv1.IPPool), kviph_clientset); err != nil {
-		// 	log.Errorf("(watchIPPoolEvents) error allocating ippool: %s", err.Error())
-		// }
+		err := registerIPPool(obj.(*kihv1.IPPool), c.ipPoolCache, c.ipam)
+		if err != nil {
+			log.Errorf("(ippool.sync) failed to allocate new pool for %s: %s", obj.(*kihv1.IPPool).GetName(), err.Error())
+		}
+		printIPPoolcache(c.ipPoolCache)
 	case UPDATE:
 		log.Infof("(ippool.sync) update action found!")
 	case DELETE:

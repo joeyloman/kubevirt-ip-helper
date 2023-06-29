@@ -58,10 +58,11 @@ type IPPoolSpec struct {
 }
 
 type IPv4Config struct {
-	Subnet string   `json:"subnet,omitempty"`
-	Pool   Pool     `json:"pool,omitempty"`
-	Router string   `json:"router,omitempty"`
-	DNS    []string `json:"dns,omitempty"`
+	ServerIP string   `json:"serverip,omitempty"`
+	Subnet   string   `json:"subnet,omitempty"`
+	Pool     Pool     `json:"pool,omitempty"`
+	Router   string   `json:"router,omitempty"`
+	DNS      []string `json:"dns,omitempty"`
 }
 
 type Pool struct {

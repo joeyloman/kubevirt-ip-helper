@@ -41,6 +41,6 @@ func main() {
 		os.Exit(1)
 	}()
 
-	mainApp.Run(ctx)
+	mainApp.Run()
 	cancel()
 }

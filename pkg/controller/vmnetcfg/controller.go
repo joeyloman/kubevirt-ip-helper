@@ -17,14 +17,14 @@ type Controller struct {
 	indexer       cache.Indexer
 	queue         workqueue.RateLimitingInterface
 	informer      cache.Controller
-	vmNetCfgCache *map[string]kihv1.VirtualMachineNetworkConfig
+	vmNetCfgCache map[string]kihv1.VirtualMachineNetworkConfig
 }
 
 func NewController(
 	queue workqueue.RateLimitingInterface,
 	indexer cache.Indexer,
 	informer cache.Controller,
-	vmNetCfgCache *map[string]kihv1.VirtualMachineNetworkConfig,
+	vmNetCfgCache map[string]kihv1.VirtualMachineNetworkConfig,
 ) *Controller {
 	log.Infof("(vmnetcfg.NewController) start")
 
@@ -70,11 +70,12 @@ func (c *Controller) sync(event Event) (err error) {
 
 	switch event.action {
 	case ADD:
-		log.Infof("(vmnetcfg.sync) event sync for VirtualMachineNetworkConfig %s", obj.(*kihv1.VirtualMachineNetworkConfig).GetName())
 		log.Infof("(vmnetcfg.sync) add action found!")
-		// if err := allocateIPPool(obj.(*kihv1.IPPool), kviph_clientset); err != nil {
-		// 	log.Errorf("(watchIPPoolEvents) error allocating ippool: %s", err.Error())
-		// }
+		err := registerVirtualMachineNetworkConfig(obj.(*kihv1.VirtualMachineNetworkConfig), c.vmNetCfgCache)
+		if err != nil {
+			log.Errorf("(vmnetcfg.sync) failed to allocate new vmnetcfg for %s: %s", obj.(*kihv1.VirtualMachineNetworkConfig).GetName(), err.Error())
+		}
+		//printVirtualMachineNetworkConfig(c.vmNetCfgCache)
 	case UPDATE:
 		log.Infof("(vmnetcfg.sync) update action found!")
 	case DELETE:

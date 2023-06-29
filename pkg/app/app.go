@@ -1,13 +1,13 @@
 package app
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"time"
 
+	goipam "github.com/metal-stack/go-ipam"
 	log "github.com/sirupsen/logrus"
-
-	"context"
 
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/controller/ippool"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/controller/vm"
@@ -17,12 +17,13 @@ import (
 )
 
 type handler struct {
-	ctx                   context.Context
-	ipPoolCache           map[string]kihv1.IPPool
-	vmNetCfgCache         map[string]kihv1.VirtualMachineNetworkConfig
-	ippoolEventListener   *ippool.EventListener
-	vmnetcfgEventListener *vmnetcfg.EventListener
-	vmEventListener       *vm.EventListener
+	ctx                 context.Context
+	ipam                goipam.Ipamer
+	ipPoolCache         map[string]kihv1.IPPool
+	vmNetCfgCache       map[string]kihv1.VirtualMachineNetworkConfig
+	ippoolEventListener *ippool.EventListener
+	vmnetcfgHandler     *vmnetcfg.Handler
+	vmEventListener     *vm.EventListener
 }
 
 func Register(ctx context.Context) *handler {
@@ -33,35 +34,38 @@ func Register(ctx context.Context) *handler {
 	}
 }
 
-func (h *handler) Run(ctx context.Context) {
+func (h *handler) Run() {
 	log.Infof("(app.Run) start")
 
-	// TODO: flag parse
+	// TODO: flag parse kubeconfig and
 
 	// temp
 	homedir := os.Getenv("HOME")
 	kubeconfig_file := filepath.Join(homedir, ".kube", "config")
+
+	// initialize the ipamer
+	h.ipam = goipam.New(h.ctx)
 
 	// initialize the pool and vm network config caches
 	h.ipPoolCache = make(map[string]kihv1.IPPool)
 	h.vmNetCfgCache = make(map[string]kihv1.VirtualMachineNetworkConfig)
 
 	// initialize the ippoolEventListener handler
-	h.ippoolEventListener = ippool.NewEventListener(ctx, &h.ipPoolCache, kubeconfig_file, "", nil, nil)
+	h.ippoolEventListener = ippool.NewEventListener(h.ctx, &h.ipam, h.ipPoolCache, kubeconfig_file, "", nil, nil)
 	if err := h.ippoolEventListener.Init(); err != nil {
 		handleErr(err)
 	}
 	go h.ippoolEventListener.Listener()
 
 	// initialize the vmnetcfgEventListener handler
-	h.vmnetcfgEventListener = vmnetcfg.NewEventListener(ctx, &h.vmNetCfgCache, kubeconfig_file, "", nil, nil)
-	if err := h.vmnetcfgEventListener.Init(); err != nil {
+	h.vmnetcfgHandler = vmnetcfg.NewHandler(h.ctx, h.vmNetCfgCache, kubeconfig_file, "", nil, nil)
+	if err := h.vmnetcfgHandler.Init(); err != nil {
 		handleErr(err)
 	}
-	go h.vmnetcfgEventListener.Listener()
+	go h.vmnetcfgHandler.EventListener()
 
 	// initialize the vmEventListener handler
-	h.vmEventListener = vm.NewEventListener(ctx, &h.vmNetCfgCache, kubeconfig_file, "", nil, nil)
+	h.vmEventListener = vm.NewEventListener(h.ctx, h.vmNetCfgCache, kubeconfig_file, "", nil, nil, nil)
 	if err := h.vmEventListener.Init(); err != nil {
 		handleErr(err)
 	}

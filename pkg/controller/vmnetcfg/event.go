@@ -23,9 +23,9 @@ const (
 	DELETE = "delete"
 )
 
-type EventListener struct {
+type Handler struct {
 	ctx            context.Context
-	vmNetCfgCache  *map[string]kihv1.VirtualMachineNetworkConfig
+	vmNetCfgCache  map[string]kihv1.VirtualMachineNetworkConfig
 	kubeConfig     string
 	kubeContext    string
 	kubeRestConfig *rest.Config
@@ -37,17 +37,17 @@ type Event struct {
 	action string
 }
 
-func NewEventListener(
+func NewHandler(
 	ctx context.Context,
-	vmNetCfgCache *map[string]kihv1.VirtualMachineNetworkConfig,
+	vmNetCfgCache map[string]kihv1.VirtualMachineNetworkConfig,
 	kubeConfig string,
 	kubeContext string,
 	kubeRestConfig *rest.Config,
 	kihClientset *kihclientset.Clientset,
-) *EventListener {
-	log.Infof("(vmnetcfg.NewEventListener) start")
+) *Handler {
+	log.Infof("(vmnetcfg.NewHandler) start")
 
-	return &EventListener{
+	return &Handler{
 		ctx:            ctx,
 		vmNetCfgCache:  vmNetCfgCache,
 		kubeConfig:     kubeConfig,
@@ -57,15 +57,15 @@ func NewEventListener(
 	}
 }
 
-func (e *EventListener) Init() (err error) {
+func (h *Handler) Init() (err error) {
 	log.Infof("(vmnetcfg.Init) start")
 
-	e.kubeRestConfig, err = e.getKubeConfig()
+	h.kubeRestConfig, err = h.getKubeConfig()
 	if err != nil {
 		return
 	}
 
-	e.kihClientset, err = kihclientset.NewForConfig(e.kubeRestConfig)
+	h.kihClientset, err = kihclientset.NewForConfig(h.kubeRestConfig)
 	if err != nil {
 		return
 	}
@@ -73,23 +73,23 @@ func (e *EventListener) Init() (err error) {
 	return
 }
 
-func (e *EventListener) getKubeConfig() (config *rest.Config, err error) {
+func (h *Handler) getKubeConfig() (config *rest.Config, err error) {
 	log.Infof("(vmnetcfg.getKubeConfig) start")
 
-	if e.kubeConfig == "" {
+	if h.kubeConfig == "" {
 		return rest.InClusterConfig()
 	}
 
 	return clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
-		&clientcmd.ClientConfigLoadingRules{ExplicitPath: e.kubeConfig},
-		&clientcmd.ConfigOverrides{ClusterInfo: clientcmdapi.Cluster{}, CurrentContext: e.kubeContext},
+		&clientcmd.ClientConfigLoadingRules{ExplicitPath: h.kubeConfig},
+		&clientcmd.ConfigOverrides{ClusterInfo: clientcmdapi.Cluster{}, CurrentContext: h.kubeContext},
 	).ClientConfig()
 }
 
-func (e *EventListener) Listener() (err error) {
-	log.Infof("(vmnetcfg.Listener) start")
+func (h *Handler) EventListener() (err error) {
+	log.Infof("(vmnetcfg.EventListener) start")
 
-	vmWatcher := cache.NewListWatchFromClient(e.kihClientset.KubevirtiphelperV1().RESTClient(), "virtualmachinenetworkconfigs", corev1.NamespaceAll, fields.Everything())
+	vmWatcher := cache.NewListWatchFromClient(h.kihClientset.KubevirtiphelperV1().RESTClient(), "virtualmachinenetworkconfigs", corev1.NamespaceAll, fields.Everything())
 
 	queue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
 
@@ -123,7 +123,7 @@ func (e *EventListener) Listener() (err error) {
 		},
 	}, cache.Indexers{})
 
-	controller := NewController(queue, indexer, informer, e.vmNetCfgCache)
+	controller := NewController(queue, indexer, informer, h.vmNetCfgCache)
 	stop := make(chan struct{})
 	defer close(stop)
 	go controller.Run(1, stop)
