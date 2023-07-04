@@ -2,7 +2,6 @@ package ippool
 
 import (
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
-	kviphclientset "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/clientset/versioned"
 
 	log "github.com/sirupsen/logrus"
 )
@@ -12,18 +11,23 @@ func (c *Controller) registerIPPool(pool *kihv1.IPPool) (err error) {
 
 	c.ipPoolCache[pool.Spec.NetworkName] = *pool
 
-	return c.ipam.NewSubnet(pool.Spec.NetworkName, pool.Spec.IPv4Config.Subnet, pool.Spec.IPv4Config.Pool.Start, pool.Spec.IPv4Config.Pool.End)
+	return c.ipam.NewSubnet(
+		pool.Spec.NetworkName,
+		pool.Spec.IPv4Config.Subnet,
+		pool.Spec.IPv4Config.Pool.Start,
+		pool.Spec.IPv4Config.Pool.End,
+	)
 }
 
-func removeIPPool(pool *kihv1.IPPool, clientset *kviphclientset.Clientset) error {
-	var err error
-
+func (c *Controller) removeIPPool(pool *kihv1.IPPool) (err error) {
 	log.Tracef("(RemoveIPPool) poolobj removed: [%+v]\n", pool)
 
-	return err
+	c.ipam.DeleteSubnet(pool.Spec.NetworkName)
+
+	return
 }
 
-func updateIPPool(oldPool *kihv1.IPPool, newPool *kihv1.IPPool, clientset *kviphclientset.Clientset) error {
+func updateIPPool(oldPool *kihv1.IPPool, newPool *kihv1.IPPool) error {
 	var err error
 
 	log.Tracef("(UpdateIPPool) poolobj updated: oldPool [%+v] / newPool [%+v]\n", oldPool, newPool)

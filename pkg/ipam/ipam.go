@@ -32,15 +32,15 @@ func NewIPAllocator() *IPAllocator {
 }
 
 func (a *IPAllocator) NewSubnet(name string, subnet string, start string, end string) (err error) {
-	sub := IPSubnet{}
-	sub.start = net.ParseIP(start)
-	sub.end = net.ParseIP(end)
+	s := IPSubnet{}
+	s.start = net.ParseIP(start)
+	s.end = net.ParseIP(end)
 
 	ipnet, err := netip.ParsePrefix(subnet)
 	if err != nil {
 		return err
 	}
-	sub.cidr = ipnet
+	s.cidr = ipnet
 
 	startIP, err := netip.ParseAddr(start)
 	if err != nil {
@@ -60,8 +60,8 @@ func (a *IPAllocator) NewSubnet(name string, subnet string, start string, end st
 		return fmt.Errorf("end address %s is not within subnet %s range", end, subnet)
 	}
 
-	startAddr, _ := netip.AddrFromSlice(sub.start)
-	endAddr, _ := netip.AddrFromSlice(sub.end)
+	startAddr, _ := netip.AddrFromSlice(s.start)
+	endAddr, _ := netip.AddrFromSlice(s.end)
 	if startAddr.Compare(endAddr) > 0 {
 		return fmt.Errorf("end address %s is smaller then the start address %s", end, start)
 	}
@@ -72,10 +72,10 @@ func (a *IPAllocator) NewSubnet(name string, subnet string, start string, end st
 	for i := range subnetStart {
 		subnetBroadcast[i] = subnetStart[i] | ^subnetMask[i]
 	}
-	sub.broadcast = subnetBroadcast
+	s.broadcast = subnetBroadcast
 
-	if sub.end.Equal(sub.broadcast) {
-		return fmt.Errorf("end address %s equals the broadcast address %s", sub.end.String(), sub.broadcast.String())
+	if s.end.Equal(s.broadcast) {
+		return fmt.Errorf("end address %s equals the broadcast address %s", s.end.String(), s.broadcast.String())
 	}
 
 	// pre-allocate all ips between the start and end address
@@ -83,11 +83,15 @@ func (a *IPAllocator) NewSubnet(name string, subnet string, start string, end st
 	for ip := startAddr; endAddr.Compare(ip.Prev()) > 0; ip = ip.Next() {
 		allocatedIPs[ip.Unmap().String()] = false
 	}
-	sub.ips = allocatedIPs
+	s.ips = allocatedIPs
 
-	a.ipam[name] = sub
+	a.ipam[name] = s
 
 	return
+}
+
+func (a *IPAllocator) DeleteSubnet(name string) {
+	delete(a.ipam, name)
 }
 
 func (a *IPAllocator) GetIP(name string, givenIP string) (string, error) {

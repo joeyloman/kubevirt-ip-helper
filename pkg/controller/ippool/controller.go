@@ -89,6 +89,12 @@ func (c *Controller) sync(event Event) (err error) {
 		log.Infof("(ippool.sync) update action found!")
 	case DELETE:
 		log.Infof("(ippool.sync) delete action found!")
+		err := c.removeIPPool(obj.(*kihv1.IPPool))
+		if err != nil {
+			log.Errorf("(ippool.sync) failed to allocate new pool for %s: %s", obj.(*kihv1.IPPool).GetName(), err.Error())
+		}
+		c.ipam.Usage(obj.(*kihv1.IPPool).Spec.NetworkName)
+		printIPPoolcache(c.ipPoolCache)
 	}
 
 	return
