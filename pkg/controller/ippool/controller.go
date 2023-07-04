@@ -3,7 +3,6 @@ package ippool
 import (
 	"time"
 
-	goipam "github.com/metal-stack/go-ipam"
 	log "github.com/sirupsen/logrus"
 
 	"k8s.io/apimachinery/pkg/util/runtime"
@@ -13,6 +12,7 @@ import (
 
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
 	kihclientset "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/clientset/versioned"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
 )
 
 type Controller struct {
@@ -20,7 +20,7 @@ type Controller struct {
 	queue        workqueue.RateLimitingInterface
 	informer     cache.Controller
 	ipPoolCache  map[string]kihv1.IPPool
-	ipam         *goipam.Ipamer
+	ipam         *ipam.IPAllocator
 	kihClientset *kihclientset.Clientset
 }
 
@@ -29,7 +29,7 @@ func NewController(
 	indexer cache.Indexer,
 	informer cache.Controller,
 	ipPoolCache map[string]kihv1.IPPool,
-	ipam *goipam.Ipamer,
+	ipam *ipam.IPAllocator,
 	kihClientset *kihclientset.Clientset,
 ) *Controller {
 	log.Infof("(ippool.NewController) start")
@@ -83,6 +83,7 @@ func (c *Controller) sync(event Event) (err error) {
 		if err != nil {
 			log.Errorf("(ippool.sync) failed to allocate new pool for %s: %s", obj.(*kihv1.IPPool).GetName(), err.Error())
 		}
+		c.ipam.Usage(obj.(*kihv1.IPPool).Spec.NetworkName)
 		printIPPoolcache(c.ipPoolCache)
 	case UPDATE:
 		log.Infof("(ippool.sync) update action found!")

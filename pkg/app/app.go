@@ -6,19 +6,19 @@ import (
 	"path/filepath"
 	"time"
 
-	goipam "github.com/metal-stack/go-ipam"
 	log "github.com/sirupsen/logrus"
 
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/controller/ippool"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/controller/vm"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/controller/vmnetcfg"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
 
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
 )
 
 type handler struct {
 	ctx                  context.Context
-	ipam                 goipam.Ipamer
+	ipam                 *ipam.IPAllocator
 	ipPoolCache          map[string]kihv1.IPPool
 	vmNetCfgCache        map[string]kihv1.VirtualMachineNetworkConfig
 	ippoolEventHandler   *ippool.EventHandler
@@ -44,21 +44,21 @@ func (h *handler) Run() {
 	kubeconfig_file := filepath.Join(homedir, ".kube", "config")
 
 	// initialize the ipamer
-	h.ipam = goipam.New(h.ctx)
+	h.ipam = ipam.New()
 
 	// initialize the pool and vm network config caches
 	h.ipPoolCache = make(map[string]kihv1.IPPool)
 	h.vmNetCfgCache = make(map[string]kihv1.VirtualMachineNetworkConfig)
 
 	// initialize the ippoolEventListener handler
-	h.ippoolEventHandler = ippool.NewEventHandler(h.ctx, &h.ipam, h.ipPoolCache, kubeconfig_file, "", nil, nil)
+	h.ippoolEventHandler = ippool.NewEventHandler(h.ctx, h.ipam, h.ipPoolCache, kubeconfig_file, "", nil, nil)
 	if err := h.ippoolEventHandler.Init(); err != nil {
 		handleErr(err)
 	}
 	go h.ippoolEventHandler.EventListener()
 
 	// initialize the vmnetcfgEventListener handler
-	h.vmnetcfgEventHandler = vmnetcfg.NewEventHandler(h.ctx, h.vmNetCfgCache, kubeconfig_file, "", nil, nil)
+	h.vmnetcfgEventHandler = vmnetcfg.NewEventHandler(h.ctx, h.ipam, h.vmNetCfgCache, kubeconfig_file, "", nil, nil)
 	if err := h.vmnetcfgEventHandler.Init(); err != nil {
 		handleErr(err)
 	}

@@ -10,11 +10,9 @@ import (
 func (c *Controller) registerIPPool(pool *kihv1.IPPool) (err error) {
 	log.Tracef("(ippool.registerIPPool) poolobj added: [%+v]\n", pool)
 
-	c.ipPoolCache[pool.Spec.IPv4Config.Subnet] = *pool
+	c.ipPoolCache[pool.Spec.NetworkName] = *pool
 
-	// TODO: add to ipam
-
-	return err
+	return c.ipam.NewSubnet(pool.Spec.NetworkName, pool.Spec.IPv4Config.Subnet, pool.Spec.IPv4Config.Pool.Start, pool.Spec.IPv4Config.Pool.End)
 }
 
 func removeIPPool(pool *kihv1.IPPool, clientset *kviphclientset.Clientset) error {

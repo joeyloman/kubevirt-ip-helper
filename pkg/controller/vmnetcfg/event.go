@@ -15,6 +15,7 @@ import (
 
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
 	kihclientset "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/clientset/versioned"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
 )
 
 const (
@@ -25,6 +26,7 @@ const (
 
 type EventHandler struct {
 	ctx            context.Context
+	ipam           *ipam.IPAllocator
 	vmNetCfgCache  map[string]kihv1.VirtualMachineNetworkConfig
 	kubeConfig     string
 	kubeContext    string
@@ -39,6 +41,7 @@ type Event struct {
 
 func NewEventHandler(
 	ctx context.Context,
+	ipam *ipam.IPAllocator,
 	vmNetCfgCache map[string]kihv1.VirtualMachineNetworkConfig,
 	kubeConfig string,
 	kubeContext string,
@@ -49,6 +52,7 @@ func NewEventHandler(
 
 	return &EventHandler{
 		ctx:            ctx,
+		ipam:           ipam,
 		vmNetCfgCache:  vmNetCfgCache,
 		kubeConfig:     kubeConfig,
 		kubeContext:    kubeContext,
@@ -123,7 +127,7 @@ func (e *EventHandler) EventListener() (err error) {
 		},
 	}, cache.Indexers{})
 
-	controller := NewController(queue, indexer, informer, e.vmNetCfgCache)
+	controller := NewController(queue, indexer, informer, e.vmNetCfgCache, e.ipam)
 	stop := make(chan struct{})
 	defer close(stop)
 	go controller.Run(1, stop)

@@ -3,7 +3,6 @@ package ippool
 import (
 	"context"
 
-	goipam "github.com/metal-stack/go-ipam"
 	log "github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
 
@@ -17,6 +16,7 @@ import (
 
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
 	kihclientset "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/clientset/versioned"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
 )
 
 const (
@@ -27,7 +27,7 @@ const (
 
 type EventHandler struct {
 	ctx            context.Context
-	ipam           *goipam.Ipamer
+	ipam           *ipam.IPAllocator
 	ipPoolCache    map[string]kihv1.IPPool
 	kubeConfig     string
 	kubeContext    string
@@ -42,7 +42,7 @@ type Event struct {
 
 func NewEventHandler(
 	ctx context.Context,
-	ipam *goipam.Ipamer,
+	ipam *ipam.IPAllocator,
 	ipPoolCache map[string]kihv1.IPPool,
 	kubeConfig string,
 	kubeContext string,

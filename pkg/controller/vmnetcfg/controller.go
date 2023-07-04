@@ -11,6 +11,7 @@ import (
 	"k8s.io/client-go/util/workqueue"
 
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
 )
 
 type Controller struct {
@@ -18,6 +19,7 @@ type Controller struct {
 	queue         workqueue.RateLimitingInterface
 	informer      cache.Controller
 	vmNetCfgCache map[string]kihv1.VirtualMachineNetworkConfig
+	ipam          *ipam.IPAllocator
 }
 
 func NewController(
@@ -25,6 +27,7 @@ func NewController(
 	indexer cache.Indexer,
 	informer cache.Controller,
 	vmNetCfgCache map[string]kihv1.VirtualMachineNetworkConfig,
+	ipam *ipam.IPAllocator,
 ) *Controller {
 	log.Infof("(vmnetcfg.NewController) start")
 
@@ -33,6 +36,7 @@ func NewController(
 		indexer:       indexer,
 		queue:         queue,
 		vmNetCfgCache: vmNetCfgCache,
+		ipam:          ipam,
 	}
 }
 

@@ -14,9 +14,14 @@ import (
 // }
 
 func registerVirtualMachineNetworkConfig(vmnetcfg *kihv1.VirtualMachineNetworkConfig, vmNetCfgCache map[string]kihv1.VirtualMachineNetworkConfig) (err error) {
-	log.Tracef("(AllocateVirtualMachineNetworkConfig) obj added: [%+v]\n", vmnetcfg)
+	log.Tracef("(registerVirtualMachineNetworkConfig) obj added: [%+v]\n", vmnetcfg)
+
+	log.Infof("(vmnetcfg.registerVirtualMachineNetworkConfig) start")
+
+	//if vmnetcfg.Spec.VirtualMachineNetworkConfigs
 
 	//vmNetCfgCache[vmnetcfg.Spec.VirtualMachineNetworkConfigs] = *vmnetcfg
+	// TODO: vmnetcfgcache is maybe not needed, a direct dhcp hwAddr cache would be better?
 
 	return err
 }
