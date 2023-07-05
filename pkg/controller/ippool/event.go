@@ -3,7 +3,6 @@ package ippool
 import (
 	"context"
 
-	log "github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
 
 	"k8s.io/apimachinery/pkg/fields"
@@ -17,6 +16,7 @@ import (
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
 	kihclientset "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/clientset/versioned"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
+	log "github.com/sirupsen/logrus"
 )
 
 const (
@@ -49,7 +49,7 @@ func NewEventHandler(
 	kubeRestConfig *rest.Config,
 	kihClientset *kihclientset.Clientset,
 ) *EventHandler {
-	log.Infof("(ippool.NewEventHandler) start")
+	//log.Infof("(ippool.NewEventHandler) start")
 
 	return &EventHandler{
 		ctx:            ctx,
@@ -63,7 +63,7 @@ func NewEventHandler(
 }
 
 func (e *EventHandler) Init() (err error) {
-	log.Infof("(ippool.Init) start")
+	//log.Infof("(ippool.Init) start")
 
 	e.kubeRestConfig, err = e.getKubeConfig()
 	if err != nil {
@@ -79,7 +79,7 @@ func (e *EventHandler) Init() (err error) {
 }
 
 func (e *EventHandler) getKubeConfig() (config *rest.Config, err error) {
-	log.Infof("(ippool.getKubeConfig) start")
+	//log.Infof("(ippool.getKubeConfig) start")
 
 	if e.kubeConfig == "" {
 		return rest.InClusterConfig()
@@ -92,7 +92,7 @@ func (e *EventHandler) getKubeConfig() (config *rest.Config, err error) {
 }
 
 func (e *EventHandler) EventListener() (err error) {
-	log.Infof("(ippool.EventListener) start")
+	log.Infof("(ippool.EventListener) starting IPPool event listener")
 
 	vmWatcher := cache.NewListWatchFromClient(e.kihClientset.KubevirtiphelperV1().RESTClient(), "ippools", corev1.NamespaceAll, fields.Everything())
 

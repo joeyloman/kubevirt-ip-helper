@@ -32,7 +32,7 @@ func NewController(
 	ipam *ipam.IPAllocator,
 	kihClientset *kihclientset.Clientset,
 ) *Controller {
-	log.Infof("(ippool.NewController) start")
+	//log.Infof("(ippool.NewController) start")
 
 	return &Controller{
 		informer:     informer,
@@ -45,7 +45,7 @@ func NewController(
 }
 
 func (c *Controller) processNextItem() bool {
-	log.Infof("(ippool.processNextItem) start")
+	//log.Infof("(ippool.processNextItem) start")
 
 	event, quit := c.queue.Get()
 	if quit {
@@ -61,7 +61,7 @@ func (c *Controller) processNextItem() bool {
 }
 
 func (c *Controller) sync(event Event) (err error) {
-	log.Infof("(ippool.sync) start")
+	//log.Infof("(ippool.sync) start")
 
 	obj, exists, err := c.indexer.GetByKey(event.key)
 	if err != nil {
@@ -91,7 +91,7 @@ func (c *Controller) sync(event Event) (err error) {
 		log.Infof("(ippool.sync) delete action found!")
 		err := c.removeIPPool(obj.(*kihv1.IPPool))
 		if err != nil {
-			log.Errorf("(ippool.sync) failed to allocate new pool for %s: %s", obj.(*kihv1.IPPool).GetName(), err.Error())
+			log.Errorf("(ippool.sync) failed to delete pool for %s: %s", obj.(*kihv1.IPPool).GetName(), err.Error())
 		}
 		c.ipam.Usage(obj.(*kihv1.IPPool).Spec.NetworkName)
 		printIPPoolcache(c.ipPoolCache)
@@ -101,7 +101,7 @@ func (c *Controller) sync(event Event) (err error) {
 }
 
 func (c *Controller) handleErr(err error, key interface{}) {
-	log.Infof("(ippool.handleErr) start")
+	//log.Infof("(ippool.handleErr) start")
 
 	if err == nil {
 		c.queue.Forget(key)
@@ -144,7 +144,7 @@ func (c *Controller) Run(workers int, stopCh chan struct{}) {
 }
 
 func (c *Controller) runWorker() {
-	log.Infof("(ippool.runWorker) start")
+	//log.Infof("(ippool.runWorker) start")
 
 	for c.processNextItem() {
 	}

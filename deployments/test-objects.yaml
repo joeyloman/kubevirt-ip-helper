@@ -45,7 +45,7 @@ metadata:
   namespace: default
 spec:
   vmname: test-vm1
-  netcfg:
+  networkconfig:
     - ipaddress: 10.135.10.195
       macaddress: 12:8b:a8:8c:da:11
       networkname: harvester-public/public-vlan-1

@@ -12,38 +12,38 @@ import (
 
 	kubevirtv1 "kubevirt.io/api/core/v1"
 
-	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/dhcp"
 	kihclientset "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/clientset/versioned"
 )
 
 type Controller struct {
-	indexer       cache.Indexer
-	queue         workqueue.RateLimitingInterface
-	informer      cache.Controller
-	vmNetCfgCache map[string]kihv1.VirtualMachineNetworkConfig
-	kihClientset  *kihclientset.Clientset
+	indexer      cache.Indexer
+	queue        workqueue.RateLimitingInterface
+	informer     cache.Controller
+	dhcp         *dhcp.DHCPAllocator
+	kihClientset *kihclientset.Clientset
 }
 
 func NewController(
 	queue workqueue.RateLimitingInterface,
 	indexer cache.Indexer,
 	informer cache.Controller,
-	vmNetCfgCache map[string]kihv1.VirtualMachineNetworkConfig,
+	dhcp *dhcp.DHCPAllocator,
 	kihClientset *kihclientset.Clientset,
 ) *Controller {
-	log.Infof("(vm.NewController) start")
+	//log.Infof("(vm.NewController) start")
 
 	return &Controller{
-		informer:      informer,
-		indexer:       indexer,
-		queue:         queue,
-		vmNetCfgCache: vmNetCfgCache,
-		kihClientset:  kihClientset,
+		informer:     informer,
+		indexer:      indexer,
+		queue:        queue,
+		dhcp:         dhcp,
+		kihClientset: kihClientset,
 	}
 }
 
 func (c *Controller) processNextItem() bool {
-	log.Infof("(vm.processNextItem) start")
+	//log.Infof("(vm.processNextItem) start")
 
 	event, quit := c.queue.Get()
 	if quit {
@@ -59,7 +59,7 @@ func (c *Controller) processNextItem() bool {
 }
 
 func (c *Controller) sync(event Event) (err error) {
-	log.Infof("(vm.sync) start")
+	//log.Infof("(vm.sync) start")
 
 	obj, exists, err := c.indexer.GetByKey(event.key)
 	if err != nil {
@@ -81,17 +81,11 @@ func (c *Controller) sync(event Event) (err error) {
 	case ADD:
 		log.Infof("(vm.sync) add action found!")
 
-		// err := c.checkVirtualMachineNetworkingDetails(obj.(*kubevirtv1.VirtualMachine))
-		// if err != nil {
-		// 	log.Errorf("(vm.sync) %s", err)
-		// }
-
 		err := c.createVirtualMachineNetworkConfigObject(obj.(*kubevirtv1.VirtualMachine))
 		if err != nil {
 			log.Errorf("(vm.sync) %s", err)
 		}
-		// getNetworkDetails(obj.(*kubevirtv1.VirtualMachine), c.vmNetCfgCache)
-		// tempPrintRegisteredVMs(c.vmNetCfgCache)
+		c.dhcp.Usage()
 	case UPDATE:
 		log.Infof("(vm.sync) update action found!")
 
@@ -99,12 +93,7 @@ func (c *Controller) sync(event Event) (err error) {
 		if err != nil {
 			log.Errorf("(vm.sync) %s", err)
 		}
-
-		// if one of the networks do not exists, do not update the vmnetcfg object
-		// if one of the mac addresses do not exists, update the vmnetcfg object
-
-		// getNetworkDetails(obj.(*kubevirtv1.VirtualMachine), c.vmNetCfgCache)
-		// tempPrintRegisteredVMs(c.vmNetCfgCache)
+		c.dhcp.Usage()
 	case DELETE:
 		log.Infof("(vm.sync) delete action found!")
 
@@ -112,18 +101,14 @@ func (c *Controller) sync(event Event) (err error) {
 		if err != nil {
 			log.Errorf("(vm.sync) %s", err)
 		}
-
-		// remove the vmnetcfg object
-
-		// delete VirtualMachineNetworkConfig object -> match objectmeta.namespace and spec.vmname
-		// tempPrintRegisteredVMs(c.vmNetCfgCache)
+		c.dhcp.Usage()
 	}
 
 	return
 }
 
 func (c *Controller) handleErr(err error, key interface{}) {
-	log.Infof("(vm.handleErr) start")
+	//log.Infof("(vm.handleErr) start")
 
 	if err == nil {
 		c.queue.Forget(key)
@@ -166,7 +151,7 @@ func (c *Controller) Run(workers int, stopCh chan struct{}) {
 }
 
 func (c *Controller) runWorker() {
-	log.Infof("(vm.runWorker) start")
+	//log.Infof("(vm.runWorker) start")
 
 	for c.processNextItem() {
 	}

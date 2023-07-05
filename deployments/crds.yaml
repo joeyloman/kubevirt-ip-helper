@@ -18,7 +18,7 @@ spec:
                 vmname:
                   type: string
                   pattern: '^[\w-]+$'
-                netcfg:
+                networkconfig:
                   type: array
                   items:
                     type: object

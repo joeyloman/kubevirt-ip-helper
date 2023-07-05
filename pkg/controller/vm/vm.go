@@ -2,7 +2,6 @@ package vm
 
 import (
 	"context"
-	"errors"
 	"fmt"
 
 	log "github.com/sirupsen/logrus"
@@ -14,40 +13,15 @@ import (
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
 )
 
-// func (c *Controller) checkVirtualMachineNetworkingDetails(vm *kubevirtV1.VirtualMachine) (err error) {
-// 	log.Infof("(vm.checkVirtualMachineNetworkingDetails) checking VirtualMachine object")
-
-// 	for _, nic := range vm.Spec.Template.Spec.Domain.Devices.Interfaces {
-// 		for _, net := range vm.Spec.Template.Spec.Networks {
-// 			if nic.Name == net.Name {
-// 				if net.Multus == nil {
-// 					log.Warnf("(vm.createVirtualMachineNetworkConfig) unsupported network type found!")
-// 				} else if nic.MacAddress == "" {
-// 					log.Errorf("(vm.createVirtualMachineNetworkConfig) no mac address found for vm [%s/%s]",
-// 						vm.ObjectMeta.Namespace, vm.ObjectMeta.Name)
-// 				} else if net.Multus.NetworkName == "" {
-// 					log.Errorf("(vm.createVirtualMachineNetworkConfig) no networkname found for vm [%s/%s]",
-// 						vm.ObjectMeta.Namespace, vm.ObjectMeta.Name)
-// 				} else {
-// 					// TODO: lookup networkname in IPPools cache
-// 					// TODO: lookup macaddress in hwAddr cache
-// 				}
-// 			}
-// 		}
-// 	}
-
-// 	return
-// }
-
 func (c *Controller) createVirtualMachineNetworkConfigObject(vm *kubevirtV1.VirtualMachine) (err error) {
-	var netCfgs []kihv1.VirtualMachineNetworkConfigs
-
 	log.Infof("(vm.createVirtualMachineNetworkConfig) creating vmnetcfg object")
 
 	newVmNetCfg := kihv1.VirtualMachineNetworkConfig{}
 	newVmNetCfg.ObjectMeta.Name = vm.ObjectMeta.Name
 	newVmNetCfg.ObjectMeta.Namespace = vm.ObjectMeta.Namespace
 	newVmNetCfg.Spec.VMName = vm.ObjectMeta.Name
+
+	netCfgs := []kihv1.NetworkConfig{}
 
 	for _, nic := range vm.Spec.Template.Spec.Domain.Devices.Interfaces {
 		for _, net := range vm.Spec.Template.Spec.Networks {
@@ -61,9 +35,12 @@ func (c *Controller) createVirtualMachineNetworkConfigObject(vm *kubevirtV1.Virt
 					log.Errorf("(vm.createVirtualMachineNetworkConfig) no networkname found for vm [%s/%s]",
 						vm.ObjectMeta.Namespace, vm.ObjectMeta.Name)
 				} else {
-					// if one of the mac addresses already exists, do not create the vmnetcfg object
-					// if one of the networks do not exists, do not create the vmnetcfg object
-					netCfg := kihv1.VirtualMachineNetworkConfigs{}
+					if c.dhcp.CheckLease(nic.MacAddress) {
+						return fmt.Errorf("hwaddr %s already exists in the leases", nic.MacAddress)
+					}
+					// TODO: if one of the networks do not exists, do not create the vmnetcfg object
+
+					netCfg := kihv1.NetworkConfig{}
 					netCfg.MACAddress = nic.MacAddress
 					netCfg.NetworkName = net.Multus.NetworkName
 
@@ -74,20 +51,20 @@ func (c *Controller) createVirtualMachineNetworkConfigObject(vm *kubevirtV1.Virt
 	}
 
 	if len(netCfgs) < 1 {
-		errMsg := fmt.Sprintf("(vm.createVirtualMachineNetworkConfig) no network configuration found for vm [%s/%s]",
+		log.Warnf("(vm.createVirtualMachineNetworkConfig) no network configuration found for vm [%s/%s]",
 			vm.ObjectMeta.Namespace, vm.ObjectMeta.Name)
 
-		return errors.New(errMsg)
+		return
 	}
 
-	newVmNetCfg.Spec.VirtualMachineNetworkConfigs = netCfgs
+	newVmNetCfg.Spec.NetworkConfig = netCfgs
+
+	//log.Infof("(vm.createVirtualMachineNetworkConfig) newVmNetCfg object: %+v", newVmNetCfg)
 
 	vmNetCfgObj, err := c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs(newVmNetCfg.Namespace).Create(context.TODO(), &newVmNetCfg, metav1.CreateOptions{})
 	if err != nil {
-		log.Errorf("(vm.createVirtualMachineNetworkConfig) cannot create VirtualMachineNetworkConfig object for vm [%s/%s]: %s",
+		return fmt.Errorf("(vm.createVirtualMachineNetworkConfig) cannot create VirtualMachineNetworkConfig object for vm [%s/%s]: %s",
 			vm.ObjectMeta.Namespace, vm.ObjectMeta.Name, err.Error())
-
-		return
 	}
 
 	log.Infof("(vm.createVirtualMachineNetworkConfig) succesfully created vmnetcfg object [%s/%s] for vm [%s/%s]",

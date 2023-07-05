@@ -16,7 +16,7 @@ import (
 	kubevirtv1 "kubevirt.io/api/core/v1"
 	"kubevirt.io/client-go/kubecli"
 
-	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/dhcp"
 	kihclientset "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/clientset/versioned"
 )
 
@@ -28,7 +28,7 @@ const (
 
 type EventHandler struct {
 	ctx            context.Context
-	vmNetCfgCache  map[string]kihv1.VirtualMachineNetworkConfig
+	dhcp           *dhcp.DHCPAllocator
 	kubeConfig     string
 	kubeContext    string
 	kubeRestConfig *rest.Config
@@ -45,18 +45,18 @@ type Event struct {
 
 func NewEventHandler(
 	ctx context.Context,
-	vmNetCfgCache map[string]kihv1.VirtualMachineNetworkConfig,
+	dhcp *dhcp.DHCPAllocator,
 	kubeConfig string,
 	kubeContext string,
 	kubeRestConfig *rest.Config,
 	kihClientset *kihclientset.Clientset,
 	kcli kubecli.KubevirtClient,
 ) *EventHandler {
-	log.Infof("(vm.NewEventHandler) start")
+	//log.Infof("(vm.NewEventHandler) start")
 
 	return &EventHandler{
 		ctx:            ctx,
-		vmNetCfgCache:  vmNetCfgCache,
+		dhcp:           dhcp,
 		kubeConfig:     kubeConfig,
 		kubeContext:    kubeContext,
 		kubeRestConfig: kubeRestConfig,
@@ -66,7 +66,7 @@ func NewEventHandler(
 }
 
 func (e *EventHandler) Init() (err error) {
-	log.Infof("(vm.Init) start")
+	//log.Infof("(vm.Init) start")
 
 	e.kubeRestConfig, err = e.getKubeConfig()
 	if err != nil {
@@ -87,7 +87,7 @@ func (e *EventHandler) Init() (err error) {
 }
 
 func (e *EventHandler) getKubeConfig() (config *rest.Config, err error) {
-	log.Infof("(vm.getKubeConfig) start")
+	//log.Infof("(vm.getKubeConfig) start")
 
 	if e.kubeConfig == "" {
 		return rest.InClusterConfig()
@@ -100,7 +100,7 @@ func (e *EventHandler) getKubeConfig() (config *rest.Config, err error) {
 }
 
 func (e *EventHandler) EventListener() (err error) {
-	log.Infof("(vm.Listener) start")
+	log.Infof("(vm.Listener) starting VirtualMachine event listener")
 
 	vmWatcher := cache.NewListWatchFromClient(e.kcli.RestClient(), "virtualmachines", corev1.NamespaceAll, fields.Everything())
 
@@ -142,7 +142,7 @@ func (e *EventHandler) EventListener() (err error) {
 		},
 	}, cache.Indexers{})
 
-	controller := NewController(queue, indexer, informer, e.vmNetCfgCache, e.kihClientset)
+	controller := NewController(queue, indexer, informer, e.dhcp, e.kihClientset)
 	stop := make(chan struct{})
 	defer close(stop)
 	go controller.Run(1, stop)

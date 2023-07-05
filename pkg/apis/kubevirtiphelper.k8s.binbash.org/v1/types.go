@@ -16,11 +16,11 @@ type VirtualMachineNetworkConfig struct {
 }
 
 type VirtualMachineNetworkConfigSpec struct {
-	VMName                       string                         `json:"vmname,omitempty"`
-	VirtualMachineNetworkConfigs []VirtualMachineNetworkConfigs `json:"virtualmachinenetworkconfigs,omitempty"`
+	VMName        string          `json:"vmname,omitempty"`
+	NetworkConfig []NetworkConfig `json:"networkconfig,omitempty"`
 }
 
-type VirtualMachineNetworkConfigs struct {
+type NetworkConfig struct {
 	IPAddress   string `json:"ipaddress,omitempty"`
 	MACAddress  string `json:"macaddress,omitempty"`
 	NetworkName string `json:"networkname,omitempty"`

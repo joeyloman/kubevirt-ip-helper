@@ -2,10 +2,11 @@ package ipam
 
 import (
 	"fmt"
-	"log"
 	"net"
 	"net/netip"
 	"sync"
+
+	log "github.com/sirupsen/logrus"
 )
 
 type IPSubnet struct {
@@ -22,7 +23,7 @@ type IPAllocator struct {
 }
 
 func NewIPAllocator() *IPAllocator {
-	log.Printf("(Register) NewIPAllocator")
+	//log.Infof("(ipam.NewIPAllocator) NewIPAllocator")
 
 	ipam := make(map[string]IPSubnet)
 
@@ -175,12 +176,12 @@ func (a *IPAllocator) ReleaseIP(name string, givenIP string) (err error) {
 
 func (a *IPAllocator) Usage(name string) {
 	if _, exists := a.ipam[name]; !exists {
-		log.Printf("network %s does not exists", name)
+		log.Infof("(ipam.Usage) network %s does not exists", name)
 
 		return
 	}
 
-	log.Printf("%s: cidr=%s, start=%s, end=%s, broadcast=%s",
+	log.Infof("(ipam.Usage) %s: cidr=%s, start=%s, end=%s, broadcast=%s",
 		name,
 		a.ipam[name].cidr.String(),
 		a.ipam[name].start.String(),
@@ -189,22 +190,22 @@ func (a *IPAllocator) Usage(name string) {
 	)
 
 	var i int = 0
-	log.Printf("allocated ips:")
+	log.Infof("(ipam.Usage) allocated ips:")
 	for ip, allocated := range a.ipam[name].ips {
 		if allocated {
-			log.Printf("- %s", ip)
+			log.Infof("- %s", ip)
 			i++
 		}
 	}
 
-	log.Printf("ipsinpool=%d, usedips=%d",
+	log.Infof("(ipam.Usage) ipsinpool=%d, usedips=%d",
 		len(a.ipam[name].ips),
 		i,
 	)
 }
 
 func New() *IPAllocator {
-	log.Printf("(ipam.New) allocating new ipam")
+	//log.Infof("(ipam.New) allocating new ipam")
 
 	return NewIPAllocator()
 }
