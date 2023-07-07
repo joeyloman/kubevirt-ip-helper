@@ -2,11 +2,13 @@ package dhcp
 
 import (
 	"net"
+	"sync"
 	"time"
 
 	log "github.com/sirupsen/logrus"
 
 	"github.com/insomniacslk/dhcp/dhcpv4"
+	"github.com/insomniacslk/dhcp/dhcpv4/server4"
 )
 
 type DHCPLease struct {
@@ -19,6 +21,7 @@ type DHCPLease struct {
 
 type DHCPAllocator struct {
 	leases map[string]DHCPLease
+	mutex  sync.Mutex
 }
 
 func NewDHCPAllocator() *DHCPAllocator {
@@ -32,6 +35,9 @@ func NewDHCPAllocator() *DHCPAllocator {
 }
 
 func (a *DHCPAllocator) AddLease(hwAddr string, serverIP string, clientIP string, subnetMask string, routerIP string, DNSServers []string) (err error) {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
 	log.Infof("(dhcp.AddLease) adding lease for hardware address: %s", hwAddr)
 
 	lease := DHCPLease{}
@@ -56,6 +62,9 @@ func (a *DHCPAllocator) CheckLease(hwAddr string) bool {
 }
 
 func (a *DHCPAllocator) DeleteLease(hwaddr string) {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
 	log.Infof("(dhcp.DeleteLease) deleting lease for hardware address: %s", hwaddr)
 	delete(a.leases, hwaddr)
 }
@@ -213,12 +222,13 @@ func (a *DHCPAllocator) dhcpHandler(conn net.PacketConn, peer net.Addr, m *dhcpv
 	}
 }
 
-func (a *DHCPAllocator) Run() {
-	log.Infof("(dhcp.Run) starting DHCP service")
-	// laddr := net.UDPAddr{
-	// 	IP:   net.ParseIP("0.0.0.0"),
-	// 	Port: 67,
-	// }
+func (a *DHCPAllocator) Run(nic string) {
+	log.Infof("(dhcp.Run) starting DHCP service on nic %s", nic)
+
+	laddr := net.UDPAddr{
+		IP:   net.ParseIP("0.0.0.0"),
+		Port: 67,
+	}
 
 	// var nics []string
 	// nics = append(nics, "enp2s0")
@@ -227,15 +237,11 @@ func (a *DHCPAllocator) Run() {
 	// for _, nic := range nics {
 	// 	log.Infof("Serving on nic: %v", nic)
 
-	// 	server, err := server4.NewServer(nic, &laddr, a.dhcpHandler)
-	// 	if err != nil {
-	// 		log.Fatal(err)
-	// 	}
+	server, err := server4.NewServer(nic, &laddr, a.dhcpHandler)
+	if err != nil {
+		log.Fatal(err)
+	}
 
-	// 	go server.Serve()
-	// }
-
-	// for {
-	// 	time.Sleep(1138800 * time.Hour)
+	go server.Serve()
 	// }
 }

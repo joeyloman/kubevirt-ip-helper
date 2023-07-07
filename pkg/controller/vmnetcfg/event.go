@@ -17,6 +17,7 @@ import (
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/dhcp"
 	kihclientset "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/clientset/versioned"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/util"
 )
 
 const (
@@ -84,7 +85,7 @@ func (e *EventHandler) Init() (err error) {
 func (e *EventHandler) getKubeConfig() (config *rest.Config, err error) {
 	//log.Infof("(vmnetcfg.getKubeConfig) start")
 
-	if e.kubeConfig == "" {
+	if !util.FileExists(e.kubeConfig) {
 		return rest.InClusterConfig()
 	}
 

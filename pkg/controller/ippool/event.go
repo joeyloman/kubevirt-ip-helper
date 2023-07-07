@@ -14,8 +14,10 @@ import (
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/dhcp"
 	kihclientset "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/clientset/versioned"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/util"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -28,6 +30,7 @@ const (
 type EventHandler struct {
 	ctx            context.Context
 	ipam           *ipam.IPAllocator
+	dhcp           *dhcp.DHCPAllocator
 	ipPoolCache    map[string]kihv1.IPPool
 	kubeConfig     string
 	kubeContext    string
@@ -43,6 +46,7 @@ type Event struct {
 func NewEventHandler(
 	ctx context.Context,
 	ipam *ipam.IPAllocator,
+	dhcp *dhcp.DHCPAllocator,
 	ipPoolCache map[string]kihv1.IPPool,
 	kubeConfig string,
 	kubeContext string,
@@ -54,6 +58,7 @@ func NewEventHandler(
 	return &EventHandler{
 		ctx:            ctx,
 		ipam:           ipam,
+		dhcp:           dhcp,
 		ipPoolCache:    ipPoolCache,
 		kubeConfig:     kubeConfig,
 		kubeContext:    kubeContext,
@@ -81,7 +86,7 @@ func (e *EventHandler) Init() (err error) {
 func (e *EventHandler) getKubeConfig() (config *rest.Config, err error) {
 	//log.Infof("(ippool.getKubeConfig) start")
 
-	if e.kubeConfig == "" {
+	if !util.FileExists(e.kubeConfig) {
 		return rest.InClusterConfig()
 	}
 
@@ -128,7 +133,7 @@ func (e *EventHandler) EventListener() (err error) {
 		},
 	}, cache.Indexers{})
 
-	controller := NewController(queue, indexer, informer, e.ipPoolCache, e.ipam, e.kihClientset)
+	controller := NewController(queue, indexer, informer, e.ipPoolCache, e.ipam, e.dhcp, e.kihClientset)
 	stop := make(chan struct{})
 	defer close(stop)
 	go controller.Run(1, stop)

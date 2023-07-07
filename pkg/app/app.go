@@ -57,6 +57,7 @@ func (h *handler) Run() {
 	h.ippoolEventHandler = ippool.NewEventHandler(
 		h.ctx,
 		h.ipam,
+		h.dhcp,
 		h.ipPoolCache,
 		kubeconfig_file,
 		"",
@@ -99,10 +100,7 @@ func (h *handler) Run() {
 	}
 	go h.vmEventHandler.EventListener()
 
-	// TODO: pass interfaces
-	h.dhcp.Run()
-
-	// TODO: replace with DHCP service
+	// keep the main thread alive
 	for {
 		time.Sleep(time.Second)
 	}

@@ -11,6 +11,7 @@ import (
 	"k8s.io/client-go/util/workqueue"
 
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/dhcp"
 	kihclientset "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/clientset/versioned"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
 )
@@ -21,6 +22,7 @@ type Controller struct {
 	informer     cache.Controller
 	ipPoolCache  map[string]kihv1.IPPool
 	ipam         *ipam.IPAllocator
+	dhcp         *dhcp.DHCPAllocator
 	kihClientset *kihclientset.Clientset
 }
 
@@ -30,6 +32,7 @@ func NewController(
 	informer cache.Controller,
 	ipPoolCache map[string]kihv1.IPPool,
 	ipam *ipam.IPAllocator,
+	dhcp *dhcp.DHCPAllocator,
 	kihClientset *kihclientset.Clientset,
 ) *Controller {
 	//log.Infof("(ippool.NewController) start")
@@ -40,6 +43,7 @@ func NewController(
 		queue:        queue,
 		ipPoolCache:  ipPoolCache,
 		ipam:         ipam,
+		dhcp:         dhcp,
 		kihClientset: kihClientset,
 	}
 }
