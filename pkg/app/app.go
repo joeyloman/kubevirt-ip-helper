@@ -69,6 +69,9 @@ func (h *handler) Run() {
 	}
 	go h.ippoolEventHandler.EventListener()
 
+	// give the ippool handler some time to gather all the pools and register the ipam subnets
+	time.Sleep(time.Second * 10)
+
 	// initialize the vmnetcfgEventListener handler
 	h.vmnetcfgEventHandler = vmnetcfg.NewEventHandler(
 		h.ctx,
@@ -84,6 +87,9 @@ func (h *handler) Run() {
 		handleErr(err)
 	}
 	go h.vmnetcfgEventHandler.EventListener()
+
+	// give the vmnetcfg handler some time to settle before collecting all the vms
+	time.Sleep(time.Second * 10)
 
 	// initialize the vmEventListener handler
 	h.vmEventHandler = vm.NewEventHandler(

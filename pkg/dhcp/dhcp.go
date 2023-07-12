@@ -20,17 +20,20 @@ type DHCPLease struct {
 }
 
 type DHCPAllocator struct {
-	leases map[string]DHCPLease
-	mutex  sync.Mutex
+	leases  map[string]DHCPLease
+	servers map[string]*server4.Server
+	mutex   sync.Mutex
 }
 
 func NewDHCPAllocator() *DHCPAllocator {
 	//log.Infof("(dhcp.NewDHCPAllocator) NewDHCPAllocator")
 
 	leases := make(map[string]DHCPLease)
+	servers := make(map[string]*server4.Server)
 
 	return &DHCPAllocator{
-		leases: leases,
+		leases:  leases,
+		servers: servers,
 	}
 }
 
@@ -82,7 +85,7 @@ func (a *DHCPAllocator) Usage() {
 }
 
 func New() *DHCPAllocator {
-	log.Infof("(dhcp.New) allocating new leases")
+	log.Infof("(dhcp.New) allocating leases memory db")
 
 	return NewDHCPAllocator()
 }
@@ -91,26 +94,26 @@ func (a *DHCPAllocator) dhcpHandler(conn net.PacketConn, peer net.Addr, m *dhcpv
 	log.Infof("(dhcp.dhcpHandler) start")
 
 	if m == nil {
-		log.Infof("Packet is nil!")
+		log.Errorf("(dhcp.dhcpHandler) Packet is nil!")
 		return
 	}
 
 	//log.Infof("INCOMING PACKET=%s", m.Summary())
 
 	if m.OpCode != dhcpv4.OpcodeBootRequest {
-		log.Infof("Not a BootRequest!")
+		log.Errorf("(dhcp.dhcpHandler) Not a BootRequest!")
 		return
 	}
 
 	reply, err := dhcpv4.NewReplyFromRequest(m)
 	if err != nil {
-		log.Infof("NewReplyFromRequest failed: %v", err)
+		log.Errorf("(dhcp.dhcpHandler) NewReplyFromRequest failed: %v", err)
 		return
 	}
 
 	lease := a.leases[m.ClientHWAddr.String()]
 
-	log.Infof("LEASE FOUND: serverip=%s, clientip=%s, mask=%s, router=%s, dns=%+v",
+	log.Infof("(dhcp.dhcpHandler) LEASE FOUND: serverip=%s, clientip=%s, mask=%s, router=%s, dns=%+v",
 		lease.ServerIP.String(), lease.ClientIP.String(), lease.SubnetMask.String(), lease.Router.String(), lease.DNS)
 
 	/*
@@ -205,43 +208,45 @@ func (a *DHCPAllocator) dhcpHandler(conn net.PacketConn, peer net.Addr, m *dhcpv
 
 	switch mt := m.MessageType(); mt {
 	case dhcpv4.MessageTypeDiscover:
-		log.Infof("DHCPDISCOVER: %+v", m)
+		log.Infof("(dhcp.dhcpHandler) DHCPDISCOVER: %+v", m)
 		reply.UpdateOption(dhcpv4.OptMessageType(dhcpv4.MessageTypeOffer))
-		log.Infof("DHCPOFFER: %+v", reply)
+		log.Infof("(dhcp.dhcpHandler) DHCPOFFER: %+v", reply)
 	case dhcpv4.MessageTypeRequest:
-		log.Infof("DHCPREQUEST: %+v", m)
+		log.Infof("(dhcp.dhcpHandler) DHCPREQUEST: %+v", m)
 		reply.UpdateOption(dhcpv4.OptMessageType(dhcpv4.MessageTypeAck))
-		log.Infof("DHCPACK: %+v", reply)
+		log.Infof("(dhcp.dhcpHandler) DHCPACK: %+v", reply)
 	default:
-		log.Infof("Unhandled message type: %v", mt)
+		log.Infof("(dhcp.dhcpHandler) Unhandled message type: %v", mt)
 		return
 	}
 
 	if _, err := conn.WriteTo(reply.ToBytes(), peer); err != nil {
-		log.Infof("Cannot reply to client: %v", err)
+		log.Errorf("(dhcp.dhcpHandler) Cannot reply to client: %v", err)
 	}
 }
 
-func (a *DHCPAllocator) Run(nic string) {
+func (a *DHCPAllocator) Run(nic string, serverip string) (err error) {
 	log.Infof("(dhcp.Run) starting DHCP service on nic %s", nic)
 
 	laddr := net.UDPAddr{
-		IP:   net.ParseIP("0.0.0.0"),
+		IP:   net.ParseIP(serverip),
 		Port: 67,
 	}
 
-	// var nics []string
-	// nics = append(nics, "enp2s0")
-	// nics = append(nics, "enp3s0")
-
-	// for _, nic := range nics {
-	// 	log.Infof("Serving on nic: %v", nic)
-
 	server, err := server4.NewServer(nic, &laddr, a.dhcpHandler)
 	if err != nil {
-		log.Fatal(err)
+		return
 	}
 
 	go server.Serve()
-	// }
+
+	a.servers[nic] = server
+
+	return
+}
+
+func (a *DHCPAllocator) Stop(nic string) (err error) {
+	log.Infof("(dhcp.Stop) stopping DHCP service on nic %s", nic)
+
+	return a.servers[nic].Close()
 }

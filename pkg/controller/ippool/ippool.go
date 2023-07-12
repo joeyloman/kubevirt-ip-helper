@@ -10,17 +10,18 @@ import (
 )
 
 func (c *Controller) registerIPPool(pool *kihv1.IPPool) (err error) {
-	log.Tracef("(ippool.registerIPPool) poolobj added: [%+v]", pool)
+	log.Infof("(ippool.registerIPPool) new IPPool added [%s]", pool.Name)
 
 	c.ipPoolCache[pool.Spec.NetworkName] = *pool
 
+	// DEBUG
 	ifaces, err := util.ListInterfaces()
 	if err != nil {
 		return
 	}
-	log.Infof("network interfaces: %+v", ifaces)
+	log.Infof("(ippool.registerIPPool) network interfaces: %+v", ifaces)
+	// end DEBUG
 
-	// TODO: get the nic from the serverip
 	nic, err := util.GetNicFromIp(net.ParseIP(pool.Spec.IPv4Config.ServerIP))
 	if err != nil {
 		return
@@ -28,8 +29,10 @@ func (c *Controller) registerIPPool(pool *kihv1.IPPool) (err error) {
 
 	log.Infof("(ippool.registerIPPool) nic found: [%s]", nic)
 
-	// TODO: start a new DHCP service listener on that nic
-	//c.dhcp.Run("eth0")
+	// start a dhcp service thread if the serverip is bound to a nic
+	if nic != "" {
+		c.dhcp.Run(nic, pool.Spec.IPv4Config.ServerIP)
+	}
 
 	return c.ipam.NewSubnet(
 		pool.Spec.NetworkName,
@@ -39,12 +42,22 @@ func (c *Controller) registerIPPool(pool *kihv1.IPPool) (err error) {
 	)
 }
 
-func (c *Controller) removeIPPool(pool *kihv1.IPPool) (err error) {
-	log.Tracef("(RemoveIPPool) poolobj removed: [%+v]\n", pool)
+func (c *Controller) cleanupIPPoolObjects(pool kihv1.IPPool) (err error) {
+	log.Infof("(ippool.cleanupIPPoolObjects) starting cleanup of IPPool %s", pool.Name)
 
-	// TODO: get the nic from the serverip
+	nic, err := util.GetNicFromIp(net.ParseIP(pool.Spec.IPv4Config.ServerIP))
+	if err != nil {
+		return
+	}
 
-	// TODO: stop the DHCP service listener from that nic
+	log.Infof("(ippool.cleanupIPPoolObjects) nic found: [%s]", nic)
+
+	if nic != "" {
+		err := c.dhcp.Stop(nic)
+		if err != nil {
+			log.Errorf("(ippool.cleanupIPPoolObjects) error while stopping DHCP service on nic %s", err.Error())
+		}
+	}
 
 	c.ipam.DeleteSubnet(pool.Spec.NetworkName)
 
@@ -53,6 +66,8 @@ func (c *Controller) removeIPPool(pool *kihv1.IPPool) (err error) {
 
 func updateIPPool(oldPool *kihv1.IPPool, newPool *kihv1.IPPool) error {
 	var err error
+
+	// TODO
 
 	log.Tracef("(UpdateIPPool) poolobj updated: oldPool [%+v] / newPool [%+v]\n", oldPool, newPool)
 

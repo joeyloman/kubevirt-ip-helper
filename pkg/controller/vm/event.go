@@ -38,10 +38,10 @@ type EventHandler struct {
 }
 
 type Event struct {
-	key       string
-	action    string
-	vmname    string
-	namespace string
+	key         string
+	action      string
+	vmName      string
+	vmNamespace string
 }
 
 func NewEventHandler(
@@ -112,10 +112,10 @@ func (e *EventHandler) EventListener() (err error) {
 			key, err := cache.MetaNamespaceKeyFunc(obj)
 			if err == nil {
 				queue.Add(Event{
-					key:       key,
-					action:    ADD,
-					vmname:    obj.(*kubevirtv1.VirtualMachine).GetName(),
-					namespace: obj.(*kubevirtv1.VirtualMachine).GetNamespace(),
+					key:         key,
+					action:      ADD,
+					vmName:      obj.(*kubevirtv1.VirtualMachine).GetName(),
+					vmNamespace: obj.(*kubevirtv1.VirtualMachine).GetNamespace(),
 				})
 			}
 		},
@@ -123,10 +123,10 @@ func (e *EventHandler) EventListener() (err error) {
 			key, err := cache.MetaNamespaceKeyFunc(new)
 			if err == nil {
 				queue.Add(Event{
-					key:       key,
-					action:    UPDATE,
-					vmname:    new.(*kubevirtv1.VirtualMachine).GetName(),
-					namespace: new.(*kubevirtv1.VirtualMachine).GetNamespace(),
+					key:         key,
+					action:      UPDATE,
+					vmName:      new.(*kubevirtv1.VirtualMachine).GetName(),
+					vmNamespace: new.(*kubevirtv1.VirtualMachine).GetNamespace(),
 				})
 			}
 		},
@@ -134,10 +134,10 @@ func (e *EventHandler) EventListener() (err error) {
 			key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
 			if err == nil {
 				queue.Add(Event{
-					key:       key,
-					action:    DELETE,
-					vmname:    obj.(*kubevirtv1.VirtualMachine).GetName(),
-					namespace: obj.(*kubevirtv1.VirtualMachine).GetNamespace(),
+					key:         key,
+					action:      DELETE,
+					vmName:      obj.(*kubevirtv1.VirtualMachine).GetName(),
+					vmNamespace: obj.(*kubevirtv1.VirtualMachine).GetNamespace(),
 				})
 			}
 		},

@@ -11,9 +11,7 @@ import (
 )
 
 func (c *Controller) registerVirtualMachineNetworkConfig(vmnetcfg *kihv1.VirtualMachineNetworkConfig) (err error) {
-	//log.Infof("(vmnetcfg.registerVirtualMachineNetworkConfig) obj added: [%+v]\n", vmnetcfg)
-
-	log.Infof("(vmnetcfg.registerVirtualMachineNetworkConfig) start")
+	log.Infof("(vmnetcfg.registerVirtualMachineNetworkConfig) new registerVirtualMachineNetworkConfig added: %s", vmnetcfg.Name)
 
 	// copy the current vmnetcfg object
 	newVmNetCfg := vmnetcfg
@@ -24,14 +22,14 @@ func (c *Controller) registerVirtualMachineNetworkConfig(vmnetcfg *kihv1.Virtual
 	for _, v := range vmnetcfg.Spec.NetworkConfig {
 		// check if the hwaddr is already registered, if so return err
 		if c.dhcp.CheckLease(v.MACAddress) {
-			log.Errorf("hwaddr %s already exists in the leases, skipping interface", v.MACAddress)
+			log.Errorf("(vmnetcfg.registerVirtualMachineNetworkConfig) hwaddr %s already exists in the leases, skipping interface", v.MACAddress)
 			continue
 		}
 
 		// if v.IPAddress is not empty we register it else we get a new one
 		ip, err := c.ipam.GetIP(v.NetworkName, v.IPAddress)
 		if err != nil {
-			log.Errorf("ipam error: %s, skipping interface", err)
+			log.Errorf("(vmnetcfg.registerVirtualMachineNetworkConfig) ipam error: %s, skipping interface", err)
 			continue
 		}
 
@@ -62,6 +60,8 @@ func (c *Controller) registerVirtualMachineNetworkConfig(vmnetcfg *kihv1.Virtual
 		n.MACAddress = v.MACAddress
 		n.NetworkName = v.NetworkName
 		newVmNetCfgs = append(newVmNetCfgs, n)
+
+		c.ipam.Usage(v.NetworkName)
 	}
 
 	newVmNetCfg.Spec.NetworkConfig = newVmNetCfgs

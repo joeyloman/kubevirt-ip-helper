@@ -4,15 +4,15 @@ metadata:
   name: public-vlan1
 spec:
   ipv4config:
-    serverip: 10.135.10.9
-    subnet: 10.135.10.0/24
+    serverip: 10.135.0.9
+    subnet: 10.135.0.0/16
     pool:
-      start: 10.135.10.10
-      end: 10.135.10.200
+      start: 10.135.0.10
+      end: 10.135.254.254
       exclude:
         - 10.135.10.150
         - 10.135.10.151
-    router: 10.135.10.1
+    router: 10.135.0.1
     dns:
       - 8.8.8.8
       - 4.4.4.4
@@ -24,19 +24,62 @@ metadata:
   name: public-vlan2
 spec:
   ipv4config:
-    serverip: 10.135.20.9
-    subnet: 10.135.20.0/24
+    serverip: 192.168.230.9
+    subnet: 192.168.230.0/24
     pool:
-      start: 10.135.20.10
-      end: 10.135.20.200
+      start: 192.168.230.10
+      end: 192.168.230.200
       exclude:
-        - 10.135.20.150
-        - 10.135.20.151
-    router: 10.135.20.1
+        - 192.168.230.150
+        - 192.168.230.151
+    router: 192.168.230.1
     dns:
       - 8.8.8.8
       - 4.4.4.4
   networkname: harvester-public/public-vlan-2
+---
+apiVersion: kubevirtiphelper.k8s.binbash.org/v1
+kind: IPPool
+metadata:
+  name: public-vlan3
+spec:
+  ipv4config:
+    serverip: 172.16.0.9
+    subnet: 172.16.0.0/16
+    pool:
+      start: 172.16.0.10
+      end: 172.16.254.250
+      exclude:
+        - 172.16.0.150
+        - 172.16.100.15
+        - 172.16.120.226
+        - 172.16.199.15
+    router: 172.16.0.1
+    dns:
+      - 8.8.8.8
+      - 4.4.4.4
+  networkname: harvester-public/public-vlan-3
+---
+apiVersion: kubevirtiphelper.k8s.binbash.org/v1
+kind: IPPool
+metadata:
+  name: public-vlan4
+spec:
+  ipv4config:
+    serverip: 192.168.250.9
+    subnet: 192.168.250.0/28
+    pool:
+      start: 192.168.250.2
+      end: 192.168.250.14
+      exclude:
+        - 192.168.250.9
+        - 192.168.250.12
+        - 192.168.250.13
+    router: 172.16.0.1
+    dns:
+      - 8.8.8.8
+      - 4.4.4.4
+  networkname: harvester-public/public-vlan-4
 ---
 apiVersion: kubevirtiphelper.k8s.binbash.org/v1
 kind: VirtualMachineNetworkConfig
@@ -46,9 +89,12 @@ metadata:
 spec:
   vmname: test-vm1
   networkconfig:
-    - ipaddress: 10.135.10.195
+    - ipaddress: 10.135.0.195
       macaddress: 12:8b:a8:8c:da:11
       networkname: harvester-public/public-vlan-1
-    - ipaddress: 10.135.20.201
+    - ipaddress: 192.168.230.201
       macaddress: aa:8b:a8:8c:da:cc
       networkname: harvester-public/public-vlan-2
+    - ipaddress: 172.16.0.11
+      macaddress: cc:9d:8a:c8:da:dd
+      networkname: harvester-public/public-vlan-3

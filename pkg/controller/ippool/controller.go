@@ -87,17 +87,21 @@ func (c *Controller) sync(event Event) (err error) {
 		if err != nil {
 			log.Errorf("(ippool.sync) failed to allocate new pool for %s: %s", obj.(*kihv1.IPPool).GetName(), err.Error())
 		}
+
+		// TODO: remove
 		c.ipam.Usage(obj.(*kihv1.IPPool).Spec.NetworkName)
 		printIPPoolcache(c.ipPoolCache)
 	case UPDATE:
 		log.Infof("(ippool.sync) update action found!")
 	case DELETE:
 		log.Infof("(ippool.sync) delete action found!")
-		err := c.removeIPPool(obj.(*kihv1.IPPool))
+		err := c.cleanupIPPoolObjects(c.ipPoolCache[event.poolNetworkName])
 		if err != nil {
-			log.Errorf("(ippool.sync) failed to delete pool for %s: %s", obj.(*kihv1.IPPool).GetName(), err.Error())
+			log.Errorf("(ippool.sync) failed to delete pool %s: %s", event.poolName, err.Error())
 		}
-		c.ipam.Usage(obj.(*kihv1.IPPool).Spec.NetworkName)
+
+		// TODO: remove
+		c.ipam.Usage(c.ipPoolCache[event.poolNetworkName].Spec.NetworkName)
 		printIPPoolcache(c.ipPoolCache)
 	}
 

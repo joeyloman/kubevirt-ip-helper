@@ -14,7 +14,7 @@ import (
 )
 
 func (c *Controller) createVirtualMachineNetworkConfigObject(vm *kubevirtV1.VirtualMachine) (err error) {
-	log.Infof("(vm.createVirtualMachineNetworkConfig) creating vmnetcfg object")
+	log.Infof("(vm.createVirtualMachineNetworkConfigObject) new VirtualMachine added [%s]", vm.Name)
 
 	newVmNetCfg := kihv1.VirtualMachineNetworkConfig{}
 	newVmNetCfg.ObjectMeta.Name = vm.ObjectMeta.Name
@@ -38,7 +38,6 @@ func (c *Controller) createVirtualMachineNetworkConfigObject(vm *kubevirtV1.Virt
 					if c.dhcp.CheckLease(nic.MacAddress) {
 						return fmt.Errorf("hwaddr %s already exists in the leases", nic.MacAddress)
 					}
-					// TODO: if one of the networks do not exists, do not create the vmnetcfg object
 
 					netCfg := kihv1.NetworkConfig{}
 					netCfg.MACAddress = nic.MacAddress
@@ -79,10 +78,10 @@ func (c *Controller) updateVirtualMachineNetworkConfigObject(vm *kubevirtV1.Virt
 	return
 }
 
-func (c *Controller) deleteVirtualMachineNetworkConfigObject(vm *kubevirtV1.VirtualMachine) (err error) {
+func (c *Controller) deleteVirtualMachineNetworkConfigObject(vmName string, vmNamespace string) (err error) {
 	log.Infof("(vm.deleteVirtualMachineNetworkConfigObject) deleting vmnetcfg object")
 
-	c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs(vm.ObjectMeta.Namespace).Delete(context.TODO(), vm.ObjectMeta.Name, metav1.DeleteOptions{})
+	c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs(vmNamespace).Delete(context.TODO(), vmName, metav1.DeleteOptions{})
 	// if err != nil {
 	// 	log.Errorf("(vm.deleteVirtualMachineNetworkConfigObject) cannot delete VirtualMachineNetworkConfig object for vm [%s/%s]: %s",
 	// 		vm.ObjectMeta.Namespace, vm.ObjectMeta.Name, err.Error())
@@ -91,7 +90,7 @@ func (c *Controller) deleteVirtualMachineNetworkConfigObject(vm *kubevirtV1.Virt
 	// }
 
 	log.Infof("(vm.createVirtualMachineNetworkConfig) succesfully deleted vmnetcfg object [%s/%s] for vm [%s/%s]",
-		vm.ObjectMeta.Namespace, vm.ObjectMeta.Name, vm.ObjectMeta.Namespace, vm.ObjectMeta.Name)
+		vmNamespace, vmName, vmNamespace, vmName)
 
 	return
 }

@@ -39,8 +39,10 @@ type EventHandler struct {
 }
 
 type Event struct {
-	key    string
-	action string
+	key             string
+	action          string
+	poolName        string
+	poolNetworkName string
 }
 
 func NewEventHandler(
@@ -108,8 +110,10 @@ func (e *EventHandler) EventListener() (err error) {
 			key, err := cache.MetaNamespaceKeyFunc(obj)
 			if err == nil {
 				queue.Add(Event{
-					key:    key,
-					action: ADD,
+					key:             key,
+					action:          ADD,
+					poolName:        obj.(*kihv1.IPPool).ObjectMeta.Name,
+					poolNetworkName: obj.(*kihv1.IPPool).Spec.NetworkName,
 				})
 			}
 		},
@@ -117,8 +121,10 @@ func (e *EventHandler) EventListener() (err error) {
 			key, err := cache.MetaNamespaceKeyFunc(new)
 			if err == nil {
 				queue.Add(Event{
-					key:    key,
-					action: UPDATE,
+					key:             key,
+					action:          UPDATE,
+					poolName:        new.(*kihv1.IPPool).ObjectMeta.Name,
+					poolNetworkName: new.(*kihv1.IPPool).Spec.NetworkName,
 				})
 			}
 		},
@@ -126,8 +132,10 @@ func (e *EventHandler) EventListener() (err error) {
 			key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
 			if err == nil {
 				queue.Add(Event{
-					key:    key,
-					action: DELETE,
+					key:             key,
+					action:          DELETE,
+					poolName:        obj.(*kihv1.IPPool).ObjectMeta.Name,
+					poolNetworkName: obj.(*kihv1.IPPool).Spec.NetworkName,
 				})
 			}
 		},

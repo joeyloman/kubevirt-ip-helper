@@ -75,7 +75,7 @@ func (c *Controller) sync(event Event) (err error) {
 	}
 
 	//log.Infof("(vm.sync) event sync for VirtualMachine %s", obj.(*kubevirtv1.VirtualMachine).GetName())
-	log.Infof("(vm.sync) processing event for VirtualMachine [%s/%s]", event.namespace, event.vmname)
+	log.Infof("(vm.sync) processing event for VirtualMachine [%s/%s]", event.vmNamespace, event.vmName)
 
 	switch event.action {
 	case ADD:
@@ -97,7 +97,7 @@ func (c *Controller) sync(event Event) (err error) {
 	case DELETE:
 		log.Infof("(vm.sync) delete action found!")
 
-		err := c.deleteVirtualMachineNetworkConfigObject(obj.(*kubevirtv1.VirtualMachine))
+		err := c.deleteVirtualMachineNetworkConfigObject(event.vmName, event.vmNamespace)
 		if err != nil {
 			log.Errorf("(vm.sync) %s", err)
 		}

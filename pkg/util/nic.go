@@ -1,6 +1,10 @@
 package util
 
-import "net"
+import (
+	"net"
+
+	log "github.com/sirupsen/logrus"
+)
 
 func GetNicFromIp(nic_ip net.IP) (str string, err error) {
 	ifaces, err := net.Interfaces()
@@ -8,6 +12,7 @@ func GetNicFromIp(nic_ip net.IP) (str string, err error) {
 		return
 	}
 	for _, i := range ifaces {
+		log.Infof("DEBUG checking: %s", i.Name)
 		addrs, err := i.Addrs()
 		if err == nil {
 			for _, a := range addrs {
@@ -15,6 +20,7 @@ func GetNicFromIp(nic_ip net.IP) (str string, err error) {
 				if err != nil {
 					return "", err
 				}
+				log.Infof("found interface %s with ip %s", i.Name, ip)
 				if ip.String() == nic_ip.String() {
 					return i.Name, err
 				}
