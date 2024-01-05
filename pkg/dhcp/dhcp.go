@@ -13,9 +13,8 @@ import (
 	"github.com/insomniacslk/dhcp/rfc1035label"
 )
 
-type DHCPLease struct {
+type DHCPPool struct {
 	ServerIP     net.IP
-	ClientIP     net.IP
 	SubnetMask   net.IPMask
 	Router       net.IP
 	DNS          []net.IP
@@ -23,29 +22,36 @@ type DHCPLease struct {
 	DomainSearch []string
 	NTP          []net.IP
 	LeaseTime    int
-	Reference    string
+}
+
+type DHCPLease struct {
+	PoolName  string
+	ClientIP  net.IP
+	Reference string
 }
 
 type DHCPAllocator struct {
+	pools   map[string]DHCPPool
 	leases  map[string]DHCPLease
 	servers map[string]*server4.Server
 	mutex   sync.Mutex
 }
 
 func NewDHCPAllocator() *DHCPAllocator {
+	pools := make(map[string]DHCPPool)
 	leases := make(map[string]DHCPLease)
 	servers := make(map[string]*server4.Server)
 
 	return &DHCPAllocator{
+		pools:   pools,
 		leases:  leases,
 		servers: servers,
 	}
 }
 
-func (a *DHCPAllocator) AddLease(
-	hwAddr string,
+func (a *DHCPAllocator) AddPool(
+	name string,
 	serverIP string,
-	clientIP string,
 	subnetMask string,
 	routerIP string,
 	DNSServers []string,
@@ -53,6 +59,72 @@ func (a *DHCPAllocator) AddLease(
 	domainSearch []string,
 	NTPServers []string,
 	leaseTime int,
+) (err error) {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	pool := DHCPPool{}
+	pool.ServerIP = net.ParseIP(serverIP)
+	pool.SubnetMask = net.IPMask(net.ParseIP(subnetMask).To4())
+	pool.Router = net.ParseIP(routerIP)
+	for i := 0; i < len(DNSServers); i++ {
+		pool.DNS = append(pool.DNS, net.ParseIP(DNSServers[i]))
+	}
+	pool.DomainName = domainName
+	pool.DomainSearch = domainSearch
+	for i := 0; i < len(NTPServers); i++ {
+		hostip := net.ParseIP(NTPServers[i])
+		if hostip.To4() != nil {
+			pool.NTP = append(pool.NTP, net.ParseIP(NTPServers[i]))
+		} else {
+			hostips, err := net.LookupIP(NTPServers[i])
+			if err != nil {
+				log.Errorf("(dhcp.AddPool) cannot get any ip addresses from ntp domainname entry %s: %s", NTPServers[i], err)
+			}
+			for _, ip := range hostips {
+				if ip.To4() != nil {
+					pool.NTP = append(pool.NTP, ip)
+				}
+			}
+		}
+	}
+	pool.LeaseTime = leaseTime
+
+	a.pools[name] = pool
+
+	log.Debugf("(dhcp.AddPool) pool %s added", name)
+
+	return
+}
+
+func (a *DHCPAllocator) CheckPool(name string) bool {
+	_, exists := a.pools[name]
+	return exists
+}
+
+func (a *DHCPAllocator) GetPool(name string) (pool DHCPPool) {
+	return a.pools[name]
+}
+
+func (a *DHCPAllocator) DeletePool(name string) (err error) {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	if !a.CheckPool(name) {
+		return fmt.Errorf("pool %s does not exists", name)
+	}
+
+	delete(a.pools, name)
+
+	log.Debugf("(dhcp.DeletePool) pool %s deleted", name)
+
+	return
+}
+
+func (a *DHCPAllocator) AddLease(
+	hwAddr string,
+	poolName string,
+	clientIP string,
 	ref string,
 ) (err error) {
 	a.mutex.Lock()
@@ -71,33 +143,8 @@ func (a *DHCPAllocator) AddLease(
 	}
 
 	lease := DHCPLease{}
-	lease.ServerIP = net.ParseIP(serverIP)
+	lease.PoolName = poolName
 	lease.ClientIP = net.ParseIP(clientIP)
-	lease.SubnetMask = net.IPMask(net.ParseIP(subnetMask).To4())
-	lease.Router = net.ParseIP(routerIP)
-	for i := 0; i < len(DNSServers); i++ {
-		lease.DNS = append(lease.DNS, net.ParseIP(DNSServers[i]))
-	}
-	lease.DomainName = domainName
-	lease.DomainSearch = domainSearch
-	for i := 0; i < len(NTPServers); i++ {
-		hostip := net.ParseIP(NTPServers[i])
-		if hostip.To4() != nil {
-			lease.NTP = append(lease.NTP, net.ParseIP(NTPServers[i]))
-		} else {
-			hostips, err := net.LookupIP(NTPServers[i])
-			if err != nil {
-				log.Errorf("(dhcp.AddLease) cannot get any ip addresses from ntp domainname entry %s: %s", NTPServers[i], err)
-			}
-			for _, ip := range hostips {
-				if ip.To4() != nil {
-					lease.NTP = append(lease.NTP, ip)
-				}
-
-			}
-		}
-	}
-	lease.LeaseTime = leaseTime
 	lease.Reference = ref
 
 	a.leases[hwAddr] = lease
@@ -133,16 +180,18 @@ func (a *DHCPAllocator) DeleteLease(hwAddr string) (err error) {
 
 func (a *DHCPAllocator) Usage() {
 	for hwaddr, lease := range a.leases {
-		log.Infof("(dhcp.Usage) lease: hwaddr=%s, clientip=%s, netmask=%s, router=%s, dns=%+v, domain=%s, domainsearch=%+v, ntp=%+v, leasetime=%d, ref=%s",
+		pool := a.pools[lease.PoolName]
+		log.Infof("(dhcp.Usage) lease: hwaddr=%s, pool=%s, clientip=%s, netmask=%s, router=%s, dns=%+v, domain=%s, domainsearch=%+v, ntp=%+v, leasetime=%d, ref=%s",
 			hwaddr,
+			lease.PoolName,
 			lease.ClientIP.String(),
-			lease.SubnetMask.String(),
-			lease.Router.String(),
-			lease.DNS,
-			lease.DomainName,
-			lease.DomainSearch,
-			lease.NTP,
-			lease.LeaseTime,
+			pool.SubnetMask.String(),
+			pool.Router.String(),
+			pool.DNS,
+			pool.DomainName,
+			pool.DomainSearch,
+			pool.NTP,
+			pool.LeaseTime,
 			lease.Reference,
 		)
 	}
@@ -179,53 +228,60 @@ func (a *DHCPAllocator) dhcpHandler(conn net.PacketConn, peer net.Addr, m *dhcpv
 		return
 	}
 
+	if !a.CheckPool(lease.PoolName) {
+		log.Warnf("(dhcp.dhcpHandler) NO MATCHED POOL FOUND FOR LEASE: hwaddr=%s", m.ClientHWAddr.String())
+
+		return
+	}
+	pool := a.pools[lease.PoolName]
+
 	log.Debugf("(dhcp.dhcpHandler) LEASE FOUND: hwaddr=%s, serverip=%s, clientip=%s, mask=%s, router=%s, dns=%+v, domainname=%s, domainsearch=%+v, ntp=%+v, leasetime=%d, reference=%s",
 		m.ClientHWAddr.String(),
-		lease.ServerIP.String(),
+		pool.ServerIP.String(),
 		lease.ClientIP.String(),
-		lease.SubnetMask.String(),
-		lease.Router.String(),
-		lease.DNS,
-		lease.DomainName,
-		lease.DomainSearch,
-		lease.NTP,
-		lease.LeaseTime,
+		pool.SubnetMask.String(),
+		pool.Router.String(),
+		pool.DNS,
+		pool.DomainName,
+		pool.DomainSearch,
+		pool.NTP,
+		pool.LeaseTime,
 		lease.Reference,
 	)
 
 	reply.ClientIPAddr = lease.ClientIP
-	reply.ServerIPAddr = lease.ServerIP
+	reply.ServerIPAddr = pool.ServerIP
 	reply.YourIPAddr = lease.ClientIP
 	reply.TransactionID = m.TransactionID
 	reply.ClientHWAddr = m.ClientHWAddr
 	reply.Flags = m.Flags
 	reply.GatewayIPAddr = m.GatewayIPAddr
 
-	reply.UpdateOption(dhcpv4.OptServerIdentifier(lease.ServerIP))
-	reply.UpdateOption(dhcpv4.OptSubnetMask(lease.SubnetMask))
-	reply.UpdateOption(dhcpv4.OptRouter(lease.Router))
+	reply.UpdateOption(dhcpv4.OptServerIdentifier(pool.ServerIP))
+	reply.UpdateOption(dhcpv4.OptSubnetMask(pool.SubnetMask))
+	reply.UpdateOption(dhcpv4.OptRouter(pool.Router))
 
-	if len(lease.DNS) > 0 {
-		reply.UpdateOption(dhcpv4.OptDNS(lease.DNS...))
+	if len(pool.DNS) > 0 {
+		reply.UpdateOption(dhcpv4.OptDNS(pool.DNS...))
 	}
 
-	if lease.DomainName != "" {
-		reply.UpdateOption(dhcpv4.OptDomainName(lease.DomainName))
+	if pool.DomainName != "" {
+		reply.UpdateOption(dhcpv4.OptDomainName(pool.DomainName))
 	}
 
-	if len(lease.DomainSearch) > 0 {
+	if len(pool.DomainSearch) > 0 {
 		dsl := rfc1035label.NewLabels()
-		dsl.Labels = append(dsl.Labels, lease.DomainSearch...)
+		dsl.Labels = append(dsl.Labels, pool.DomainSearch...)
 
 		reply.UpdateOption(dhcpv4.OptDomainSearch(dsl))
 	}
 
-	if len(lease.NTP) > 0 {
-		reply.UpdateOption(dhcpv4.OptNTPServers(lease.NTP...))
+	if len(pool.NTP) > 0 {
+		reply.UpdateOption(dhcpv4.OptNTPServers(pool.NTP...))
 	}
 
-	if lease.LeaseTime > 0 {
-		reply.UpdateOption(dhcpv4.OptIPAddressLeaseTime(time.Duration(lease.LeaseTime) * time.Second))
+	if pool.LeaseTime > 0 {
+		reply.UpdateOption(dhcpv4.OptIPAddressLeaseTime(time.Duration(pool.LeaseTime) * time.Second))
 	} else {
 		// default lease time: 1 year
 		reply.UpdateOption(dhcpv4.OptIPAddressLeaseTime(31536000 * time.Second))

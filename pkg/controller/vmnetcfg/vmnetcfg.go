@@ -3,8 +3,6 @@ package vmnetcfg
 import (
 	"context"
 	"fmt"
-	"net"
-	"net/netip"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -159,30 +157,11 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 		}
 		log.Tracef("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] got IP %s from ipam", vmnetcfg.Namespace, vmnetcfg.Name, ip)
 
-		ipnet, err := netip.ParsePrefix(pool.(kihv1.IPPool).Spec.IPv4Config.Subnet)
-		if err != nil {
-			if ipamErr := c.ipam.ReleaseIP(v.NetworkName, v.IPAddress); ipamErr != nil {
-				log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] %s",
-					vmnetcfg.Namespace, vmnetcfg.Name, ipamErr)
-			}
-
-			// abort update
-			return err
-		}
-		subnetMask := net.CIDRMask(ipnet.Bits(), 32)
 		ref := fmt.Sprintf("%s/%s", vmnetcfg.Namespace, vmnetcfg.Spec.VMName)
-
 		c.dhcp.AddLease(
 			v.MACAddress,
-			pool.(kihv1.IPPool).Spec.IPv4Config.ServerIP,
+			pool.(kihv1.IPPool).Spec.NetworkName,
 			ip,
-			net.IP(subnetMask).String(),
-			pool.(kihv1.IPPool).Spec.IPv4Config.Router,
-			pool.(kihv1.IPPool).Spec.IPv4Config.DNS,
-			pool.(kihv1.IPPool).Spec.IPv4Config.DomainName,
-			pool.(kihv1.IPPool).Spec.IPv4Config.DomainSearch,
-			pool.(kihv1.IPPool).Spec.IPv4Config.NTP,
-			pool.(kihv1.IPPool).Spec.IPv4Config.LeaseTime,
 			ref,
 		)
 

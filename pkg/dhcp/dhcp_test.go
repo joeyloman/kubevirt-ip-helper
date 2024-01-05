@@ -9,10 +9,9 @@ import (
 func TestDHCP(t *testing.T) {
 	td := New()
 
-	testLeases := []struct {
-		hwAddr       string
+	testPools := []struct {
+		name         string
 		serverIP     string
-		clientIP     string
 		subnetMask   string
 		routerIP     string
 		DNSServers   []string
@@ -20,106 +19,140 @@ func TestDHCP(t *testing.T) {
 		domainSearch []string
 		NTPServers   []string
 		leaseTime    int
-		Reference    string
 		want         error
 	}{
 		{
-			hwAddr:       "aa:bb:cc:dd:ee:ff",
+			name:         "vlan1",
 			serverIP:     "0.0.0.0",
-			clientIP:     "192.168.0.10",
-			subnetMask:   "192.168.0.254",
+			subnetMask:   "255.255.255.0",
 			routerIP:     "192.168.0.254",
 			DNSServers:   []string{"8.8.8.8", "8.8.4.4"},
 			domainName:   "example.com",
 			domainSearch: []string{"example.com"},
 			NTPServers:   []string{"localhost", "127.0.0.2"},
 			leaseTime:    300,
-			Reference:    "",
 			want:         nil,
 		},
 		{
-			hwAddr:       "aa:bb:cc:dd:ee:ff",
+			name:         "vlan2",
 			serverIP:     "0.0.0.0",
-			clientIP:     "192.168.0.10",
-			subnetMask:   "192.168.0.254",
-			routerIP:     "192.168.0.254",
+			subnetMask:   "255.255.0.0",
+			routerIP:     "172.16.0.254",
 			DNSServers:   []string{"8.8.8.8", "8.8.4.4"},
 			domainName:   "example.com",
 			domainSearch: []string{"example.com"},
 			NTPServers:   []string{},
-			leaseTime:    300,
-			Reference:    "",
-			want:         fmt.Errorf("lease for hwaddr aa:bb:cc:dd:ee:ff already exists"),
+			leaseTime:    1800,
+			want:         nil,
 		},
 		{
-			hwAddr:       "00:01:02:03:04:05",
+			name:         "vlan3",
 			serverIP:     "0.0.0.0",
-			clientIP:     "192.168.0.11",
-			subnetMask:   "192.168.0.254",
-			routerIP:     "192.168.0.254",
+			subnetMask:   "255.0.0.0",
+			routerIP:     "10.0.0.254",
 			DNSServers:   []string{"8.8.8.8", "8.8.4.4"},
 			domainName:   "example.com",
 			domainSearch: []string{"example.com"},
 			NTPServers:   []string{},
-			leaseTime:    300,
-			Reference:    "someref",
+			leaseTime:    0,
 			want:         nil,
 		},
+	}
+
+	// AddPool function tests
+	for i := 0; i < len(testPools); i++ {
+		if got := td.AddPool(
+			testPools[i].name,
+			testPools[i].serverIP,
+			testPools[i].subnetMask,
+			testPools[i].routerIP,
+			testPools[i].DNSServers,
+			testPools[i].domainName,
+			testPools[i].domainSearch,
+			testPools[i].NTPServers,
+			testPools[i].leaseTime,
+		); got != testPools[i].want {
+			if got == nil || testPools[i].want == nil {
+				t.Errorf("got %q, wanted %q", got, testPools[i].want)
+			} else if got.Error() != testPools[i].want.Error() {
+				t.Errorf("got %q, wanted %q", got, testPools[i].want)
+			}
+		}
+	}
+
+	// GetPool function tests
+	pool1 := td.GetPool("vlan2")
+	if !pool1.Router.Equal(net.ParseIP(testPools[1].routerIP)) {
+		t.Errorf("got %q, wanted %q", pool1.Router.String(), testPools[1].routerIP)
+	}
+	pool2 := td.GetPool("vlan10")
+	if len(pool2.ServerIP) > 0 {
+		t.Errorf("got %q, wanted nil", pool2.ServerIP.String())
+	}
+
+	// CheckPool function tests
+	if !td.CheckPool("vlan1") {
+		t.Errorf("got false, wanted true for poolname vlan1")
+	}
+	if td.CheckPool("vlan10") {
+		t.Errorf("got true, wanted false for poolname vlan10")
+	}
+
+	testLeases := []struct {
+		hwAddr    string
+		poolName  string
+		clientIP  string
+		Reference string
+		want      error
+	}{
 		{
-			hwAddr:       "01:02:03:04:05:06",
-			serverIP:     "",
-			clientIP:     "",
-			subnetMask:   "",
-			routerIP:     "",
-			DNSServers:   []string{},
-			domainName:   "",
-			domainSearch: []string{},
-			NTPServers:   []string{},
-			leaseTime:    0,
-			Reference:    "",
-			want:         nil,
+			hwAddr:    "aa:bb:cc:dd:ee:ff",
+			poolName:  "vlan1",
+			clientIP:  "192.168.0.10",
+			Reference: "",
+			want:      nil,
 		},
 		{
-			hwAddr:       "ZZ:01:02:03:04:05",
-			serverIP:     "",
-			clientIP:     "",
-			subnetMask:   "",
-			routerIP:     "",
-			DNSServers:   []string{},
-			domainName:   "",
-			domainSearch: []string{},
-			NTPServers:   []string{},
-			leaseTime:    0,
-			Reference:    "",
-			want:         fmt.Errorf("hwaddr ZZ:01:02:03:04:05 is not valid"),
+			hwAddr:    "aa:bb:cc:dd:ee:ff",
+			poolName:  "vlan1",
+			clientIP:  "192.168.0.10",
+			Reference: "",
+			want:      fmt.Errorf("lease for hwaddr aa:bb:cc:dd:ee:ff already exists"),
 		},
 		{
-			hwAddr:       "00-01:02:03:04:05",
-			serverIP:     "",
-			clientIP:     "",
-			subnetMask:   "",
-			routerIP:     "",
-			DNSServers:   []string{},
-			domainName:   "",
-			domainSearch: []string{},
-			NTPServers:   []string{},
-			leaseTime:    0,
-			Reference:    "",
-			want:         fmt.Errorf("hwaddr 00-01:02:03:04:05 is not valid"),
+			hwAddr:    "00:01:02:03:04:05",
+			poolName:  "vlan1",
+			clientIP:  "192.168.0.11",
+			Reference: "someref",
+			want:      nil,
 		},
 		{
-			hwAddr:       "",
-			serverIP:     "",
-			clientIP:     "",
-			subnetMask:   "",
-			routerIP:     "",
-			DNSServers:   []string{},
-			domainName:   "",
-			domainSearch: []string{},
-			NTPServers:   []string{},
-			leaseTime:    0,
-			Reference:    "",
-			want:         fmt.Errorf("hwaddr is empty"),
+			hwAddr:    "01:02:03:04:05:06",
+			poolName:  "vlan1",
+			clientIP:  "",
+			Reference: "",
+			want:      nil,
+		},
+		{
+			hwAddr:    "ZZ:01:02:03:04:05",
+			poolName:  "vlan2",
+			clientIP:  "",
+			Reference: "",
+			want:      fmt.Errorf("hwaddr ZZ:01:02:03:04:05 is not valid"),
+		},
+		{
+			hwAddr:    "00-01:02:03:04:05",
+			poolName:  "vlan2",
+			clientIP:  "",
+			Reference: "",
+			want:      fmt.Errorf("hwaddr 00-01:02:03:04:05 is not valid"),
+		},
+		{
+			hwAddr:    "",
+			poolName:  "vlan2",
+			clientIP:  "",
+			Reference: "",
+			want:      fmt.Errorf("hwaddr is empty"),
 		},
 	}
 
@@ -127,15 +160,8 @@ func TestDHCP(t *testing.T) {
 	for i := 0; i < len(testLeases); i++ {
 		if got := td.AddLease(
 			testLeases[i].hwAddr,
-			testLeases[i].serverIP,
+			testLeases[i].poolName,
 			testLeases[i].clientIP,
-			testLeases[i].subnetMask,
-			testLeases[i].routerIP,
-			testLeases[i].DNSServers,
-			testLeases[i].domainName,
-			testLeases[i].domainSearch,
-			testLeases[i].NTPServers,
-			testLeases[i].leaseTime,
 			testLeases[i].Reference,
 		); got != testLeases[i].want {
 			if got == nil || testLeases[i].want == nil {
@@ -180,6 +206,17 @@ func TestDHCP(t *testing.T) {
 	}
 	if got := td.DeleteLease("aa:bb:cc:dd:ee:ff"); got != nil {
 		wanted := "lease for hwaddr aa:bb:cc:dd:ee:ff does not exists"
+		if got.Error() != wanted {
+			t.Errorf("got %q, wanted %q", got, wanted)
+		}
+	}
+
+	// DeletePool function tests
+	if got := td.DeletePool("vlan2"); got != nil {
+		t.Errorf("got %q, wanted nil", got)
+	}
+	if got := td.DeletePool("vlan10"); got != nil {
+		wanted := "pool vlan10 does not exists"
 		if got.Error() != wanted {
 			t.Errorf("got %q, wanted %q", got, wanted)
 		}
