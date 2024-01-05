@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/netip"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -31,11 +32,33 @@ func (c *Controller) registerIPPool(pool *kihv1.IPPool) (err error) {
 
 	log.Debugf("(ippool.registerIPPool) [%s] nic found: [%s]", pool.Name, nic)
 
+	// convert the subnetmask
+	ipnet, err := netip.ParsePrefix(pool.Spec.IPv4Config.Subnet)
+	if err != nil {
+		// abort update
+		return
+	}
+	subnetMask := net.CIDRMask(ipnet.Bits(), 32)
+
 	// start a dhcp service thread if the serverip is bound to a nic
 	if nic != "" {
 		c.dhcp.Run(nic, pool.Spec.IPv4Config.ServerIP)
 	}
 
+	// register the new subnet in dhcp
+	c.dhcp.AddPool(
+		pool.Spec.NetworkName,
+		pool.Spec.IPv4Config.ServerIP,
+		net.IP(subnetMask).String(),
+		pool.Spec.IPv4Config.Router,
+		pool.Spec.IPv4Config.DNS,
+		pool.Spec.IPv4Config.DomainName,
+		pool.Spec.IPv4Config.DomainSearch,
+		pool.Spec.IPv4Config.NTP,
+		pool.Spec.IPv4Config.LeaseTime,
+	)
+
+	// register the new subnet in ipam
 	if err = c.ipam.NewSubnet(
 		pool.Spec.NetworkName,
 		pool.Spec.IPv4Config.Subnet,
@@ -98,6 +121,7 @@ func (c *Controller) cleanupIPPoolObjects(pool *kihv1.IPPool) (err error) {
 	}
 
 	c.ipam.DeleteSubnet(pool.Spec.NetworkName)
+	c.dhcp.DeletePool(pool.Spec.NetworkName)
 	c.metrics.DeleteIPPool(pool.Name, pool.Spec.IPv4Config.Subnet, pool.Spec.NetworkName)
 	c.cache.Delete("pool", pool.Spec.NetworkName)
 
@@ -122,9 +146,6 @@ func (c *Controller) resetIPPoolStatus(pool *kihv1.IPPool) (uPool *kihv1.IPPool,
 
 	allocatedExcludes := make(map[string]string)
 	for _, v := range pool.Spec.IPv4Config.Pool.Exclude {
-		// TODO: remove
-		// log.Debugf("(ippool.resetIPPoolStatus) [%s] adding exclude ip [%s] to the status for network [%s]", pool.Name, v, pool.Spec.NetworkName)
-
 		allocatedExcludes[v] = "EXCLUDED"
 	}
 	cPool.Status.IPv4.Allocated = allocatedExcludes
