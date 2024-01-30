@@ -37,9 +37,9 @@ func main() {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 
-	ctx, cancel := context.WithCancel(context.Background())
+	_, cancel := context.WithCancel(context.Background())
 
-	mainApp := app.Register(ctx)
+	mainApp := app.Register()
 
 	go func() {
 		<-sig
@@ -47,6 +47,7 @@ func main() {
 		os.Exit(1)
 	}()
 
+	mainApp.Init()
 	mainApp.Run()
 	cancel()
 }

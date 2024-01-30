@@ -39,6 +39,7 @@ type EventHandler struct {
 	kubeContext    string
 	kubeRestConfig *rest.Config
 	kihClientset   *kihclientset.Clientset
+	appStatus      *int
 }
 
 type Event struct {
@@ -58,6 +59,7 @@ func NewEventHandler(
 	kubeContext string,
 	kubeRestConfig *rest.Config,
 	kihClientset *kihclientset.Clientset,
+	appStatus *int,
 ) *EventHandler {
 	return &EventHandler{
 		ctx:            ctx,
@@ -69,6 +71,7 @@ func NewEventHandler(
 		kubeContext:    kubeContext,
 		kubeRestConfig: kubeRestConfig,
 		kihClientset:   kihClientset,
+		appStatus:      appStatus,
 	}
 }
 
@@ -140,10 +143,14 @@ func (e *EventHandler) EventListener() (err error) {
 		},
 	}, cache.Indexers{})
 
-	controller := NewController(queue, indexer, informer, e.cache, e.ipam, e.dhcp, e.metrics, e.kihClientset)
+	controller := NewController(queue, indexer, informer, e.ctx, e.cache, e.ipam, e.dhcp, e.metrics, e.kihClientset, e.appStatus)
 	stop := make(chan struct{})
 	defer close(stop)
 	go controller.Run(1, stop)
 
-	select {}
+	select {
+	case <-e.ctx.Done():
+		log.Infof("(ippool.EventListener) stopping IPPool event listener")
+		return
+	}
 }
