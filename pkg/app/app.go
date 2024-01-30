@@ -17,8 +17,16 @@ import (
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/metrics"
 )
 
+const (
+	APP_INIT    = 0
+	APP_RUNNING = 1
+	APP_RESTART = 2
+)
+
 type handler struct {
 	ctx                  context.Context
+	kubeConfigFile       string
+	kubeContext          string
 	ipam                 *ipam.IPAllocator
 	dhcp                 *dhcp.DHCPAllocator
 	cache                *cache.CacheAllocator
@@ -26,24 +34,53 @@ type handler struct {
 	ippoolEventHandler   *ippool.EventHandler
 	vmnetcfgEventHandler *vmnetcfg.EventHandler
 	vmEventHandler       *vm.EventHandler
+	appStatus            int
 }
 
-func Register(ctx context.Context) *handler {
-	return &handler{
-		ctx: ctx,
+func Register() *handler {
+	return &handler{}
+}
+
+func (h *handler) Init() {
+	h.kubeConfigFile = os.Getenv("KUBECONFIG")
+	if h.kubeConfigFile == "" {
+		homedir := os.Getenv("HOME")
+		h.kubeConfigFile = filepath.Join(homedir, ".kube", "config")
 	}
+
+	h.kubeContext = os.Getenv("KUBECONTEXT")
+
+	h.appStatus = APP_INIT
 }
 
 func (h *handler) Run() {
-	var kubeconfig_file string
+	var ctx context.Context
+	var cancel context.CancelFunc
 
-	kubeconfig_file = os.Getenv("KUBECONFIG")
-	if kubeconfig_file == "" {
-		homedir := os.Getenv("HOME")
-		kubeconfig_file = filepath.Join(homedir, ".kube", "config")
+	ctx, cancel = context.WithCancel(context.Background())
+	h.RunServices(ctx)
+	h.appStatus = APP_RUNNING
+
+	// keep the main thread alive
+	for {
+		time.Sleep(time.Second)
+		if h.appStatus == APP_RESTART {
+			cancel()
+			h.metrics.Stop()
+
+			time.Sleep(time.Second * 10)
+
+			h.appStatus = APP_INIT
+			ctx, cancel = context.WithCancel(context.Background())
+			h.RunServices(ctx)
+			h.appStatus = APP_RUNNING
+		}
 	}
+}
 
-	kubeconfig_context := os.Getenv("KUBECONTEXT")
+func (h *handler) RunServices(ctx context.Context) {
+	// register the new context
+	h.ctx = ctx
 
 	// initialize the ipam service
 	h.ipam = ipam.New()
@@ -65,10 +102,11 @@ func (h *handler) Run() {
 		h.dhcp,
 		h.metrics,
 		h.cache,
-		kubeconfig_file,
-		kubeconfig_context,
+		h.kubeConfigFile,
+		h.kubeContext,
 		nil,
 		nil,
+		&h.appStatus,
 	)
 	if err := h.ippoolEventHandler.Init(); err != nil {
 		handleErr(err)
@@ -85,8 +123,8 @@ func (h *handler) Run() {
 		h.dhcp,
 		h.metrics,
 		h.cache,
-		kubeconfig_file,
-		kubeconfig_context,
+		h.kubeConfigFile,
+		h.kubeContext,
 		nil,
 		nil,
 	)
@@ -104,8 +142,8 @@ func (h *handler) Run() {
 		h.ipam,
 		h.dhcp,
 		h.cache,
-		kubeconfig_file,
-		kubeconfig_context,
+		h.kubeConfigFile,
+		h.kubeContext,
 		nil,
 		nil,
 		nil,
@@ -114,11 +152,10 @@ func (h *handler) Run() {
 		handleErr(err)
 	}
 	go h.vmEventHandler.EventListener()
+}
 
-	// keep the main thread alive
-	for {
-		time.Sleep(time.Second)
-	}
+func (h *handler) Stop() {
+
 }
 
 func handleErr(err error) {

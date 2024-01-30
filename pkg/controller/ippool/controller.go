@@ -1,6 +1,7 @@
 package ippool
 
 import (
+	"context"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -22,32 +23,38 @@ type Controller struct {
 	indexer      cache.Indexer
 	queue        workqueue.RateLimitingInterface
 	informer     cache.Controller
+	ctx          context.Context
 	cache        *kihcache.CacheAllocator
 	ipam         *ipam.IPAllocator
 	dhcp         *dhcp.DHCPAllocator
 	metrics      *metrics.MetricsAllocator
 	kihClientset *kihclientset.Clientset
+	appStatus    *int
 }
 
 func NewController(
 	queue workqueue.RateLimitingInterface,
 	indexer cache.Indexer,
 	informer cache.Controller,
+	ctx context.Context,
 	cache *kihcache.CacheAllocator,
 	ipam *ipam.IPAllocator,
 	dhcp *dhcp.DHCPAllocator,
 	metrics *metrics.MetricsAllocator,
 	kihClientset *kihclientset.Clientset,
+	appStatus *int,
 ) *Controller {
 	return &Controller{
 		informer:     informer,
 		indexer:      indexer,
 		queue:        queue,
+		ctx:          ctx,
 		cache:        cache,
 		ipam:         ipam,
 		dhcp:         dhcp,
 		metrics:      metrics,
 		kihClientset: kihClientset,
+		appStatus:    appStatus,
 	}
 }
 
@@ -84,14 +91,24 @@ func (c *Controller) sync(event Event) (err error) {
 		err := c.registerIPPool(obj.(*kihv1.IPPool))
 		if err != nil {
 			log.Errorf("(ippool.sync) failed to allocate new pool for %s: %s",
-				obj.(*kihv1.IPPool).GetName(), err.Error())
+				event.poolName, err.Error())
 
 			if err := c.cleanupIPPoolObjects(obj.(*kihv1.IPPool)); err != nil {
 				log.Errorf("(ippool.sync) failed to cleanup pool %s: %s", event.poolName, err.Error())
 			}
 		}
-	// case UPDATE:
-	// TODO
+	case UPDATE:
+		pool, err := c.cache.Get("pool", event.poolNetworkName)
+		if err != nil {
+			log.Errorf("(ippool.sync) %s", err)
+		} else {
+			oldPool := pool.(kihv1.IPPool)
+			err := c.handleIPPoolObjectChange(oldPool, obj.(*kihv1.IPPool))
+			if err != nil {
+				log.Errorf("(ippool.sync) failed to handle IPPool update for %s: %s",
+					event.poolName, err.Error())
+			}
+		}
 	case DELETE:
 		pool, err := c.cache.Get("pool", event.poolNetworkName)
 		if err != nil {

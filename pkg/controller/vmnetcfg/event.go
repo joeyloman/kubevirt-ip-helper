@@ -136,5 +136,9 @@ func (e *EventHandler) EventListener() (err error) {
 	defer close(stop)
 	go controller.Run(1, stop)
 
-	select {}
+	select {
+	case <-e.ctx.Done():
+		log.Infof("(vmnetcfg.EventListener) stopping VirtualMachineNetworkConfig event listener")
+		return
+	}
 }

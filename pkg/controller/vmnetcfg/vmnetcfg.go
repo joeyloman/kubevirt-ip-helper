@@ -265,6 +265,9 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 		log.Errorf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] %s",
 			vmnetcfg.Namespace, vmnetcfg.Name, err)
 	} else {
+		// TODO: remove
+		log.Infof("(REMOVE) DELETE VMNETCFG cached pool: [%+v]", pool)
+
 		if err := c.updateIPPoolStatus(
 			DELETE,
 			vmnetcfg.Namespace,
@@ -400,6 +403,7 @@ func (c *Controller) updateVirtualMachineNetworkConfigMetrics(vmnetcfgNamespace 
 			vmnetcfgNamespace, vmnetcfgName, err.Error())
 	}
 
+	c.metrics.DeleteVmNetCfgStatus(fmt.Sprintf("%s/%s", vmnetcfgNamespace, vmnetcfgName))
 	for _, netstat := range vmnetcfg.Status.NetworkConfig {
 		for _, netcfg := range vmnetcfg.Spec.NetworkConfig {
 			if netstat.MACAddress == netcfg.MACAddress {

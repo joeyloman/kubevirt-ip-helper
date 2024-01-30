@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"os"
@@ -23,6 +24,7 @@ var (
 )
 
 type MetricsAllocator struct {
+	httpServer                      http.Server
 	kubevirtiphelperIPPoolUsed      *prometheus.GaugeVec
 	kubevirtiphelperIPPoolAvailable *prometheus.GaugeVec
 	kubevirtiphelperVmNetCfgStatus  *prometheus.GaugeVec
@@ -162,10 +164,21 @@ func (m *MetricsAllocator) Run() {
 	if err != nil {
 		metricsPort = 8080
 	}
-
 	listenAddress := fmt.Sprintf(":%d", metricsPort)
-	http.Handle("/metrics", promhttp.HandlerFor(m.registry, promhttp.HandlerOpts{Registry: m.registry}))
-	log.Fatal(http.ListenAndServe(listenAddress, nil))
+
+	m.httpServer = http.Server{
+		Addr:    listenAddress,
+		Handler: promhttp.HandlerFor(m.registry, promhttp.HandlerOpts{Registry: m.registry}),
+	}
+
+	log.Infof("(metrics.Run) %s", m.httpServer.ListenAndServe())
+}
+
+func (m *MetricsAllocator) Stop() {
+	log.Infof("(metrics.Stop) stopping Metrics service")
+	if err := m.httpServer.Shutdown(context.Background()); err != nil {
+		log.Errorf("(metrics.Stop) error while stopping Metrics service: %s", err.Error())
+	}
 }
 
 func New() *MetricsAllocator {
