@@ -333,8 +333,7 @@ func (c *Controller) cleanupVirtualMachineNetworkConfig(vmnetcfg *kihv1.VirtualM
 func (c *Controller) updateIPPoolStatus(event string, vmnetcfgNamespace string, vmnetcfgVMName string, ip string, networkName string, hwAddr string, poolName string) (err error) {
 	currentPool, err := c.kihClientset.KubevirtiphelperV1().IPPools().Get(context.TODO(), poolName, metav1.GetOptions{})
 	if err != nil {
-		return fmt.Errorf("(vmnetcfg.updateIPPoolStatus) [%s/%s] cannot get IPPool %s: %s",
-			vmnetcfgNamespace, vmnetcfgVMName, poolName, err.Error())
+		return fmt.Errorf("cannot get IPPool %s: %s", poolName, err.Error())
 	}
 
 	updatedPool := currentPool.DeepCopy()
@@ -343,8 +342,7 @@ func (c *Controller) updateIPPoolStatus(event string, vmnetcfgNamespace string, 
 	case ADD:
 		for k, v := range currentPool.Status.IPv4.Allocated {
 			if k == ip {
-				return fmt.Errorf("(vmnetcfg.updateIPPoolStatus) [%s/%s] ip %s already found in IPPool status",
-					vmnetcfgNamespace, vmnetcfgVMName, ip)
+				return fmt.Errorf("ip %s already found in IPPool status", ip)
 			}
 			updatedAllocated[k] = v
 		}
@@ -362,8 +360,7 @@ func (c *Controller) updateIPPoolStatus(event string, vmnetcfgNamespace string, 
 	updatedPool.Status.LastUpdate = metav1.Now()
 
 	if _, err := c.kihClientset.KubevirtiphelperV1().IPPools().UpdateStatus(context.TODO(), updatedPool, metav1.UpdateOptions{}); err != nil {
-		return fmt.Errorf("(vmnetcfg.updateIPPoolStatus) [%s/%s] cannot update status of IPPool %s: %s",
-			vmnetcfgNamespace, vmnetcfgVMName, updatedPool.Name, err.Error())
+		return fmt.Errorf("cannot update status of IPPool %s: %s", updatedPool.Name, err.Error())
 	}
 
 	return
@@ -374,8 +371,7 @@ func (c *Controller) updateVirtualMachineNetworkConfigStatus(vmnetcfg *kihv1.Vir
 
 	vmNetCfgStatusObj, err := c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs(vmnetcfg.Namespace).UpdateStatus(context.TODO(), vmnetcfg, metav1.UpdateOptions{})
 	if err != nil {
-		return fmt.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfigStatus) [%s/%s] cannot update status of VirtualMachineNetworkConfig: %s",
-			vmnetcfg.Namespace, vmnetcfg.Name, err.Error())
+		return fmt.Errorf("cannot update status of VirtualMachineNetworkConfig: %s", err.Error())
 	}
 
 	log.Debugf("(vmnetcfg.updateVirtualMachineNetworkConfigStatus) [%s/%s] successfully updated status of vmnetcfg object",
@@ -387,7 +383,7 @@ func (c *Controller) updateVirtualMachineNetworkConfigStatus(vmnetcfg *kihv1.Vir
 func (c *Controller) updateIPPoolMetrics(poolName string) (err error) {
 	pool, err := c.kihClientset.KubevirtiphelperV1().IPPools().Get(context.TODO(), poolName, metav1.GetOptions{})
 	if err != nil {
-		return fmt.Errorf("(vmnetcfg.updateIPPoolMetrics) cannot get IPPool %s: %s", poolName, err.Error())
+		return fmt.Errorf("cannot get IPPool %s: %s", poolName, err.Error())
 	}
 
 	c.metrics.UpdateIPPoolUsed(pool.Name, pool.Spec.IPv4Config.Subnet, pool.Spec.NetworkName, pool.Status.IPv4.Used)

@@ -100,6 +100,12 @@ func (c *Controller) registerIPPool(pool *kihv1.IPPool) (err error) {
 func (c *Controller) handleIPPoolObjectChange(oldPool kihv1.IPPool, newPool *kihv1.IPPool) (err error) {
 	var updateAction int = IPPOOL_NOCHANGE
 
+	// if the app still initializing don't handle IPPool updates
+	if *c.appStatus == APP_INIT {
+		log.Debugf("(ippool.handleIPPoolObjectChange) application is still in initializing state, ignoring updates until it's running..")
+		return
+	}
+
 	for {
 		if *c.appStatus != APP_RESTART {
 			break
