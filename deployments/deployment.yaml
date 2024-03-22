@@ -16,7 +16,7 @@ metadata:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: kubevirt-ip-helper-read
+  name: kubevirt-ip-helper
   labels:
     app: kubevirt-ip-helper
 rules:
@@ -35,13 +35,42 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: kubevirt-ip-helper-read
+  name: kubevirt-ip-helper
   labels:
     app: kubevirt-ip-helper
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: kubevirt-ip-helper-read
+  name: kubevirt-ip-helper
+subjects:
+- kind: ServiceAccount
+  name: kubevirt-ip-helper
+  namespace: kubevirt-ip-helper
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kubevirt-ip-helper
+  namespace: kubevirt-ip-helper
+  labels:
+    app: kubevirt-ip-helper
+rules:
+- apiGroups: ["coordination.k8s.io"]
+  resources:
+  - leases
+  verbs: ["get", "list", "watch", "create", "update", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kubevirt-ip-helper
+  namespace: kubevirt-ip-helper
+  labels:
+    app: kubevirt-ip-helper
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kubevirt-ip-helper
 subjects:
 - kind: ServiceAccount
   name: kubevirt-ip-helper
@@ -56,7 +85,7 @@ metadata:
   namespace: kubevirt-ip-helper
 spec:
   progressDeadlineSeconds: 600
-  replicas: 1
+  replicas: 2
   revisionHistoryLimit: 10
   selector:
     matchLabels:
@@ -76,13 +105,6 @@ spec:
       containers:
       - name: kubevirt-ip-helper
         image: ghcr.io/joeyloman/kubevirt-ip-helper:latest
-        command:
-        - /bin/sh
-        - '-ec'
-        - |
-          ip addr flush dev eth1
-          ip addr add <IP_ADDRESS>/<CIDR_MASK> dev eth1
-          /app/kubevirt-ip-helper
         env:
           - name: LOGLEVEL
             value: INFO

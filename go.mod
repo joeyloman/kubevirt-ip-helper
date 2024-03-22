@@ -1,15 +1,17 @@
 module github.com/joeyloman/kubevirt-ip-helper
 
-go 1.21
+go 1.22
 
 replace k8s.io/apimachinery => k8s.io/apimachinery v0.24.0
 
 replace k8s.io/client-go => k8s.io/client-go v0.24.0
 
 require (
+	github.com/google/uuid v1.3.0
 	github.com/insomniacslk/dhcp v0.0.0-20230612134759-b20c9ba983df
 	github.com/prometheus/client_golang v1.11.1
 	github.com/sirupsen/logrus v1.9.0
+	github.com/vishvananda/netlink v1.1.0
 	k8s.io/api v0.24.0
 	k8s.io/apimachinery v0.24.0
 	k8s.io/client-go v12.0.0+incompatible
@@ -40,7 +42,6 @@ require (
 	github.com/google/gnostic v0.5.7-v3refs // indirect
 	github.com/google/go-cmp v0.5.9 // indirect
 	github.com/google/gofuzz v1.1.0 // indirect
-	github.com/google/uuid v1.3.0 // indirect
 	github.com/gorilla/websocket v1.5.0 // indirect
 	github.com/imdario/mergo v0.3.10 // indirect
 	github.com/josharian/intern v1.0.0 // indirect
@@ -65,6 +66,7 @@ require (
 	github.com/spf13/pflag v1.0.5 // indirect
 	github.com/stretchr/testify v1.8.2 // indirect
 	github.com/u-root/uio v0.0.0-20230220225925-ffce2a382923 // indirect
+	github.com/vishvananda/netns v0.0.0-20191106174202-0a2b9b5464df // indirect
 	golang.org/x/net v0.20.0 // indirect
 	golang.org/x/oauth2 v0.4.0 // indirect
 	golang.org/x/sys v0.16.0 // indirect

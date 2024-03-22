@@ -37,17 +37,23 @@ func main() {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 
-	_, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(context.Background())
 
 	mainApp := app.Register()
+
+	// This is a workaround for a situation when the process gets killed and
+	// doesn't cleanup the IP addresses when SIGINT is catched. If another pod
+	// will be the new leader then the IP address get's duplicated on the network.
+	mainApp.NetworkCleanup()
 
 	go func() {
 		<-sig
 		cancel()
+		mainApp.NetworkCleanup()
 		os.Exit(1)
 	}()
 
 	mainApp.Init()
-	mainApp.Run()
+	mainApp.Run(ctx)
 	cancel()
 }

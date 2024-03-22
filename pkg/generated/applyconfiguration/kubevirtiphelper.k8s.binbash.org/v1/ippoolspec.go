@@ -1,5 +1,5 @@
 /*
-Copyright 2023 The Kubernetes Authors.
+Copyright 2024 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,8 +21,9 @@ package v1
 // IPPoolSpecApplyConfiguration represents an declarative configuration of the IPPoolSpec type for use
 // with apply.
 type IPPoolSpecApplyConfiguration struct {
-	IPv4Config  *IPv4ConfigApplyConfiguration `json:"ipv4config,omitempty"`
-	NetworkName *string                       `json:"networkname,omitempty"`
+	IPv4Config    *IPv4ConfigApplyConfiguration `json:"ipv4config,omitempty"`
+	NetworkName   *string                       `json:"networkname,omitempty"`
+	BindInterface *string                       `json:"bindinterface,omitempty"`
 }
 
 // IPPoolSpecApplyConfiguration constructs an declarative configuration of the IPPoolSpec type for use with
@@ -44,5 +45,13 @@ func (b *IPPoolSpecApplyConfiguration) WithIPv4Config(value *IPv4ConfigApplyConf
 // If called multiple times, the NetworkName field is set to the value of the last call.
 func (b *IPPoolSpecApplyConfiguration) WithNetworkName(value string) *IPPoolSpecApplyConfiguration {
 	b.NetworkName = &value
+	return b
+}
+
+// WithBindInterface sets the BindInterface field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the BindInterface field is set to the value of the last call.
+func (b *IPPoolSpecApplyConfiguration) WithBindInterface(value string) *IPPoolSpecApplyConfiguration {
+	b.BindInterface = &value
 	return b
 }
