@@ -127,6 +127,9 @@ spec:
                 networkname:
                   type: string
                   pattern: '^[\w\/-]+$'
+                bindinterface:
+                  type: string
+                  pattern: '^[\w\/-]+$'
             status:
               type: object
               properties:

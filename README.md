@@ -84,33 +84,13 @@ spec:
 
 > **_NOTE:_** Make sure to replace the \<NETWORKATTACHMENTDEFINITION_NAME> and \<NAMESPACE> placeholders.
 
-Configure the IP address and CIDR mask which the DHCP service should listen on for pod device eth1, for example 172.16.0.2/16:
-```YAML
-spec:
-  [..]
-  template:
-    [..]
-    spec:
-      containers:
-        [..]
-        command:
-        - /bin/sh
-        - '-ec'
-        - |
-          ip addr flush dev eth1
-          ip addr add <IP_ADDRESS>/<CIDR_MASK> dev eth1
-          /app/kubevirt-ip-helper
-```
-
-> **_NOTE:_** Make sure to replace the \<IP_ADDRESS> and \<CIDR_MASK> placeholders.
-
 ## Usage
 
 ### Creating an IPPool object
 
-First you need to create an IPPool object with the Network/DHCP configuration like in the example below. This will allocate a new IPAM subnet memory DB and starts a DHCP service. Make sure the serverip matches the \<IP_ADDRESS> in the deployment.yaml example above otherwise it doesn't responds on DHCP requests.
+First you need to create an IPPool object with the Network/DHCP configuration like in the example below. This will allocate a new IPAM subnet memory DB and starts a DHCP service on the bindinterface.
 
-The following yaml/command can be used to create a new IPPool object with a class b-subnet:
+The following yaml/command example can be used to create a new IPPool object with a class b-subnet:
 
 ```SH
 (
@@ -142,6 +122,7 @@ spec:
       - 1.pool.ntp.org
     leasetime: 300
   networkname: <NAMESPACE>/<NETWORKATTACHMENTDEFINITION_NAME>
+  bindinterface: eth1
 EOF
 ) | kubectl create -f -
 ```
@@ -180,7 +161,7 @@ Metrics are exported on port 8080 by default. This can be changed by adding the 
 
 # License
 
-Copyright (c) 2023 Joey Loman <joey@binbash.org>
+Copyright (c) 2024 Joey Loman <joey@binbash.org>
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
