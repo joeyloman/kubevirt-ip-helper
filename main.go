@@ -46,7 +46,6 @@ func main() {
 	// will be the new leader then the IP address get's duplicated on the network.
 	// The same applies for the LeaderPodLabel.
 	mainApp.NetworkCleanup()
-	mainApp.RemoveLeaderPodLabel()
 
 	go func() {
 		<-sig
