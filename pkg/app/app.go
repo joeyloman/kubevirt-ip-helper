@@ -88,6 +88,9 @@ func (h *handler) Init() {
 	}
 	h.namespace = string(ns)
 
+	// make sure the leader label is removed in case the pod crashed
+	h.RemoveLeaderPodLabel()
+
 	h.appStatus = APP_INIT
 
 	config, err := h.getKubeConfig()
