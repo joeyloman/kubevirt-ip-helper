@@ -44,11 +44,14 @@ func main() {
 	// This is a workaround for a situation when the process gets killed and
 	// doesn't cleanup the IP addresses when SIGINT is catched. If another pod
 	// will be the new leader then the IP address get's duplicated on the network.
+	// The same applies for the LeaderPodLabel.
 	mainApp.NetworkCleanup()
+	mainApp.RemoveLeaderPodLabel()
 
 	go func() {
 		<-sig
 		cancel()
+		mainApp.RemoveLeaderPodLabel()
 		mainApp.NetworkCleanup()
 		os.Exit(1)
 	}()

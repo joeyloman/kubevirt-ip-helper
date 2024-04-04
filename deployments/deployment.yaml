@@ -55,6 +55,10 @@ metadata:
   labels:
     app: kubevirt-ip-helper
 rules:
+- apiGroups: [""]
+  resources:
+  - pods
+  verbs: ["get", "update"]
 - apiGroups: ["coordination.k8s.io"]
   resources:
   - leases
@@ -142,6 +146,7 @@ metadata:
 spec:
   selector:
     app: kubevirt-ip-helper
+    kubevirtiphelper/leader: active
   ports:
     - name: metrics
       port: 8080
