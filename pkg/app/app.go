@@ -43,6 +43,7 @@ type handler struct {
 	ctx                  context.Context
 	kubeConfigFile       string
 	kubeContext          string
+	namespace            string
 	ipam                 *ipam.IPAllocator
 	dhcp                 *dhcp.DHCPAllocator
 	cache                *cache.CacheAllocator
@@ -79,6 +80,14 @@ func (h *handler) Init() {
 
 	h.kubeContext = os.Getenv("KUBECONTEXT")
 
+	ns, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+	if err != nil {
+		log.Errorf("(app.Run) cannot determine current namespace (using the default): %s", err.Error())
+
+		h.namespace = "kubevirt-ip-helper"
+	}
+	h.namespace = string(ns)
+
 	h.appStatus = APP_INIT
 
 	config, err := h.getKubeConfig()
@@ -97,7 +106,7 @@ func (h *handler) Init() {
 	h.lock = &resourcelock.LeaseLock{
 		LeaseMeta: metav1.ObjectMeta{
 			Name:      "kubevirt-ip-helper-lock",
-			Namespace: "kubevirt-ip-helper",
+			Namespace: h.namespace,
 		},
 		Client: k8s_clientset.CoordinationV1(),
 		LockConfig: resourcelock.ResourceLockConfig{
@@ -129,6 +138,7 @@ func (h *handler) Run(mainCtx context.Context) {
 					time.Sleep(time.Second)
 					if h.appStatus == APP_RESTART {
 						cancel()
+						h.RemoveLeaderPodLabel()
 						h.metrics.Stop()
 						h.stopDHCPListeners()
 						h.NetworkCleanup()
@@ -144,6 +154,8 @@ func (h *handler) Run(mainCtx context.Context) {
 			},
 			OnStoppedLeading: func() {
 				log.Infof("(app.Run) leader lost: %s", h.leaderId)
+				h.RemoveLeaderPodLabel()
+				h.metrics.Stop()
 				h.stopDHCPListeners()
 				h.NetworkCleanup()
 				os.Exit(1)
@@ -172,6 +184,9 @@ func (h *handler) RunServices(ctx context.Context) {
 	// initialize the metrics service
 	h.metrics = metrics.New()
 	go h.metrics.Run()
+
+	// add the kubevirtiphelper/leader pod label
+	h.addLeaderPodLabel()
 
 	// initialize the pool cache
 	h.cache = cache.New()
@@ -299,6 +314,102 @@ func (h *handler) stopDHCPListeners() {
 				pool.Spec.BindInterface, pool.Spec.NetworkName, err.Error())
 		}
 	}
+}
+
+// The addLeaderPodLabel and removeLeaderPodLabel funtions are managing the kubevirtiphelper/leader label.
+// This label is used by the metrics-service to determine the active leader.
+// If the function(s) fail the application should ignore it and still service DHCP requests.
+func (h *handler) addLeaderPodLabel() {
+	podName, err := os.Hostname()
+	if err != nil {
+		log.Errorf("(app.addLeaderPodLabel) cannot get current pod name: %s", err.Error())
+
+		return
+	}
+
+	kubeRestConfig, err := h.getKubeConfig()
+	if err != nil {
+		log.Errorf("(app.addLeaderPodLabel) cannot get kubeRestConfig: %s", err.Error())
+
+		return
+	}
+
+	k8sClientset, err := kubernetes.NewForConfig(kubeRestConfig)
+	if err != nil {
+		log.Errorf("(app.addLeaderPodLabel) cannot get kihClientset: %s", err.Error())
+
+		return
+	}
+
+	curPod, err := k8sClientset.CoreV1().Pods(h.namespace).Get(context.TODO(), podName, metav1.GetOptions{})
+	if err != nil {
+		log.Errorf("(app.addLeaderPodLabel) cannot get current pod object: %s", err.Error())
+
+		return
+	}
+
+	newPod := curPod.DeepCopy()
+	newLabels := make(map[string]string)
+	for k, v := range newPod.Labels {
+		newLabels[k] = v
+	}
+	newLabels["kubevirtiphelper/leader"] = "active"
+	newPod.Labels = newLabels
+
+	updatedPod, err := k8sClientset.CoreV1().Pods(h.namespace).Update(context.TODO(), newPod, metav1.UpdateOptions{})
+	if err != nil {
+		log.Errorf("(app.addLeaderPodLabel) cannot update the pod object: %s", err.Error())
+
+		return
+	}
+	_ = updatedPod
+}
+
+func (h *handler) RemoveLeaderPodLabel() {
+	podName, err := os.Hostname()
+	if err != nil {
+		log.Errorf("(app.RemoveLeaderPodLabel) cannot get current pod name: %s", err.Error())
+
+		return
+	}
+
+	kubeRestConfig, err := h.getKubeConfig()
+	if err != nil {
+		log.Errorf("(app.RemoveLeaderPodLabel) cannot get kubeRestConfig: %s", err.Error())
+
+		return
+	}
+
+	k8sClientset, err := kubernetes.NewForConfig(kubeRestConfig)
+	if err != nil {
+		log.Errorf("(app.RemoveLeaderPodLabel) cannot get kihClientset: %s", err.Error())
+
+		return
+	}
+
+	curPod, err := k8sClientset.CoreV1().Pods(h.namespace).Get(context.TODO(), podName, metav1.GetOptions{})
+	if err != nil {
+		log.Errorf("(app.RemoveLeaderPodLabel) cannot get current pod object: %s", err.Error())
+
+		return
+	}
+
+	newPod := curPod.DeepCopy()
+	newLabels := make(map[string]string)
+	for k, v := range newPod.Labels {
+		if k != "kubevirtiphelper/leader" {
+			newLabels[k] = v
+		}
+	}
+	newPod.Labels = newLabels
+
+	updatedPod, err := k8sClientset.CoreV1().Pods(h.namespace).Update(context.TODO(), newPod, metav1.UpdateOptions{})
+	if err != nil {
+		log.Errorf("(app.RemoveLeaderPodLabel) cannot update the pod object: %s", err.Error())
+
+		return
+	}
+	_ = updatedPod
 }
 
 func handleErr(err error) {
