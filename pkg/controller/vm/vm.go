@@ -85,8 +85,6 @@ func (c *Controller) updateVirtualMachineNetworkConfigObject(vm *kubevirtV1.Virt
 	log.Tracef("(vm.updateVirtualMachineNetworkConfigObject) [%s/%s] new vmnetcfg networkconfig: [%+v]",
 		vm.Namespace, vm.Name, newVmNetCfg.Spec.NetworkConfig)
 
-	// TODO: check the vmnetcfg status for ERROR(s) and skip them
-
 	// when the nics in the vm differs from the vmnetcfg the mismatches should be cleaned up first
 	var nicCleanup bool
 	for _, curNetCfg := range vmnetcfg.Spec.NetworkConfig {

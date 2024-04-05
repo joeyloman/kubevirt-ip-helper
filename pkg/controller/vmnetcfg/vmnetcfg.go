@@ -32,10 +32,6 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 	newVmNetCfgs := []kihv1.NetworkConfig{}
 	newNetCfgStatusList := []kihv1.NetworkConfigStatus{}
 	for _, v := range vmnetcfg.Spec.NetworkConfig {
-		// TODO: remove
-		// log.Debugf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] processing hwaddr [%s] and network [%s]",
-		// 	vmnetcfg.Namespace, vmnetcfg.Name, v.MACAddress, v.NetworkName)
-
 		pool, err := c.cache.Get("pool", v.NetworkName)
 		if err != nil {
 			return err
@@ -265,9 +261,6 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 		log.Errorf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] %s",
 			vmnetcfg.Namespace, vmnetcfg.Name, err)
 	} else {
-		// TODO: remove
-		log.Infof("(REMOVE) DELETE VMNETCFG cached pool: [%+v]", pool)
-
 		if err := c.updateIPPoolStatus(
 			DELETE,
 			vmnetcfg.Namespace,
@@ -302,18 +295,11 @@ func (c *Controller) cleanupVirtualMachineNetworkConfig(vmnetcfg *kihv1.VirtualM
 	newFinalizers := []string{}
 	for i := 0; i < len(vmnetcfg.ObjectMeta.Finalizers); i++ {
 		if vmnetcfg.ObjectMeta.Finalizers[i] != "kubevirtiphelper" {
-			// TODO: remove
-			// log.Debugf("(vmnetcfg.cleanupVirtualMachineNetworkConfig) [%s/%s] adding finalizer %s",
-			// 	vmnetcfg.Namespace, vmnetcfg.Name, vmnetcfg.ObjectMeta.Finalizers[i])
 			newFinalizers = append(newFinalizers, vmnetcfg.ObjectMeta.Finalizers[i])
 		}
 	}
 
 	if len(newFinalizers) == len(updatedVmNetCfg.ObjectMeta.Finalizers) {
-		// TODO: remove
-		// log.Warnf("(vmnetcfg.cleanupVirtualMachineNetworkConfig) [%s/%s] no finalizers found for VirtualMachineNetworkConfig object",
-		// 	vmnetcfg.Namespace, vmnetcfg.Name)
-
 		return
 	}
 
