@@ -27,8 +27,7 @@ func New() *CacheAllocator {
 func (c *CacheAllocator) Add(t interface{}) (err error) {
 	switch t.(type) {
 	case *kihv1.IPPool:
-		// TODO: remove?
-		log.Debugf("(cache.AddToCache) adding pool for %s", t.(*kihv1.IPPool).Spec.NetworkName)
+		log.Debugf("(cache.Add) adding pool for %s", t.(*kihv1.IPPool).Spec.NetworkName)
 
 		if _, exists := c.ipPoolCache[t.(*kihv1.IPPool).Spec.NetworkName]; exists {
 			return fmt.Errorf("IPPool %s already exists in cache", t.(*kihv1.IPPool).Spec.NetworkName)
@@ -53,7 +52,6 @@ func (c *CacheAllocator) Check(t interface{}) bool {
 func (c *CacheAllocator) Get(t string, name string) (i interface{}, err error) {
 	switch t {
 	case "pool":
-		// TODO: remove
 		log.Debugf("(cache.Get) returning pool for %s", name)
 
 		if _, exists := c.ipPoolCache[name]; !exists {
@@ -68,8 +66,7 @@ func (c *CacheAllocator) Get(t string, name string) (i interface{}, err error) {
 func (c *CacheAllocator) Delete(t string, name string) (err error) {
 	switch t {
 	case "pool":
-		// TODO: remove
-		log.Debugf("(cache.DeleteFromCache) deleting pool for %s", name)
+		log.Debugf("(cache.Delete) deleting pool for %s", name)
 
 		if _, exists := c.ipPoolCache[name]; !exists {
 			return fmt.Errorf("IPPool %s does not exists in cache", name)
