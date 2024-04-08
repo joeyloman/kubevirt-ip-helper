@@ -158,8 +158,6 @@ func (h *handler) Run(mainCtx context.Context) {
 			OnStoppedLeading: func() {
 				log.Infof("(app.Run) leader lost: %s", h.leaderId)
 				h.RemoveLeaderPodLabel()
-				h.metrics.Stop()
-				h.stopDHCPListeners()
 				h.NetworkCleanup()
 				os.Exit(1)
 			},
