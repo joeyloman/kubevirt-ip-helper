@@ -157,6 +157,11 @@ Name: kubevirtiphelper_vmnetcfg_status
 Description: Information and status of the VirtualMachineNetworkConfig objects.
 ```
 
+```YAML
+Name: kubevirtiphelper_app_logs
+Description: Amount of warnings or errors detected.
+```
+
 Metrics are exported on port 8080 by default. This can be changed by adding the METRICS_PORT environment variable in the deployment. The deployment example also contains a servicemonitor object which can be automatically picked up by the Prometheus monitoring solution.
 
 # License
