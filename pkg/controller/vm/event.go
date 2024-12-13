@@ -19,6 +19,7 @@ import (
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/dhcp"
 	kihclientset "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/clientset/versioned"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/metrics"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/util"
 	log "github.com/sirupsen/logrus"
 )
@@ -33,6 +34,7 @@ type EventHandler struct {
 	ctx            context.Context
 	ipam           *ipam.IPAllocator
 	dhcp           *dhcp.DHCPAllocator
+	metrics        *metrics.MetricsAllocator
 	cache          *kihcache.CacheAllocator
 	kubeConfig     string
 	kubeContext    string
@@ -52,6 +54,7 @@ func NewEventHandler(
 	ctx context.Context,
 	ipam *ipam.IPAllocator,
 	dhcp *dhcp.DHCPAllocator,
+	metrics *metrics.MetricsAllocator,
 	cache *kihcache.CacheAllocator,
 	kubeConfig string,
 	kubeContext string,
@@ -63,6 +66,7 @@ func NewEventHandler(
 		ctx:            ctx,
 		ipam:           ipam,
 		dhcp:           dhcp,
+		metrics:        metrics,
 		cache:          cache,
 		kubeConfig:     kubeConfig,
 		kubeContext:    kubeContext,
@@ -103,7 +107,7 @@ func (e *EventHandler) getKubeConfig() (config *rest.Config, err error) {
 }
 
 func (e *EventHandler) EventListener() (err error) {
-	log.Infof("(vm.EventListener) starting VirtualMachine event listener")
+	log.Infof("(vm.EventListener) starting the VirtualMachine event listener")
 
 	vmWatcher := cache.NewListWatchFromClient(e.kcli.RestClient(), "virtualmachines", corev1.NamespaceAll, fields.Everything())
 
@@ -145,14 +149,14 @@ func (e *EventHandler) EventListener() (err error) {
 		},
 	}, cache.Indexers{})
 
-	controller := NewController(queue, indexer, informer, e.cache, e.ipam, e.dhcp, e.kihClientset)
+	controller := NewController(queue, indexer, informer, e.cache, e.ipam, e.dhcp, e.metrics, e.kihClientset)
 	stop := make(chan struct{})
 	defer close(stop)
 	go controller.Run(1, stop)
 
 	select {
 	case <-e.ctx.Done():
-		log.Infof("(vm.EventListener) stopping VirtualMachine event listener")
+		log.Infof("(vm.EventListener) stopping the VirtualMachine event listener")
 		return
 	}
 }

@@ -62,6 +62,7 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 			if lease.Reference != fmt.Sprintf("%s/%s", vmnetcfg.Namespace, vmnetcfg.Spec.VMName) {
 				log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] hwaddr %s belongs to %s",
 					vmnetcfg.Namespace, vmnetcfg.Name, v.MACAddress, lease.Reference)
+				c.metrics.UpdateLogStatus("error")
 
 				netcfgStatus.Status = "ERROR"
 				netcfgStatus.Message = "macaddress belongs to another vm"
@@ -79,13 +80,14 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 				pool.(kihv1.IPPool).Status.LastUpdate.Time)
 
 			// put the network interfaces in ERROR state when the vmnetcfg is (manually) created between
-			// the last status update before the program was stopped and the restart of the program.
-			// this could cause a possible hijack of ip addresses which are already registered in existing vmnetcfgs.
-			// this should be automatically handled by the vm controller and not manually when the program is not running.
+			// the last status update before the program was stopped and the restart of the program
+			// this could cause a possible hijack of ip addresses which are already registered in existing vmnetcfgs
+			// this should be automatically handled by the vm controller and not manually when the program is not running
 			if vmnetcfg.CreationTimestamp.After(pool.(kihv1.IPPool).Status.LastUpdateBeforeStart.Time) &&
 				pool.(kihv1.IPPool).Status.LastUpdate.After(vmnetcfg.CreationTimestamp.Time) {
 				log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] vmnetcfg was manually created after this program was (re)started, preventing possible ip hijack",
 					vmnetcfg.Namespace, vmnetcfg.Name)
+				c.metrics.UpdateLogStatus("error")
 
 				netcfgStatus.Status = "ERROR"
 				netcfgStatus.Message = "vmnetcfg was manually created after this program was (re)started, preventing possible ip hijack"
@@ -98,6 +100,7 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 		if skipNic {
 			log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] network interface has an error status, skipping updates",
 				vmnetcfg.Namespace, vmnetcfg.Name)
+			c.metrics.UpdateLogStatus("error")
 
 			newVmNetCfgs = append(newVmNetCfgs, v)
 
@@ -110,6 +113,7 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 			if lease.ClientIP.String() != v.IPAddress {
 				log.Warnf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] ip address update found for hwaddr=%s, oldip=%s, newip=%s, starting cleanup of old ip address",
 					vmnetcfg.Namespace, vmnetcfg.Name, v.MACAddress, lease.ClientIP.String(), v.IPAddress)
+				c.metrics.UpdateLogStatus("warning")
 
 				oldNetcfg := kihv1.NetworkConfig{}
 				oldNetcfg.NetworkName = v.NetworkName
@@ -142,6 +146,7 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 		if err != nil {
 			log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] ipam error: %s, skipping interface",
 				vmnetcfg.Namespace, vmnetcfg.Name, err)
+			c.metrics.UpdateLogStatus("error")
 
 			newVmNetCfgs = append(newVmNetCfgs, v)
 
@@ -182,11 +187,13 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 		); err != nil {
 			log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] %s",
 				vmnetcfg.Namespace, vmnetcfg.Name, err)
+			c.metrics.UpdateLogStatus("error")
 		}
 
 		if err := c.updateIPPoolMetrics(pool.(kihv1.IPPool).Name); err != nil {
 			log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] %s",
 				vmnetcfg.Namespace, vmnetcfg.Name, err)
+			c.metrics.UpdateLogStatus("error")
 		}
 
 		networkChange = true
@@ -204,11 +211,13 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 			if err := c.updateVirtualMachineNetworkConfigStatus(vmnetcfg, &newVmnetCfgStatus); err != nil {
 				log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] %s",
 					vmnetcfg.ObjectMeta.Namespace, vmnetcfg.ObjectMeta.Name, err)
+				c.metrics.UpdateLogStatus("error")
 			}
 
 			if err := c.updateVirtualMachineNetworkConfigMetrics(vmnetcfg.Namespace, vmnetcfg.Name); err != nil {
 				log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] %s",
 					vmnetcfg.Namespace, vmnetcfg.Name, err)
+				c.metrics.UpdateLogStatus("error")
 			}
 		}
 
@@ -232,11 +241,13 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 	if err := c.updateVirtualMachineNetworkConfigStatus(vmNetCfgObj, &newVmnetCfgStatus); err != nil {
 		log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] %s",
 			vmNetCfgObj.ObjectMeta.Namespace, vmNetCfgObj.ObjectMeta.Name, err)
+		c.metrics.UpdateLogStatus("error")
 	}
 
 	if err := c.updateVirtualMachineNetworkConfigMetrics(vmNetCfgObj.Namespace, vmNetCfgObj.Name); err != nil {
 		log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] %s",
 			vmNetCfgObj.Namespace, vmNetCfgObj.Name, err)
+		c.metrics.UpdateLogStatus("error")
 	}
 
 	return
@@ -249,17 +260,20 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 	if err := c.dhcp.DeleteLease(netCfg.MACAddress); err != nil {
 		log.Errorf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] error deleting lease from dhcp: %s",
 			vmnetcfg.Namespace, vmnetcfg.Name, err)
+		c.metrics.UpdateLogStatus("error")
 	}
 
 	if err := c.ipam.ReleaseIP(netCfg.NetworkName, netCfg.IPAddress); err != nil {
 		log.Errorf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] error releasing ip from ipam: %s",
 			vmnetcfg.Namespace, vmnetcfg.Name, err)
+		c.metrics.UpdateLogStatus("error")
 	}
 
 	pool, err := c.cache.Get("pool", netCfg.NetworkName)
 	if err != nil {
 		log.Errorf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] %s",
 			vmnetcfg.Namespace, vmnetcfg.Name, err)
+		c.metrics.UpdateLogStatus("error")
 	} else {
 		if err := c.updateIPPoolStatus(
 			DELETE,
@@ -272,11 +286,13 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 		); err != nil {
 			log.Errorf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] %s",
 				vmnetcfg.Namespace, vmnetcfg.Name, err)
+			c.metrics.UpdateLogStatus("error")
 		}
 
 		if err := c.updateIPPoolMetrics(pool.(kihv1.IPPool).Name); err != nil {
 			log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] %s",
 				vmnetcfg.Namespace, vmnetcfg.Name, err)
+			c.metrics.UpdateLogStatus("error")
 		}
 	}
 }

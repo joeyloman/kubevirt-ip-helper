@@ -29,15 +29,17 @@ const (
 )
 
 type EventHandler struct {
-	ctx            context.Context
-	ipam           *ipam.IPAllocator
-	dhcp           *dhcp.DHCPAllocator
-	metrics        *metrics.MetricsAllocator
-	cache          *kihcache.CacheAllocator
-	kubeConfig     string
-	kubeContext    string
-	kubeRestConfig *rest.Config
-	kihClientset   *kihclientset.Clientset
+	ctx                  context.Context
+	ipam                 *ipam.IPAllocator
+	dhcp                 *dhcp.DHCPAllocator
+	metrics              *metrics.MetricsAllocator
+	cache                *kihcache.CacheAllocator
+	kubeConfig           string
+	kubeContext          string
+	kubeRestConfig       *rest.Config
+	kihClientset         *kihclientset.Clientset
+	appStatus            *int
+	vmnetcfgCountCurrent *int
 }
 
 type Event struct {
@@ -55,17 +57,21 @@ func NewEventHandler(
 	kubeContext string,
 	kubeRestConfig *rest.Config,
 	kihClientset *kihclientset.Clientset,
+	appStatus *int,
+	vmnetcfgCountCurrent *int,
 ) *EventHandler {
 	return &EventHandler{
-		ctx:            ctx,
-		ipam:           ipam,
-		dhcp:           dhcp,
-		metrics:        metrics,
-		cache:          cache,
-		kubeConfig:     kubeConfig,
-		kubeContext:    kubeContext,
-		kubeRestConfig: kubeRestConfig,
-		kihClientset:   kihClientset,
+		ctx:                  ctx,
+		ipam:                 ipam,
+		dhcp:                 dhcp,
+		metrics:              metrics,
+		cache:                cache,
+		kubeConfig:           kubeConfig,
+		kubeContext:          kubeContext,
+		kubeRestConfig:       kubeRestConfig,
+		kihClientset:         kihClientset,
+		appStatus:            appStatus,
+		vmnetcfgCountCurrent: vmnetcfgCountCurrent,
 	}
 }
 
@@ -95,7 +101,7 @@ func (e *EventHandler) getKubeConfig() (config *rest.Config, err error) {
 }
 
 func (e *EventHandler) EventListener() (err error) {
-	log.Infof("(vmnetcfg.EventListener) starting VirtualMachineNetworkConfig event listener")
+	log.Infof("(vmnetcfg.EventListener) starting the VirtualMachineNetworkConfig event listener")
 
 	vmWatcher := cache.NewListWatchFromClient(e.kihClientset.KubevirtiphelperV1().RESTClient(), "virtualmachinenetworkconfigs", corev1.NamespaceAll, fields.Everything())
 
@@ -131,14 +137,14 @@ func (e *EventHandler) EventListener() (err error) {
 		},
 	}, cache.Indexers{})
 
-	controller := NewController(queue, indexer, informer, e.cache, e.ipam, e.dhcp, e.metrics, e.kihClientset)
+	controller := NewController(queue, indexer, informer, e.cache, e.ipam, e.dhcp, e.metrics, e.kihClientset, e.appStatus, e.vmnetcfgCountCurrent)
 	stop := make(chan struct{})
 	defer close(stop)
 	go controller.Run(1, stop)
 
 	select {
 	case <-e.ctx.Done():
-		log.Infof("(vmnetcfg.EventListener) stopping VirtualMachineNetworkConfig event listener")
+		log.Infof("(vmnetcfg.EventListener) stopping the VirtualMachineNetworkConfig event listener")
 		return
 	}
 }

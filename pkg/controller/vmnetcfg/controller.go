@@ -18,15 +18,23 @@ import (
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/metrics"
 )
 
+const (
+	APP_INIT    = 0
+	APP_RUNNING = 1
+	APP_RESTART = 2
+)
+
 type Controller struct {
-	indexer      cache.Indexer
-	queue        workqueue.RateLimitingInterface
-	informer     cache.Controller
-	cache        *kihcache.CacheAllocator
-	ipam         *ipam.IPAllocator
-	dhcp         *dhcp.DHCPAllocator
-	metrics      *metrics.MetricsAllocator
-	kihClientset *kihclientset.Clientset
+	indexer              cache.Indexer
+	queue                workqueue.RateLimitingInterface
+	informer             cache.Controller
+	cache                *kihcache.CacheAllocator
+	ipam                 *ipam.IPAllocator
+	dhcp                 *dhcp.DHCPAllocator
+	metrics              *metrics.MetricsAllocator
+	kihClientset         *kihclientset.Clientset
+	appStatus            *int
+	vmnetcfgCountCurrent *int
 }
 
 func NewController(
@@ -38,16 +46,20 @@ func NewController(
 	dhcp *dhcp.DHCPAllocator,
 	metrics *metrics.MetricsAllocator,
 	kihClientset *kihclientset.Clientset,
+	appStatus *int,
+	vmnetcfgCountCurrent *int,
 ) *Controller {
 	return &Controller{
-		informer:     informer,
-		indexer:      indexer,
-		queue:        queue,
-		cache:        cache,
-		ipam:         ipam,
-		dhcp:         dhcp,
-		metrics:      metrics,
-		kihClientset: kihClientset,
+		informer:             informer,
+		indexer:              indexer,
+		queue:                queue,
+		cache:                cache,
+		ipam:                 ipam,
+		dhcp:                 dhcp,
+		metrics:              metrics,
+		kihClientset:         kihClientset,
+		appStatus:            appStatus,
+		vmnetcfgCountCurrent: vmnetcfgCountCurrent,
 	}
 }
 
@@ -69,12 +81,14 @@ func (c *Controller) sync(event Event) (err error) {
 	obj, exists, err := c.indexer.GetByKey(event.key)
 	if err != nil {
 		log.Errorf("(vmnetcfg.sync) fetching object with key %s from store failed with %v", event.key, err)
+		c.metrics.UpdateLogStatus("error")
 
 		return
 	}
 
 	if !exists && event.action != DELETE {
-		log.Errorf("(vmnetcfg.sync) VirtualMachineNetworkConfig %s does not exist anymore", event.key)
+		log.Warnf("(vmnetcfg.sync) VirtualMachineNetworkConfig %s does not exist anymore", event.key)
+		c.metrics.UpdateLogStatus("warning")
 
 		return
 	}
@@ -84,11 +98,20 @@ func (c *Controller) sync(event Event) (err error) {
 		err := c.updateVirtualMachineNetworkConfig(event.action, obj.(*kihv1.VirtualMachineNetworkConfig))
 		if err != nil {
 			log.Errorf("(vmnetcfg.sync) failed to update vmnetcfg for %s: %s", obj.(*kihv1.VirtualMachineNetworkConfig).GetName(), err.Error())
+			c.metrics.UpdateLogStatus("error")
+		}
+
+		// increase the vmnetcfgCountCurrent if the application is still initializing
+		// it's important that all processed vmnetcfgs are count, even if they are in error state
+		// otherwise the application will not become operational
+		if *c.appStatus == APP_INIT {
+			*c.vmnetcfgCountCurrent++
 		}
 	case UPDATE:
 		err := c.updateVirtualMachineNetworkConfig(event.action, obj.(*kihv1.VirtualMachineNetworkConfig))
 		if err != nil {
 			log.Errorf("(vmnetcfg.sync) failed to update vmnetcfg for %s: %s", obj.(*kihv1.VirtualMachineNetworkConfig).GetName(), err.Error())
+			c.metrics.UpdateLogStatus("error")
 		}
 		// case DELETE:
 		// 	log.Infof("(vmnetcfg.sync) delete action found!")
@@ -115,17 +138,19 @@ func (c *Controller) handleErr(err error, key interface{}) {
 	c.queue.Forget(key)
 
 	log.Errorf("(vmnetcfg.handleErr) dropping VirtualMachineNetworkConfig %q out of the queue: %v", key, err)
+	c.metrics.UpdateLogStatus("error")
 }
 
 func (c *Controller) Run(workers int, stopCh chan struct{}) {
 	defer runtime.HandleCrash()
 
 	defer c.queue.ShutDown()
-	log.Infof("(vmnetcfg.Run) starting VirtualMachineNetworkConfig controller")
+	log.Infof("(vmnetcfg.Run) starting the VirtualMachineNetworkConfig controller")
 
 	go c.informer.Run(stopCh)
 	if !cache.WaitForCacheSync(stopCh, c.informer.HasSynced) {
 		log.Errorf("(vmnetcfg.Run) timed out waiting for caches to sync")
+		c.metrics.UpdateLogStatus("error")
 
 		return
 	}
@@ -135,7 +160,7 @@ func (c *Controller) Run(workers int, stopCh chan struct{}) {
 	}
 
 	<-stopCh
-	log.Infof("(vmnetcfg.Run) stopping VirtualMachineNetworkConfig controller")
+	log.Infof("(vmnetcfg.Run) stopping the VirtualMachineNetworkConfig controller")
 }
 
 func (c *Controller) runWorker() {

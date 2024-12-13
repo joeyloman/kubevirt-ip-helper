@@ -29,7 +29,7 @@ func (c *Controller) handleVirtualMachineObjectChange(vm *kubevirtV1.VirtualMach
 }
 
 func (c *Controller) createVirtualMachineNetworkConfigObject(vm *kubevirtV1.VirtualMachine) (err error) {
-	log.Tracef("(vm.createVirtualMachineNetworkConfigObject) [%s/%s] processing new VirtualMachine  [%+v]",
+	log.Tracef("(vm.createVirtualMachineNetworkConfigObject) [%s/%s] processing new VirtualMachine [%+v]",
 		vm.Namespace, vm.Name, vm)
 
 	newVmNetCfg := kihv1.VirtualMachineNetworkConfig{}
@@ -58,7 +58,7 @@ func (c *Controller) createVirtualMachineNetworkConfigObject(vm *kubevirtV1.Virt
 			vm.Namespace, vm.Name, err.Error())
 	}
 
-	log.Debugf("(vm.createVirtualMachineNetworkConfig) [%s/%s] successfully created vmnetcfg object [%s/%s]",
+	log.Infof("(vm.createVirtualMachineNetworkConfig) [%s/%s] successfully created vmnetcfg object [%s/%s]",
 		vm.Namespace, vm.Name, vmNetCfgObj.ObjectMeta.Namespace, vmNetCfgObj.ObjectMeta.Name)
 
 	return
@@ -105,7 +105,7 @@ func (c *Controller) updateVirtualMachineNetworkConfigObject(vm *kubevirtV1.Virt
 			vm.Namespace, vm.Name, err.Error())
 	}
 
-	log.Debugf("(vm.updateVirtualMachineNetworkConfigObject) [%s/%s] successfully updated vmnetcfg object [%s/%s]",
+	log.Infof("(vm.updateVirtualMachineNetworkConfigObject) [%s/%s] successfully updated vmnetcfg object [%s/%s]",
 		vm.Namespace, vm.Name, vmNetCfgObj.ObjectMeta.Namespace, vmNetCfgObj.ObjectMeta.Name)
 
 	return
@@ -147,15 +147,16 @@ func (c *Controller) getNetworkConfigs(vm *kubevirtV1.VirtualMachine, curNetCfg 
 					log.Warnf("(vm.getNetworkConfigs) [%s/%s] unsupported network type found!",
 						vm.Namespace, vm.Name)
 				} else if nic.MacAddress == "" {
-					// when a new vm is created the macaddress doesn't exists immediately.
-					// it takes a couple of object updates before the macaddress is assigned.
-					// so avoid confusion and don't log errors here.
+					// when a new vm is created the macaddress doesn't exists immediately
+					// it takes a couple of object updates before the macaddress is assigned
+					// so avoid confusion and don't log errors here
 					log.Debugf("(vm.getNetworkConfigs) [%s/%s] no mac address found for vm",
 						vm.Namespace, vm.Name)
 				} else if net.Multus.NetworkName == "" {
 					// the networkname should be there from the beginning
 					log.Errorf("(vm.getNetworkConfigs) [%s/%s] no networkname found for vm",
 						vm.Namespace, vm.Name)
+					c.metrics.UpdateLogStatus("error")
 				} else {
 					if c.dhcp.CheckLease(nic.MacAddress) {
 						lease := c.dhcp.GetLease(nic.MacAddress)
@@ -191,17 +192,20 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 	if err := c.dhcp.DeleteLease(netCfg.MACAddress); err != nil {
 		log.Errorf("(vm.cleanupNetworkInterface) [%s/%s] error deleting lease from dhcp: %s",
 			vmnetcfg.Namespace, vmnetcfg.Name, err)
+		c.metrics.UpdateLogStatus("error")
 	}
 
 	if err := c.ipam.ReleaseIP(netCfg.NetworkName, netCfg.IPAddress); err != nil {
 		log.Errorf("(vm.cleanupNetworkInterface) [%s/%s] error releasing ip from ipam: %s",
 			vmnetcfg.Namespace, vmnetcfg.Name, err)
+		c.metrics.UpdateLogStatus("error")
 	}
 
 	pool, err := c.cache.Get("pool", netCfg.NetworkName)
 	if err != nil {
 		log.Errorf("(vm.cleanupNetworkInterface) [%s/%s] %s",
 			vmnetcfg.Namespace, vmnetcfg.Name, err)
+		c.metrics.UpdateLogStatus("error")
 	} else {
 		if err := c.updateIPPoolStatus(
 			DELETE,
@@ -214,6 +218,7 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 		); err != nil {
 			log.Errorf("(vm.cleanupNetworkInterface) [%s/%s] %s",
 				vmnetcfg.Namespace, vmnetcfg.Name, err)
+			c.metrics.UpdateLogStatus("error")
 		}
 	}
 }

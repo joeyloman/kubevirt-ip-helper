@@ -22,6 +22,7 @@ type DHCPPool struct {
 	DomainSearch []string
 	NTP          []net.IP
 	LeaseTime    int
+	Nic          string
 }
 
 type DHCPLease struct {
@@ -59,6 +60,7 @@ func (a *DHCPAllocator) AddPool(
 	domainSearch []string,
 	NTPServers []string,
 	leaseTime int,
+	nic string,
 ) (err error) {
 	a.mutex.Lock()
 	defer a.mutex.Unlock()
@@ -89,6 +91,7 @@ func (a *DHCPAllocator) AddPool(
 		}
 	}
 	pool.LeaseTime = leaseTime
+	pool.Nic = nic
 
 	a.pools[name] = pool
 
@@ -181,7 +184,7 @@ func (a *DHCPAllocator) DeleteLease(hwAddr string) (err error) {
 func (a *DHCPAllocator) Usage() {
 	for hwaddr, lease := range a.leases {
 		pool := a.pools[lease.PoolName]
-		log.Infof("(dhcp.Usage) lease: hwaddr=%s, pool=%s, clientip=%s, netmask=%s, router=%s, dns=%+v, domain=%s, domainsearch=%+v, ntp=%+v, leasetime=%d, ref=%s",
+		log.Infof("(dhcp.Usage) lease: hwaddr=%s, pool=%s, clientip=%s, netmask=%s, router=%s, dns=%+v, domain=%s, domainsearch=%+v, ntp=%+v, leasetime=%d, ref=%s, nic=%s",
 			hwaddr,
 			lease.PoolName,
 			lease.ClientIP.String(),
@@ -193,6 +196,7 @@ func (a *DHCPAllocator) Usage() {
 			pool.NTP,
 			pool.LeaseTime,
 			lease.Reference,
+			pool.Nic,
 		)
 	}
 }
@@ -235,7 +239,7 @@ func (a *DHCPAllocator) dhcpHandler(conn net.PacketConn, peer net.Addr, m *dhcpv
 	}
 	pool := a.pools[lease.PoolName]
 
-	log.Debugf("(dhcp.dhcpHandler) LEASE FOUND: hwaddr=%s, serverip=%s, clientip=%s, mask=%s, router=%s, dns=%+v, domainname=%s, domainsearch=%+v, ntp=%+v, leasetime=%d, reference=%s",
+	log.Debugf("(dhcp.dhcpHandler) LEASE FOUND: hwaddr=%s, serverip=%s, clientip=%s, mask=%s, router=%s, dns=%+v, domainname=%s, domainsearch=%+v, ntp=%+v, leasetime=%d, reference=%s, nic=%s",
 		m.ClientHWAddr.String(),
 		pool.ServerIP.String(),
 		lease.ClientIP.String(),
@@ -247,6 +251,7 @@ func (a *DHCPAllocator) dhcpHandler(conn net.PacketConn, peer net.Addr, m *dhcpv
 		pool.NTP,
 		pool.LeaseTime,
 		lease.Reference,
+		pool.Nic,
 	)
 
 	reply.ClientIPAddr = lease.ClientIP
@@ -289,15 +294,15 @@ func (a *DHCPAllocator) dhcpHandler(conn net.PacketConn, peer net.Addr, m *dhcpv
 
 	switch mt := m.MessageType(); mt {
 	case dhcpv4.MessageTypeDiscover:
-		log.Debugf("(dhcp.dhcpHandler) DHCPDISCOVER: %+v", m)
+		log.Infof("(dhcp.dhcpHandler) [txid=%s] DHCPDISCOVER from %s via %s", m.TransactionID.String(), m.ClientHWAddr.String(), pool.Nic)
 		reply.UpdateOption(dhcpv4.OptMessageType(dhcpv4.MessageTypeOffer))
-		log.Debugf("(dhcp.dhcpHandler) DHCPOFFER: %+v", reply)
+		log.Infof("(dhcp.dhcpHandler) [txid=%s] DHCPOFFER on %s to %s via %s", m.TransactionID.String(), lease.ClientIP, m.ClientHWAddr.String(), pool.Nic)
 	case dhcpv4.MessageTypeRequest:
-		log.Debugf("(dhcp.dhcpHandler) DHCPREQUEST: %+v", m)
+		log.Infof("(dhcp.dhcpHandler) [txid=%s] DHCPREQUEST for %s from %s via %s", m.TransactionID.String(), lease.ClientIP, m.ClientHWAddr.String(), pool.Nic)
 		reply.UpdateOption(dhcpv4.OptMessageType(dhcpv4.MessageTypeAck))
-		log.Debugf("(dhcp.dhcpHandler) DHCPACK: %+v", reply)
+		log.Infof("(dhcp.dhcpHandler) [txid=%s] DHCPACK on %s to %s via %s", m.TransactionID.String(), lease.ClientIP, m.ClientHWAddr.String(), pool.Nic)
 	default:
-		log.Warnf("(dhcp.dhcpHandler) Unhandled message type for hwaddr [%s]: %v", m.ClientHWAddr.String(), mt)
+		log.Warnf("(dhcp.dhcpHandler) [txid=%s] Unhandled message type for %s via %s: %v", m.TransactionID.String(), m.ClientHWAddr.String(), pool.Nic, mt)
 		return
 	}
 
