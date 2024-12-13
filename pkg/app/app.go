@@ -52,6 +52,10 @@ type handler struct {
 	vmnetcfgEventHandler *vmnetcfg.EventHandler
 	vmEventHandler       *vm.EventHandler
 	appStatus            int
+	ippoolCountTarget    int
+	ippoolCountCurrent   int
+	vmnetcfgCountTarget  int
+	vmnetcfgCountCurrent int
 	lock                 *resourcelock.LeaseLock
 	leaderId             string
 }
@@ -172,6 +176,8 @@ func (h *handler) Run(mainCtx context.Context) {
 }
 
 func (h *handler) RunServices(ctx context.Context) {
+	var logStartupStateCheck int
+
 	// TODO: follow best practice by removing the ctx from the struct
 	// register the new context
 	h.ctx = ctx
@@ -192,6 +198,17 @@ func (h *handler) RunServices(ctx context.Context) {
 	// initialize the pool cache
 	h.cache = cache.New()
 
+	// gather the ippool count so we know how many pools we should initialize during startup before initializing the next controller
+	IPPoolList, err := h.getIPPools()
+	if err != nil {
+		log.Errorf("(app.RunServices) %s", err.Error())
+		h.metrics.UpdateLogStatus("error")
+
+		return
+	}
+	h.ippoolCountTarget = len(IPPoolList)
+	h.ippoolCountCurrent = 0
+
 	// initialize the ippoolEventListener handler
 	h.ippoolEventHandler = ippool.NewEventHandler(
 		h.ctx,
@@ -204,14 +221,51 @@ func (h *handler) RunServices(ctx context.Context) {
 		nil,
 		nil,
 		&h.appStatus,
+		&h.ippoolCountCurrent,
 	)
 	if err := h.ippoolEventHandler.Init(); err != nil {
 		handleErr(err)
 	}
 	go h.ippoolEventHandler.EventListener()
 
-	// give the ippool handler some time to gather all the pools and register the ipam subnets
-	time.Sleep(time.Second * 10)
+	// wait for the ippool handler to gather all the pools before proceeding the vmnetcfg controller
+	// this prevents race conditions
+	logStartupStateCheck = 0
+	for {
+		if h.ippoolCountCurrent != h.ippoolCountTarget {
+			time.Sleep(time.Second * 5)
+
+			if logStartupStateCheck == 12 {
+				log.Warnf("app.RunServices) still waiting for IPPool initialization [%d out of %d] after 1 min.", h.ippoolCountCurrent, h.ippoolCountTarget)
+				logStartupStateCheck++
+				h.metrics.UpdateLogStatus("warning")
+			} else if logStartupStateCheck == 24 {
+				log.Errorf("app.RunServices) DHCP services are still NOT running [%d out of %d]! There might be something wrong with one of the IPPools!"+
+					" Check above logs for errors and fix them. Then restart the application!",
+					h.ippoolCountCurrent, h.ippoolCountTarget)
+				// log again in 65 secs
+				logStartupStateCheck = 13
+				h.metrics.UpdateLogStatus("error")
+			} else {
+				logStartupStateCheck++
+			}
+		} else {
+			log.Infof("(app.RunServices) all DHCP services are started, proceeding with the vmnetcfg controller startup")
+
+			break
+		}
+	}
+
+	// gather the vmnetcfg count so we know how many network configs we should initialize during startup before initializing the next controller
+	vmnetcfgList, err := h.getVmNetCfgs()
+	if err != nil {
+		log.Errorf("(app.RunServices) %s", err.Error())
+		h.metrics.UpdateLogStatus("error")
+
+		return
+	}
+	h.vmnetcfgCountTarget = len(vmnetcfgList)
+	h.vmnetcfgCountCurrent = 0
 
 	// initialize the vmnetcfgEventListener handler
 	h.vmnetcfgEventHandler = vmnetcfg.NewEventHandler(
@@ -224,20 +278,52 @@ func (h *handler) RunServices(ctx context.Context) {
 		h.kubeContext,
 		nil,
 		nil,
+		&h.appStatus,
+		&h.vmnetcfgCountCurrent,
 	)
 	if err := h.vmnetcfgEventHandler.Init(); err != nil {
 		handleErr(err)
 	}
 	go h.vmnetcfgEventHandler.EventListener()
 
-	// give the vmnetcfg handler some time to settle before collecting all the vms
-	time.Sleep(time.Second * 30)
+	// wait for the vmnetcfg handler to gather all the network configs before proceeding the vm controller
+	// this prevents race conditions
+	logStartupStateCheck = 0
+	for {
+		if h.vmnetcfgCountCurrent != h.vmnetcfgCountTarget {
+			time.Sleep(time.Second * 10)
+
+			if logStartupStateCheck == 30 {
+				log.Warnf("app.RunServices) still waiting for VirtualMachineNetworkConfiguration initialization [%d out of %d] after 5 mins.", h.vmnetcfgCountCurrent, h.vmnetcfgCountTarget)
+				logStartupStateCheck++
+				h.metrics.UpdateLogStatus("warning")
+			} else if logStartupStateCheck == 60 {
+				log.Warnf("app.RunServices) still waiting for VirtualMachineNetworkConfiguration initialization [%d out of %d] after 10 mins.", h.vmnetcfgCountCurrent, h.vmnetcfgCountTarget)
+				logStartupStateCheck++
+				h.metrics.UpdateLogStatus("warning")
+			} else if logStartupStateCheck == 90 {
+				log.Errorf("app.RunServices) VirtualMachineNetworkConfiguration initialization is still not complete [%d out of %d] after > 15 mins! There might be something wrong with the VmNetCfgs count!"+
+					" Check above logs for errors and fix them. Then restart the application!",
+					h.vmnetcfgCountCurrent, h.vmnetcfgCountTarget)
+				// log again in 60 secs
+				logStartupStateCheck = 84
+				h.metrics.UpdateLogStatus("error")
+			} else {
+				logStartupStateCheck++
+			}
+		} else {
+			log.Infof("(app.RunServices) all VirtualMachineNetworkConfiguration objects are initialized, proceeding with the vm controller startup")
+
+			break
+		}
+	}
 
 	// initialize the vmEventListener handler
 	h.vmEventHandler = vm.NewEventHandler(
 		h.ctx,
 		h.ipam,
 		h.dhcp,
+		h.metrics,
 		h.cache,
 		h.kubeConfigFile,
 		h.kubeContext,
@@ -249,6 +335,12 @@ func (h *handler) RunServices(ctx context.Context) {
 		handleErr(err)
 	}
 	go h.vmEventHandler.EventListener()
+
+	// the vm controller is the last service and has no dependencies
+	// so no need to wait until it's initialized completely
+	// the 1 sec sleep is just to log the next line after the vm controller thread is started
+	time.Sleep(time.Second * 1)
+	log.Infof("(app.RunServices) all services are successfully initialized and started")
 }
 
 func (h *handler) getIPPools() (IPPools []v1.IPPool, err error) {
@@ -268,6 +360,25 @@ func (h *handler) getIPPools() (IPPools []v1.IPPool, err error) {
 	}
 
 	return IPPoolList.Items, err
+}
+
+func (h *handler) getVmNetCfgs() (vmnetcfgs []v1.VirtualMachineNetworkConfig, err error) {
+	kubeRestConfig, err := h.getKubeConfig()
+	if err != nil {
+		return vmnetcfgs, fmt.Errorf("cannot get kubeRestConfig: %s", err.Error())
+	}
+
+	kihClientset, err := kihclientset.NewForConfig(kubeRestConfig)
+	if err != nil {
+		return vmnetcfgs, fmt.Errorf("cannot get kihClientset: %s", err.Error())
+	}
+
+	vmnetcfgList, err := kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs("").List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return vmnetcfgs, fmt.Errorf("cannot get the vmnetcfgList: %s", err.Error())
+	}
+
+	return vmnetcfgList.Items, err
 }
 
 func (h *handler) NetworkCleanup() {

@@ -17,41 +17,43 @@ import (
 )
 
 const (
-	APP_INIT    = 0
-	APP_RUNNING = 1
-	APP_RESTART = 2
-
 	IPPOOL_NOCHANGE = 0
 	IPPOOL_RELOAD   = 1
 	IPPOOL_RESTART  = 2
 )
 
-func (c *Controller) registerIPPool(pool *kihv1.IPPool) (err error) {
+func (c *Controller) registerIPPool(pool *kihv1.IPPool) (cleanup bool, err error) {
 	log.Infof("(ippool.registerIPPool) [%s] new IPPool added", pool.Name)
+
+	// by default cleanup the pool sub resources
+	cleanup = false
 
 	// add the serverip to the bindinterface
 	ipnet, err := netip.ParsePrefix(pool.Spec.IPv4Config.Subnet)
 	if err != nil {
-		return fmt.Errorf("error while parsing subnet [%s] for network [%s]: %s",
+		return cleanup, fmt.Errorf("error while parsing subnet [%s] for network [%s]: %s",
 			pool.Spec.IPv4Config.Subnet, pool.Spec.NetworkName, err.Error())
 	}
 	ip4 := fmt.Sprintf("%s/%d", pool.Spec.IPv4Config.ServerIP, ipnet.Bits())
 	if err := network.AddIpToNic(pool.Spec.BindInterface, ip4); err != nil {
-		return fmt.Errorf("error while adding IP4 address [%s] to bind interface [%s] for network [%s]: %s",
+		return cleanup, fmt.Errorf("error while adding IP4 address [%s] to bind interface [%s] for network [%s]: %s",
 			ip4, pool.Spec.BindInterface, pool.Spec.NetworkName, err.Error())
 	}
 
 	log.Debugf("(ippool.registerIPPool) added IP4 address [%s] to nic [%s] for network [%s]",
 		ip4, pool.Spec.BindInterface, pool.Spec.NetworkName)
 
+	// from here pool sub resources needs to be cleaned up when something goes wrong
+	cleanup = true
+
 	// create the new dhcp pool
 	if err := c.createOrUpdateDHCPPool(pool); err != nil {
-		return fmt.Errorf("error while registering DHCP pool for network [%s]: %s", pool.Spec.NetworkName, err.Error())
+		return cleanup, fmt.Errorf("error while registering DHCP pool for network [%s]: %s", pool.Spec.NetworkName, err.Error())
 	}
 
 	// start a dhcp service thread
 	if err := c.dhcp.Run(pool.Spec.BindInterface, pool.Spec.IPv4Config.ServerIP); err != nil {
-		return fmt.Errorf("error while starting DHCP service thread for network [%s]: %s", pool.Spec.NetworkName, err.Error())
+		return cleanup, fmt.Errorf("error while starting DHCP service thread for network [%s]: %s", pool.Spec.NetworkName, err.Error())
 	}
 
 	// register the new subnet in ipam
@@ -61,19 +63,19 @@ func (c *Controller) registerIPPool(pool *kihv1.IPPool) (err error) {
 		pool.Spec.IPv4Config.Pool.Start,
 		pool.Spec.IPv4Config.Pool.End,
 	); err != nil {
-		return fmt.Errorf("error while allocating a new subnet in IPAM for network [%s]: %s", pool.Spec.NetworkName, err.Error())
+		return cleanup, fmt.Errorf("error while allocating a new subnet in IPAM for network [%s]: %s", pool.Spec.NetworkName, err.Error())
 	}
 
 	// mark the exclude ips as used
 	for _, v := range pool.Spec.IPv4Config.Pool.Exclude {
 		ip, err := c.ipam.GetIP(pool.Spec.NetworkName, v)
 		if err != nil {
-			return fmt.Errorf("error while excluding ip [%s] in IPAM for network [%s]: %s", v, pool.Spec.NetworkName, err.Error())
+			return cleanup, fmt.Errorf("error while excluding ip [%s] in IPAM for network [%s]: %s", v, pool.Spec.NetworkName, err.Error())
 		}
 
 		// maybe unnecesarry check, but just to make sure
 		if ip != v {
-			return fmt.Errorf("error got ip [%s] from IPAM, but it doesn't match the exclude ip [%s] for network [%s]",
+			return cleanup, fmt.Errorf("error got ip [%s] from IPAM, but it doesn't match the exclude ip [%s] for network [%s]",
 				ip, v, pool.Spec.NetworkName)
 		}
 	}
@@ -81,17 +83,22 @@ func (c *Controller) registerIPPool(pool *kihv1.IPPool) (err error) {
 	// rebuild the pool status after restarting the process
 	rPool, err := c.resetIPPoolStatus(pool)
 	if err != nil {
-		return fmt.Errorf("error while restting IPPool status for network [%s]: %s", pool.Spec.NetworkName, err.Error())
+		return cleanup, fmt.Errorf("error while restting IPPool status for network [%s]: %s", pool.Spec.NetworkName, err.Error())
 	}
 
 	// reset the pool metrics after restarting the process
 	if err = c.resetIPPoolMetrics(pool); err != nil {
-		return fmt.Errorf("error while restting IPPool metrics for network [%s]: %s", pool.Spec.NetworkName, err.Error())
+		return cleanup, fmt.Errorf("error while restting IPPool metrics for network [%s]: %s", pool.Spec.NetworkName, err.Error())
 	}
 
 	// cache the pool with an empty status
 	if err = c.cache.Add(rPool); err != nil {
-		return fmt.Errorf("error while caching the IPPool for network [%s]: %s", pool.Spec.NetworkName, err.Error())
+		return cleanup, fmt.Errorf("error while caching the IPPool for network [%s]: %s", pool.Spec.NetworkName, err.Error())
+	}
+
+	// increase the poolCountCurrent if the application is still initializing
+	if *c.appStatus == APP_INIT {
+		*c.ippoolCountCurrent++
 	}
 
 	return
@@ -169,6 +176,7 @@ func (c *Controller) handleIPPoolObjectChange(oldPool kihv1.IPPool, newPool *kih
 
 		if err := c.createOrUpdateDHCPPool(newPool); err != nil {
 			log.Errorf("(ippool.handleIPPoolObjectChange) error while updating dhcppool [%s]: %s", newPool.Spec.NetworkName, err.Error())
+			c.metrics.UpdateLogStatus("error")
 		}
 	}
 
@@ -189,6 +197,7 @@ func (c *Controller) stopDHCPListener(pool *kihv1.IPPool) {
 	if err := c.dhcp.Stop(pool.Spec.BindInterface); err != nil {
 		log.Errorf("(ippool.stopDHCPListener) error while shutting down DHCP listener running on nic [%s] for network [%s]: %s",
 			pool.Spec.BindInterface, pool.Spec.NetworkName, err.Error())
+		c.metrics.UpdateLogStatus("error")
 	}
 }
 
@@ -215,6 +224,7 @@ func (c *Controller) createOrUpdateDHCPPool(pool *kihv1.IPPool) (err error) {
 	if c.dhcp.CheckPool(pool.Spec.NetworkName) {
 		if err := c.dhcp.DeletePool(pool.Spec.NetworkName); err != nil {
 			log.Errorf("(ippool.createOrUpdateDHCPPool) while deleting dhcppool [%s]: %s", pool.Spec.NetworkName, err.Error())
+			c.metrics.UpdateLogStatus("error")
 		}
 	}
 
@@ -237,6 +247,7 @@ func (c *Controller) createOrUpdateDHCPPool(pool *kihv1.IPPool) (err error) {
 		pool.Spec.IPv4Config.DomainSearch,
 		pool.Spec.IPv4Config.NTP,
 		pool.Spec.IPv4Config.LeaseTime,
+		pool.Spec.BindInterface,
 	)
 
 	return

@@ -19,6 +19,7 @@ func TestDHCP(t *testing.T) {
 		domainSearch []string
 		NTPServers   []string
 		leaseTime    int
+		nic          string
 		want         error
 	}{
 		{
@@ -31,6 +32,7 @@ func TestDHCP(t *testing.T) {
 			domainSearch: []string{"example.com"},
 			NTPServers:   []string{"localhost", "127.0.0.2"},
 			leaseTime:    300,
+			nic:          "eth1",
 			want:         nil,
 		},
 		{
@@ -43,6 +45,7 @@ func TestDHCP(t *testing.T) {
 			domainSearch: []string{"example.com"},
 			NTPServers:   []string{},
 			leaseTime:    1800,
+			nic:          "eth1",
 			want:         nil,
 		},
 		{
@@ -55,6 +58,7 @@ func TestDHCP(t *testing.T) {
 			domainSearch: []string{"example.com"},
 			NTPServers:   []string{},
 			leaseTime:    0,
+			nic:          "",
 			want:         nil,
 		},
 	}
@@ -71,6 +75,7 @@ func TestDHCP(t *testing.T) {
 			testPools[i].domainSearch,
 			testPools[i].NTPServers,
 			testPools[i].leaseTime,
+			testPools[i].nic,
 		); got != testPools[i].want {
 			if got == nil || testPools[i].want == nil {
 				t.Errorf("got %q, wanted %q", got, testPools[i].want)

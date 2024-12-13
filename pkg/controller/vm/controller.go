@@ -16,6 +16,7 @@ import (
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/dhcp"
 	kihclientset "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/clientset/versioned"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/metrics"
 )
 
 type Controller struct {
@@ -25,6 +26,7 @@ type Controller struct {
 	cache        *kihcache.CacheAllocator
 	ipam         *ipam.IPAllocator
 	dhcp         *dhcp.DHCPAllocator
+	metrics      *metrics.MetricsAllocator
 	kihClientset *kihclientset.Clientset
 }
 
@@ -35,6 +37,7 @@ func NewController(
 	cache *kihcache.CacheAllocator,
 	ipam *ipam.IPAllocator,
 	dhcp *dhcp.DHCPAllocator,
+	metrics *metrics.MetricsAllocator,
 	kihClientset *kihclientset.Clientset,
 ) *Controller {
 	return &Controller{
@@ -44,6 +47,7 @@ func NewController(
 		cache:        cache,
 		ipam:         ipam,
 		dhcp:         dhcp,
+		metrics:      metrics,
 		kihClientset: kihClientset,
 	}
 }
@@ -66,12 +70,13 @@ func (c *Controller) sync(event Event) (err error) {
 	obj, exists, err := c.indexer.GetByKey(event.key)
 	if err != nil {
 		log.Errorf("(vm.sync) fetching object with key %s from store failed with %v", event.key, err)
+		c.metrics.UpdateLogStatus("error")
 
 		return
 	}
 
 	if !exists && event.action != DELETE {
-		// disabled error logging because sometimes a vm object could already be removed when there is still an update job in the queue
+		// disabled warn logging because sometimes a vm object could already be removed when there is still an update job in the queue
 		log.Debugf("(vm.sync) VirtualMachine %s does not exist anymore", event.key)
 
 		return
@@ -82,16 +87,19 @@ func (c *Controller) sync(event Event) (err error) {
 		err := c.handleVirtualMachineObjectChange(obj.(*kubevirtv1.VirtualMachine))
 		if err != nil {
 			log.Errorf("(vm.sync) %s", err)
+			c.metrics.UpdateLogStatus("error")
 		}
 	case UPDATE:
 		err := c.handleVirtualMachineObjectChange(obj.(*kubevirtv1.VirtualMachine))
 		if err != nil {
 			log.Errorf("(vm.sync) %s", err)
+			c.metrics.UpdateLogStatus("error")
 		}
 	case DELETE:
 		err := c.deleteVirtualMachineNetworkConfigObject(event.vmNamespace, event.vmName)
 		if err != nil {
 			log.Errorf("(vm.sync) %s", err)
+			c.metrics.UpdateLogStatus("error")
 		}
 	}
 
@@ -116,17 +124,19 @@ func (c *Controller) handleErr(err error, key interface{}) {
 	c.queue.Forget(key)
 
 	log.Errorf("(vm.handleErr) dropping VirtualMachine %q out of the queue: %v", key, err)
+	c.metrics.UpdateLogStatus("error")
 }
 
 func (c *Controller) Run(workers int, stopCh chan struct{}) {
 	defer runtime.HandleCrash()
 
 	defer c.queue.ShutDown()
-	log.Infof("(vm.Run) starting VirtualMachine controller")
+	log.Infof("(vm.Run) starting the VirtualMachine controller")
 
 	go c.informer.Run(stopCh)
 	if !cache.WaitForCacheSync(stopCh, c.informer.HasSynced) {
 		log.Errorf("Timed out waiting for caches to sync")
+		c.metrics.UpdateLogStatus("error")
 
 		return
 	}
@@ -136,7 +146,7 @@ func (c *Controller) Run(workers int, stopCh chan struct{}) {
 	}
 
 	<-stopCh
-	log.Infof("(vm.runWorker) stopping VirtualMachine controller")
+	log.Infof("(vm.runWorker) stopping the VirtualMachine controller")
 }
 
 func (c *Controller) runWorker() {

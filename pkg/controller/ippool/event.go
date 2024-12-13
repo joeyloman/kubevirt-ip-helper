@@ -30,16 +30,17 @@ const (
 )
 
 type EventHandler struct {
-	ctx            context.Context
-	ipam           *ipam.IPAllocator
-	dhcp           *dhcp.DHCPAllocator
-	metrics        *metrics.MetricsAllocator
-	cache          *kihcache.CacheAllocator
-	kubeConfig     string
-	kubeContext    string
-	kubeRestConfig *rest.Config
-	kihClientset   *kihclientset.Clientset
-	appStatus      *int
+	ctx                context.Context
+	ipam               *ipam.IPAllocator
+	dhcp               *dhcp.DHCPAllocator
+	metrics            *metrics.MetricsAllocator
+	cache              *kihcache.CacheAllocator
+	kubeConfig         string
+	kubeContext        string
+	kubeRestConfig     *rest.Config
+	kihClientset       *kihclientset.Clientset
+	appStatus          *int
+	ippoolCountCurrent *int
 }
 
 type Event struct {
@@ -60,18 +61,20 @@ func NewEventHandler(
 	kubeRestConfig *rest.Config,
 	kihClientset *kihclientset.Clientset,
 	appStatus *int,
+	ippoolCountCurrent *int,
 ) *EventHandler {
 	return &EventHandler{
-		ctx:            ctx,
-		ipam:           ipam,
-		dhcp:           dhcp,
-		metrics:        metrics,
-		cache:          cache,
-		kubeConfig:     kubeConfig,
-		kubeContext:    kubeContext,
-		kubeRestConfig: kubeRestConfig,
-		kihClientset:   kihClientset,
-		appStatus:      appStatus,
+		ctx:                ctx,
+		ipam:               ipam,
+		dhcp:               dhcp,
+		metrics:            metrics,
+		cache:              cache,
+		kubeConfig:         kubeConfig,
+		kubeContext:        kubeContext,
+		kubeRestConfig:     kubeRestConfig,
+		kihClientset:       kihClientset,
+		appStatus:          appStatus,
+		ippoolCountCurrent: ippoolCountCurrent,
 	}
 }
 
@@ -101,7 +104,7 @@ func (e *EventHandler) getKubeConfig() (config *rest.Config, err error) {
 }
 
 func (e *EventHandler) EventListener() (err error) {
-	log.Infof("(ippool.EventListener) starting IPPool event listener")
+	log.Infof("(ippool.EventListener) starting the IPPool event listener")
 
 	vmWatcher := cache.NewListWatchFromClient(e.kihClientset.KubevirtiphelperV1().RESTClient(), "ippools", corev1.NamespaceAll, fields.Everything())
 
@@ -143,14 +146,14 @@ func (e *EventHandler) EventListener() (err error) {
 		},
 	}, cache.Indexers{})
 
-	controller := NewController(queue, indexer, informer, e.ctx, e.cache, e.ipam, e.dhcp, e.metrics, e.kihClientset, e.appStatus)
+	controller := NewController(queue, indexer, informer, e.ctx, e.cache, e.ipam, e.dhcp, e.metrics, e.kihClientset, e.appStatus, e.ippoolCountCurrent)
 	stop := make(chan struct{})
 	defer close(stop)
 	go controller.Run(1, stop)
 
 	select {
 	case <-e.ctx.Done():
-		log.Infof("(ippool.EventListener) stopping IPPool event listener")
+		log.Infof("(ippool.EventListener) stopping the IPPool event listener")
 		return
 	}
 }

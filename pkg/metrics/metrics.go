@@ -14,6 +14,7 @@ import (
 )
 
 var (
+	LabelLogLevel    = "loglevel"
 	LabelIPPoolName  = "ippool"
 	LabelSubnet      = "subnet"
 	LabelNetworkName = "network"
@@ -25,6 +26,7 @@ var (
 
 type MetricsAllocator struct {
 	httpServer                      http.Server
+	kubevirtiphelperAppLogs         *prometheus.GaugeVec
 	kubevirtiphelperIPPoolUsed      *prometheus.GaugeVec
 	kubevirtiphelperIPPoolAvailable *prometheus.GaugeVec
 	kubevirtiphelperVmNetCfgStatus  *prometheus.GaugeVec
@@ -33,6 +35,15 @@ type MetricsAllocator struct {
 
 func NewMetricsAllocator() *MetricsAllocator {
 	m := &MetricsAllocator{
+		kubevirtiphelperAppLogs: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Name: "kubevirtiphelper_app_logs",
+				Help: "Important log entries of the application",
+			},
+			[]string{
+				LabelLogLevel,
+			},
+		),
 		kubevirtiphelperIPPoolUsed: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
 				Name: "kubevirtiphelper_ippool_used",
@@ -71,11 +82,18 @@ func NewMetricsAllocator() *MetricsAllocator {
 	}
 
 	m.registry = prometheus.NewRegistry()
+	m.registry.MustRegister(m.kubevirtiphelperAppLogs)
 	m.registry.MustRegister(m.kubevirtiphelperIPPoolUsed)
 	m.registry.MustRegister(m.kubevirtiphelperIPPoolAvailable)
 	m.registry.MustRegister(m.kubevirtiphelperVmNetCfgStatus)
 
 	return m
+}
+
+func (m *MetricsAllocator) UpdateLogStatus(loglevel string) {
+	m.kubevirtiphelperAppLogs.With(prometheus.Labels{
+		LabelLogLevel: loglevel,
+	}).Inc()
 }
 
 func (m *MetricsAllocator) UpdateIPPoolUsed(ippoolName string, subnet string, networkName string, used int) {
@@ -156,7 +174,7 @@ func (m *MetricsAllocator) DeleteVmNetCfgStatus(vmName string) {
 }
 
 func (m *MetricsAllocator) Run() {
-	log.Infof("(metrics.Run) starting Metrics service")
+	log.Infof("(metrics.Run) starting the Metrics service")
 
 	var metricsPort int
 
@@ -175,9 +193,9 @@ func (m *MetricsAllocator) Run() {
 }
 
 func (m *MetricsAllocator) Stop() {
-	log.Infof("(metrics.Stop) stopping Metrics service")
+	log.Infof("(metrics.Stop) stopping the Metrics service")
 	if err := m.httpServer.Shutdown(context.Background()); err != nil {
-		log.Errorf("(metrics.Stop) error while stopping Metrics service: %s", err.Error())
+		log.Errorf("(metrics.Stop) error while stopping the Metrics service: %s", err.Error())
 	}
 }
 
