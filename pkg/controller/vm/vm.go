@@ -124,7 +124,7 @@ func (c *Controller) deleteVirtualMachineNetworkConfigObject(vmNamespace string,
 			vmNamespace, vmName, err.Error())
 	}
 
-	log.Debugf("(vm.deleteVirtualMachineNetworkConfigObject) [%s/%s] successfully released vmnetcfg object [%s/%s]",
+	log.Infof("(vm.deleteVirtualMachineNetworkConfigObject) [%s/%s] successfully released vmnetcfg object [%s/%s]",
 		vmNamespace, vmName, vmNamespace, vmName)
 
 	return
