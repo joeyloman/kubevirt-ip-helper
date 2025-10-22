@@ -310,7 +310,8 @@ func (c *Controller) cleanupVirtualMachineNetworkConfig(vmnetcfg *kihv1.VirtualM
 	updatedVmNetCfg := vmnetcfg.DeepCopy()
 	newFinalizers := []string{}
 	for i := 0; i < len(vmnetcfg.ObjectMeta.Finalizers); i++ {
-		if vmnetcfg.ObjectMeta.Finalizers[i] != "kubevirtiphelper" {
+		// TODO: remove the "kubevirtiphelper" finalizer in the next minor release
+		if vmnetcfg.ObjectMeta.Finalizers[i] != "kubevirtiphelper" && vmnetcfg.ObjectMeta.Finalizers[i] != "kubevirtiphelper.k8s.binbash.org/vmnetcfg-cleanup" {
 			newFinalizers = append(newFinalizers, vmnetcfg.ObjectMeta.Finalizers[i])
 		}
 	}
