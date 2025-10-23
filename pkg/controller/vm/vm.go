@@ -36,7 +36,7 @@ func (c *Controller) createVirtualMachineNetworkConfigObject(vm *kubevirtV1.Virt
 	newVmNetCfg.ObjectMeta.Name = vm.ObjectMeta.Name
 	newVmNetCfg.ObjectMeta.Namespace = vm.ObjectMeta.Namespace
 	finalizers := []string{}
-	finalizers = append(finalizers, "kubevirtiphelper")
+	finalizers = append(finalizers, "kubevirtiphelper.k8s.binbash.org/vmnetcfg-cleanup")
 	newVmNetCfg.ObjectMeta.Finalizers = finalizers
 	newVmNetCfg.Spec.VMName = vm.ObjectMeta.Name
 
