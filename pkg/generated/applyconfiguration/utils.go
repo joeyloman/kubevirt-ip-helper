@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Kubernetes Authors.
+Copyright 2023 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -9,7 +9,7 @@ You may obtain a copy of the License at
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+WITHOUTHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
@@ -20,8 +20,11 @@ package applyconfiguration
 
 import (
 	v1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
+	internal "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/applyconfiguration/internal"
 	kubevirtiphelperk8sbinbashorgv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/applyconfiguration/kubevirtiphelper.k8s.binbash.org/v1"
+	runtime "k8s.io/apimachinery/pkg/runtime"
 	schema "k8s.io/apimachinery/pkg/runtime/schema"
+	managedfields "k8s.io/apimachinery/pkg/util/managedfields"
 )
 
 // ForKind returns an apply configuration type for the given GroupVersionKind, or nil if no
@@ -54,4 +57,8 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 
 	}
 	return nil
+}
+
+func NewTypeConverter(scheme *runtime.Scheme) managedfields.TypeConverter {
+	return managedfields.NewSchemeTypeConverter(scheme, internal.Parser())
 }

@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Kubernetes Authors.
+Copyright 2023 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -9,7 +9,7 @@ You may obtain a copy of the License at
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+WITHOUTHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
@@ -19,10 +19,10 @@ limitations under the License.
 package v1
 
 import (
-	v1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/client-go/tools/cache"
+	kubevirtiphelperk8sbinbashorgv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
+	labels "k8s.io/apimachinery/pkg/labels"
+	listers "k8s.io/client-go/listers"
+	cache "k8s.io/client-go/tools/cache"
 )
 
 // VirtualMachineNetworkConfigLister helps list VirtualMachineNetworkConfigs.
@@ -30,7 +30,7 @@ import (
 type VirtualMachineNetworkConfigLister interface {
 	// List lists all VirtualMachineNetworkConfigs in the indexer.
 	// Objects returned here must be treated as read-only.
-	List(selector labels.Selector) (ret []*v1.VirtualMachineNetworkConfig, err error)
+	List(selector labels.Selector) (ret []*kubevirtiphelperk8sbinbashorgv1.VirtualMachineNetworkConfig, err error)
 	// VirtualMachineNetworkConfigs returns an object that can list and get VirtualMachineNetworkConfigs.
 	VirtualMachineNetworkConfigs(namespace string) VirtualMachineNetworkConfigNamespaceLister
 	VirtualMachineNetworkConfigListerExpansion
@@ -38,25 +38,17 @@ type VirtualMachineNetworkConfigLister interface {
 
 // virtualMachineNetworkConfigLister implements the VirtualMachineNetworkConfigLister interface.
 type virtualMachineNetworkConfigLister struct {
-	indexer cache.Indexer
+	listers.ResourceIndexer[*kubevirtiphelperk8sbinbashorgv1.VirtualMachineNetworkConfig]
 }
 
 // NewVirtualMachineNetworkConfigLister returns a new VirtualMachineNetworkConfigLister.
 func NewVirtualMachineNetworkConfigLister(indexer cache.Indexer) VirtualMachineNetworkConfigLister {
-	return &virtualMachineNetworkConfigLister{indexer: indexer}
-}
-
-// List lists all VirtualMachineNetworkConfigs in the indexer.
-func (s *virtualMachineNetworkConfigLister) List(selector labels.Selector) (ret []*v1.VirtualMachineNetworkConfig, err error) {
-	err = cache.ListAll(s.indexer, selector, func(m interface{}) {
-		ret = append(ret, m.(*v1.VirtualMachineNetworkConfig))
-	})
-	return ret, err
+	return &virtualMachineNetworkConfigLister{listers.New[*kubevirtiphelperk8sbinbashorgv1.VirtualMachineNetworkConfig](indexer, kubevirtiphelperk8sbinbashorgv1.Resource("virtualmachinenetworkconfig"))}
 }
 
 // VirtualMachineNetworkConfigs returns an object that can list and get VirtualMachineNetworkConfigs.
 func (s *virtualMachineNetworkConfigLister) VirtualMachineNetworkConfigs(namespace string) VirtualMachineNetworkConfigNamespaceLister {
-	return virtualMachineNetworkConfigNamespaceLister{indexer: s.indexer, namespace: namespace}
+	return virtualMachineNetworkConfigNamespaceLister{listers.NewNamespaced[*kubevirtiphelperk8sbinbashorgv1.VirtualMachineNetworkConfig](s.ResourceIndexer, namespace)}
 }
 
 // VirtualMachineNetworkConfigNamespaceLister helps list and get VirtualMachineNetworkConfigs.
@@ -64,36 +56,15 @@ func (s *virtualMachineNetworkConfigLister) VirtualMachineNetworkConfigs(namespa
 type VirtualMachineNetworkConfigNamespaceLister interface {
 	// List lists all VirtualMachineNetworkConfigs in the indexer for a given namespace.
 	// Objects returned here must be treated as read-only.
-	List(selector labels.Selector) (ret []*v1.VirtualMachineNetworkConfig, err error)
+	List(selector labels.Selector) (ret []*kubevirtiphelperk8sbinbashorgv1.VirtualMachineNetworkConfig, err error)
 	// Get retrieves the VirtualMachineNetworkConfig from the indexer for a given namespace and name.
 	// Objects returned here must be treated as read-only.
-	Get(name string) (*v1.VirtualMachineNetworkConfig, error)
+	Get(name string) (*kubevirtiphelperk8sbinbashorgv1.VirtualMachineNetworkConfig, error)
 	VirtualMachineNetworkConfigNamespaceListerExpansion
 }
 
 // virtualMachineNetworkConfigNamespaceLister implements the VirtualMachineNetworkConfigNamespaceLister
 // interface.
 type virtualMachineNetworkConfigNamespaceLister struct {
-	indexer   cache.Indexer
-	namespace string
-}
-
-// List lists all VirtualMachineNetworkConfigs in the indexer for a given namespace.
-func (s virtualMachineNetworkConfigNamespaceLister) List(selector labels.Selector) (ret []*v1.VirtualMachineNetworkConfig, err error) {
-	err = cache.ListAllByNamespace(s.indexer, s.namespace, selector, func(m interface{}) {
-		ret = append(ret, m.(*v1.VirtualMachineNetworkConfig))
-	})
-	return ret, err
-}
-
-// Get retrieves the VirtualMachineNetworkConfig from the indexer for a given namespace and name.
-func (s virtualMachineNetworkConfigNamespaceLister) Get(name string) (*v1.VirtualMachineNetworkConfig, error) {
-	obj, exists, err := s.indexer.GetByKey(s.namespace + "/" + name)
-	if err != nil {
-		return nil, err
-	}
-	if !exists {
-		return nil, errors.NewNotFound(v1.Resource("virtualmachinenetworkconfig"), name)
-	}
-	return obj.(*v1.VirtualMachineNetworkConfig), nil
+	listers.ResourceIndexer[*kubevirtiphelperk8sbinbashorgv1.VirtualMachineNetworkConfig]
 }

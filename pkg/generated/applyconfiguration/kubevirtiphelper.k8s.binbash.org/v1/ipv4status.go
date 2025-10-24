@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Kubernetes Authors.
+Copyright 2023 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -9,7 +9,7 @@ You may obtain a copy of the License at
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+WITHOUTHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
@@ -18,7 +18,7 @@ limitations under the License.
 
 package v1
 
-// IPv4StatusApplyConfiguration represents an declarative configuration of the IPv4Status type for use
+// IPv4StatusApplyConfiguration represents a declarative configuration of the IPv4Status type for use
 // with apply.
 type IPv4StatusApplyConfiguration struct {
 	Allocated map[string]string `json:"allocated,omitempty"`
@@ -26,7 +26,7 @@ type IPv4StatusApplyConfiguration struct {
 	Available *int              `json:"available,omitempty"`
 }
 
-// IPv4StatusApplyConfiguration constructs an declarative configuration of the IPv4Status type for use with
+// IPv4StatusApplyConfiguration constructs a declarative configuration of the IPv4Status type for use with
 // apply.
 func IPv4Status() *IPv4StatusApplyConfiguration {
 	return &IPv4StatusApplyConfiguration{}

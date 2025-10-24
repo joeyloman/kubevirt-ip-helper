@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Kubernetes Authors.
+Copyright 2023 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -9,7 +9,7 @@ You may obtain a copy of the License at
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+WITHOUTHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
@@ -19,171 +19,35 @@ limitations under the License.
 package fake
 
 import (
-	"context"
-	json "encoding/json"
-	"fmt"
-
 	v1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
 	kubevirtiphelperk8sbinbashorgv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/applyconfiguration/kubevirtiphelper.k8s.binbash.org/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	labels "k8s.io/apimachinery/pkg/labels"
-	types "k8s.io/apimachinery/pkg/types"
-	watch "k8s.io/apimachinery/pkg/watch"
-	testing "k8s.io/client-go/testing"
+	typedkubevirtiphelperk8sbinbashorgv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/clientset/versioned/typed/kubevirtiphelper.k8s.binbash.org/v1"
+	gentype "k8s.io/client-go/gentype"
 )
 
-// FakeVirtualMachineNetworkConfigs implements VirtualMachineNetworkConfigInterface
-type FakeVirtualMachineNetworkConfigs struct {
+// fakeVirtualMachineNetworkConfigs implements VirtualMachineNetworkConfigInterface
+type fakeVirtualMachineNetworkConfigs struct {
+	*gentype.FakeClientWithListAndApply[*v1.VirtualMachineNetworkConfig, *v1.VirtualMachineNetworkConfigList, *kubevirtiphelperk8sbinbashorgv1.VirtualMachineNetworkConfigApplyConfiguration]
 	Fake *FakeKubevirtiphelperV1
-	ns   string
 }
 
-var virtualmachinenetworkconfigsResource = v1.SchemeGroupVersion.WithResource("virtualmachinenetworkconfigs")
-
-var virtualmachinenetworkconfigsKind = v1.SchemeGroupVersion.WithKind("VirtualMachineNetworkConfig")
-
-// Get takes name of the virtualMachineNetworkConfig, and returns the corresponding virtualMachineNetworkConfig object, and an error if there is any.
-func (c *FakeVirtualMachineNetworkConfigs) Get(ctx context.Context, name string, options metav1.GetOptions) (result *v1.VirtualMachineNetworkConfig, err error) {
-	obj, err := c.Fake.
-		Invokes(testing.NewGetAction(virtualmachinenetworkconfigsResource, c.ns, name), &v1.VirtualMachineNetworkConfig{})
-
-	if obj == nil {
-		return nil, err
+func newFakeVirtualMachineNetworkConfigs(fake *FakeKubevirtiphelperV1, namespace string) typedkubevirtiphelperk8sbinbashorgv1.VirtualMachineNetworkConfigInterface {
+	return &fakeVirtualMachineNetworkConfigs{
+		gentype.NewFakeClientWithListAndApply[*v1.VirtualMachineNetworkConfig, *v1.VirtualMachineNetworkConfigList, *kubevirtiphelperk8sbinbashorgv1.VirtualMachineNetworkConfigApplyConfiguration](
+			fake.Fake,
+			namespace,
+			v1.SchemeGroupVersion.WithResource("virtualmachinenetworkconfigs"),
+			v1.SchemeGroupVersion.WithKind("VirtualMachineNetworkConfig"),
+			func() *v1.VirtualMachineNetworkConfig { return &v1.VirtualMachineNetworkConfig{} },
+			func() *v1.VirtualMachineNetworkConfigList { return &v1.VirtualMachineNetworkConfigList{} },
+			func(dst, src *v1.VirtualMachineNetworkConfigList) { dst.ListMeta = src.ListMeta },
+			func(list *v1.VirtualMachineNetworkConfigList) []*v1.VirtualMachineNetworkConfig {
+				return gentype.ToPointerSlice(list.Items)
+			},
+			func(list *v1.VirtualMachineNetworkConfigList, items []*v1.VirtualMachineNetworkConfig) {
+				list.Items = gentype.FromPointerSlice(items)
+			},
+		),
+		fake,
 	}
-	return obj.(*v1.VirtualMachineNetworkConfig), err
-}
-
-// List takes label and field selectors, and returns the list of VirtualMachineNetworkConfigs that match those selectors.
-func (c *FakeVirtualMachineNetworkConfigs) List(ctx context.Context, opts metav1.ListOptions) (result *v1.VirtualMachineNetworkConfigList, err error) {
-	obj, err := c.Fake.
-		Invokes(testing.NewListAction(virtualmachinenetworkconfigsResource, virtualmachinenetworkconfigsKind, c.ns, opts), &v1.VirtualMachineNetworkConfigList{})
-
-	if obj == nil {
-		return nil, err
-	}
-
-	label, _, _ := testing.ExtractFromListOptions(opts)
-	if label == nil {
-		label = labels.Everything()
-	}
-	list := &v1.VirtualMachineNetworkConfigList{ListMeta: obj.(*v1.VirtualMachineNetworkConfigList).ListMeta}
-	for _, item := range obj.(*v1.VirtualMachineNetworkConfigList).Items {
-		if label.Matches(labels.Set(item.Labels)) {
-			list.Items = append(list.Items, item)
-		}
-	}
-	return list, err
-}
-
-// Watch returns a watch.Interface that watches the requested virtualMachineNetworkConfigs.
-func (c *FakeVirtualMachineNetworkConfigs) Watch(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
-	return c.Fake.
-		InvokesWatch(testing.NewWatchAction(virtualmachinenetworkconfigsResource, c.ns, opts))
-
-}
-
-// Create takes the representation of a virtualMachineNetworkConfig and creates it.  Returns the server's representation of the virtualMachineNetworkConfig, and an error, if there is any.
-func (c *FakeVirtualMachineNetworkConfigs) Create(ctx context.Context, virtualMachineNetworkConfig *v1.VirtualMachineNetworkConfig, opts metav1.CreateOptions) (result *v1.VirtualMachineNetworkConfig, err error) {
-	obj, err := c.Fake.
-		Invokes(testing.NewCreateAction(virtualmachinenetworkconfigsResource, c.ns, virtualMachineNetworkConfig), &v1.VirtualMachineNetworkConfig{})
-
-	if obj == nil {
-		return nil, err
-	}
-	return obj.(*v1.VirtualMachineNetworkConfig), err
-}
-
-// Update takes the representation of a virtualMachineNetworkConfig and updates it. Returns the server's representation of the virtualMachineNetworkConfig, and an error, if there is any.
-func (c *FakeVirtualMachineNetworkConfigs) Update(ctx context.Context, virtualMachineNetworkConfig *v1.VirtualMachineNetworkConfig, opts metav1.UpdateOptions) (result *v1.VirtualMachineNetworkConfig, err error) {
-	obj, err := c.Fake.
-		Invokes(testing.NewUpdateAction(virtualmachinenetworkconfigsResource, c.ns, virtualMachineNetworkConfig), &v1.VirtualMachineNetworkConfig{})
-
-	if obj == nil {
-		return nil, err
-	}
-	return obj.(*v1.VirtualMachineNetworkConfig), err
-}
-
-// UpdateStatus was generated because the type contains a Status member.
-// Add a +genclient:noStatus comment above the type to avoid generating UpdateStatus().
-func (c *FakeVirtualMachineNetworkConfigs) UpdateStatus(ctx context.Context, virtualMachineNetworkConfig *v1.VirtualMachineNetworkConfig, opts metav1.UpdateOptions) (*v1.VirtualMachineNetworkConfig, error) {
-	obj, err := c.Fake.
-		Invokes(testing.NewUpdateSubresourceAction(virtualmachinenetworkconfigsResource, "status", c.ns, virtualMachineNetworkConfig), &v1.VirtualMachineNetworkConfig{})
-
-	if obj == nil {
-		return nil, err
-	}
-	return obj.(*v1.VirtualMachineNetworkConfig), err
-}
-
-// Delete takes name of the virtualMachineNetworkConfig and deletes it. Returns an error if one occurs.
-func (c *FakeVirtualMachineNetworkConfigs) Delete(ctx context.Context, name string, opts metav1.DeleteOptions) error {
-	_, err := c.Fake.
-		Invokes(testing.NewDeleteActionWithOptions(virtualmachinenetworkconfigsResource, c.ns, name, opts), &v1.VirtualMachineNetworkConfig{})
-
-	return err
-}
-
-// DeleteCollection deletes a collection of objects.
-func (c *FakeVirtualMachineNetworkConfigs) DeleteCollection(ctx context.Context, opts metav1.DeleteOptions, listOpts metav1.ListOptions) error {
-	action := testing.NewDeleteCollectionAction(virtualmachinenetworkconfigsResource, c.ns, listOpts)
-
-	_, err := c.Fake.Invokes(action, &v1.VirtualMachineNetworkConfigList{})
-	return err
-}
-
-// Patch applies the patch and returns the patched virtualMachineNetworkConfig.
-func (c *FakeVirtualMachineNetworkConfigs) Patch(ctx context.Context, name string, pt types.PatchType, data []byte, opts metav1.PatchOptions, subresources ...string) (result *v1.VirtualMachineNetworkConfig, err error) {
-	obj, err := c.Fake.
-		Invokes(testing.NewPatchSubresourceAction(virtualmachinenetworkconfigsResource, c.ns, name, pt, data, subresources...), &v1.VirtualMachineNetworkConfig{})
-
-	if obj == nil {
-		return nil, err
-	}
-	return obj.(*v1.VirtualMachineNetworkConfig), err
-}
-
-// Apply takes the given apply declarative configuration, applies it and returns the applied virtualMachineNetworkConfig.
-func (c *FakeVirtualMachineNetworkConfigs) Apply(ctx context.Context, virtualMachineNetworkConfig *kubevirtiphelperk8sbinbashorgv1.VirtualMachineNetworkConfigApplyConfiguration, opts metav1.ApplyOptions) (result *v1.VirtualMachineNetworkConfig, err error) {
-	if virtualMachineNetworkConfig == nil {
-		return nil, fmt.Errorf("virtualMachineNetworkConfig provided to Apply must not be nil")
-	}
-	data, err := json.Marshal(virtualMachineNetworkConfig)
-	if err != nil {
-		return nil, err
-	}
-	name := virtualMachineNetworkConfig.Name
-	if name == nil {
-		return nil, fmt.Errorf("virtualMachineNetworkConfig.Name must be provided to Apply")
-	}
-	obj, err := c.Fake.
-		Invokes(testing.NewPatchSubresourceAction(virtualmachinenetworkconfigsResource, c.ns, *name, types.ApplyPatchType, data), &v1.VirtualMachineNetworkConfig{})
-
-	if obj == nil {
-		return nil, err
-	}
-	return obj.(*v1.VirtualMachineNetworkConfig), err
-}
-
-// ApplyStatus was generated because the type contains a Status member.
-// Add a +genclient:noStatus comment above the type to avoid generating ApplyStatus().
-func (c *FakeVirtualMachineNetworkConfigs) ApplyStatus(ctx context.Context, virtualMachineNetworkConfig *kubevirtiphelperk8sbinbashorgv1.VirtualMachineNetworkConfigApplyConfiguration, opts metav1.ApplyOptions) (result *v1.VirtualMachineNetworkConfig, err error) {
-	if virtualMachineNetworkConfig == nil {
-		return nil, fmt.Errorf("virtualMachineNetworkConfig provided to Apply must not be nil")
-	}
-	data, err := json.Marshal(virtualMachineNetworkConfig)
-	if err != nil {
-		return nil, err
-	}
-	name := virtualMachineNetworkConfig.Name
-	if name == nil {
-		return nil, fmt.Errorf("virtualMachineNetworkConfig.Name must be provided to Apply")
-	}
-	obj, err := c.Fake.
-		Invokes(testing.NewPatchSubresourceAction(virtualmachinenetworkconfigsResource, c.ns, *name, types.ApplyPatchType, data, "status"), &v1.VirtualMachineNetworkConfig{})
-
-	if obj == nil {
-		return nil, err
-	}
-	return obj.(*v1.VirtualMachineNetworkConfig), err
 }

@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Kubernetes Authors.
+Copyright 2023 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -9,7 +9,7 @@ You may obtain a copy of the License at
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+WITHOUTHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
@@ -19,13 +19,13 @@ limitations under the License.
 package v1
 
 import (
-	"context"
+	context "context"
 	time "time"
 
-	kubevirtiphelperk8sbinbashorgv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
+	apiskubevirtiphelperk8sbinbashorgv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
 	versioned "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/clientset/versioned"
 	internalinterfaces "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/informers/externalversions/internalinterfaces"
-	v1 "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/listers/kubevirtiphelper.k8s.binbash.org/v1"
+	kubevirtiphelperk8sbinbashorgv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/listers/kubevirtiphelper.k8s.binbash.org/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	runtime "k8s.io/apimachinery/pkg/runtime"
 	watch "k8s.io/apimachinery/pkg/watch"
@@ -36,7 +36,7 @@ import (
 // VirtualMachineNetworkConfigs.
 type VirtualMachineNetworkConfigInformer interface {
 	Informer() cache.SharedIndexInformer
-	Lister() v1.VirtualMachineNetworkConfigLister
+	Lister() kubevirtiphelperk8sbinbashorgv1.VirtualMachineNetworkConfigLister
 }
 
 type virtualMachineNetworkConfigInformer struct {
@@ -62,16 +62,28 @@ func NewFilteredVirtualMachineNetworkConfigInformer(client versioned.Interface, 
 				if tweakListOptions != nil {
 					tweakListOptions(&options)
 				}
-				return client.KubevirtiphelperV1().VirtualMachineNetworkConfigs(namespace).List(context.TODO(), options)
+				return client.KubevirtiphelperV1().VirtualMachineNetworkConfigs(namespace).List(context.Background(), options)
 			},
 			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
 				if tweakListOptions != nil {
 					tweakListOptions(&options)
 				}
-				return client.KubevirtiphelperV1().VirtualMachineNetworkConfigs(namespace).Watch(context.TODO(), options)
+				return client.KubevirtiphelperV1().VirtualMachineNetworkConfigs(namespace).Watch(context.Background(), options)
+			},
+			ListWithContextFunc: func(ctx context.Context, options metav1.ListOptions) (runtime.Object, error) {
+				if tweakListOptions != nil {
+					tweakListOptions(&options)
+				}
+				return client.KubevirtiphelperV1().VirtualMachineNetworkConfigs(namespace).List(ctx, options)
+			},
+			WatchFuncWithContext: func(ctx context.Context, options metav1.ListOptions) (watch.Interface, error) {
+				if tweakListOptions != nil {
+					tweakListOptions(&options)
+				}
+				return client.KubevirtiphelperV1().VirtualMachineNetworkConfigs(namespace).Watch(ctx, options)
 			},
 		},
-		&kubevirtiphelperk8sbinbashorgv1.VirtualMachineNetworkConfig{},
+		&apiskubevirtiphelperk8sbinbashorgv1.VirtualMachineNetworkConfig{},
 		resyncPeriod,
 		indexers,
 	)
@@ -82,9 +94,9 @@ func (f *virtualMachineNetworkConfigInformer) defaultInformer(client versioned.I
 }
 
 func (f *virtualMachineNetworkConfigInformer) Informer() cache.SharedIndexInformer {
-	return f.factory.InformerFor(&kubevirtiphelperk8sbinbashorgv1.VirtualMachineNetworkConfig{}, f.defaultInformer)
+	return f.factory.InformerFor(&apiskubevirtiphelperk8sbinbashorgv1.VirtualMachineNetworkConfig{}, f.defaultInformer)
 }
 
-func (f *virtualMachineNetworkConfigInformer) Lister() v1.VirtualMachineNetworkConfigLister {
-	return v1.NewVirtualMachineNetworkConfigLister(f.Informer().GetIndexer())
+func (f *virtualMachineNetworkConfigInformer) Lister() kubevirtiphelperk8sbinbashorgv1.VirtualMachineNetworkConfigLister {
+	return kubevirtiphelperk8sbinbashorgv1.NewVirtualMachineNetworkConfigLister(f.Informer().GetIndexer())
 }

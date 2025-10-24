@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Kubernetes Authors.
+Copyright 2023 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -9,7 +9,7 @@ You may obtain a copy of the License at
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+WITHOUTHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
@@ -19,18 +19,18 @@ limitations under the License.
 package v1
 
 import (
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// IPPoolStatusApplyConfiguration represents an declarative configuration of the IPPoolStatus type for use
+// IPPoolStatusApplyConfiguration represents a declarative configuration of the IPPoolStatus type for use
 // with apply.
 type IPPoolStatusApplyConfiguration struct {
-	LastUpdate            *v1.Time                      `json:"lastupdate,omitempty"`
-	LastUpdateBeforeStart *v1.Time                      `json:"lastupdatebeforestart,omitempty"`
+	LastUpdate            *metav1.Time                  `json:"lastupdate,omitempty"`
+	LastUpdateBeforeStart *metav1.Time                  `json:"lastupdatebeforestart,omitempty"`
 	IPv4                  *IPv4StatusApplyConfiguration `json:"ipv4,omitempty"`
 }
 
-// IPPoolStatusApplyConfiguration constructs an declarative configuration of the IPPoolStatus type for use with
+// IPPoolStatusApplyConfiguration constructs a declarative configuration of the IPPoolStatus type for use with
 // apply.
 func IPPoolStatus() *IPPoolStatusApplyConfiguration {
 	return &IPPoolStatusApplyConfiguration{}
@@ -39,7 +39,7 @@ func IPPoolStatus() *IPPoolStatusApplyConfiguration {
 // WithLastUpdate sets the LastUpdate field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
 // If called multiple times, the LastUpdate field is set to the value of the last call.
-func (b *IPPoolStatusApplyConfiguration) WithLastUpdate(value v1.Time) *IPPoolStatusApplyConfiguration {
+func (b *IPPoolStatusApplyConfiguration) WithLastUpdate(value metav1.Time) *IPPoolStatusApplyConfiguration {
 	b.LastUpdate = &value
 	return b
 }
@@ -47,7 +47,7 @@ func (b *IPPoolStatusApplyConfiguration) WithLastUpdate(value v1.Time) *IPPoolSt
 // WithLastUpdateBeforeStart sets the LastUpdateBeforeStart field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
 // If called multiple times, the LastUpdateBeforeStart field is set to the value of the last call.
-func (b *IPPoolStatusApplyConfiguration) WithLastUpdateBeforeStart(value v1.Time) *IPPoolStatusApplyConfiguration {
+func (b *IPPoolStatusApplyConfiguration) WithLastUpdateBeforeStart(value metav1.Time) *IPPoolStatusApplyConfiguration {
 	b.LastUpdateBeforeStart = &value
 	return b
 }
