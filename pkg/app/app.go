@@ -329,6 +329,7 @@ func (h *handler) RunServices(ctx context.Context) {
 		h.kubeContext,
 		nil,
 		nil,
+		nil,
 	)
 	if err := h.vmEventHandler.Init(); err != nil {
 		handleErr(err)

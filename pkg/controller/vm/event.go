@@ -13,6 +13,7 @@ import (
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 
 	kubevirtv1 "kubevirt.io/api/core/v1"
+	"kubevirt.io/client-go/kubecli"
 
 	kihcache "github.com/joeyloman/kubevirt-ip-helper/pkg/cache"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/dhcp"
@@ -39,6 +40,7 @@ type EventHandler struct {
 	kubeContext    string
 	kubeRestConfig *rest.Config
 	kihClientset   *kihclientset.Clientset
+	kcli           kubecli.KubevirtClient
 }
 
 type Event struct {
@@ -58,6 +60,7 @@ func NewEventHandler(
 	kubeContext string,
 	kubeRestConfig *rest.Config,
 	kihClientset *kihclientset.Clientset,
+	kcli kubecli.KubevirtClient,
 ) *EventHandler {
 	return &EventHandler{
 		ctx:            ctx,
@@ -69,6 +72,7 @@ func NewEventHandler(
 		kubeContext:    kubeContext,
 		kubeRestConfig: kubeRestConfig,
 		kihClientset:   kihClientset,
+		kcli:           kcli,
 	}
 }
 
@@ -79,6 +83,11 @@ func (e *EventHandler) Init() (err error) {
 	}
 
 	e.kihClientset, err = kihclientset.NewForConfig(e.kubeRestConfig)
+	if err != nil {
+		return
+	}
+
+	e.kcli, err = kubecli.GetKubevirtClientFromRESTConfig(e.kubeRestConfig)
 	if err != nil {
 		return
 	}
@@ -100,13 +109,7 @@ func (e *EventHandler) getKubeConfig() (config *rest.Config, err error) {
 func (e *EventHandler) EventListener() (err error) {
 	log.Infof("(vm.EventListener) starting the VirtualMachine event listener")
 
-	// Create a REST client for kubevirt.io API
-	restClient, err := rest.RESTClientFor(e.kubeRestConfig)
-	if err != nil {
-		return err
-	}
-
-	vmWatcher := cache.NewListWatchFromClient(restClient, "virtualmachines", corev1.NamespaceAll, fields.Everything())
+	vmWatcher := cache.NewListWatchFromClient(e.kcli.RestClient(), "virtualmachines", corev1.NamespaceAll, fields.Everything())
 
 	queue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
 
