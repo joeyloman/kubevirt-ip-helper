@@ -3,7 +3,7 @@ RUN mkdir /src /deps
 RUN apk update && apk add git build-base binutils-gold
 WORKDIR /deps
 ADD go.mod /deps
-RUN go mod download
+# RUN go mod download
 ADD / /src
 WORKDIR /src
 RUN go build -mod=vendor -o kubevirt-ip-helper .
