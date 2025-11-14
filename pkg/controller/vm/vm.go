@@ -2,6 +2,7 @@ package vm
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"strings"
@@ -140,6 +141,17 @@ func (c *Controller) checkVirtualMachineNetworkConfigObject(vmNamespace string, 
 }
 
 func (c *Controller) getNetworkConfigs(vm *kubevirtV1.VirtualMachine, curNetCfg []kihv1.NetworkConfig) (netCfgs []kihv1.NetworkConfig, err error) {
+	// make sure it also stays compatible with Harvester
+	var harvesterMacs map[string]string
+	if vm.ObjectMeta.Annotations != nil {
+		if macAnnotation, exists := vm.ObjectMeta.Annotations["harvesterhci.io/mac-address"]; exists {
+			if err := json.Unmarshal([]byte(macAnnotation), &harvesterMacs); err != nil {
+				log.Warnf("(vm.getNetworkConfigs) [%s/%s] failed to parse harvesterhci.io/mac-address annotation: %s",
+					vm.Namespace, vm.Name, err)
+			}
+		}
+	}
+
 	for _, nic := range vm.Spec.Template.Spec.Domain.Devices.Interfaces {
 		for _, net := range vm.Spec.Template.Spec.Networks {
 			if nic.Name == net.Name {
@@ -147,37 +159,54 @@ func (c *Controller) getNetworkConfigs(vm *kubevirtV1.VirtualMachine, curNetCfg 
 					// we only support multus at the moment
 					log.Warnf("(vm.getNetworkConfigs) [%s/%s] unsupported network type found!",
 						vm.Namespace, vm.Name)
-				} else if nic.MacAddress == "" {
-					// when a new vm is created the macaddress doesn't exists immediately
-					// it takes a couple of object updates before the macaddress is assigned
-					// so avoid confusion and don't log errors here
-					log.Debugf("(vm.getNetworkConfigs) [%s/%s] no mac address found for vm",
-						vm.Namespace, vm.Name)
-				} else if net.Multus.NetworkName == "" {
-					// the networkname should be there from the beginning
-					log.Errorf("(vm.getNetworkConfigs) [%s/%s] no networkname found for vm",
-						vm.Namespace, vm.Name)
-					c.metrics.UpdateLogStatus("error")
 				} else {
-					if c.dhcp.CheckLease(nic.MacAddress) {
-						lease := c.dhcp.GetLease(nic.MacAddress)
-						if lease.Reference != fmt.Sprintf("%s/%s", vm.Namespace, vm.Name) {
-							return netCfgs, fmt.Errorf("hwaddr %s belongs to %s instead of %s/%s, skipping vmnetcfg actions",
-								nic.MacAddress, lease.Reference, vm.Namespace, vm.Name)
+					if nic.MacAddress == "" {
+						// when a new vm is created the macaddress doesn't exists immediately
+						// it takes a couple of object updates before the macaddress is assigned
+
+						// try to get it from harvester annotation
+						macAddress := ""
+						if harvesterMacs != nil {
+							if macFromAnnotation, found := harvesterMacs[net.Name]; found {
+								macAddress = macFromAnnotation
+								log.Debugf("(vm.getNetworkConfigs) [%s/%s] found mac address %s from harvester annotation for %s",
+									vm.Namespace, vm.Name, macAddress, net.Name)
+							}
 						}
-					}
-
-					netCfg := kihv1.NetworkConfig{}
-					netCfg.MACAddress = nic.MacAddress
-					netCfg.NetworkName = net.Multus.NetworkName
-
-					for _, oldnet := range curNetCfg {
-						if oldnet.MACAddress == nic.MacAddress && oldnet.NetworkName == net.Multus.NetworkName {
-							netCfg.IPAddress = oldnet.IPAddress
+						if macAddress == "" {
+							log.Debugf("(vm.getNetworkConfigs) [%s/%s] no mac address found for vm",
+								vm.Namespace, vm.Name)
+							continue
 						}
+						// use the MAC address from annotation for further processing
+						nic.MacAddress = macAddress
 					}
+					if net.Multus.NetworkName == "" {
+						// the networkname should be there from the beginning
+						log.Errorf("(vm.getNetworkConfigs) [%s/%s] no networkname found for vm",
+							vm.Namespace, vm.Name)
+						c.metrics.UpdateLogStatus("error")
+					} else {
+						if c.dhcp.CheckLease(nic.MacAddress) {
+							lease := c.dhcp.GetLease(nic.MacAddress)
+							if lease.Reference != fmt.Sprintf("%s/%s", vm.Namespace, vm.Name) {
+								return netCfgs, fmt.Errorf("hwaddr %s belongs to %s instead of %s/%s, skipping vmnetcfg actions",
+									nic.MacAddress, lease.Reference, vm.Namespace, vm.Name)
+							}
+						}
 
-					netCfgs = append(netCfgs, netCfg)
+						netCfg := kihv1.NetworkConfig{}
+						netCfg.MACAddress = nic.MacAddress
+						netCfg.NetworkName = net.Multus.NetworkName
+
+						for _, oldnet := range curNetCfg {
+							if oldnet.MACAddress == nic.MacAddress && oldnet.NetworkName == net.Multus.NetworkName {
+								netCfg.IPAddress = oldnet.IPAddress
+							}
+						}
+
+						netCfgs = append(netCfgs, netCfg)
+					}
 				}
 			}
 		}
