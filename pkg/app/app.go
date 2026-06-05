@@ -110,9 +110,14 @@ func (h *handler) Init() {
 	h.leaderId = uuid.NewString()
 	log.Infof("(app.Run) generated leader id: %s", h.leaderId)
 
+	leaseLockName := os.Getenv("LEASE_LOCK_NAME")
+	if leaseLockName == "" {
+		leaseLockName = "kubevirt-ip-helper-lock"
+	}
+
 	h.lock = &resourcelock.LeaseLock{
 		LeaseMeta: metav1.ObjectMeta{
-			Name:      "kubevirt-ip-helper-lock",
+			Name:      leaseLockName,
 			Namespace: h.namespace,
 		},
 		Client: k8s_clientset.CoordinationV1(),
