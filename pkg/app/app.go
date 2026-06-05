@@ -364,7 +364,18 @@ func (h *handler) getIPPools() (IPPools []v1.IPPool, err error) {
 		return IPPools, fmt.Errorf("cannot get the IPPoolList: %s", err.Error())
 	}
 
-	return IPPoolList.Items, err
+	for _, pool := range IPPoolList.Items {
+		if pool.Labels["kubevirtiphelper/managed"] == "true" {
+			for _, p := range IPPoolList.Items {
+				if p.Labels["kubevirtiphelper/managed"] == "true" {
+					IPPools = append(IPPools, p)
+				}
+			}
+			return IPPools, nil
+		}
+	}
+
+	return IPPoolList.Items, nil
 }
 
 func (h *handler) getVmNetCfgs() (vmnetcfgs []v1.VirtualMachineNetworkConfig, err error) {
