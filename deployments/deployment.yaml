@@ -114,6 +114,10 @@ spec:
             value: INFO
           - name: METRICS_PORT
             value: "8080"
+          - name: LEASE_LOCK_NAME
+            value: "kubevirt-ip-helper-lock"
+          - name: VLAN_ID
+            value: ""
         imagePullPolicy: Always
         resources:
           requests:
