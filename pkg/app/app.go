@@ -364,18 +364,24 @@ func (h *handler) getIPPools() (IPPools []v1.IPPool, err error) {
 		return IPPools, fmt.Errorf("cannot get the IPPoolList: %s", err.Error())
 	}
 
-	for _, pool := range IPPoolList.Items {
-		if pool.Labels["kubevirtiphelper/managed"] == "true" {
-			for _, p := range IPPoolList.Items {
-				if p.Labels["kubevirtiphelper/managed"] == "true" {
-					IPPools = append(IPPools, p)
-				}
-			}
-			return IPPools, nil
-		}
+	if vlanID, ok := os.LookupEnv("VLAN_ID"); ok {
+		return filterIPPoolsByVLAN(IPPoolList.Items, vlanID), nil
 	}
 
 	return IPPoolList.Items, nil
+}
+
+// filterIPPoolsByVLAN returns the pools whose "kubevirtiphelper/vlan-id" annotation matches vlanID.
+func filterIPPoolsByVLAN(pools []v1.IPPool, vlanID string) []v1.IPPool {
+	var filtered []v1.IPPool
+
+	for _, pool := range pools {
+		if val, ok := pool.Annotations["kubevirtiphelper/vlan-id"]; ok && val == vlanID {
+			filtered = append(filtered, pool)
+		}
+	}
+
+	return filtered
 }
 
 func (h *handler) getVmNetCfgs() (vmnetcfgs []v1.VirtualMachineNetworkConfig, err error) {
