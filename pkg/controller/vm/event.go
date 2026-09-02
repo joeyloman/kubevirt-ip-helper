@@ -137,13 +137,24 @@ func (e *EventHandler) EventListener() (err error) {
 			}
 		},
 		DeleteFunc: func(obj interface{}) {
+			// when the resource was deleted while the watcher was out of
+			// sync, the informer delivers a tombstone instead of the object
+			if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+				obj = tombstone.Obj
+			}
+
+			virtualMachine, isVM := obj.(*kubevirtv1.VirtualMachine)
+			if !isVM {
+				return
+			}
+
 			key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
 			if err == nil {
 				queue.Add(Event{
 					key:         key,
 					action:      DELETE,
-					vmName:      obj.(*kubevirtv1.VirtualMachine).GetName(),
-					vmNamespace: obj.(*kubevirtv1.VirtualMachine).GetNamespace(),
+					vmName:      virtualMachine.GetName(),
+					vmNamespace: virtualMachine.GetNamespace(),
 				})
 			}
 		},

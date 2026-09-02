@@ -136,13 +136,24 @@ func (e *EventHandler) EventListener() (err error) {
 			}
 		},
 		DeleteFunc: func(obj interface{}) {
+			// when the resource was deleted while the watcher was out of
+			// sync, the informer delivers a tombstone instead of the object
+			if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+				obj = tombstone.Obj
+			}
+
+			pool, isPool := obj.(*kihv1.IPPool)
+			if !isPool {
+				return
+			}
+
 			key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
 			if err == nil {
 				queue.Add(Event{
 					key:             key,
 					action:          DELETE,
-					poolName:        obj.(*kihv1.IPPool).ObjectMeta.Name,
-					poolNetworkName: obj.(*kihv1.IPPool).Spec.NetworkName,
+					poolName:        pool.ObjectMeta.Name,
+					poolNetworkName: pool.Spec.NetworkName,
 				})
 			}
 		},
