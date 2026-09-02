@@ -137,12 +137,18 @@ func (a *DHCPAllocator) AddLease(
 		return fmt.Errorf("hwaddr is empty")
 	}
 
-	if _, err := net.ParseMAC(hwAddr); err != nil {
+	hw, err := net.ParseMAC(hwAddr)
+	if err != nil {
 		return fmt.Errorf("hwaddr %s is not valid", hwAddr)
 	}
 
-	if a.CheckLease(hwAddr) {
-		return fmt.Errorf("lease for hwaddr %s already exists", hwAddr)
+	// leases are stored under the canonical colon form of the mac address,
+	// so hyphen and uppercase spellings of the same hardware address map to
+	// the same lease key
+	key := hw.String()
+
+	if _, exists := a.leases[key]; exists {
+		return fmt.Errorf("lease for hwaddr %s already exists", key)
 	}
 
 	lease := DHCPLease{}
@@ -150,33 +156,77 @@ func (a *DHCPAllocator) AddLease(
 	lease.ClientIP = net.ParseIP(clientIP)
 	lease.Reference = ref
 
-	a.leases[hwAddr] = lease
+	a.leases[key] = lease
 
-	log.Debugf("(dhcp.AddLease) lease added for hardware address: %s", hwAddr)
+	log.Debugf("(dhcp.AddLease) lease added for hardware address: %s", key)
 
 	return
 }
 
 func (a *DHCPAllocator) CheckLease(hwAddr string) bool {
-	_, exists := a.leases[hwAddr]
+	hw, err := net.ParseMAC(hwAddr)
+	if err != nil {
+		return false
+	}
+
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	_, exists := a.leases[hw.String()]
+
 	return exists
 }
 
 func (a *DHCPAllocator) GetLease(hwAddr string) (lease DHCPLease) {
-	return a.leases[hwAddr]
+	hw, err := net.ParseMAC(hwAddr)
+	if err != nil {
+		return
+	}
+
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	return a.leases[hw.String()]
+}
+
+// GetLeaseByIP returns the lease which currently holds the given client ip.
+// It is used to check whether an ip address was already reassigned to
+// another owner before releasing it.
+func (a *DHCPAllocator) GetLeaseByIP(clientIP string) (hwAddr string, lease DHCPLease, found bool) {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	for hw, l := range a.leases {
+		if l.ClientIP != nil && l.ClientIP.String() == clientIP {
+			hwAddr = hw
+			lease = l
+			found = true
+
+			return
+		}
+	}
+
+	return
 }
 
 func (a *DHCPAllocator) DeleteLease(hwAddr string) (err error) {
 	a.mutex.Lock()
 	defer a.mutex.Unlock()
 
-	if !a.CheckLease(hwAddr) {
-		return fmt.Errorf("lease for hwaddr %s does not exists", hwAddr)
+	hw, err := net.ParseMAC(hwAddr)
+	if err != nil {
+		return fmt.Errorf("hwaddr %s is not valid", hwAddr)
 	}
 
-	delete(a.leases, hwAddr)
+	key := hw.String()
 
-	log.Debugf("(dhcp.DeleteLease) lease deleted for hardware address: %s", hwAddr)
+	if _, exists := a.leases[key]; !exists {
+		return fmt.Errorf("lease for hwaddr %s does not exists", key)
+	}
+
+	delete(a.leases, key)
+
+	log.Debugf("(dhcp.DeleteLease) lease deleted for hardware address: %s", key)
 
 	return
 }
