@@ -258,6 +258,7 @@ func New() *DHCPAllocator {
 func (a *DHCPAllocator) dhcpHandler(conn net.PacketConn, peer net.Addr, m *dhcpv4.DHCPv4) {
 	if m == nil {
 		log.Errorf("(dhcp.dhcpHandler) packet is nil!")
+
 		return
 	}
 
@@ -265,16 +266,12 @@ func (a *DHCPAllocator) dhcpHandler(conn net.PacketConn, peer net.Addr, m *dhcpv
 
 	if m.OpCode != dhcpv4.OpcodeBootRequest {
 		log.Errorf("(dhcp.dhcpHandler) not a BootRequest!")
+
 		return
 	}
 
-	reply, err := dhcpv4.NewReplyFromRequest(m)
-	if err != nil {
-		log.Errorf("(dhcp.dhcpHandler) NewReplyFromRequest failed: %v", err)
-		return
-	}
-
-	lease := a.leases[m.ClientHWAddr.String()]
+	// lease lookups use the canonical colon form of the mac address
+	lease := a.GetLease(m.ClientHWAddr.String())
 
 	if lease.ClientIP == nil {
 		log.Warnf("(dhcp.dhcpHandler) NO LEASE FOUND: hwaddr=%s", m.ClientHWAddr.String())
@@ -304,14 +301,80 @@ func (a *DHCPAllocator) dhcpHandler(conn net.PacketConn, peer net.Addr, m *dhcpv
 		pool.Nic,
 	)
 
-	reply.ClientIPAddr = lease.ClientIP
+	var replyType dhcpv4.MessageType
+	var sendReply bool
+
+	switch mt := m.MessageType(); mt {
+	case dhcpv4.MessageTypeDiscover:
+		log.Infof("(dhcp.dhcpHandler) [txid=%s] DHCPDISCOVER from %s via %s", m.TransactionID.String(), m.ClientHWAddr.String(), pool.Nic)
+
+		replyType = dhcpv4.MessageTypeOffer
+		sendReply = true
+	case dhcpv4.MessageTypeRequest:
+		// a request must reference the offered address, either through the
+		// requested-ip/server-identifier options (address selection) or
+		// through the client address field (renewal)
+		if serverID := m.ServerIdentifier(); len(serverID) > 0 && !serverID.Equal(pool.ServerIP) {
+			log.Infof("(dhcp.dhcpHandler) [txid=%s] DHCPREQUEST from %s via %s ignored: server identifier %s does not match this server",
+				m.TransactionID.String(), m.ClientHWAddr.String(), pool.Nic, serverID.String())
+
+			return
+		}
+
+		claimIP := m.RequestedIPAddress()
+		if len(claimIP) == 0 || claimIP.Equal(net.IPv4zero) {
+			claimIP = m.ClientIPAddr
+		}
+
+		if len(claimIP) == 0 || !claimIP.Equal(lease.ClientIP) {
+			log.Warnf("(dhcp.dhcpHandler) [txid=%s] DHCPREQUEST from %s via %s claims ip %s, but the lease holds %s, sending DHCPNAK",
+				m.TransactionID.String(), m.ClientHWAddr.String(), pool.Nic, claimIP, lease.ClientIP)
+
+			a.sendNak(conn, peer, m, pool.ServerIP)
+
+			return
+		}
+
+		log.Infof("(dhcp.dhcpHandler) [txid=%s] DHCPREQUEST for %s from %s via %s", m.TransactionID.String(), lease.ClientIP, m.ClientHWAddr.String(), pool.Nic)
+
+		replyType = dhcpv4.MessageTypeAck
+		sendReply = true
+	case dhcpv4.MessageTypeRelease:
+		// rfc 2131 4.3.4: a release is a one-way notification without a reply
+		log.Infof("(dhcp.dhcpHandler) [txid=%s] DHCPRELEASE for %s from %s via %s", m.TransactionID.String(), lease.ClientIP, m.ClientHWAddr.String(), pool.Nic)
+
+		return
+	default:
+		log.Warnf("(dhcp.dhcpHandler) [txid=%s] Unhandled message type for %s via %s: %v", m.TransactionID.String(), m.ClientHWAddr.String(), pool.Nic, mt)
+
+		return
+	}
+
+	if !sendReply {
+		return
+	}
+
+	reply, err := dhcpv4.NewReplyFromRequest(m)
+	if err != nil {
+		log.Errorf("(dhcp.dhcpHandler) NewReplyFromRequest failed: %v", err)
+
+		return
+	}
+
+	// rfc 2131 figure 3: an offer always carries a zero ciaddr and the
+	// offered address in yiaddr; an ack copies the client address of its
+	// request, which is set during renewal and zero during address selection
 	reply.ServerIPAddr = pool.ServerIP
 	reply.YourIPAddr = lease.ClientIP
 	reply.TransactionID = m.TransactionID
 	reply.ClientHWAddr = m.ClientHWAddr
 	reply.Flags = m.Flags
 	reply.GatewayIPAddr = m.GatewayIPAddr
+	if replyType == dhcpv4.MessageTypeAck {
+		reply.ClientIPAddr = m.ClientIPAddr
+	}
 
+	reply.UpdateOption(dhcpv4.OptMessageType(replyType))
 	reply.UpdateOption(dhcpv4.OptServerIdentifier(pool.ServerIP))
 	reply.UpdateOption(dhcpv4.OptSubnetMask(pool.SubnetMask))
 	reply.UpdateOption(dhcpv4.OptRouter(pool.Router))
@@ -342,22 +405,22 @@ func (a *DHCPAllocator) dhcpHandler(conn net.PacketConn, peer net.Addr, m *dhcpv
 		reply.UpdateOption(dhcpv4.OptIPAddressLeaseTime(31536000 * time.Second))
 	}
 
-	switch mt := m.MessageType(); mt {
-	case dhcpv4.MessageTypeDiscover:
-		log.Infof("(dhcp.dhcpHandler) [txid=%s] DHCPDISCOVER from %s via %s", m.TransactionID.String(), m.ClientHWAddr.String(), pool.Nic)
-		reply.UpdateOption(dhcpv4.OptMessageType(dhcpv4.MessageTypeOffer))
-		log.Infof("(dhcp.dhcpHandler) [txid=%s] DHCPOFFER on %s to %s via %s", m.TransactionID.String(), lease.ClientIP, m.ClientHWAddr.String(), pool.Nic)
-	case dhcpv4.MessageTypeRequest:
-		log.Infof("(dhcp.dhcpHandler) [txid=%s] DHCPREQUEST for %s from %s via %s", m.TransactionID.String(), lease.ClientIP, m.ClientHWAddr.String(), pool.Nic)
-		reply.UpdateOption(dhcpv4.OptMessageType(dhcpv4.MessageTypeAck))
-		log.Infof("(dhcp.dhcpHandler) [txid=%s] DHCPACK on %s to %s via %s", m.TransactionID.String(), lease.ClientIP, m.ClientHWAddr.String(), pool.Nic)
-	case dhcpv4.MessageTypeRelease:
-		// only informational
-		log.Infof("(dhcp.dhcpHandler) [txid=%s] DHCPRELEASE for %s from %s via %s", m.TransactionID.String(), lease.ClientIP, m.ClientHWAddr.String(), pool.Nic)
-	default:
-		log.Warnf("(dhcp.dhcpHandler) [txid=%s] Unhandled message type for %s via %s: %v", m.TransactionID.String(), m.ClientHWAddr.String(), pool.Nic, mt)
+	if _, err := conn.WriteTo(reply.ToBytes(), peer); err != nil {
+		log.Errorf("(dhcp.dhcpHandler) Cannot reply to client: %v", err)
+	}
+}
+
+// sendNak tells the client that its request does not match the lease state,
+// so it restarts the discovery. A nak contains no lease options.
+func (a *DHCPAllocator) sendNak(conn net.PacketConn, peer net.Addr, m *dhcpv4.DHCPv4, serverIP net.IP) {
+	reply, err := dhcpv4.NewReplyFromRequest(m, dhcpv4.WithMessageType(dhcpv4.MessageTypeNak))
+	if err != nil {
+		log.Errorf("(dhcp.dhcpHandler) building DHCPNAK failed: %v", err)
+
 		return
 	}
+
+	reply.UpdateOption(dhcpv4.OptServerIdentifier(serverIP))
 
 	if _, err := conn.WriteTo(reply.ToBytes(), peer); err != nil {
 		log.Errorf("(dhcp.dhcpHandler) Cannot reply to client: %v", err)
