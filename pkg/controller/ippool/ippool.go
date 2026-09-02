@@ -173,10 +173,11 @@ func (c *Controller) handleIPPoolObjectChange(oldPool kihv1.IPPool, newPool *kih
 		return
 	} else if updateAction == IPPOOL_RELOAD {
 		log.Infof("(ippool.handleIPPoolObjectChange) IPPool configuration changes detected, updating the dhcppool")
-
 		if err := c.createOrUpdateDHCPPool(newPool); err != nil {
-			log.Errorf("(ippool.handleIPPoolObjectChange) error while updating dhcppool [%s]: %s", newPool.Spec.NetworkName, err.Error())
-			c.metrics.UpdateLogStatus("error")
+			// a rejected reload must not enter the invalid configuration
+			// into the cache either: keep the previously cached pool
+			return fmt.Errorf("(ippool.handleIPPoolObjectChange) error while updating dhcppool [%s]: %s",
+				newPool.Spec.NetworkName, err.Error())
 		}
 	}
 
@@ -221,20 +222,22 @@ func (c *Controller) cleanupIPPoolObjects(pool *kihv1.IPPool) (err error) {
 }
 
 func (c *Controller) createOrUpdateDHCPPool(pool *kihv1.IPPool) (err error) {
+	// validate the projection first: only a subnet which parses may replace
+	// the active dhcp pool, otherwise a rejected update would destroy the
+	// working configuration
+	ipnet, err := netip.ParsePrefix(pool.Spec.IPv4Config.Subnet)
+	if err != nil {
+		return fmt.Errorf("(ippool.createOrUpdateDHCPPool) invalid subnet [%s] for network [%s]: %s",
+			pool.Spec.IPv4Config.Subnet, pool.Spec.NetworkName, err.Error())
+	}
+	subnetMask := net.CIDRMask(ipnet.Bits(), 32)
+
 	if c.dhcp.CheckPool(pool.Spec.NetworkName) {
 		if err := c.dhcp.DeletePool(pool.Spec.NetworkName); err != nil {
 			log.Errorf("(ippool.createOrUpdateDHCPPool) while deleting dhcppool [%s]: %s", pool.Spec.NetworkName, err.Error())
 			c.metrics.UpdateLogStatus("error")
 		}
 	}
-
-	// convert the subnetmask
-	ipnet, err := netip.ParsePrefix(pool.Spec.IPv4Config.Subnet)
-	if err != nil {
-		// abort update
-		return
-	}
-	subnetMask := net.CIDRMask(ipnet.Bits(), 32)
 
 	// register the new subnet in dhcp
 	c.dhcp.AddPool(
