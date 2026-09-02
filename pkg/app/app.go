@@ -6,12 +6,14 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	log "github.com/sirupsen/logrus"
 
 	v1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
+
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/cache"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/controller/ippool"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/controller/vm"
@@ -82,15 +84,14 @@ func (h *handler) Init() {
 		h.kubeConfigFile = filepath.Join(homedir, ".kube", "config")
 	}
 
-	h.kubeContext = os.Getenv("KUBECONTEXT")
-
-	ns, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
-	if err != nil {
-		log.Errorf("(app.Run) cannot determine current namespace (using the default): %s", err.Error())
+	ns, nsErr := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+	if nsErr != nil {
+		log.Errorf("(app.Run) cannot determine current namespace (using the default): %s", nsErr.Error())
 
 		h.namespace = "kubevirt-ip-helper"
+	} else {
+		h.namespace = strings.TrimSpace(string(ns))
 	}
-	h.namespace = string(ns)
 
 	// make sure the leader label is removed in case the pod crashed
 	h.RemoveLeaderPodLabel()
