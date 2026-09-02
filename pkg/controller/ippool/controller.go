@@ -99,42 +99,48 @@ func (c *Controller) sync(event Event) (err error) {
 
 	switch event.action {
 	case ADD:
-		cleanup, err := c.registerIPPool(obj.(*kihv1.IPPool))
+		var cleanup bool
+
+		cleanup, err = c.registerIPPool(obj.(*kihv1.IPPool))
 		if err != nil {
 			log.Errorf("(ippool.sync) failed to allocate new pool for %s: %s", event.poolName, err.Error())
 			c.metrics.UpdateLogStatus("error")
 
 			if cleanup {
-				if err := c.cleanupIPPoolObjects(obj.(*kihv1.IPPool)); err != nil {
-					log.Errorf("(ippool.sync) failed to cleanup pool %s: %s", event.poolName, err.Error())
+				if cleanupErr := c.cleanupIPPoolObjects(obj.(*kihv1.IPPool)); cleanupErr != nil {
+					log.Errorf("(ippool.sync) failed to cleanup pool %s: %s", event.poolName, cleanupErr.Error())
 					c.metrics.UpdateLogStatus("error")
 				}
 			}
 		}
 	case UPDATE:
-		pool, err := c.cache.Get("pool", event.poolNetworkName)
-		if err != nil {
-			log.Errorf("(ippool.sync) %s", err)
+		pool, poolErr := c.cache.Get("pool", event.poolNetworkName)
+		if poolErr != nil {
+			log.Errorf("(ippool.sync) %s", poolErr)
 			c.metrics.UpdateLogStatus("error")
-		} else {
-			oldPool := pool.(kihv1.IPPool)
-			err := c.handleIPPoolObjectChange(oldPool, obj.(*kihv1.IPPool))
-			if err != nil {
-				log.Errorf("(ippool.sync) failed to handle IPPool update for %s: %s", event.poolName, err.Error())
-				c.metrics.UpdateLogStatus("error")
-			}
+
+			return poolErr
+		}
+
+		oldPool := pool.(kihv1.IPPool)
+		err = c.handleIPPoolObjectChange(oldPool, obj.(*kihv1.IPPool))
+		if err != nil {
+			log.Errorf("(ippool.sync) failed to handle IPPool update for %s: %s", event.poolName, err.Error())
+			c.metrics.UpdateLogStatus("error")
 		}
 	case DELETE:
-		pool, err := c.cache.Get("pool", event.poolNetworkName)
-		if err != nil {
-			log.Errorf("(ippool.sync) %s", err)
+		pool, poolErr := c.cache.Get("pool", event.poolNetworkName)
+		if poolErr != nil {
+			log.Errorf("(ippool.sync) %s", poolErr)
 			c.metrics.UpdateLogStatus("error")
-		} else {
-			p := pool.(kihv1.IPPool)
-			if err := c.cleanupIPPoolObjects(&p); err != nil {
-				log.Errorf("(ippool.sync) failed to cleanup pool %s: %s", event.poolName, err.Error())
-				c.metrics.UpdateLogStatus("error")
-			}
+
+			return
+		}
+
+		p := pool.(kihv1.IPPool)
+		if err = c.cleanupIPPoolObjects(&p); err != nil {
+			log.Errorf("(ippool.sync) failed to cleanup pool %s: %s", event.poolName, err.Error())
+			c.metrics.UpdateLogStatus("error")
 		}
 
 		// decreasing the ippoolCountCurrent is not necessary during application initialization, because:
