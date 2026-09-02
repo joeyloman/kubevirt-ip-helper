@@ -115,13 +115,18 @@ func (c *Controller) sync(event Event) (err error) {
 		}
 	case UPDATE:
 		pool, poolErr := c.cache.Get("pool", event.poolNetworkName)
+		if poolErr != nil && event.oldPoolNetworkName != "" && event.oldPoolNetworkName != event.poolNetworkName {
+			// the networkname changed: the cache still holds the pool under
+			// the old key, so the restart handling sees the old configuration
+			pool, poolErr = c.cache.Get("pool", event.oldPoolNetworkName)
+		}
+
 		if poolErr != nil {
 			log.Errorf("(ippool.sync) %s", poolErr)
 			c.metrics.UpdateLogStatus("error")
 
 			return poolErr
 		}
-
 		oldPool := pool.(kihv1.IPPool)
 		err = c.handleIPPoolObjectChange(oldPool, obj.(*kihv1.IPPool))
 		if err != nil {

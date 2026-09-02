@@ -44,10 +44,11 @@ type EventHandler struct {
 }
 
 type Event struct {
-	key             string
-	action          string
-	poolName        string
-	poolNetworkName string
+	key                string
+	action             string
+	poolName           string
+	poolNetworkName    string
+	oldPoolNetworkName string
 }
 
 func NewEventHandler(
@@ -126,10 +127,11 @@ func (e *EventHandler) EventListener() (err error) {
 			key, err := cache.MetaNamespaceKeyFunc(new)
 			if err == nil {
 				queue.Add(Event{
-					key:             key,
-					action:          UPDATE,
-					poolName:        new.(*kihv1.IPPool).ObjectMeta.Name,
-					poolNetworkName: new.(*kihv1.IPPool).Spec.NetworkName,
+					key:                key,
+					action:             UPDATE,
+					poolName:           new.(*kihv1.IPPool).ObjectMeta.Name,
+					poolNetworkName:    new.(*kihv1.IPPool).Spec.NetworkName,
+					oldPoolNetworkName: old.(*kihv1.IPPool).Spec.NetworkName,
 				})
 			}
 		},
