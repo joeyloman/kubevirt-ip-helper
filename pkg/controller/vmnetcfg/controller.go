@@ -94,25 +94,23 @@ func (c *Controller) sync(event Event) (err error) {
 	}
 
 	switch event.action {
-	case ADD:
-		err := c.updateVirtualMachineNetworkConfig(event.action, obj.(*kihv1.VirtualMachineNetworkConfig))
+	case ADD, UPDATE:
+		err = c.updateVirtualMachineNetworkConfig(event.action, obj.(*kihv1.VirtualMachineNetworkConfig))
 		if err != nil {
-			log.Errorf("(vmnetcfg.sync) failed to update vmnetcfg for %s: %s", obj.(*kihv1.VirtualMachineNetworkConfig).GetName(), err.Error())
+			log.Errorf("(vmnetcfg.sync) failed to update vmnetcfg for %s: %s", event.key, err.Error())
 			c.metrics.UpdateLogStatus("error")
+
+			return
 		}
 
 		// increase the vmnetcfgCountCurrent if the application is still initializing
-		// it's important that all processed vmnetcfgs are count, even if they are in error state
+		// vmnetcfgs with nics in the ERROR status are counted as well because they
+		// were processed successfully, only real update failures are retried instead
 		// otherwise the application will not become operational
-		if *c.appStatus == APP_INIT {
+		if event.action == ADD && *c.appStatus == APP_INIT {
 			*c.vmnetcfgCountCurrent++
 		}
-	case UPDATE:
-		err := c.updateVirtualMachineNetworkConfig(event.action, obj.(*kihv1.VirtualMachineNetworkConfig))
-		if err != nil {
-			log.Errorf("(vmnetcfg.sync) failed to update vmnetcfg for %s: %s", obj.(*kihv1.VirtualMachineNetworkConfig).GetName(), err.Error())
-			c.metrics.UpdateLogStatus("error")
-		}
+
 		// case DELETE:
 		// 	log.Infof("(vmnetcfg.sync) delete action found!")
 	}
