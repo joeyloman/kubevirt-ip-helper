@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"reflect"
 	"strings"
 	"time"
@@ -277,6 +278,11 @@ func (c *Controller) updateIPPoolStatus(event string, vmnetcfgNamespace string, 
 
 		updatedPool := currentPool.DeepCopy()
 		updatedAllocated := make(map[string]string)
+
+		// allocation references carry the canonical mac address spelling so
+		// add and delete computations agree on the owner identity
+		ownerRef := fmt.Sprintf("%s/%s [%s]", vmnetcfgNamespace, vmnetcfgVMName, canonicalHWAddr(hwAddr))
+
 		switch event {
 		case ADD:
 			for k, v := range currentPool.Status.IPv4.Allocated {
@@ -285,12 +291,16 @@ func (c *Controller) updateIPPoolStatus(event string, vmnetcfgNamespace string, 
 				}
 				updatedAllocated[k] = v
 			}
-			updatedAllocated[ip] = fmt.Sprintf("%s/%s [%s]", vmnetcfgNamespace, vmnetcfgVMName, hwAddr)
+			updatedAllocated[ip] = ownerRef
 		case DELETE:
 			for k, v := range currentPool.Status.IPv4.Allocated {
 				if k != ip {
 					updatedAllocated[k] = v
 				}
+			}
+
+			if existing, exists := currentPool.Status.IPv4.Allocated[ip]; exists && existing != ownerRef {
+				return fmt.Errorf("allocation for ip %s belongs to %s, not removing it from the %s status", ip, existing, poolName)
 			}
 		}
 		updatedPool.Status.IPv4.Allocated = updatedAllocated
@@ -320,4 +330,14 @@ func (c *Controller) updateIPPoolStatus(event string, vmnetcfgNamespace string, 
 	}
 
 	return fmt.Errorf("cannot update status of IPPool %s after max retries: %s", poolName, err.Error())
+}
+
+// canonicalHWAddr normalizes mac address spellings to the canonical colon
+// form so lease and allocation identities do not depend on the formatting.
+func canonicalHWAddr(hwAddr string) string {
+	if hw, parseErr := net.ParseMAC(hwAddr); parseErr == nil {
+		return hw.String()
+	}
+
+	return hwAddr
 }
