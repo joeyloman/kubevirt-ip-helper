@@ -31,6 +31,15 @@ func NewIPAllocator() *IPAllocator {
 }
 
 func (a *IPAllocator) NewSubnet(name string, subnet string, start string, end string) (err error) {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	if _, exists := a.ipam[name]; exists {
+		// replacing an existing subnet would drop its allocation bitmap,
+		// so live addresses would be reissued to other clients
+		return fmt.Errorf("network %s already exists", name)
+	}
+
 	s := IPSubnet{}
 	s.start = net.ParseIP(start)
 	s.end = net.ParseIP(end)
