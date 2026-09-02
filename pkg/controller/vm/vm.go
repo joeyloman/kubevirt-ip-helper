@@ -10,6 +10,7 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	kubevirtV1 "kubevirt.io/api/core/v1"
@@ -121,7 +122,17 @@ func (c *Controller) deleteVirtualMachineNetworkConfigObject(vmNamespace string,
 		return
 	}
 
-	if err := c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs(vmNamespace).Delete(context.TODO(), vmName, metav1.DeleteOptions{}); err != nil {
+	if err = c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs(vmNamespace).Delete(context.TODO(), vmName, metav1.DeleteOptions{}); err != nil {
+		if apierrors.IsNotFound(err) {
+			// another worker or a concurrent cleanup already removed the object
+			log.Debugf("(vm.deleteVirtualMachineNetworkConfigObject) [%s/%s] vmnetcfg object already deleted",
+				vmNamespace, vmName)
+
+			err = nil
+
+			return
+		}
+
 		return fmt.Errorf("(vm.deleteVirtualMachineNetworkConfigObject) [%s/%s] cannot delete VirtualMachineNetworkConfig object for vm: %s",
 			vmNamespace, vmName, err.Error())
 	}

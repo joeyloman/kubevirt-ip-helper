@@ -83,24 +83,15 @@ func (c *Controller) sync(event Event) (err error) {
 	}
 
 	switch event.action {
-	case ADD:
-		err := c.handleVirtualMachineObjectChange(obj.(*kubevirtv1.VirtualMachine))
-		if err != nil {
-			log.Errorf("(vm.sync) %s", err)
-			c.metrics.UpdateLogStatus("error")
-		}
-	case UPDATE:
-		err := c.handleVirtualMachineObjectChange(obj.(*kubevirtv1.VirtualMachine))
-		if err != nil {
-			log.Errorf("(vm.sync) %s", err)
-			c.metrics.UpdateLogStatus("error")
-		}
+	case ADD, UPDATE:
+		err = c.handleVirtualMachineObjectChange(obj.(*kubevirtv1.VirtualMachine))
 	case DELETE:
-		err := c.deleteVirtualMachineNetworkConfigObject(event.vmNamespace, event.vmName)
-		if err != nil {
-			log.Errorf("(vm.sync) %s", err)
-			c.metrics.UpdateLogStatus("error")
-		}
+		err = c.deleteVirtualMachineNetworkConfigObject(event.vmNamespace, event.vmName)
+	}
+
+	if err != nil {
+		log.Errorf("(vm.sync) %s", err)
+		c.metrics.UpdateLogStatus("error")
 	}
 
 	return
