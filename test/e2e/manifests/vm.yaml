@@ -1,0 +1,100 @@
+# Halted on creation: the helper reserves the address for the explicit MAC
+# before run.sh starts this VM. The pod network remains the guest default; the
+# helper-served Multus NIC is found by its explicit MAC.
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: e2e-vm
+  namespace: e2e
+  labels:
+    app: kubevirt-ip-helper-e2e
+spec:
+  runStrategy: Halted
+  template:
+    metadata:
+      labels:
+        app: kubevirt-ip-helper-e2e
+    spec:
+      domain:
+        cpu:
+          cores: 1
+        memory:
+          guest: 256Mi
+        devices:
+          disks:
+            - name: containerdisk
+              disk:
+                bus: virtio
+            - name: cloudinitdisk
+              disk:
+                bus: virtio
+          interfaces:
+            - name: default
+              masquerade: {}
+            - name: kihnet0
+              bridge: {}
+              macAddress: 02:00:00:00:00:11
+      networks:
+        - name: default
+          pod: {}
+        - name: kihnet0
+          multus:
+            networkName: kubevirt-ip-helper/kubevirt-ip-helper-e2e
+      volumes:
+        - name: containerdisk
+          containerDisk:
+            image: quay.io/kubevirt/cirros-container-disk-demo:v1.9.0@sha256:ebdb8d8b9b480f6ee7664ed3fdde8428767664f507d98f94090edeff04d7ebf2
+        - name: cloudinitdisk
+          cloudInitNoCloud:
+            userData: |
+              #!/bin/sh
+              i=0
+              IP=""
+              IFACE=""
+              cat > /tmp/e2e-udhcpc.sh <<'EOF'
+              #!/bin/sh
+              echo "E2E_UDHCPC event=$1 interface=${interface:-unset} ip=${ip:-unset}" > /dev/ttyS0
+              echo "E2E_DHCP_EVENT=${1:-unset}:${ip:-unset}" > /dev/ttyS0
+              case "$1" in
+                bound|renew)
+                  ip -4 addr flush dev "$interface"
+                  ip -4 addr add "$ip/24" dev "$interface"
+                  ;;
+              esac
+              EOF
+              chmod 755 /tmp/e2e-udhcpc.sh
+              while [ "$i" -lt 30 ]; do
+                for path in /sys/class/net/*; do
+                  if [ "$(cat "${path}/address" 2>/dev/null)" = "02:00:00:00:00:11" ]; then
+                    IFACE="${path##*/}"
+                    break
+                  fi
+                done
+                if [ -n "$IFACE" ]; then
+                  ip link set "$IFACE" up 2>/dev/null
+                  udhcpc -i "$IFACE" -n -q -t 5 -T 2 -s /tmp/e2e-udhcpc.sh > /dev/ttyS0 2>&1
+                  IP=$(ip -4 addr show dev "$IFACE" 2>/dev/null | sed -n 's/^[[:space:]]*inet \([0-9.]*\)\/.*/\1/p' | grep '^10\.77\.0\.' | head -n1)
+                fi
+                [ -n "$IP" ] && break
+                i=$((i + 1))
+                sleep 2
+              done
+              if [ -z "$IP" ]; then
+                echo "E2E_DHCP_FAILED interface=${IFACE:-missing}" > /dev/ttyS0
+                exit 1
+              fi
+              n=0
+              while [ "$n" -lt 6 ]; do
+                echo "E2E_DHCP_OK=$IP" > /dev/ttyS0
+                echo "E2E_DHCP_OK=$IP"
+                n=$((n + 1))
+                sleep 1
+              done
+              # Keep exercising the live DHCP client path until the VM is
+              # stopped. BusyBox may renew, rebind, or perform a fresh DORA;
+              # the suite observes the event rather than assuming its timer
+              # semantics, and always requires the same reserved address.
+              while :; do
+                sleep 20
+                udhcpc -i "$IFACE" -n -q -t 5 -T 2 -s /tmp/e2e-udhcpc.sh > /dev/ttyS0 2>&1
+              done

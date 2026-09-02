@@ -1,0 +1,28 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Disposable e2e overlay for kubevirt-ip-helper. Layered on top of the
+# production manifests so the run exercises the same CRD/RBAC shape operators
+# get, with e2e specific overrides below.
+# Render with:
+#   kubectl kustomize --load-restrictor=LoadRestrictionsNone test/e2e/manifests
+# The production resources live above this kustomization root.
+resources:
+  - ../../../deployments/crds.yaml
+  - ../../../deployments/deployment.yaml
+  - namespaces.yaml
+  - nad.yaml
+
+patches:
+  # Helper deployment: pinned local image, IfNotPresent, two replicas, and the
+  # contracted Multus attachment (interface kihnet0) on the helper pod.
+  - path: helper-overlay.yaml
+  # kind clusters have no monitoring.coreos.com CRD, so the ServiceMonitor from
+  # the production manifest must not reach the API server.
+  - patch: |-
+      apiVersion: monitoring.coreos.com/v1
+      kind: ServiceMonitor
+      metadata:
+        name: kubevirt-ip-helper
+        namespace: kubevirt-ip-helper
+      $patch: delete

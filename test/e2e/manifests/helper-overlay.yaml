@@ -1,0 +1,23 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kubevirt-ip-helper
+  namespace: kubevirt-ip-helper
+spec:
+  replicas: 2
+  template:
+    metadata:
+      annotations:
+        k8s.v1.cni.cncf.io/networks: '[{"name":"kubevirt-ip-helper-e2e","namespace":"kubevirt-ip-helper","interface":"kihnet0"}]'
+      labels:
+        app: kubevirt-ip-helper
+    spec:
+      containers:
+        - name: kubevirt-ip-helper
+          image: kubevirt-ip-helper:e2e
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: LOGLEVEL
+              value: INFO
+            - name: METRICS_PORT
+              value: "8080"

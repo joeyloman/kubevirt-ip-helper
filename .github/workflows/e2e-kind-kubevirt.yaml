@@ -1,0 +1,73 @@
+name: E2E kind + Multus + KubeVirt
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    name: kind / Multus / bridge / KubeVirt (${{ matrix.E2E_STACK }} / ${{ matrix.E2E_GROUP }})
+    runs-on: ubuntu-latest
+    # `current` is split into bounded core, pool, lease, HA/recovery, and
+    # multi-pool groups. Every group first proves the unchanged core lifecycle.
+    # `dependency-era` runs only the compact core compatibility contract.
+    # Stack and group are part of cluster, cache, and artifact names so jobs
+    # cannot collide.
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - E2E_STACK: dependency-era
+            E2E_GROUP: core
+          - E2E_STACK: current
+            E2E_GROUP: core
+          - E2E_STACK: current
+            E2E_GROUP: pool
+          - E2E_STACK: current
+            E2E_GROUP: lease
+          - E2E_STACK: current
+            E2E_GROUP: ha
+          - E2E_STACK: current
+            E2E_GROUP: multipool
+    env:
+      E2E_STACK: ${{ matrix.E2E_STACK }}
+      E2E_GROUP: ${{ matrix.E2E_GROUP }}
+
+    steps:
+      - name: Checkout repository
+        # actions/checkout v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+
+      - name: Verify Docker and kubectl prerequisites
+        run: |
+          for attempt in $(seq 1 30); do
+            if docker info > /dev/null 2>&1; then
+              break
+            fi
+            sleep 2
+          done
+          docker info
+          docker --version
+          kubectl version --client
+
+      - name: Run the kind, Multus and KubeVirt end-to-end suite
+        timeout-minutes: 40
+        run: |
+          short_sha="${GITHUB_SHA}"
+          short_sha="${short_sha%${short_sha#????????}}"
+          E2E_IMAGE="ghcr.io/${GITHUB_REPOSITORY}:${short_sha}" \
+            ./test/e2e/run.sh
+
+      - name: Upload diagnostics
+        if: always()
+        # actions/upload-artifact v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: e2e-${{ matrix.E2E_STACK }}-${{ matrix.E2E_GROUP }}-artifacts
+          path: _artifacts/e2e/${{ matrix.E2E_STACK }}-${{ matrix.E2E_GROUP }}
+          if-no-files-found: warn
+          retention-days: 14

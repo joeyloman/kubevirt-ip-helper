@@ -1,0 +1,19 @@
+# Applied after the helper pods have kihnet0, so the DHCP service can bind an
+# interface that already exists.
+apiVersion: kubevirtiphelper.k8s.binbash.org/v1
+kind: IPPool
+metadata:
+  name: e2e-pool
+  labels:
+    app: kubevirt-ip-helper-e2e
+spec:
+  ipv4config:
+    serverip: 10.77.0.2
+    subnet: 10.77.0.0/24
+    pool:
+      start: 10.77.0.100
+      end: 10.77.0.110
+    router: 10.77.0.1
+    leasetime: 300
+  networkname: kubevirt-ip-helper/kubevirt-ip-helper-e2e
+  bindinterface: kihnet0

@@ -1,0 +1,21 @@
+# Disposable kind cluster for the kubevirt-ip-helper E2E suite: one
+# control-plane plus one worker.
+#
+# The node image is intentionally not set here: bootstrap.sh passes the
+# digest-pinned ${KINDEST_NODE_IMAGE} from versions.env with
+# `kind create --image`, so the pin lives in exactly one place.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  # The worker hosts helper and guest data-plane workloads. The separate
+  # control-plane proves bootstrap and every CNI layer across both node roles;
+  # the secondary bridge itself remains node-local.
+  - role: control-plane
+  - role: worker
+networking:
+  # kindnet stays the delegate CNI. Multus is installed as the master plugin on
+  # top of its config in /etc/cni/net.d, which is what the CNI preflight checks.
+  disableDefaultCNI: false
+  # Deliberately clear of the 10.77.0.0/24 IPPool used on the bridge network.
+  podSubnet: 10.244.0.0/16
+  serviceSubnet: 10.96.0.0/16
