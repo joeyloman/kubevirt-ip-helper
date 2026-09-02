@@ -14,6 +14,45 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+// allocatedNetworkConfig tracks one fully applied interface allocation of a
+// vmnetcfg object so it can be reverted if the durable object update fails.
+type allocatedNetworkConfig struct {
+	macAddress  string
+	networkName string
+	ipAddress   string
+	poolName    string
+}
+
+// rollbackNetworkAllocation reverts the allocation side effects of a single
+// network interface of a vmnetcfg object.
+func (c *Controller) rollbackNetworkAllocation(vmnetcfg *kihv1.VirtualMachineNetworkConfig, allocated allocatedNetworkConfig) {
+	if err := c.updateIPPoolStatus(
+		DELETE,
+		vmnetcfg.Namespace,
+		vmnetcfg.Spec.VMName,
+		allocated.ipAddress,
+		allocated.networkName,
+		allocated.macAddress,
+		allocated.poolName,
+	); err != nil {
+		log.Errorf("(vmnetcfg.rollbackNetworkAllocation) [%s/%s] failed to revert the ippool status for ip %s: %s",
+			vmnetcfg.Namespace, vmnetcfg.Name, allocated.ipAddress, err)
+		c.metrics.UpdateLogStatus("error")
+	}
+
+	if err := c.dhcp.DeleteLease(allocated.macAddress); err != nil && !strings.Contains(err.Error(), "does not exists") {
+		log.Errorf("(vmnetcfg.rollbackNetworkAllocation) [%s/%s] failed to revert the dhcp lease for hwaddr %s: %s",
+			vmnetcfg.Namespace, vmnetcfg.Name, allocated.macAddress, err)
+		c.metrics.UpdateLogStatus("error")
+	}
+
+	if err := c.ipam.ReleaseIP(allocated.networkName, allocated.ipAddress); err != nil && !isAlreadyReleased(err) {
+		log.Errorf("(vmnetcfg.rollbackNetworkAllocation) [%s/%s] failed to revert the ipam allocation for ip %s: %s",
+			vmnetcfg.Namespace, vmnetcfg.Name, allocated.ipAddress, err)
+		c.metrics.UpdateLogStatus("error")
+	}
+}
+
 func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnetcfg *kihv1.VirtualMachineNetworkConfig) (err error) {
 	var networkChange bool = false
 	var skipNic bool = false
@@ -34,6 +73,11 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 	newVmNetCfg := vmnetcfg.DeepCopy()
 	newVmNetCfgs := []kihv1.NetworkConfig{}
 	newNetCfgStatusList := []kihv1.NetworkConfigStatus{}
+
+	// allocations which are applied to dhcp/ipam/ippool status while
+	// processing this object; reverted when the object update fails
+	appliedAllocations := []allocatedNetworkConfig{}
+
 	for _, v := range vmnetcfg.Spec.NetworkConfig {
 		pool, err := c.cache.Get("pool", v.NetworkName)
 		if err != nil {
@@ -122,7 +166,10 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 				oldNetcfg.NetworkName = v.NetworkName
 				oldNetcfg.MACAddress = v.MACAddress
 				oldNetcfg.IPAddress = lease.ClientIP.String()
-				c.cleanupNetworkInterface(vmnetcfg, &oldNetcfg)
+
+				if err := c.cleanupNetworkInterface(vmnetcfg, &oldNetcfg); err != nil {
+					return err
+				}
 			} else {
 				log.Debugf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] hwaddr %s already exists in the leases, skipping interface",
 					vmnetcfg.Namespace, vmnetcfg.Name, v.MACAddress)
@@ -159,15 +206,30 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 
 			continue
 		}
-		log.Tracef("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] got IP %s from ipam", vmnetcfg.Namespace, vmnetcfg.Name, ip)
 
 		ref := fmt.Sprintf("%s/%s", vmnetcfg.Namespace, vmnetcfg.Spec.VMName)
-		c.dhcp.AddLease(
+		if err := c.dhcp.AddLease(
 			v.MACAddress,
 			pool.(kihv1.IPPool).Spec.NetworkName,
 			ip,
 			ref,
-		)
+		); err != nil {
+			// dhcp must not serve the address when its owner reference
+			// cannot be registered, drop the ipam claim again
+			log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] error registering the dhcp lease: %s",
+				vmnetcfg.Namespace, vmnetcfg.Name, err)
+			c.metrics.UpdateLogStatus("error")
+
+			c.rollbackNetworkAllocation(vmnetcfg, allocatedNetworkConfig{
+				macAddress:  v.MACAddress,
+				networkName: v.NetworkName,
+				ipAddress:   ip,
+				poolName:    pool.(kihv1.IPPool).Name,
+			})
+
+			return fmt.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] cannot register the dhcp lease for hwaddr %s: %s",
+				vmnetcfg.Namespace, vmnetcfg.Name, v.MACAddress, err.Error())
+		}
 
 		n := kihv1.NetworkConfig{}
 		n.IPAddress = ip
@@ -188,9 +250,20 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 			v.MACAddress,
 			pool.(kihv1.IPPool).Name,
 		); err != nil {
+			// the lease would be served while the durable allocation state
+			// is missing, revert the whole allocation of this interface
 			log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] %s",
 				vmnetcfg.Namespace, vmnetcfg.Name, err)
 			c.metrics.UpdateLogStatus("error")
+
+			c.rollbackNetworkAllocation(vmnetcfg, allocatedNetworkConfig{
+				macAddress:  v.MACAddress,
+				networkName: v.NetworkName,
+				ipAddress:   ip,
+				poolName:    pool.(kihv1.IPPool).Name,
+			})
+			return fmt.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] cannot update the IPPool %s status for ip %s: %s",
+				vmnetcfg.Namespace, vmnetcfg.Name, pool.(kihv1.IPPool).Name, ip, err.Error())
 		}
 
 		if err := c.updateIPPoolMetrics(pool.(kihv1.IPPool).Name); err != nil {
@@ -198,6 +271,13 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 				vmnetcfg.Namespace, vmnetcfg.Name, err)
 			c.metrics.UpdateLogStatus("error")
 		}
+
+		appliedAllocations = append(appliedAllocations, allocatedNetworkConfig{
+			macAddress:  v.MACAddress,
+			networkName: v.NetworkName,
+			ipAddress:   ip,
+			poolName:    pool.(kihv1.IPPool).Name,
+		})
 
 		networkChange = true
 	}
@@ -234,8 +314,14 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 
 	vmNetCfgObj, err := c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs(newVmNetCfg.Namespace).Update(context.TODO(), newVmNetCfg, metav1.UpdateOptions{})
 	if err != nil {
+		// the durable object still holds the previous configuration; revert
+		// dhcp/ipam/ippool status so they cannot serve unrecorded addresses
+		for i := len(appliedAllocations) - 1; i >= 0; i-- {
+			c.rollbackNetworkAllocation(vmnetcfg, appliedAllocations[i])
+		}
+
 		return fmt.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] cannot update VirtualMachineNetworkConfig object: %s",
-			vmNetCfgObj.ObjectMeta.Namespace, vmNetCfgObj.ObjectMeta.Name, err.Error())
+			newVmNetCfg.Namespace, newVmNetCfg.Name, err.Error())
 	}
 
 	log.Debugf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] successfully processed the network configuration",
@@ -319,12 +405,6 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 	); err != nil {
 		return fmt.Errorf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] %s",
 			vmnetcfg.Namespace, vmnetcfg.Name, err.Error())
-	}
-
-	if err := c.updateIPPoolMetrics(pool.(kihv1.IPPool).Name); err != nil {
-		log.Errorf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] %s",
-			vmnetcfg.Namespace, vmnetcfg.Name, err)
-		c.metrics.UpdateLogStatus("error")
 	}
 
 	return
@@ -412,6 +492,13 @@ func (c *Controller) updateIPPoolStatus(event string, vmnetcfgNamespace string, 
 		case ADD:
 			for k, v := range currentPool.Status.IPv4.Allocated {
 				if k == ip {
+					if v == ownerRef {
+						// the allocation reference is already recorded, so a
+						// retry after a partially applied update treats it as
+						// done
+						return nil
+					}
+
 					return fmt.Errorf("ip %s already found in IPPool status", ip)
 				}
 				updatedAllocated[k] = v
