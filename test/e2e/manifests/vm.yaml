@@ -55,6 +55,7 @@ spec:
               #!/bin/sh
               echo "E2E_UDHCPC event=$1 interface=${interface:-unset} ip=${ip:-unset}" > /dev/ttyS0
               echo "E2E_DHCP_EVENT=${1:-unset}:${ip:-unset}" > /dev/ttyS0
+              echo "E2E_DHCP_ROUTER=${router:-unset}" > /dev/ttyS0
               case "$1" in
                 bound|renew)
                   ip -4 addr flush dev "$interface"
@@ -73,7 +74,10 @@ spec:
                 if [ -n "$IFACE" ]; then
                   ip link set "$IFACE" up 2>/dev/null
                   udhcpc -i "$IFACE" -n -q -t 5 -T 2 -s /tmp/e2e-udhcpc.sh > /dev/ttyS0 2>&1
-                  IP=$(ip -4 addr show dev "$IFACE" 2>/dev/null | sed -n 's/^[[:space:]]*inet \([0-9.]*\)\/.*/\1/p' | grep '^10\.77\.0\.' | head -n1)
+                  # Both helper-served ranges are accepted: the primary pool answers
+                  # 10.77.0.x and the second bridge answers 10.78.0.x. The pod network
+                  # is not matched here, so only a helper lease counts as success.
+                  IP=$(ip -4 addr show dev "$IFACE" 2>/dev/null | sed -n 's/^[[:space:]]*inet \([0-9.]*\)\/.*/\1/p' | grep -E '^10\.7[78]\.0\.' | head -n1)
                 fi
                 [ -n "$IP" ] && break
                 i=$((i + 1))

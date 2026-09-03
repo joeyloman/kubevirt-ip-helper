@@ -34,6 +34,68 @@ export E2E_CLUSTER_NAME E2E_IMAGE E2E_KEEP_CLUSTER E2E_CACHE_DIR E2E_BIN_DIR
 export E2E_ARTIFACTS_DIR E2E_CLUSTER_STATE_FILE VIRTCTL
 
 EVIDENCE_FILE="${E2E_ARTIFACTS_DIR}/bootstrap-evidence.txt"
+BOOTSTRAP_CASES_FILE="${E2E_ARTIFACTS_DIR}/bootstrap-cases.jsonl"
+BOOTSTRAP_JOURNAL_ERRORS_FILE="${E2E_ARTIFACTS_DIR}/bootstrap-journal-errors.txt"
+BOOTSTRAP_CASE_ID=""
+BOOTSTRAP_CASE_NAME=""
+BOOTSTRAP_CASE_T0=""
+: > "${BOOTSTRAP_CASES_FILE}"
+: > "${BOOTSTRAP_JOURNAL_ERRORS_FILE}"
+
+bootstrap_now_ms() {
+  local stamp
+  stamp="$(date +%s%3N 2> /dev/null)" || stamp=""
+  case "${stamp}" in
+    '' | *[!0-9]*) printf '%s' "$((SECONDS * 1000))" ;;
+    *) printf '%s' "${stamp}" ;;
+  esac
+}
+
+bootstrap_escape() {
+  local text="$1"
+  text="${text//\\/\\\\}"
+  text="${text//\"/\\\"}"
+  text="${text//$'\t'/ }"
+  text="${text//$'\r'/}"
+  text="${text//$'\n'/ }"
+  printf '%s' "${text}"
+}
+
+bootstrap_case_start() {
+  BOOTSTRAP_CASE_ID="$1"
+  BOOTSTRAP_CASE_NAME="$2"
+  BOOTSTRAP_CASE_T0="$(bootstrap_now_ms)"
+}
+
+bootstrap_case_close() {
+  local status="$1" detail="$2" now elapsed rc=0
+  [ -n "${BOOTSTRAP_CASE_ID}" ] || return 0
+  now="$(bootstrap_now_ms)"
+  elapsed=$((now - BOOTSTRAP_CASE_T0))
+  [ "${elapsed}" -ge 0 ] || elapsed=0
+  printf '{"kind":"bootstrap-case","id":"%s","name":"%s","group":"bootstrap","status":"%s","durationMs":%s,"detail":"%s"}\n' \
+    "$(bootstrap_escape "${BOOTSTRAP_CASE_ID}")" \
+    "$(bootstrap_escape "${BOOTSTRAP_CASE_NAME}")" \
+    "${status}" "${elapsed}" "$(bootstrap_escape "${detail}")" \
+    >> "${BOOTSTRAP_CASES_FILE}" || rc=1
+  if [ "${rc}" -ne 0 ]; then
+    printf '%s\t%s\t%s\t%s\n' \
+      "$(bootstrap_now_ms)" "${BOOTSTRAP_CASE_ID}" "${status}" "${detail}" \
+      >> "${BOOTSTRAP_JOURNAL_ERRORS_FILE}" || true
+  fi
+  BOOTSTRAP_CASE_ID=""
+  BOOTSTRAP_CASE_NAME=""
+  BOOTSTRAP_CASE_T0=""
+  return "${rc}"
+}
+
+bootstrap_gate() { # <case-id> <description> <command...>
+  local id="$1" description="$2"
+  shift 2
+  bootstrap_case_start "${id}" "${description}"
+  "$@"
+  bootstrap_case_close passed "${description} completed"
+}
 
 log() { printf '[bootstrap] %s\n' "$*"; }
 
@@ -60,9 +122,18 @@ capture_evidence() {
   } >> "${EVIDENCE_FILE}" 2>&1 || true
 }
 trap capture_evidence ERR
+bootstrap_exit() {
+  local rc=$?
+  if [ -n "${BOOTSTRAP_CASE_ID}" ]; then
+    bootstrap_case_close failed "bootstrap exited with status ${rc}" || true
+  fi
+  exit "${rc}"
+}
+trap bootstrap_exit EXIT
 
 die() {
   printf '[bootstrap] ERROR: %s\n' "$*" >&2
+  bootstrap_case_close failed "$*" || true
   capture_evidence
   exit 1
 }
@@ -158,9 +229,13 @@ ensure_kind() {
 }
 
 verify_cluster_pin() {
-  local node image kubelet_version control_planes
-  local -a nodes
-  mapfile -t nodes < <("${KIND}" get nodes --name "${E2E_CLUSTER_NAME}")
+  local node image kubelet_version control_planes nodes_output
+  local -a nodes=()
+  nodes_output="$("${KIND}" get nodes --name "${E2E_CLUSTER_NAME}")" ||
+    die "cannot enumerate kind nodes for ${E2E_CLUSTER_NAME}"
+  while IFS= read -r node; do
+    [ -n "${node}" ] && nodes+=("${node}")
+  done <<< "${nodes_output}"
   # Topology contract: exactly one control-plane and one worker. Every
   # per-node layer iterates over both nodes via cluster_nodes.
   control_planes="$(kubectl get nodes \
@@ -216,13 +291,21 @@ ensure_helper_image() {
   fi
 }
 
-cluster_nodes() { "${KIND}" get nodes --name "${E2E_CLUSTER_NAME}"; }
+cluster_nodes() {
+  local nodes count
+  nodes="$("${KIND}" get nodes --name "${E2E_CLUSTER_NAME}")" || return 1
+  count="$(printf '%s\n' "${nodes}" | sed '/^$/d' | wc -l)"
+  [ "${count}" -eq 2 ] || return 1
+  printf '%s\n' "${nodes}"
+}
 
 # inspect_kindnet checks the delegate CNI each node starts with, before Multus
 # takes over as master plugin. Without it Multus has nothing to chain to.
 inspect_kindnet() {
-  local node listing delegate content
-  for node in $(cluster_nodes); do
+  local node listing delegate content nodes
+  nodes="$(cluster_nodes)" ||
+    die "kind cannot enumerate exactly two nodes for ${E2E_CLUSTER_NAME}"
+  while IFS= read -r node; do
     listing="$("${RUNTIME}" exec "${node}" ls -1 /etc/cni/net.d)"
     delegate="$(printf '%s\n' "${listing}" | awk '!/multus/ && !seen++')"
     [ -n "${delegate}" ] || die "node ${node}: no CNI config in /etc/cni/net.d"
@@ -231,13 +314,13 @@ inspect_kindnet() {
       *kindnet*) log "node ${node}: delegate ${delegate} uses kindnet" ;;
       *) die "node ${node}: ${delegate} does not configure the kindnet CNI" ;;
     esac
-  done
+  done <<< "${nodes}"
 }
 
 # ensure_bridge_plugin installs the pinned CNI plugin bundle into every node and
 # checks the bridge binary actually reports the pinned version.
 ensure_bridge_plugin() {
-  local sha_var tgz stage node out
+  local sha_var tgz stage node out nodes
   sha_var="CNI_PLUGINS_SHA256_$(upper_arch "${KIND_ARCH}")"
   tgz="${E2E_CACHE_DIR}/cni-plugins-${KIND_ARCH}-${CNI_PLUGINS_VERSION}.tgz"
   stage="${E2E_CACHE_DIR}/cni-plugins-${KIND_ARCH}-${CNI_PLUGINS_VERSION}"
@@ -249,7 +332,9 @@ ensure_bridge_plugin() {
     mkdir -p "${stage}"
     tar -xzf "${tgz}" -C "${stage}"
   fi
-  for node in $(cluster_nodes); do
+  nodes="$(cluster_nodes)" ||
+    die "kind cannot enumerate exactly two nodes for ${E2E_CLUSTER_NAME}"
+  while IFS= read -r node; do
     "${RUNTIME}" exec "${node}" mkdir -p /opt/cni/bin
     tar -C "${stage}" -cf - . |
       "${RUNTIME}" exec -i "${node}" tar -xf - -C /opt/cni/bin
@@ -260,7 +345,7 @@ ensure_bridge_plugin() {
         ;;
       *) die "node ${node}: /opt/cni/bin/bridge reports '${out}', expected '${CNI_PLUGINS_VERSION}'" ;;
     esac
-  done
+  done <<< "${nodes}"
 }
 
 # ensure_multus applies the upstream thick manifest with the moving snapshot tag
@@ -285,8 +370,10 @@ ensure_multus() {
 # assert_multus_chain checks that Multus took over as master config while the
 # kindnet delegate config stayed in place, and that both CNI binaries exist.
 assert_multus_chain() {
-  local node listing master delegate content
-  for node in $(cluster_nodes); do
+  local node listing master delegate content nodes
+  nodes="$(cluster_nodes)" ||
+    die "kind cannot enumerate exactly two nodes for ${E2E_CLUSTER_NAME}"
+  while IFS= read -r node; do
     master=""
     for _ in $(seq 1 30); do
       listing="$("${RUNTIME}" exec "${node}" ls -1 /etc/cni/net.d)"
@@ -313,7 +400,7 @@ assert_multus_chain() {
     "${RUNTIME}" exec "${node}" test -x /opt/cni/bin/bridge ||
       die "node ${node}: /opt/cni/bin/bridge is missing"
     log "node ${node}: ${master} chains to ${delegate}"
-  done
+  done <<< "${nodes}"
 }
 
 ensure_namespaces() {
@@ -349,7 +436,7 @@ wait_for_probe() { # <pod>
 run_cni_preflight() {
   ensure_namespaces
   apply_nad
-  local node pod pod_ip status
+  local node pod pod_ip status nodes
   local index=0
 
   kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete \
@@ -374,7 +461,9 @@ EOF
 
   kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete pods \
     -l app=kubevirt-ip-helper-e2e-nad-probe --ignore-not-found
-  for node in $(cluster_nodes); do
+  nodes="$(cluster_nodes)" ||
+    die "kind cannot enumerate exactly two nodes for ${E2E_CLUSTER_NAME}"
+  while IFS= read -r node; do
     index=$((index + 1))
     pod="${KIH_NAD_PROBE_POD}-${index}"
     kubectl apply -f - << EOF
@@ -406,7 +495,7 @@ EOF
     "${RUNTIME}" exec "${node}" ip -o link show "${KIH_BRIDGE_NAME}" > /dev/null 2>&1 ||
       die "node ${node}: bridge ${KIH_BRIDGE_NAME} was not created by its NAD probe"
     log "node ${node}: NAD probe attached ${KIH_HELPER_INTERFACE}; bridge ${KIH_BRIDGE_NAME} exists"
-  done
+  done <<< "${nodes}"
 
   kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete \
     "pod/${KIH_PLAIN_PROBE_POD}" --ignore-not-found
@@ -476,23 +565,29 @@ EOF
   log "KubeVirt ${KUBEVIRT_VERSION} available with software emulation"
 }
 
+bootstrap_select_arch() {
+  KIND_ARCH="$(arch_suffix)"
+}
+
 main() {
   # Every pin below comes from the selected profile in versions.env, so the
   # bootstrap evidence stays attributable to one lane.
   log "stack profile '${E2E_STACK}': Kubernetes ${KUBERNETES_VERSION}, \
 KubeVirt ${KUBEVIRT_VERSION}, guest ${KIH_GUEST_IMAGE}"
-  KIND_ARCH="$(arch_suffix)"
-  resolve_runtime
-  ensure_kind
-  ensure_cluster
-  ensure_helper_image
-  inspect_kindnet
-  ensure_bridge_plugin
-  ensure_multus
-  assert_multus_chain
-  run_cni_preflight
-  ensure_virtctl
-  ensure_kubevirt
+  bootstrap_gate BOOTSTRAP-ARCH "linux amd64 architecture is supported" \
+    bootstrap_select_arch
+  bootstrap_gate BOOTSTRAP-RUNTIME "container runtime is available" resolve_runtime
+  bootstrap_gate BOOTSTRAP-KIND "pinned kind binary is available" ensure_kind
+  bootstrap_gate BOOTSTRAP-CLUSTER "pinned two-node kind cluster is ready" ensure_cluster
+  bootstrap_gate BOOTSTRAP-IMAGE "helper image is loaded into the cluster" ensure_helper_image
+  bootstrap_gate BOOTSTRAP-KINDNET "kindnet delegate is present on every node" inspect_kindnet
+  bootstrap_gate BOOTSTRAP-BRIDGE "pinned bridge CNI is installed on every node" ensure_bridge_plugin
+  bootstrap_gate BOOTSTRAP-MULTUS "pinned Multus is installed" ensure_multus
+  bootstrap_gate BOOTSTRAP-MULTUS-CHAIN "Multus chains to kindnet on every node" assert_multus_chain
+  bootstrap_gate BOOTSTRAP-CNI-PREFLIGHT "plain and NAD-attached CNI probes are Ready" \
+    run_cni_preflight
+  bootstrap_gate BOOTSTRAP-VIRTCTL "pinned virtctl is available" ensure_virtctl
+  bootstrap_gate BOOTSTRAP-KUBEVIRT "KubeVirt is Available with software emulation" ensure_kubevirt
   log "cluster '${E2E_CLUSTER_NAME}' bootstrapped"
 }
 

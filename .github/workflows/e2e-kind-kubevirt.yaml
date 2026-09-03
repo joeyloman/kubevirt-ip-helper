@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   e2e:
@@ -16,23 +17,31 @@ jobs:
     # `dependency-era` runs only the compact core compatibility contract.
     # Stack and group are part of cluster, cache, and artifact names so jobs
     # cannot collide.
-    timeout-minutes: 45
+    # The 40-minute test step can receive TERM; keep ten minutes for the bounded
+    # 180-second diagnostics pass, 180-second cluster cleanup, and report upload.
+    timeout-minutes: 50
     strategy:
       fail-fast: false
       matrix:
         include:
           - E2E_STACK: dependency-era
             E2E_GROUP: core
+            E2E_ARTIFACT_SUFFIX: dependency-era-core
           - E2E_STACK: current
             E2E_GROUP: core
+            E2E_ARTIFACT_SUFFIX: current-core
           - E2E_STACK: current
             E2E_GROUP: pool
+            E2E_ARTIFACT_SUFFIX: current-pool
           - E2E_STACK: current
             E2E_GROUP: lease
+            E2E_ARTIFACT_SUFFIX: current-lease
           - E2E_STACK: current
             E2E_GROUP: ha
+            E2E_ARTIFACT_SUFFIX: current-ha
           - E2E_STACK: current
             E2E_GROUP: multipool
+            E2E_ARTIFACT_SUFFIX: current-multipool
     env:
       E2E_STACK: ${{ matrix.E2E_STACK }}
       E2E_GROUP: ${{ matrix.E2E_GROUP }}
@@ -42,6 +51,55 @@ jobs:
         # actions/checkout v5
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
 
+
+      - name: Restore previous E2E artifact baseline
+        env:
+          GH_TOKEN: ${{ github.token }}
+          E2E_ARTIFACT_ROOT: _artifacts/e2e/${{ matrix.E2E_ARTIFACT_SUFFIX }}
+          E2E_ARTIFACT_NAME: e2e-${{ matrix.E2E_STACK }}-${{ matrix.E2E_GROUP }}-artifacts
+        run: |
+          set -u
+          mkdir -p "${E2E_ARTIFACT_ROOT}"
+          if ! command -v gh > /dev/null 2>&1 || ! command -v jq > /dev/null 2>&1; then
+            echo "gh or jq unavailable; no prior CI artifact baseline will be restored"
+            exit 0
+          fi
+          baseline_ref="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
+          if ! runs_json="$(gh run list \
+            --workflow .github/workflows/e2e-kind-kubevirt.yaml \
+            --branch "${baseline_ref}" --status success --limit 50 --json databaseId 2>&1)"; then
+            echo "cannot list prior successful workflow runs; continuing without a baseline"
+            echo "${runs_json}"
+            exit 0
+          fi
+          prior_run="$(printf '%s\n' "${runs_json}" |
+            jq -r --arg current "${GITHUB_RUN_ID}" \
+              '[.[] | select((.databaseId | tostring) != $current) | .databaseId] |
+               first // empty')" || {
+            echo "cannot parse prior workflow runs; continuing without a baseline"
+            exit 0
+          }
+          if [ -z "${prior_run}" ]; then
+            echo "no prior successful workflow run; this is the first CI baseline"
+            exit 0
+          fi
+          download_dir="${E2E_ARTIFACT_ROOT}.previous.tmp"
+          rm -rf "${download_dir}"
+          mkdir -p "${download_dir}"
+          if gh run download "${prior_run}" --name "${E2E_ARTIFACT_NAME}" \
+            --dir "${download_dir}"; then
+            if cp -a "${download_dir}/." "${E2E_ARTIFACT_ROOT}/"; then
+              rm -rf "${download_dir}"
+              echo "restored ${E2E_ARTIFACT_NAME} from successful run ${prior_run}"
+            else
+              rm -rf "${download_dir}" "${E2E_ARTIFACT_ROOT}"
+              mkdir -p "${E2E_ARTIFACT_ROOT}"
+              echo "cannot copy the prior artifact; no baseline restored"
+            fi
+          else
+            rm -rf "${download_dir}"
+            echo "prior run ${prior_run} has no downloadable ${E2E_ARTIFACT_NAME}; no baseline restored"
+          fi
       - name: Verify Docker and kubectl prerequisites
         run: |
           for attempt in $(seq 1 30); do
@@ -55,6 +113,8 @@ jobs:
           kubectl version --client
 
       - name: Run the kind, Multus and KubeVirt end-to-end suite
+        # `run.sh` prints its `report.txt` from the exit trap on success and on
+        # failure alike, so the suite summary is already in this step's log.
         timeout-minutes: 40
         run: |
           short_sha="${GITHUB_SHA}"
@@ -62,12 +122,20 @@ jobs:
           E2E_IMAGE="ghcr.io/${GITHUB_REPOSITORY}:${short_sha}" \
             ./test/e2e/run.sh
 
-      - name: Upload diagnostics
+      - name: Upload reports, evidence, and diagnostics
         if: always()
         # actions/upload-artifact v4
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
+          # The artifact root keeps the shared layout: the `latest` pointer file,
+          # every `runs/<id>/` directory with its reports, evidence checkpoints,
+          # copied diagnostics and checksum manifest, plus the numbered
+          # `collect.sh` captures. `always()` retains them for a failed job as
+          # well as a passed one, and a missing file only warns, so packaging can
+          # never override the exit status of the suite. Inside any downloaded
+          # `runs/<id>/`, `sha256sum -c artifact-manifest.sha256` verifies the set.
           name: e2e-${{ matrix.E2E_STACK }}-${{ matrix.E2E_GROUP }}-artifacts
-          path: _artifacts/e2e/${{ matrix.E2E_STACK }}-${{ matrix.E2E_GROUP }}
+          path: _artifacts/e2e/${{ matrix.E2E_ARTIFACT_SUFFIX }}
           if-no-files-found: warn
+          include-hidden-files: true
           retention-days: 14
