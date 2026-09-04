@@ -313,9 +313,9 @@ func TestSyncReturnsIndexerError(t *testing.T) {
 	}
 }
 
-func TestSyncUpdateSucceedsWhenServerErrors(t *testing.T) {
-	// an UPDATE event whose API lookup fails logs the failure and returns
-	// without error: handler errors never escape sync
+func TestSyncUpdateReturnsServerError(t *testing.T) {
+	// an UPDATE event whose API lookup fails must return the error so the
+	// queue applies a rate-limited requeue instead of forgetting the event
 	var log requestLog
 	server := newFakeServer(t, &log, func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, serverErrorJSON)
@@ -325,8 +325,8 @@ func TestSyncUpdateSucceedsWhenServerErrors(t *testing.T) {
 	indexer.Add(testVirtualMachine(false))
 	controller := newTestController(t, newTestQueue(), indexer, nil, newTestClientset(t, server))
 
-	if err := controller.sync(testEvent(UPDATE)); err != nil {
-		t.Errorf("sync(UPDATE) returned error %v, want nil", err)
+	if err := controller.sync(testEvent(UPDATE)); err == nil {
+		t.Error("sync(UPDATE) returned nil, want a rate-limited requeue error from the failed api call")
 	}
 
 	if !log.seenRequest("GET", "/virtualmachinenetworkconfigs/vm-test") {
@@ -358,7 +358,8 @@ func TestSyncDeleteSnapshotSkipsDeletedObject(t *testing.T) {
 
 func TestSyncDeleteSnapshotDeletesReferencedObject(t *testing.T) {
 	// a DELETE snapshot whose vmnetcfg object still exists leads to a delete
-	// attempt; a failing delete is logged but does not escape sync
+	// attempt; a not-found response is treated as an already-completed
+	// cleanup
 	var log requestLog
 	server := newFakeServer(t, &log, func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
@@ -404,9 +405,9 @@ func TestSyncAddSkipsCreateWithoutNetworkConfig(t *testing.T) {
 	}
 }
 
-func TestSyncAddCreateFailureSucceeds(t *testing.T) {
+func TestSyncAddCreateFailureReturnsError(t *testing.T) {
 	// an ADD event for a VM with a NIC leads to a create attempt; a failing
-	// create is logged but does not escape sync
+	// create returns the error so the queue applies rate-limited requeues
 	var log requestLog
 	server := newFakeServer(t, &log, func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
@@ -423,8 +424,8 @@ func TestSyncAddCreateFailureSucceeds(t *testing.T) {
 	indexer.Add(testVirtualMachine(true))
 	controller := newTestController(t, newTestQueue(), indexer, nil, newTestClientset(t, server))
 
-	if err := controller.sync(testEvent(ADD)); err != nil {
-		t.Errorf("sync(ADD) returned error %v, want nil", err)
+	if err := controller.sync(testEvent(ADD)); err == nil {
+		t.Error("sync(ADD) returned nil, want a rate-limited requeue error from the failed create")
 	}
 
 	if !log.seenRequest("GET", "/virtualmachinenetworkconfigs/vm-test") {
