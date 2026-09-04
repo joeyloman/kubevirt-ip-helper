@@ -141,25 +141,33 @@ func TestIPAMNewSubnetValidationErrors(t *testing.T) {
 	}
 }
 
-func TestIPAMNewSubnetOverwrites(t *testing.T) {
+// A repeated subnet name must be rejected while keeping the allocation
+// bitmap of the original registration. Silent replacement drops live
+// addresses from accounting, so they could be reissued to other clients.
+func TestIPAMRejectsDuplicateSubnetName(t *testing.T) {
 	a := New()
 	if err := a.NewSubnet("net", "192.168.1.0/30", "192.168.1.1", "192.168.1.2"); err != nil {
 		t.Fatalf("first NewSubnet: %v", err)
 	}
-	// Re-registering the same name replaces the subnet with no error.
-	if err := a.NewSubnet("net", "192.168.2.0/30", "192.168.2.1", "192.168.2.2"); err != nil {
-		t.Fatalf("second NewSubnet: %v", err)
+	occupied, err := a.GetIP("net", "192.168.1.1")
+	if err != nil {
+		t.Fatalf("GetIP to occupy an address: %v", err)
+	}
+	// Re-registering the same name must fail with the state kept.
+	if err := a.NewSubnet("net", "192.168.2.0/30", "192.168.2.1", "192.168.2.2"); err == nil {
+		t.Fatal("second NewSubnet must be rejected as duplicate")
+	} else if !strings.Contains(err.Error(), "already exists") {
+		t.Errorf("duplicate error = %q, want already-exists message", err)
 	}
 
-	if got := a.Used("net"); got != 0 {
-		t.Errorf("Used = %d, want 0 after replace", got)
+	if occupied != "192.168.1.1" {
+		t.Errorf("occupied = %s, want the first allocation to remain", occupied)
 	}
-	ip, err := a.GetIP("net", "192.168.2.1")
-	if err != nil {
-		t.Fatalf("GetIP after replace: %v", err)
+	if _, err := a.GetIP("net", "192.168.1.1"); !strings.Contains(err.Error(), "already allocated") {
+		t.Errorf("original allocation must still be held, got %q", err)
 	}
-	if ip != "192.168.2.1" {
-		t.Errorf("got %s, want 192.168.2.1", ip)
+	if got := a.Used("net"); got != 1 {
+		t.Errorf("Used = %d, want 1 (the original allocation is kept)", got)
 	}
 }
 
