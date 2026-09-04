@@ -153,6 +153,53 @@ func TestCacheGetReturnsValueCopy(t *testing.T) {
 	}
 }
 
+// nested state (slices/maps) must be isolated in both directions: mutating
+// the added source object, or the value returned by Get, must never rewrite
+// the cached pool.
+func TestCacheNestedStateIsolated(t *testing.T) {
+	c := New()
+	pool := newTestPool("default/net-a")
+	pool.Spec.IPv4Config.DNS = []string{"10.0.0.53"}
+	pool.Status.IPv4.Allocated = map[string]string{"10.0.0.10": "default/vm [aa:bb:cc:dd:ee:01]"}
+
+	if err := c.Add(pool); err != nil {
+		t.Fatalf("Add returned error: %v", err)
+	}
+
+	// mutating the source must not leak into the cache
+	pool.Spec.IPv4Config.DNS[0] = "192.0.2.99"
+	pool.Status.IPv4.Allocated["10.0.0.10"] = "rewritten"
+	pool.Status.IPv4.Allocated["10.0.0.11"] = "added"
+
+	got, err := c.Get("pool", "default/net-a")
+	if err != nil {
+		t.Fatalf("Get returned error: %v", err)
+	}
+	stored := got.(kihv1.IPPool)
+	if dns := stored.Spec.IPv4Config.DNS; len(dns) != 1 || dns[0] != "10.0.0.53" {
+		t.Errorf("cached dns = %v, want [10.0.0.53] (source mutation leaked)", dns)
+	}
+	if allocated := stored.Status.IPv4.Allocated; len(allocated) != 1 || allocated["10.0.0.10"] != "default/vm [aa:bb:cc:dd:ee:01]" {
+		t.Errorf("cached allocated = %v, want the original entry only (source mutation leaked)", allocated)
+	}
+
+	// mutating the returned value must not leak into the cache either
+	stored.Spec.IPv4Config.DNS[0] = "192.0.2.11"
+	stored.Status.IPv4.Allocated["10.0.0.10"] = "rewritten"
+
+	again, err := c.Get("pool", "default/net-a")
+	if err != nil {
+		t.Fatalf("second Get returned error: %v", err)
+	}
+	againPool := again.(kihv1.IPPool)
+	if dns := againPool.Spec.IPv4Config.DNS; len(dns) != 1 || dns[0] != "10.0.0.53" {
+		t.Errorf("cached dns = %v, want [10.0.0.53] (returned copy aliased the cache)", dns)
+	}
+	if allocated := againPool.Status.IPv4.Allocated; allocated["10.0.0.10"] != "default/vm [aa:bb:cc:dd:ee:01]" {
+		t.Errorf("cached allocated = %v, want the original entry (returned copy aliased the cache)", allocated)
+	}
+}
+
 type captureHook struct {
 	entries []*log.Entry
 }
