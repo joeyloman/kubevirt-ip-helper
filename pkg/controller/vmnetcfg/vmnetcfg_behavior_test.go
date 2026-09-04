@@ -996,7 +996,42 @@ func TestUpdateIPPoolStatusBranches(t *testing.T) {
 		}
 	})
 
-	t.Run("delete", func(t *testing.T) {
+	t.Run("foreign-owner delete is rejected and kept", func(t *testing.T) {
+		e := newTestEnv(t)
+		e.seedPoolWith(&kihv1.IPPool{
+			ObjectMeta: metav1.ObjectMeta{Name: testPoolName},
+			Spec:       kihv1.IPPoolSpec{NetworkName: testNetwork},
+			Status: kihv1.IPPoolStatus{
+				IPv4: kihv1.IPv4Status{Allocated: map[string]string{
+					"10.0.0.1": testNamespace + "/other-vm [" + testMAC + "]",
+					"10.0.0.2": testNamespace + "/vm-test [" + testMAC + "]",
+				}},
+			},
+		})
+
+		// removing an allocation reference the caller does not own must fail
+		// without a write: the address was meanwhile reassigned
+		err := e.controller.updateIPPoolStatus(DELETE, testNamespace, testVMName, "10.0.0.1", testNetwork, testMAC, testPoolName)
+		if err == nil {
+			t.Fatal("want error for a foreign-owner delete")
+		}
+		if !strings.Contains(err.Error(), "belongs to") {
+			t.Errorf("error = %q, want foreign-owner message", err)
+		}
+		if e.countRequests(http.MethodPut, ippoolStatusPath) != 0 {
+			t.Error("status update requests = 0 wanted, the foreign allocation must not be overwritten")
+		}
+
+		pool := e.getStoredPool()
+		if got := pool.Status.IPv4.Allocated["10.0.0.1"]; got != testNamespace+"/other-vm ["+testMAC+"]" {
+			t.Errorf("allocated[10.0.0.1] = %q, want the foreign reference preserved", got)
+		}
+		if got := pool.Status.IPv4.Allocated["10.0.0.2"]; got != testNamespace+"/vm-test ["+testMAC+"]" {
+			t.Errorf("allocated[10.0.0.2] = %q, want it untouched", got)
+		}
+	})
+
+	t.Run("own allocation is removed", func(t *testing.T) {
 		e := newTestEnv(t)
 		e.addSubnet("10.0.0.1", "10.0.0.1")
 		if _, err := e.ipam.GetIP(testNetwork, "10.0.0.1"); err != nil {
@@ -1007,7 +1042,7 @@ func TestUpdateIPPoolStatusBranches(t *testing.T) {
 			Spec:       kihv1.IPPoolSpec{NetworkName: testNetwork},
 			Status: kihv1.IPPoolStatus{
 				IPv4: kihv1.IPv4Status{Allocated: map[string]string{
-					"10.0.0.1": "a [x]",
+					"10.0.0.1": testNamespace + "/vm-test [" + testMAC + "]",
 					"10.0.0.2": "b [y]",
 				}},
 			},
@@ -1019,7 +1054,7 @@ func TestUpdateIPPoolStatusBranches(t *testing.T) {
 
 		pool := e.getStoredPool()
 		if _, exists := pool.Status.IPv4.Allocated["10.0.0.1"]; exists {
-			t.Error("deleted ip must be removed from allocated")
+			t.Error("the owned allocation must be removed from allocated")
 		}
 		if got := pool.Status.IPv4.Allocated["10.0.0.2"]; got != "b [y]" {
 			t.Errorf("remaining allocation = %q, want b [y]", got)
@@ -1122,7 +1157,9 @@ func TestVMNetCfgIPAMErrorSetsErrorStatus(t *testing.T) {
 	}
 }
 
-func TestVMNetCfgUpdateFailureReturnsError(t *testing.T) {
+// A failing object update must roll back the allocation side effects: DHCP
+// may not keep serving an address the durable vmnetcfg object never recorded.
+func TestVMNetCfgUpdateFailureRollsBackAllocations(t *testing.T) {
 	e := newTestEnv(t)
 	e.addSubnet("10.0.0.1", "10.0.0.1")
 	e.seedPool(nil)
@@ -1141,8 +1178,15 @@ func TestVMNetCfgUpdateFailureReturnsError(t *testing.T) {
 	if n := e.countRequests(http.MethodPut, vmnetcfgStatusPath); n != 0 {
 		t.Errorf("status update requests = %d, want 0", n)
 	}
-	// allocation side effects were already applied before the object update
-	if !e.dhcp.CheckLease(testMAC) {
-		t.Error("lease must exist: allocation happens before the object update")
+	// the allocation side effects are reverted with the durable update gone
+	if e.dhcp.CheckLease(testMAC) {
+		t.Error("lease must be rolled back when the object update fails")
+	}
+	if got := e.ipam.Used(testNetwork); got != 0 {
+		t.Errorf("ipam used = %d, want 0 after the rollback", got)
+	}
+	pool := e.getStoredPool()
+	if len(pool.Status.IPv4.Allocated) != 0 {
+		t.Errorf("ippool status allocations = %v, want empty after the rollback", pool.Status.IPv4.Allocated)
 	}
 }

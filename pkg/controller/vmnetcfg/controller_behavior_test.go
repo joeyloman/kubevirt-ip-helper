@@ -347,9 +347,10 @@ func TestSyncUpdateDoesNotIncrementCounterWhileInitializing(t *testing.T) {
 	}
 }
 
-func TestSyncAddCountsEvenWhenUpdateFails(t *testing.T) {
-	// objects are counted even when their update fails, otherwise the
-	// application would never become operational
+func TestSyncAddFailureReturnsErrorAndDoesNotCount(t *testing.T) {
+	// a failed update must return the error so the queue requeues the event
+	// rate-limited; the initialization counter only counts successful syncs,
+	// otherwise every requeued attempt would overcount past the target
 	appStatus := APP_INIT
 	countCurrent := 0
 	indexer := newTestIndexer()
@@ -358,11 +359,11 @@ func TestSyncAddCountsEvenWhenUpdateFails(t *testing.T) {
 	}))
 	controller := newTestController(t, newTestQueue(), indexer, nil, &appStatus, &countCurrent, nil)
 
-	if err := controller.sync(testEvent(ADD)); err != nil {
-		t.Errorf("sync(ADD) returned error %v, want nil", err)
+	if err := controller.sync(testEvent(ADD)); err == nil {
+		t.Error("sync(ADD) returned nil, want a rate-limited requeue error for the failed update")
 	}
-	if countCurrent != 1 {
-		t.Errorf("counter = %d after a failed update while initializing, want 1", countCurrent)
+	if countCurrent != 0 {
+		t.Errorf("counter = %d after a failed update, want 0", countCurrent)
 	}
 }
 
