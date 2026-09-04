@@ -52,6 +52,7 @@ E2E_ARTIFACTS_ROOT=_artifacts/e2e/current
 E2E_KEEP_CLUSTER=1
 E2E_VM_BOOT_TIMEOUT=300
 ```
+New knobs: `E2E_PRED_SECONDS` (default 20; see Assertions), `E2E_LEASE_STORM_COUNT` (default 3) and `E2E_LEASE_STORM_WINDOW` (default 10, minutes), which bound the lease-storm scenario.
 
 A cluster created by `run.sh` is deleted after diagnostics on success or failure; if bounded deletion itself fails, the report records `SUITE-CLUSTER-CLEANUP` and leaves the cluster for diagnosis. A compatible cluster that already existed is reused but never deleted by the harness. `E2E_KEEP_CLUSTER=1` retains a newly created cluster; resolve `${E2E_ARTIFACTS_ROOT}/latest` to the current run before reading its kubeconfig:
 
@@ -138,6 +139,13 @@ A run fails on any missing invariant:
 17. The `multipool` group adds a second bridge attachment and helper interface, initializes an independent non-overlapping pool, proves a real VM gets a `10.78.0.x` lease from it, then deletes that IPPool while helpers are live. The second server address, pool metric, attachment, and interface must disappear while the primary pool stays healthy.
 
 These assertions are the complete contract of the emulated suite and every executed item receives a stable case ID in `cases.jsonl`, `report.json`, and `report.txt`. The scope is deliberately narrower than physical deployment qualification: kind uses KubeVirt software emulation on Linux `amd64`, so this suite does not claim KVM acceleration, external or VLAN-backed L2 reachability, cross-node broadcast behavior, control-plane network partitions, clock skew, or non-`amd64` coverage. It verifies the assigned address and router DHCP option rather than every optional DHCP field. Those boundaries are explicit exclusions, not silently skipped test cases.
+Metric predicates re-resolve the labelled leader pod on every scrape: each used, available, and VMNetCfg-status read first locates the pod carrying `kubevirtiphelper/leader=active`, and the exec read is bounded by `wget -T`. Series matching is exact: a predicate matches the single `^kubevirtiphelper_ippool_(used|available)` line for its pool label, the trailing value must be strictly numeric, and equality is exact; absence assertions match only that pool label's series lines. Accounting follows invariants: `used` must be a strict number — a missing `used` is a failure — while an empty or absent `available` normalizes to 0, because the helper omits `available` when the pool is exhausted; that omission is an accepted encoding, not an error. Expected capacity derives from the pool spec's inclusive start/end range.
+
+`wait_for` polls each predicate in a subshell with a per-poll watchdog (`E2E_PRED_SECONDS`, default 20), so a wedged kubectl or exec cannot consume the loop budget; at timeout exhaustion it allows one grace re-probe, recorded explicitly. `wait_before_deadline` keeps the watchdog but never takes a grace probe, because its deadlines are window contracts.
+
+A predicate may return exit code 2 to signal a production-bug signature; the driver then dies immediately with a mapped explanation. The duplicate-owner-after-cfg boot uses this: if the leader's log shows repeated `NO LEASE FOUND` for the owner MAC after the refused duplicate VirtualMachineNetworkConfig was deleted, the case fails fast with an attribution to lease release keyed by MAC without ownership verification.
+
+`console_has_router_marker` requires the expected router to be the entire non-`unset` marker set and the last non-`unset` marker.
 
 ## Diagnostics
 
@@ -204,6 +212,7 @@ _artifacts/e2e/current-core/                     # E2E_ARTIFACTS_ROOT
 ```
 
 - The default run id is the UTC second plus the harness process id (`20260903T085931Z-18422`), so directory names sort in execution order while simultaneous starts remain isolated. An explicit `E2E_RUN_ID` is useful for external correlation, but it must be unique: selecting an existing nonempty run directory is rejected rather than overwriting history.
+- `E2E_ARTIFACTS_DIR` is overridable only as `${E2E_ARTIFACTS_ROOT}/runs/${E2E_RUN_ID}`; any other value aborts at startup with a corrective message.
 - `latest` is an atomically replaced one-line text pointer to the newest successful finalized run. An interrupted, unfinalized, failed, or incomplete-evidence run therefore never becomes the baseline, and the pointer survives `actions/upload-artifact` unchanged. Resolve it from the repository root:
 
 ```sh
@@ -243,6 +252,7 @@ Four files describe one execution, from machine-readable to human-readable, with
 
 After `report_init` succeeds, reporting opens before the first test action and is finalized from the `EXIT` trap, so a failure in an early gate still yields a complete `report.json` containing exactly the assertions that ran, in order, each once. Bootstrap gates are journaled independently and imported into the same case stream; a journal append failure creates `bootstrap-journal-errors.txt` and makes bootstrap report import fail rather than silently accepting a missing gate. A failed evidence capture is reported as a failed case and also listed in `evidence/capture-errors.txt`, never silently skipped, so the counts always explain the exit code.
 TERM, INT, and HUP are converted into a failed signal case before finalization so CI cancellation still leaves a report and evidence attempt; SIGKILL cannot be intercepted by a shell.
+The suite's `EXIT` and signal traps also tear down the guest console capture (`CONSOLE_PID`, `CONSOLE_FEEDER_PID`, and the FIFO), even when a boot assertion fails mid-way.
 
 Because `report.txt` is echoed on the way out for both outcomes, the console and the CI job log already show the result without parsing anything. To read the stored files instead:
 

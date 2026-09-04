@@ -73,6 +73,11 @@ LEADER_SELECTOR="kubevirtiphelper/leader=active"
 LEADER_LEASE="kubevirt-ip-helper-lock"
 METRICS_SERVICE="kubevirt-ip-helper-metrics"
 E2E_VM_BOOT_TIMEOUT="${E2E_VM_BOOT_TIMEOUT:-300}"
+E2E_PRED_SECONDS="${E2E_PRED_SECONDS:-20}"
+# Lease-loss fast-fail: a storm of "NO LEASE FOUND" entries for the owner MAC
+# inside the storm window flags the duplicate-cfg lease-release bug signature.
+E2E_LEASE_STORM_COUNT="${E2E_LEASE_STORM_COUNT:-3}"
+E2E_LEASE_STORM_WINDOW="${E2E_LEASE_STORM_WINDOW:-10}"
 LEADER_POD=""
 LEADER_ID=""
 RESERVED_IP=""
@@ -171,13 +176,23 @@ finish() {
   trap - EXIT
   trap '' INT TERM HUP
   set +e
-  if [ -n "${CONSOLE_PID}" ]; then
+  # Any assertion-failure path that bypasses the success-path teardown in
+  # start_guest_and_assert can still have the console capture running; the
+  # kill -0 guards touch only still-live pids, and clearing the globals
+  # keeps this a single effective teardown even if the trap sequence runs
+  # once more after a signal.
+  if [ -n "${CONSOLE_PID}" ] && kill -0 "${CONSOLE_PID}" > /dev/null 2>&1; then
     kill "${CONSOLE_PID}" > /dev/null 2>&1 || true
   fi
-  if [ -n "${CONSOLE_FEEDER_PID}" ]; then
+  if [ -n "${CONSOLE_FEEDER_PID}" ] && kill -0 "${CONSOLE_FEEDER_PID}" > /dev/null 2>&1; then
     kill "${CONSOLE_FEEDER_PID}" > /dev/null 2>&1 || true
   fi
-  [ -z "${CONSOLE_FIFO}" ] || rm -f "${CONSOLE_FIFO}"
+  if [ -n "${CONSOLE_FIFO}" ] && [ -e "${CONSOLE_FIFO}" ]; then
+    rm -f "${CONSOLE_FIFO}"
+  fi
+  CONSOLE_PID=""
+  CONSOLE_FEEDER_PID=""
+  CONSOLE_FIFO=""
   if [ -s "${E2E_CLUSTER_STATE_FILE}" ]; then
     CLUSTER_STATE="$(cat "${E2E_CLUSTER_STATE_FILE}")"
   fi
@@ -284,14 +299,35 @@ trap 'on_signal INT 130' INT
 trap 'on_signal TERM 143' TERM
 trap 'on_signal HUP 129' HUP
 
+# Runs one predicate under a hard per-attempt cap so a single wedged
+# kubectl/exec cannot consume the whole loop budget: the predicate runs in a
+# background subshell, a sleep-based watchdog SIGTERMs it once <seconds> are
+# gone (default E2E_PRED_SECONDS), and the wrapper returns the subshell's
+# status (143 when the watchdog fired, which polling treats as a plain
+# failure). Subshells inherit shell functions, so function predicates work
+# unchanged. A kubectl child the killed subshell strands is bounded by the
+# run's existing EXIT-trap cleanup of stray processes.
+run_pred_once() { # <seconds> <predicate> [args...]
+  local guard="$1" rc=0
+  shift
+  ( "$@" ) &
+  local pred_pid=$!
+  ( sleep "${guard}" && kill "${pred_pid}" ) &
+  local guard_pid=$!
+  wait "${pred_pid}" || rc=$?
+  kill "${guard_pid}" > /dev/null 2>&1 || true
+  wait "${guard_pid}" > /dev/null 2>&1 || true
+  return "${rc}"
+}
+
 wait_for() { # <case-id> <seconds> <description> <predicate> [args...]
-  local case_id="$1" timeout="$2" description="$3" start
+  local case_id="$1" timeout="$2" description="$3" start rc=0
   shift 3
   start="${SECONDS}"
   local deadline=$((SECONDS + timeout))
   report_case_start "${case_id}" "${description}"
   while [ "${SECONDS}" -lt "${deadline}" ]; do
-    if "$@"; then
+    if run_pred_once "${E2E_PRED_SECONDS}" "$@"; then
       if [ "${SECONDS}" -lt "${deadline}" ]; then
         log "ok: ${description}"
         report_case_pass "satisfied $((SECONDS - start))s after the first attempt"
@@ -299,20 +335,48 @@ wait_for() { # <case-id> <seconds> <description> <predicate> [args...]
       fi
       break
     fi
+    rc=$?
+    if [ "${rc}" -eq 2 ]; then
+      die "bug signature detected: ${description} (owner DHCP lease destroyed by duplicate-cfg cleanup; lease release is keyed by MAC without ownership check)"
+    fi
     sleep 2
   done
+  # One final probe outside the watchdog at the deadline: a predicate that
+  # only needs one more event can still pass, and the pass then carries the
+  # grace detail instead of a timeout.
+  if "$@"; then
+    log "ok: ${description}"
+    report_case_pass "satisfied via grace probe at the ${timeout}s deadline"
+    return 0
+  fi
   die "timed out after ${timeout}s: ${description}"
 }
 
 wait_before_deadline() { # <case-id> <absolute SECONDS> <maximum seconds> <description> <predicate> [args...]
-  local case_id="$1" deadline="$2" maximum="$3" description="$4" remaining
+  local case_id="$1" deadline="$2" maximum="$3" description="$4" remaining rc=0 start window
   shift 4
   report_case_start "${case_id}" "${description}"
   remaining=$((deadline - SECONDS))
   [ "${remaining}" -gt 0 ] ||
     die "deadline expired before ${description}"
   [ "${remaining}" -le "${maximum}" ] || remaining="${maximum}"
-  wait_for "${case_id}" "${remaining}" "${description}" "$@"
+  start="${SECONDS}"
+  window=$((start + remaining))
+  # The per-attempt watchdog applies here too, but never a grace probe:
+  # absolute deadlines are window contracts and must not pass after expiry.
+  while [ "${SECONDS}" -lt "${window}" ]; do
+    if run_pred_once "${E2E_PRED_SECONDS}" "$@"; then
+      log "ok: ${description}"
+      report_case_pass "satisfied $((SECONDS - start))s after the first attempt"
+      return 0
+    fi
+    rc=$?
+    if [ "${rc}" -eq 2 ]; then
+      die "bug signature detected: ${description} (owner DHCP lease destroyed by duplicate-cfg cleanup; lease release is keyed by MAC without ownership check)"
+    fi
+    sleep 2
+  done
+  die "timed out after ${remaining}s: ${description}"
 }
 
 resolve_runtime() {
@@ -405,14 +469,25 @@ helper_pods_unchanged_since() { # <pod<TAB>uid<TAB>restart snapshot>
   return 0
 }
 
-leader_consistent() {
-  local pods holder generated endpoint_ips pod_ip
-  local -a pod_names endpoint_addresses
+# The pod that currently carries the leader label. Metric predicates
+# resolve this fresh on every call so they follow a transition, while the
+# global LEADER_POD keeps serving failover bookkeeping (new_leader_elected,
+# start_guest_and_assert argument capture) unchanged.
+current_leader_pod() {
+  local pods pod
+  local -a pod_names
   pods="$(kubectl -n "${KIH_HELPER_NAMESPACE}" get pods -l "${LEADER_SELECTOR}" \
-    -o jsonpath='{.items[*].metadata.name}' 2> /dev/null)"
+    -o jsonpath='{.items[*].metadata.name}' 2> /dev/null)" || return 1
   read -r -a pod_names <<< "${pods}"
   [ "${#pod_names[@]}" -eq 1 ] || return 1
-  LEADER_POD="${pod_names[0]}"
+  printf '%s\n' "${pod_names[0]}"
+}
+
+leader_consistent() {
+  local pods holder generated endpoint_ips pod_ip
+  local -a endpoint_addresses
+  pods="$(current_leader_pod)" || return 1
+  LEADER_POD="${pods}"
   holder="$(kubectl -n "${KIH_HELPER_NAMESPACE}" get lease "${LEADER_LEASE}" \
     -o jsonpath='{.spec.holderIdentity}' 2> /dev/null)"
   [ -n "${holder}" ] || return 1
@@ -430,37 +505,76 @@ leader_consistent() {
 }
 
 pool_initialized() {
-  local last used available
+  local last used available capacity
   last="$(kubectl get ippool "${KIH_IPPOOL_NAME}" -o jsonpath='{.status.lastupdate}' 2> /dev/null)"
   used="$(kubectl get ippool "${KIH_IPPOOL_NAME}" -o jsonpath='{.status.ipv4.used}' 2> /dev/null)"
   available="$(kubectl get ippool "${KIH_IPPOOL_NAME}" -o jsonpath='{.status.ipv4.available}' 2> /dev/null)"
-  case "${used}" in "" | 0) ;; *) return 1 ;; esac
-  [ -n "${last}" ] && [ "${available}" = "11" ]
+  # used is strictly required and must be exactly zero; missing or empty
+  # fails. available is normalized: absent means an exhausted pool (0) and
+  # must then equal the capacity derived from the spec pool range.
+  case "${used}" in '' | *[!0-9]*) return 1 ;; esac
+  [ "${used}" -eq 0 ] || return 1
+  [ -n "${available}" ] || available=0
+  case "${available}" in '' | *[!0-9]*) return 1 ;; esac
+  capacity="$(capacity_from_spec "${KIH_IPPOOL_NAME}")" || return 1
+  [ -n "${last}" ] && [ "${available}" -eq "${capacity}" ]
 }
 
+# Metrics are scraped from whichever pod currently holds the leader label,
+# resolved per call (never through the cached LEADER_POD). The -T 5
+# watchdog bounds the in-pod wget so one exec cannot hang the caller.
 metrics_text() {
-  kubectl -n "${KIH_HELPER_NAMESPACE}" exec "${LEADER_POD}" -- \
-    wget -qO- http://127.0.0.1:8080/ 2> /dev/null
+  local pod
+  pod="$(current_leader_pod)" || return 1
+  kubectl -n "${KIH_HELPER_NAMESPACE}" exec "${pod}" -- \
+    wget -T 5 -qO- http://127.0.0.1:8080/ 2> /dev/null
+}
+
+# Extracts the value of exactly one exposition series: matching lines must
+# start with the family name and carry every required label substring,
+# exactly one line may match (duplicate series lines are a helper-side
+# leak and fail the extraction), and the value must be the sole trailing
+# token after the closing brace and strictly numeric.
+metric_value_for() { # <family> <label-substring> [label-substring...]
+  local text matches count value sub
+  text="$(metrics_text)" || return 1
+  matches="$(printf '%s\n' "${text}" | grep "^${1}{" || true)"
+  shift
+  for sub in "$@"; do
+    matches="$(printf '%s\n' "${matches}" | grep -F "${sub}" || true)"
+  done
+  count="$(printf '%s\n' "${matches}" | sed '/^$/d' | wc -l)"
+  [ "${count}" -eq 1 ] || return 1
+  value="${matches##*\}}"
+  case "${value}" in
+    ' '*)
+      value="${value# }"
+      case "${value}" in
+        '' | *[!0-9]*) return 1 ;;
+      esac
+      printf '%s\n' "${value}"
+      return 0
+      ;;
+  esac
+  return 1
 }
 
 metric_pool_equals() { # <used> <available>
-  local text used_line available_line
-  text="$(metrics_text)" || return 1
-  used_line="$(printf '%s\n' "${text}" | grep '^kubevirtiphelper_ippool_used{' |
-    grep 'ippool="e2e-pool"' | grep 'network="kubevirt-ip-helper/kubevirt-ip-helper-e2e"' || true)"
-  available_line="$(printf '%s\n' "${text}" | grep '^kubevirtiphelper_ippool_available{' |
-    grep 'ippool="e2e-pool"' | grep 'network="kubevirt-ip-helper/kubevirt-ip-helper-e2e"' || true)"
-  case "${used_line}" in *" $1") ;; *) return 1 ;; esac
-  case "${available_line}" in *" $2") ;; *) return 1 ;; esac
+  local used available
+  used="$(metric_value_for kubevirtiphelper_ippool_used 'ippool="e2e-pool"' \
+    'network="kubevirt-ip-helper/kubevirt-ip-helper-e2e"')" || return 1
+  available="$(metric_value_for kubevirtiphelper_ippool_available 'ippool="e2e-pool"' \
+    'network="kubevirt-ip-helper/kubevirt-ip-helper-e2e"')" || return 1
+  [ "${used}" = "$1" ] && [ "${available}" = "$2" ]
 }
 
 metric_vm_ok() {
-  local text line
-  text="$(metrics_text)" || return 1
-  line="$(printf '%s\n' "${text}" | grep '^kubevirtiphelper_vmnetcfg_status{' |
-    grep 'vm="e2e/e2e-vm"' | grep 'mac="02:00:00:00:00:11"' |
-    grep "ip=\"${RESERVED_IP}\"" | grep 'status="OK"' || true)"
-  case "${line}" in *" 1") return 0 ;; *) return 1 ;; esac
+  local value
+  value="$(metric_value_for kubevirtiphelper_vmnetcfg_status \
+    'vm="e2e/e2e-vm"' 'mac="02:00:00:00:00:11"' \
+    "ip=\"${RESERVED_IP}\"" 'status="OK"')" || return 1
+  # The helper always exposes the vmnetcfg-status series with value 1.
+  [ "${value}" = "1" ]
 }
 
 metric_vm_absent() {
@@ -472,7 +586,8 @@ metric_vm_absent() {
 metric_ippool_absent() { # <pool>
   local text
   text="$(metrics_text)" || return 1
-  ! printf '%s\n' "${text}" | grep -qF "ippool=\"$1\""
+  # No used or available series line may carry the pool label.
+  ! printf '%s\n' "${text}" | grep '^kubevirtiphelper_ippool_' | grep -qF "ippool=\"$1\""
 }
 
 leader_services_healthy() {
@@ -511,6 +626,28 @@ vmnetcfg_pool_name() {
     2> /dev/null
 }
 
+# Inclusive capacity of the configured pool range, derived from the spec
+# pool start/end in ip_number arithmetic (never hard-coded): the same
+# accounting the helper itself uses.
+capacity_from_spec() { # <pool>
+  local pool="$1" capacity
+  capacity="$(
+    kubectl get ippool "${pool}" -o json |
+      jq -e -r '
+        def ip_number:
+          split(".") | map(tonumber) |
+          .[0] * 16777216 + .[1] * 65536 + .[2] * 256 + .[3];
+        (.spec.ipv4config.pool.start | ip_number) as $start |
+        (.spec.ipv4config.pool.end | ip_number) as $end |
+        if $end >= $start then ($end - $start + 1)
+        else error("invalid IPPool range")
+        end
+      ' 2> /dev/null
+  )" || return 1
+  case "${capacity}" in '' | *[!0-9]*) return 1 ;; esac
+  printf '%s\n' "${capacity}"
+}
+
 pool_allocation_matches() {
   local allocations pool used available allocated_count capacity
   pool="$(vmnetcfg_pool_name)" || return 1
@@ -528,23 +665,7 @@ pool_allocation_matches() {
   case "${used}" in '' | *[!0-9]*) return 1 ;; esac
   case "${available}" in '' | *[!0-9]*) return 1 ;; esac
   allocated_count="$(printf '%s\n' "${allocations}" | sed '/^$/d' | wc -l)"
-  # Derive the expected free count from the configured inclusive range so the
-  # same accounting invariant works for the eleven-address primary pool and
-  # the three-address second pool.
-  capacity="$(
-    kubectl get ippool "${pool}" -o json |
-      jq -e -r '
-        def ip_number:
-          split(".") | map(tonumber) |
-          .[0] * 16777216 + .[1] * 65536 + .[2] * 256 + .[3];
-        (.spec.ipv4config.pool.start | ip_number) as $start |
-        (.spec.ipv4config.pool.end | ip_number) as $end |
-        if $end >= $start then ($end - $start + 1)
-        else error("invalid IPPool range")
-        end
-      ' 2> /dev/null
-  )" || return 1
-  case "${capacity}" in '' | *[!0-9]*) return 1 ;; esac
+  capacity="$(capacity_from_spec "${pool}")" || return 1
   [ "${used}" -eq "${allocated_count}" ] &&
     [ "${available}" -eq "$((capacity - used))" ]
 }
@@ -575,8 +696,9 @@ vmi_absent() {
   object_absent_not_found -n "${KIH_WORKLOAD_NAMESPACE}" get vmi "${KIH_VM_NAME}"
 }
 
-console_has_reserved_ip() { # <file>
-  grep -q "${E2E_DHCP_MARKER}=${RESERVED_IP}" "$1"
+console_has_reserved_ip() { # <file> [ip]
+  local ip="${2:-${RESERVED_IP}}"
+  grep -q "${E2E_DHCP_MARKER}=${ip}" "$1"
 }
 console_has_dhcp_event() { # <file> <address>
   grep -qF "E2E_DHCP_EVENT=bound:${2}" "$1" ||
@@ -584,13 +706,48 @@ console_has_dhcp_event() { # <file> <address>
 }
 
 # The udhcpc deconfig callback reports an empty or `unset` router before a
-# successful bound/renew event. Ignore only those pre-bind markers; any actual
-# option printed by the guest must agree with the expected pool router.
+# successful bound/renew event. Ignore only those pre-bind markers; any
+# actual option printed by the guest must agree with the expected pool
+# router, and the last non-unset marker must carry the same router: after
+# a pool switch the guest configures itself from that final option.
 console_has_router_marker() { # <file> <router>
-  local routers
+  local routers last
   routers="$(grep -oE 'E2E_DHCP_ROUTER=[^[:space:]]+' "$1" |
     grep -vE '=unset$|=$' | sort -u || true)"
-  [ "${routers}" = "E2E_DHCP_ROUTER=$2" ]
+  last="$(grep -oE 'E2E_DHCP_ROUTER=[^[:space:]]+' "$1" |
+    grep -vE '=unset$|=$' | tail -n 1 || true)"
+  [ "${routers}" = "E2E_DHCP_ROUTER=$2" ] &&
+    [ "${last}" = "E2E_DHCP_ROUTER=$2" ]
+}
+
+# The duplicate-cfg cleanup released the DHCP lease keyed by MAC without an
+# ownership check (pkg/controller/vmnetcfg/vmnetcfg.go:262,
+# pkg/dhcp/dhcp.go:169-183), so the live owner's lease can be destroyed
+# with the duplicate. Once that happened, every request from the owner
+# MAC hits "NO LEASE FOUND" in the leader log: a storm of those entries is
+# the lease-loss signature.
+leader_log_storm_for() { # <mac> <since-minutes>
+  local mac="$1" since="$2" pod count
+  pod="$(current_leader_pod)" || return 1
+  count="$(kubectl -n "${KIH_HELPER_NAMESPACE}" logs "${pod}" --since="${since}m" 2> /dev/null |
+    grep -cF "NO LEASE FOUND: hwaddr=${mac}" || true)"
+  [ "${count}" -ge "${E2E_LEASE_STORM_COUNT}" ]
+}
+
+# Boot predicate for the boot that follows the duplicate config cleanup:
+# the awaited marker passes normally; otherwise a lease-loss storm for the
+# owner MAC is the production-bug signature and must fail fast (exit code
+# 2). The marker is checked before the log scan for clarity, though once
+# the lease is gone it can no longer appear.
+boot_marker_or_lease_loss() { # <log-file> <owner-mac> <expected-ip>
+  local log_file="$1" owner_mac="$2" expected_ip="$3"
+  if console_has_reserved_ip "${log_file}" "${expected_ip}"; then
+    return 0
+  fi
+  if leader_log_storm_for "${owner_mac}" "${E2E_LEASE_STORM_WINDOW}"; then
+    return 2
+  fi
+  return 1
 }
 
 # The router option belongs to the pool that owns the guest's own network: the
@@ -646,6 +803,10 @@ start_guest_and_assert() { # <label> [absolute SECONDS deadline]
   if [ -n "${deadline}" ]; then
     wait_before_deadline "BOOT-${label}-DHCP" "${deadline}" "${E2E_VM_BOOT_TIMEOUT}" \
       "guest DHCP marker (${label})" console_has_reserved_ip "${console_log}"
+  elif [ "${label}" = "duplicate-owner-after-cfg" ]; then
+    wait_for "BOOT-${label}-DHCP" "${E2E_VM_BOOT_TIMEOUT}" \
+      "guest DHCP marker (${label}) (fails fast on the lease-loss signature)" \
+      boot_marker_or_lease_loss "${console_log}" "${KIH_VM_MAC}" "${RESERVED_IP}"
   else
     wait_for "BOOT-${label}-DHCP" "${E2E_VM_BOOT_TIMEOUT}" "guest DHCP marker (${label})" \
       console_has_reserved_ip "${console_log}"
@@ -750,23 +911,33 @@ new_leader_elected() { # <old pod> <old id>
 }
 
 cleanup_complete() {
-  local used available allocations
+  local used available allocations capacity
   object_absent_not_found -n "${KIH_WORKLOAD_NAMESPACE}" \
     get vmnetcfg "${KIH_VM_NAME}" || return 1
   used="$(kubectl get ippool "${KIH_IPPOOL_NAME}" -o jsonpath='{.status.ipv4.used}' 2> /dev/null)"
   available="$(kubectl get ippool "${KIH_IPPOOL_NAME}" -o jsonpath='{.status.ipv4.available}' 2> /dev/null)"
   # shellcheck disable=SC2016
   allocations="$(kubectl get ippool "${KIH_IPPOOL_NAME}" -o go-template='{{range $ip, $owner := .status.ipv4.allocated}}{{$ip}}={{$owner}}{{"\n"}}{{end}}' 2> /dev/null)"
-  case "${used}" in "" | 0) ;; *) return 1 ;; esac
-  [ "${available}" = "11" ] && [ -z "${allocations}" ]
+  # used is strictly required and must be exactly zero; missing or empty
+  # fails. available is normalized: absent means an exhausted pool (0),
+  # and the expected free count is the spec-derived capacity.
+  case "${used}" in '' | *[!0-9]*) return 1 ;; esac
+  [ "${used}" -eq 0 ] || return 1
+  [ -n "${available}" ] || available=0
+  case "${available}" in '' | *[!0-9]*) return 1 ;; esac
+  capacity="$(capacity_from_spec "${KIH_IPPOOL_NAME}")" || return 1
+  [ "${available}" -eq "${capacity}" ] && [ -z "${allocations}" ]
 }
 
 pool_counts_equal() { # <pool> <used> <available>
   local pool="$1" expected_used="$2" expected_available="$3" used available
   used="$(kubectl get ippool "${pool}" -o jsonpath='{.status.ipv4.used}' 2> /dev/null)" || return 1
   available="$(kubectl get ippool "${pool}" -o jsonpath='{.status.ipv4.available}' 2> /dev/null)" || return 1
-  used="${used:-0}"
-  available="${available:-0}"
+  # used is strictly numeric; available is normalized: absent means an
+  # exhausted pool (0).
+  case "${used}" in '' | *[!0-9]*) return 1 ;; esac
+  [ -n "${available}" ] || available=0
+  case "${available}" in '' | *[!0-9]*) return 1 ;; esac
   [ "${used}" = "${expected_used}" ] && [ "${available}" = "${expected_available}" ]
 }
 
@@ -1495,6 +1666,17 @@ EOF
 
 main() {
   local rendered vm_rendered default_image old_leader old_id octet failover_deadline failover_budget retained_lease_deadline router_original reinit_before
+  # versions.env composes E2E_ARTIFACTS_DIR as ${root}/runs/${E2E_RUN_ID},
+  # and report/evidence derive the artifact root by stripping that exact
+  # suffix. An environment override that does not carry it would make those
+  # derivations misbehave, so reject it before any run artifact is written.
+  # shellcheck disable=SC2153 # E2E_RUN_ID is assigned in versions.env, which shellcheck cannot follow
+  case "${E2E_ARTIFACTS_DIR}" in
+    */runs/${E2E_RUN_ID}) ;;
+    *)
+      die "E2E_ARTIFACTS_DIR must be unset or end with runs/${E2E_RUN_ID}"
+      ;;
+  esac
   rm -f "${E2E_CLUSTER_STATE_FILE}"
   report_case_start CORE-PREREQUISITES \
     "container runtime, kubectl, GNU timeout, and jq are available"
