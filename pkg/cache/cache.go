@@ -62,11 +62,12 @@ func (c *CacheAllocator) Get(t string, name string) (i interface{}, err error) {
 			return i, fmt.Errorf("IPPool %s does not exists in cache", name)
 		}
 
-		// return a deep copy too, so callers cannot mutate the cached pool
-		// through the nested slices and maps of the returned value
+		// return a deep copy as a value, so callers cannot mutate the cached
+		// pool through its nested slices and maps while the callers keep
+		// interpreting providers as kihv1.IPPool values
 		stored := c.ipPoolCache[name]
 
-		return stored.DeepCopy(), nil
+		return *stored.DeepCopy(), nil
 	}
 
 	return
