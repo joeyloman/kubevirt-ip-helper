@@ -615,3 +615,32 @@ func TestSyncAddReturnsErrorWhenPoolFailsToRegister(t *testing.T) {
 		t.Errorf("app log status gauge: got value %v found %v, want exactly 1 error entry", v, ok)
 	}
 }
+
+// a pool whose networkname changed keeps its cache entry under the old key:
+// its update event must still reach the restart handling through it
+func TestSyncUpdateReachesRestartAfterNetworkNameChange(t *testing.T) {
+	appStatus := APP_RUNNING
+	oldPool := testPool("pool-n", "net-old", 60)
+	newPool := testPool("pool-n", "net-new", 60)
+
+	indexer := newTestIndexer()
+	if err := indexer.Add(newPool); err != nil {
+		t.Fatalf("seeding indexer: %v", err)
+	}
+
+	controller, cacheAllocator := newTestController(t, newTestQueue(), indexer, nil, &appStatus, new(int))
+	if err := cacheAllocator.Add(oldPool); err != nil {
+		t.Fatalf("seeding cache: %v", err)
+	}
+
+	event := testPoolEvent("pool-n", UPDATE, "net-new")
+	event.oldPoolNetworkName = "net-old"
+
+	if err := controller.sync(event); err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	}
+
+	if appStatus != APP_RESTART {
+		t.Errorf("app status = %d, want %d after a networkname change", appStatus, APP_RESTART)
+	}
+}
