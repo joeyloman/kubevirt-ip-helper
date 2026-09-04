@@ -425,21 +425,19 @@ func TestHandleIPPoolObjectChangeReloadAddsNewCacheEntry(t *testing.T) {
 	}
 }
 
-func TestHandleIPPoolObjectChangeReloadWithInvalidSubnet(t *testing.T) {
-	c, _, d, ca, m := ippoolBehaviorNewTestController(t, nil)
+// A rejected reload must not destroy the active dhcp pool and must keep the
+// previously cached valid configuration; the error escapes so the queue can
+// retry the update.
+func TestHandleIPPoolObjectChangeRejectedInvalidSubnet(t *testing.T) {
+	c, _, d, ca, _ := ippoolBehaviorNewTestController(t, nil)
 
-	// both old and new pool carry the same unparsable subnet, so the
-	// subnet field itself is unchanged and only reload-class options
-	// differ. The change therefore stays on the in-process reload
-	// branch of handleIPPoolObjectChange: no DHCP server stop and no
-	// netlink call are involved.
 	oldPool := ippoolBehaviorNewTestPool("pool1", "net-a")
-	oldPool.Spec.IPv4Config.Subnet = "not-a-subnet"
+	oldPool.Spec.IPv4Config.LeaseTime = 3600
 	if err := ca.Add(oldPool); err != nil {
 		t.Fatalf("failed to seed cache: %s", err.Error())
 	}
-	// a dhcp pool already exists for the network (as if registered while
-	// the subnet was still valid); the failed re-projection must drop it
+	// a dhcp pool already exists for the network; the rejected reload must
+	// leave it intact
 	if err := d.AddPool(
 		"net-a",
 		"10.10.10.1",
@@ -459,34 +457,31 @@ func TestHandleIPPoolObjectChangeReloadWithInvalidSubnet(t *testing.T) {
 	newPool.Spec.IPv4Config.Subnet = "not-a-subnet"
 	newPool.Spec.IPv4Config.LeaseTime = 4200
 
-	if err := c.handleIPPoolObjectChange(*oldPool, newPool); err != nil {
-		t.Fatalf("unexpected error: %s", err.Error())
+	err := c.handleIPPoolObjectChange(*oldPool, newPool)
+	if err == nil {
+		t.Fatal("reload with an invalid subnet must return an error")
+	}
+	if !strings.Contains(err.Error(), "invalid subnet") {
+		t.Error("the returned error must name the invalid subnet projection")
 	}
 
-	// createOrUpdateDHCPPool deletes the existing pool before parsing the
-	// subnet, so the aborted parse leaves no dhcp pool behind while the
-	// cache still receives the update
-	if d.CheckPool("net-a") {
-		t.Errorf("expected the dhcp pool to be dropped after the failed update")
+	// the active dhcp pool must survive the rejected update
+	if !d.CheckPool("net-a") {
+		t.Errorf("the active dhcp pool was deleted although the replacement was rejected")
 	}
 	stored, err := ca.Get("pool", "net-a")
 	if err != nil {
-		t.Fatalf("updated pool missing from cache: %s", err.Error())
+		t.Fatalf("the valid pool is missing from cache: %s", err.Error())
 	}
 	storedPool := stored.(kihv1.IPPool)
-	if storedPool.Spec.IPv4Config.Subnet != "not-a-subnet" {
-		t.Errorf("cache does not hold the reloaded pool with its subnet")
+	if storedPool.Spec.IPv4Config.Subnet != "10.0.0.0/24" {
+		t.Errorf("cache holds subnet %q, want the previously valid configuration", storedPool.Spec.IPv4Config.Subnet)
 	}
-	if storedPool.Spec.IPv4Config.LeaseTime != 4200 {
-		t.Errorf("cache does not hold the reloaded pool options")
+	if storedPool.Spec.IPv4Config.LeaseTime != 3600 {
+		t.Errorf("cache lease time = %d, want the previously valid 3600", storedPool.Spec.IPv4Config.LeaseTime)
 	}
 	if *c.appStatus != APP_RUNNING {
 		t.Errorf("app status changed: got %d, want %d", *c.appStatus, APP_RUNNING)
-	}
-	// handleIPPoolObjectChange records the parse failure reported by
-	// createOrUpdateDHCPPool.
-	if v, ok := ippoolBehaviorMetricValue(t, m, "kubevirtiphelper_app_logs", map[string]string{"loglevel": "error"}); !ok || v != 1 {
-		t.Errorf("error log status metric = %v (found %t), want 1", v, ok)
 	}
 }
 
