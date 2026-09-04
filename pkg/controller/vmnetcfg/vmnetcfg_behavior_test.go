@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -35,6 +36,13 @@ const (
 
 	testMAC  = "02:00:00:00:00:01"
 	testMAC2 = "02:00:00:00:00:02"
+)
+
+const (
+	// competingAllocationIP is the sentinel address a conflict injects into
+	// the pool status, simulating the allocation of another writer whose
+	// entry must survive any subsequent retry
+	competingAllocationIP = "10.99.0.99"
 )
 
 const (
@@ -286,13 +294,26 @@ func newFakeAPIServer() *fakeAPIServer {
 func (f *fakeAPIServer) seedPool(pool *kihv1.IPPool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if pool.ObjectMeta.ResourceVersion == "" {
+		pool.ObjectMeta.ResourceVersion = "1"
+	}
 	f.ippools[pool.Name] = pool.DeepCopy()
 }
 
 func (f *fakeAPIServer) seedVMNetCfg(obj *kihv1.VirtualMachineNetworkConfig) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if obj.ObjectMeta.ResourceVersion == "" {
+		obj.ObjectMeta.ResourceVersion = "1"
+	}
 	f.vmnetcfgs[obj.Namespace+"/"+obj.Name] = obj.DeepCopy()
+}
+
+// bumpResourceVersion mimics the apiserver increasing the resourceVersion
+// whenever an object is written.
+func bumpResourceVersion(meta metav1.Object) {
+	rv, _ := strconv.Atoi(meta.GetResourceVersion())
+	meta.SetResourceVersion(strconv.Itoa(rv + 1))
 }
 
 func (f *fakeAPIServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
@@ -355,6 +376,18 @@ func (f *fakeAPIServer) handleIPPool(w http.ResponseWriter, r *http.Request, nam
 		failCode := f.poolStatusPutCode
 		f.mu.Unlock()
 		if conflict {
+			// mimic a competing writer: the stored version advances and a
+			// foreign allocation appears in the status, so a retried stale
+			// write cannot pass the fake
+			f.mu.Lock()
+			if pool, found := f.ippools[name]; found {
+				bumpResourceVersion(pool)
+				if pool.Status.IPv4.Allocated == nil {
+					pool.Status.IPv4.Allocated = map[string]string{}
+				}
+				pool.Status.IPv4.Allocated[competingAllocationIP] = "other-writer [aa:11:22:33:44:55]"
+			}
+			f.mu.Unlock()
 			writeStatus(w, http.StatusConflict, metav1.StatusReasonConflict, "please apply your changes to the latest version and try again")
 			return
 		}
@@ -368,6 +401,25 @@ func (f *fakeAPIServer) handleIPPool(w http.ResponseWriter, r *http.Request, nam
 			return
 		}
 		f.mu.Lock()
+		stored, found := f.ippools[name]
+		if !found {
+			f.mu.Unlock()
+			writeStatus(w, http.StatusNotFound, metav1.StatusReasonNotFound, "the server could not find the requested resource")
+			return
+		}
+		// reject writes that are not based on the latest stored version or
+		// whose body does not match the requested object identity
+		if submitted := pool.ObjectMeta.ResourceVersion; submitted == "" || stored.ObjectMeta.ResourceVersion != submitted {
+			f.mu.Unlock()
+			writeStatus(w, http.StatusConflict, metav1.StatusReasonConflict, "please apply your changes to the latest version and try again")
+			return
+		}
+		if pool.ObjectMeta.Name != name {
+			f.mu.Unlock()
+			writeStatus(w, http.StatusBadRequest, metav1.StatusReasonBadRequest, "the object name does not match the requested object")
+			return
+		}
+		bumpResourceVersion(&pool)
 		f.ippools[name] = pool.DeepCopy()
 		f.mu.Unlock()
 		f.writePool(w, &pool)
@@ -378,6 +430,12 @@ func (f *fakeAPIServer) handleIPPool(w http.ResponseWriter, r *http.Request, nam
 			return
 		}
 		f.mu.Lock()
+		if pool.ObjectMeta.Name != name {
+			f.mu.Unlock()
+			writeStatus(w, http.StatusBadRequest, metav1.StatusReasonBadRequest, "the object name does not match the requested object")
+			return
+		}
+		bumpResourceVersion(&pool)
 		f.ippools[name] = pool.DeepCopy()
 		f.mu.Unlock()
 		f.writePool(w, &pool)
@@ -1121,6 +1179,14 @@ func TestUpdateIPPoolStatusBranches(t *testing.T) {
 		pool := e.getStoredPool()
 		if got := pool.Status.IPv4.Allocated["10.0.0.2"]; got != testNamespace+"/"+testVMName+" ["+testMAC+"]" {
 			t.Errorf("allocated[10.0.0.2] = %q, want ref", got)
+		}
+		// the retried write must be based on the re-read state: the sentinel
+		// allocation of the competing writer survived the merge
+		if got := pool.Status.IPv4.Allocated[competingAllocationIP]; !strings.HasPrefix(got, "other-writer") {
+			t.Errorf("allocated[%s] = %q, want the competing writer sentinel preserved", competingAllocationIP, got)
+		}
+		if pool.ObjectMeta.ResourceVersion == "1" {
+			t.Errorf("resourceVersion = %q, want a version bumped by the conflict and the write", pool.ObjectMeta.ResourceVersion)
 		}
 	})
 
