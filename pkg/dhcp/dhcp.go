@@ -443,7 +443,9 @@ func (a *DHCPAllocator) Run(nic string, serverip string) (err error) {
 
 	go server.Serve()
 
+	a.mutex.Lock()
 	a.servers[nic] = server
+	a.mutex.Unlock()
 
 	return
 }
@@ -451,5 +453,16 @@ func (a *DHCPAllocator) Run(nic string, serverip string) (err error) {
 func (a *DHCPAllocator) Stop(nic string) (err error) {
 	log.Infof("(dhcp.Stop) stopping DHCP service on nic %s", nic)
 
-	return a.servers[nic].Close()
+	a.mutex.Lock()
+	server, exists := a.servers[nic]
+	delete(a.servers, nic)
+	a.mutex.Unlock()
+
+	if !exists || server == nil {
+		log.Debugf("(dhcp.Stop) no running dhcp service on nic %s, nothing to stop", nic)
+
+		return
+	}
+
+	return server.Close()
 }
