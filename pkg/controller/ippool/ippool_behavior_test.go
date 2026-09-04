@@ -431,7 +431,10 @@ func TestHandleIPPoolObjectChangeReloadAddsNewCacheEntry(t *testing.T) {
 func TestHandleIPPoolObjectChangeRejectedInvalidSubnet(t *testing.T) {
 	c, _, d, ca, _ := ippoolBehaviorNewTestController(t, nil)
 
+	// both pool versions carry the same (invalid) subnet textually, so the
+	// change classifies as a reload and rejects in the dhcp projection
 	oldPool := ippoolBehaviorNewTestPool("pool1", "net-a")
+	oldPool.Spec.IPv4Config.Subnet = "not-a-subnet"
 	oldPool.Spec.IPv4Config.LeaseTime = 3600
 	if err := ca.Add(oldPool); err != nil {
 		t.Fatalf("failed to seed cache: %s", err.Error())
@@ -474,11 +477,11 @@ func TestHandleIPPoolObjectChangeRejectedInvalidSubnet(t *testing.T) {
 		t.Fatalf("the valid pool is missing from cache: %s", err.Error())
 	}
 	storedPool := stored.(kihv1.IPPool)
-	if storedPool.Spec.IPv4Config.Subnet != "10.0.0.0/24" {
-		t.Errorf("cache holds subnet %q, want the previously valid configuration", storedPool.Spec.IPv4Config.Subnet)
+	if storedPool.Spec.IPv4Config.Subnet != "not-a-subnet" {
+		t.Errorf("cache holds subnet %q, want the previously cached entry preserved", storedPool.Spec.IPv4Config.Subnet)
 	}
 	if storedPool.Spec.IPv4Config.LeaseTime != 3600 {
-		t.Errorf("cache lease time = %d, want the previously valid 3600", storedPool.Spec.IPv4Config.LeaseTime)
+		t.Errorf("cache lease time = %d, want the previously cached 3600, not the rejected 4200", storedPool.Spec.IPv4Config.LeaseTime)
 	}
 	if *c.appStatus != APP_RUNNING {
 		t.Errorf("app status changed: got %d, want %d", *c.appStatus, APP_RUNNING)
