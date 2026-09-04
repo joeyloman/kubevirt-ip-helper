@@ -284,16 +284,17 @@ func TestSyncDeleteSucceedsWhenPoolNotCached(t *testing.T) {
 	}
 }
 
-func TestSyncUpdateSucceedsWhenPoolNotCached(t *testing.T) {
-	// an UPDATE event with an index entry but no cache entry logs the cache
-	// miss and returns without error
+func TestSyncUpdateReturnsErrorWhenPoolNotCached(t *testing.T) {
+	// an UPDATE event whose pool is missing from the cache is an invariant
+	// violation: it must return the error so the queue retries, instead of
+	// silently forgetting the event
 	var appStatus int
 	indexer := newTestIndexer()
 	indexer.Add(testPool("pool-i", "net-i", 60))
 	controller, _ := newTestController(t, newTestQueue(), indexer, nil, &appStatus, new(int))
 
-	if err := controller.sync(testPoolEvent("pool-i", UPDATE, "net-i")); err != nil {
-		t.Errorf("sync(UPDATE) returned error %v, want nil", err)
+	if err := controller.sync(testPoolEvent("pool-i", UPDATE, "net-i")); err == nil {
+		t.Error("sync(UPDATE) returned nil, want a rate-limited requeue error for the missing cache entry")
 	}
 }
 
@@ -586,11 +587,12 @@ func TestEventHandlerInitFailsOnMalformedKubeconfig(t *testing.T) {
 		t.Error("Init() must not build a clientset when the kubeconfig fails to load")
 	}
 }
-
-func TestSyncAddReturnsNilWhenPoolFailsToRegister(t *testing.T) {
+func TestSyncAddReturnsErrorWhenPoolFailsToRegister(t *testing.T) {
 	// an ADD event whose pool has an invalid subnet fails inside registerIPPool
-	// before any netlink or dhcp work; sync logs the failure and reports no
-	// error to the queue machinery.
+	// before any netlink or dhcp work; sync must return the error so the
+	// queue applies a rate-limited requeue. A nil error would Forget the
+	// event and the successful-pool counter would never reach the target
+	// count, blocking initialization forever.
 	pool := testPool("pool-m", "net-m", 60)
 	pool.Spec.IPv4Config.Subnet = "not-a-cidr"
 
@@ -602,8 +604,8 @@ func TestSyncAddReturnsNilWhenPoolFailsToRegister(t *testing.T) {
 	var appStatus int
 	controller, _ := newTestController(t, newTestQueue(), indexer, nil, &appStatus, new(int))
 
-	if err := controller.sync(testPoolEvent("pool-m", ADD, "net-m")); err != nil {
-		t.Errorf("sync(ADD) returned error %v, want nil", err)
+	if err := controller.sync(testPoolEvent("pool-m", ADD, "net-m")); err == nil {
+		t.Error("sync(ADD) returned nil, want a rate-limited requeue error from the registration failure")
 	}
 
 	if controller.dhcp.CheckPool("net-m") {
