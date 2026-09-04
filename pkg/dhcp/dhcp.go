@@ -404,6 +404,11 @@ func (a *DHCPAllocator) dhcpHandler(conn net.PacketConn, peer net.Addr, m *dhcpv
 		// default lease time: 1 year
 		reply.UpdateOption(dhcpv4.OptIPAddressLeaseTime(31536000 * time.Second))
 	}
+	if replyType == dhcpv4.MessageTypeOffer {
+		log.Infof("(dhcp.dhcpHandler) [txid=%s] DHCPOFFER on %s to %s via %s", m.TransactionID.String(), lease.ClientIP, m.ClientHWAddr.String(), pool.Nic)
+	} else {
+		log.Infof("(dhcp.dhcpHandler) [txid=%s] DHCPACK on %s to %s via %s", m.TransactionID.String(), lease.ClientIP, m.ClientHWAddr.String(), pool.Nic)
+	}
 
 	if _, err := conn.WriteTo(reply.ToBytes(), peer); err != nil {
 		log.Errorf("(dhcp.dhcpHandler) Cannot reply to client: %v", err)
