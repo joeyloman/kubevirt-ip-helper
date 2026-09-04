@@ -137,18 +137,12 @@ func (e *EventHandler) EventListener() (err error) {
 			}
 		},
 		DeleteFunc: func(obj interface{}) {
-			// when the resource was deleted while the watcher was out of
-			// sync, the informer delivers a tombstone instead of the object
-			if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
-				obj = tombstone.Obj
-			}
-
-			virtualMachine, isVM := obj.(*kubevirtv1.VirtualMachine)
+			virtualMachine, isVM := unwrapTombstone(obj).(*kubevirtv1.VirtualMachine)
 			if !isVM {
 				return
 			}
 
-			key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
+			key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(virtualMachine)
 			if err == nil {
 				queue.Add(Event{
 					key:         key,
@@ -170,4 +164,14 @@ func (e *EventHandler) EventListener() (err error) {
 		log.Infof("(vm.EventListener) stopping the VirtualMachine event listener")
 		return
 	}
+}
+
+// unwrapTombstone resolves the informer object for delete handlers: delayed
+// deletions arrive as cache.DeletedFinalStateUnknown instead of the object.
+func unwrapTombstone(obj interface{}) interface{} {
+	if tombstone, isTombstone := obj.(cache.DeletedFinalStateUnknown); isTombstone {
+		return tombstone.Obj
+	}
+
+	return obj
 }

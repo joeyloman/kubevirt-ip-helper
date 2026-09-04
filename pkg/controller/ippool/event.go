@@ -136,18 +136,12 @@ func (e *EventHandler) EventListener() (err error) {
 			}
 		},
 		DeleteFunc: func(obj interface{}) {
-			// when the resource was deleted while the watcher was out of
-			// sync, the informer delivers a tombstone instead of the object
-			if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
-				obj = tombstone.Obj
-			}
-
-			pool, isPool := obj.(*kihv1.IPPool)
+			pool, isPool := unwrapTombstone(obj).(*kihv1.IPPool)
 			if !isPool {
 				return
 			}
 
-			key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
+			key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(pool)
 			if err == nil {
 				queue.Add(Event{
 					key:             key,
@@ -169,4 +163,14 @@ func (e *EventHandler) EventListener() (err error) {
 		log.Infof("(ippool.EventListener) stopping the IPPool event listener")
 		return
 	}
+}
+
+// unwrapTombstone resolves the informer object for delete handlers: delayed
+// deletions arrive as cache.DeletedFinalStateUnknown instead of the object.
+func unwrapTombstone(obj interface{}) interface{} {
+	if tombstone, isTombstone := obj.(cache.DeletedFinalStateUnknown); isTombstone {
+		return tombstone.Obj
+	}
+
+	return obj
 }
