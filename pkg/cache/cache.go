@@ -33,7 +33,11 @@ func (c *CacheAllocator) Add(t interface{}) (err error) {
 			return fmt.Errorf("IPPool %s already exists in cache", t.(*kihv1.IPPool).Spec.NetworkName)
 		}
 
-		c.ipPoolCache[t.(*kihv1.IPPool).Spec.NetworkName] = *t.(*kihv1.IPPool)
+		// deep-copy the object into the cache: a shallow struct copy would
+		// share the nested slices and maps with the source object, so
+		// mutating the source would silently rewrite the cached pool too
+		copiedPool := t.(*kihv1.IPPool).DeepCopy()
+		c.ipPoolCache[t.(*kihv1.IPPool).Spec.NetworkName] = *copiedPool
 	}
 
 	return
@@ -58,8 +62,13 @@ func (c *CacheAllocator) Get(t string, name string) (i interface{}, err error) {
 			return i, fmt.Errorf("IPPool %s does not exists in cache", name)
 		}
 
-		return c.ipPoolCache[name], nil
+		// return a deep copy too, so callers cannot mutate the cached pool
+		// through the nested slices and maps of the returned value
+		stored := c.ipPoolCache[name]
+
+		return stored.DeepCopy(), nil
 	}
+
 	return
 }
 
