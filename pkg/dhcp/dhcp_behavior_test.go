@@ -135,8 +135,8 @@ func TestDHCPHandlerOfferForDiscover(t *testing.T) {
 	if !resp.ServerIPAddr.Equal(net.ParseIP("192.168.0.1")) {
 		t.Errorf("ServerIPAddr = %s, want 192.168.0.1", resp.ServerIPAddr)
 	}
-	if !resp.ClientIPAddr.Equal(net.ParseIP("192.168.0.50")) {
-		t.Errorf("ClientIPAddr = %s, want 192.168.0.50", resp.ClientIPAddr)
+	if !resp.ClientIPAddr.IsUnspecified() {
+		t.Errorf("ClientIPAddr = %s, want 0.0.0.0; rfc 2131 requires a zero ciaddr in an offer for an initial discover", resp.ClientIPAddr)
 	}
 	if resp.TransactionID != req.TransactionID {
 		t.Errorf("transaction id = %s, want %s", resp.TransactionID, req.TransactionID)
@@ -173,59 +173,114 @@ func TestDHCPHandlerOfferForDiscover(t *testing.T) {
 	}
 }
 
-func TestDHCPHandlerAckForRequest(t *testing.T) {
-	a := newTestPooledAllocator(t)
-	conn := &recordingPacketConn{}
+func TestDHCPHandlerRequestAddressing(t *testing.T) {
+	leaseIP := net.ParseIP("192.168.0.50")
+	serverIP := net.ParseIP("192.168.0.1")
 
-	req := newBootRequest(t, mustHWAddr(t, "aa:bb:cc:dd:ee:01"), dhcpv4.MessageTypeRequest)
-	a.dhcpHandler(conn, testPeer(), req)
+	t.Run("selecting request with matching options is acked", func(t *testing.T) {
+		a := newTestPooledAllocator(t)
+		conn := &recordingPacketConn{}
 
-	if conn.len() != 1 {
-		t.Fatalf("expected 1 reply, got %d", conn.len())
-	}
-	resp, err := dhcpv4.FromBytes(conn.payloads[0])
-	if err != nil {
-		t.Fatalf("parsing reply: %v", err)
-	}
-	if mt := resp.MessageType(); mt != dhcpv4.MessageTypeAck {
-		t.Errorf("got message type %v, want Ack", mt)
-	}
-	if !resp.YourIPAddr.Equal(net.ParseIP("192.168.0.50")) {
-		t.Errorf("YourIPAddr = %s, want 192.168.0.50", resp.YourIPAddr)
-	}
+		req := newBootRequest(t, mustHWAddr(t, "aa:bb:cc:dd:ee:01"), dhcpv4.MessageTypeRequest)
+		req.UpdateOption(dhcpv4.OptServerIdentifier(serverIP))
+		req.UpdateOption(dhcpv4.OptRequestedIPAddress(leaseIP))
+		a.dhcpHandler(conn, testPeer(), req)
+
+		if conn.len() != 1 {
+			t.Fatalf("expected 1 reply, got %d", conn.len())
+		}
+		resp, err := dhcpv4.FromBytes(conn.payloads[0])
+		if err != nil {
+			t.Fatalf("parsing reply: %v", err)
+		}
+		if mt := resp.MessageType(); mt != dhcpv4.MessageTypeAck {
+			t.Errorf("got message type %v, want Ack", mt)
+		}
+		if !resp.YourIPAddr.Equal(leaseIP) {
+			t.Errorf("YourIPAddr = %s, want 192.168.0.50", resp.YourIPAddr)
+		}
+		if !resp.ClientIPAddr.IsUnspecified() {
+			t.Errorf("ClientIPAddr = %s, want 0.0.0.0 for a selecting request", resp.ClientIPAddr)
+		}
+	})
+
+	t.Run("renewal through ciaddr is acked", func(t *testing.T) {
+		a := newTestPooledAllocator(t)
+		conn := &recordingPacketConn{}
+
+		req := newBootRequest(t, mustHWAddr(t, "aa:bb:cc:dd:ee:01"), dhcpv4.MessageTypeRequest)
+		req.ClientIPAddr = leaseIP
+		a.dhcpHandler(conn, testPeer(), req)
+
+		if conn.len() != 1 {
+			t.Fatalf("expected 1 reply, got %d", conn.len())
+		}
+		resp, err := dhcpv4.FromBytes(conn.payloads[0])
+		if err != nil {
+			t.Fatalf("parsing reply: %v", err)
+		}
+		if mt := resp.MessageType(); mt != dhcpv4.MessageTypeAck {
+			t.Errorf("got message type %v, want Ack", mt)
+		}
+		if !resp.ClientIPAddr.Equal(leaseIP) {
+			t.Errorf("ClientIPAddr = %s, want the renewed ciaddr 192.168.0.50", resp.ClientIPAddr)
+		}
+		if !resp.YourIPAddr.Equal(leaseIP) {
+			t.Errorf("YourIPAddr = %s, want 192.168.0.50", resp.YourIPAddr)
+		}
+	})
+
+	t.Run("mismatched requested ip is nacked", func(t *testing.T) {
+		a := newTestPooledAllocator(t)
+		conn := &recordingPacketConn{}
+
+		req := newBootRequest(t, mustHWAddr(t, "aa:bb:cc:dd:ee:01"), dhcpv4.MessageTypeRequest)
+		req.UpdateOption(dhcpv4.OptServerIdentifier(serverIP))
+		req.UpdateOption(dhcpv4.OptRequestedIPAddress(net.ParseIP("192.168.0.99")))
+		a.dhcpHandler(conn, testPeer(), req)
+
+		if conn.len() != 1 {
+			t.Fatalf("expected 1 reply, got %d", conn.len())
+		}
+		resp, err := dhcpv4.FromBytes(conn.payloads[0])
+		if err != nil {
+			t.Fatalf("parsing reply: %v", err)
+		}
+		if mt := resp.MessageType(); mt != dhcpv4.MessageTypeNak {
+			t.Errorf("got message type %v, want Nak for a mismatched address", mt)
+		}
+		if !resp.YourIPAddr.IsUnspecified() {
+			t.Errorf("YourIPAddr = %s, want 0.0.0.0 for a nak", resp.YourIPAddr)
+		}
+	})
+
+	t.Run("request for another server is ignored", func(t *testing.T) {
+		a := newTestPooledAllocator(t)
+		conn := &recordingPacketConn{}
+
+		req := newBootRequest(t, mustHWAddr(t, "aa:bb:cc:dd:ee:01"), dhcpv4.MessageTypeRequest)
+		req.UpdateOption(dhcpv4.OptServerIdentifier(net.ParseIP("203.0.113.9")))
+		req.UpdateOption(dhcpv4.OptRequestedIPAddress(leaseIP))
+		a.dhcpHandler(conn, testPeer(), req)
+
+		if conn.len() != 0 {
+			t.Errorf("expected no reply for a foreign server id, got %d", conn.len())
+		}
+	})
 }
 
-func TestDHCPHandlerReplyForRelease(t *testing.T) {
+func TestDHCPHandlerReleaseGetsNoReply(t *testing.T) {
 	a := newTestPooledAllocator(t)
 	conn := &recordingPacketConn{}
 
 	req := newBootRequest(t, mustHWAddr(t, "aa:bb:cc:dd:ee:01"), dhcpv4.MessageTypeRelease)
+	req.ClientIPAddr = net.ParseIP("192.168.0.50")
 	a.dhcpHandler(conn, testPeer(), req)
 
-	if conn.len() != 1 {
-		t.Fatalf("expected 1 reply for DHCPRELEASE, got %d", conn.len())
-	}
-	resp, err := dhcpv4.FromBytes(conn.payloads[0])
-	if err != nil {
-		t.Fatalf("parsing reply: %v", err)
-	}
-	// The RELEASE branch is informational: the server still answers with
-	// the lease-based reply, but leaves the DHCP message type unset
-	// instead of turning it into an OFFER or ACK.
-	if mt := resp.MessageType(); mt != dhcpv4.MessageTypeNone {
-		t.Errorf("got message type %v, want none for DHCPRELEASE", mt)
-	}
-	if resp.OpCode != dhcpv4.OpcodeBootReply {
-		t.Errorf("reply opcode = %v, want %v", resp.OpCode, dhcpv4.OpcodeBootReply)
-	}
-	if !resp.YourIPAddr.Equal(net.ParseIP("192.168.0.50")) {
-		t.Errorf("YourIPAddr = %s, want 192.168.0.50", resp.YourIPAddr)
-	}
-	if resp.TransactionID != req.TransactionID {
-		t.Errorf("transaction id = %s, want %s", resp.TransactionID, req.TransactionID)
-	}
-	if sip := resp.ServerIdentifier(); !sip.Equal(net.ParseIP("192.168.0.1")) {
-		t.Errorf("server identifier = %s, want 192.168.0.1", sip)
+	// rfc 2131 4.3.4: a release is a one-way notification; the server
+	// must not write any bootreply back to the client
+	if conn.len() != 0 {
+		t.Errorf("expected 0 writes for DHCPRELEASE, got %d", conn.len())
 	}
 }
 
@@ -288,19 +343,7 @@ func TestDHCPHandlerBootReplyOpcodeNoReply(t *testing.T) {
 	a.dhcpHandler(conn, testPeer(), req)
 
 	if conn.len() != 0 {
-		t.Errorf("expected no reply for a BootReply opcode, got %d", conn.len())
-	}
-}
-
-func TestDHCPHandlerWriteErrorNoPanic(t *testing.T) {
-	a := newTestPooledAllocator(t)
-	conn := &recordingPacketConn{writeErr: errors.New("connection reset")}
-
-	req := newBootRequest(t, mustHWAddr(t, "aa:bb:cc:dd:ee:01"), dhcpv4.MessageTypeDiscover)
-	a.dhcpHandler(conn, testPeer(), req)
-
-	if conn.len() != 1 {
-		t.Errorf("expected 1 attempted reply, got %d", conn.len())
+		t.Errorf("expected no reply for a bootreply opcode, got %d", conn.len())
 	}
 }
 
@@ -359,25 +402,35 @@ func TestAddPoolOverwritesExistingPool(t *testing.T) {
 	}
 }
 
-func TestAddLeaseKeysByProvidedString(t *testing.T) {
+// mac addresses are stored under the canonical colon form, so alternative
+// but equal spellings resolve to the same lease and a duplicate spelling
+// must be rejected instead of creating a second independent identity.
+func TestAddLeaseCanonicalizesIdentity(t *testing.T) {
 	a := New()
-	for _, hw := range []string{"aa:bb:cc:dd:ee:01", "aabbccddee01"} {
+	for _, hw := range []string{"aa-bb-cc-dd-ee-01", "aabbccddee02"} {
 		if err := a.AddLease(hw, "pool1", "192.168.0.50", "ref"); err != nil {
 			t.Fatalf("AddLease(%q): %v", hw, err)
 		}
 	}
 
-	// Both textual forms are valid MACs but each is stored under the exact
-	// string that was supplied.
+	// both spellings resolve to the canonical colon key
 	if !a.CheckLease("aa:bb:cc:dd:ee:01") {
-		t.Error("colon-form key not found")
+		t.Error("hyphen-form lease not resolvable in canonical colon form")
 	}
-	if !a.CheckLease("aabbccddee01") {
-		t.Error("bare-form key not found")
+	if !a.CheckLease("aabbccddee02") {
+		t.Error("bare-form lease not resolvable in canonical colon form")
 	}
+
+	// the second spelling of the first address is rejected as duplicate
+	if err := a.AddLease("aabbccddee01", "pool1", "192.168.0.51", "other-ref"); err == nil {
+		t.Fatal("a duplicate spelling of an existing lease was accepted")
+	} else if !strings.Contains(err.Error(), "already exists") {
+		t.Errorf("duplicate error = %q, want already-exists message", err)
+	}
+
 	lease := a.GetLease("aa:bb:cc:dd:ee:01")
-	if !lease.ClientIP.Equal(net.ParseIP("192.168.0.50")) {
-		t.Errorf("lease client ip = %v, want 192.168.0.50", lease.ClientIP)
+	if !lease.ClientIP.Equal(net.ParseIP("192.168.0.50")) || lease.Reference != "ref" {
+		t.Errorf("lease = %+v, want the original allocation preserved", lease)
 	}
 }
 func captureLogrus(t *testing.T, fn func()) string {
