@@ -122,6 +122,9 @@ func clearInClusterEnv(t *testing.T) {
 	t.Helper()
 	t.Setenv("KUBERNETES_SERVICE_HOST", "")
 	t.Setenv("KUBERNETES_SERVICE_PORT", "")
+	// an inherited kube context from a developer or ci environment would
+	// silently select a nonexistent fixture context
+	t.Setenv("KUBECONTEXT", "")
 }
 
 func TestHandler_Register(t *testing.T) {

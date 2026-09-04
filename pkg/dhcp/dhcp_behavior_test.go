@@ -481,30 +481,22 @@ func TestUsageWithMissingPoolDoesNotPanic(t *testing.T) {
 	}
 }
 
-func TestAddPoolResolvesNTPHostnameToIPv4(t *testing.T) {
+// Hostname resolution in AddPool is intentionally not covered: without a
+// resolver seam the results depend on the host configuration (localhost may
+// map to several v4/v6 addresses, name lookups may delay or vary). Only
+// literal addresses are tested here.
+func TestAddPoolAcceptsLiteralNTPAddresses(t *testing.T) {
 	a := New()
-	if err := a.AddPool("p", "192.168.0.1", "255.255.255.0", "192.168.0.254", nil, "", nil, []string{"localhost"}, 3600, "eth0"); err != nil {
+	if err := a.AddPool("p", "192.168.0.1", "255.255.255.0", "192.168.0.254", nil, "", nil, []string{"10.0.0.53"}, 3600, "eth0"); err != nil {
 		t.Fatalf("AddPool: %v", err)
 	}
 
 	pool := a.GetPool("p")
 	if len(pool.NTP) != 1 {
-		t.Fatalf("NTP entries = %d, want 1 (resolved localhost)", len(pool.NTP))
+		t.Fatalf("NTP entries = %d, want 1", len(pool.NTP))
 	}
-	if !pool.NTP[0].Equal(net.ParseIP("127.0.0.1")) {
-		t.Errorf("NTP = %v, want 127.0.0.1", pool.NTP)
-	}
-}
-
-func TestAddPoolUnresolvableNTPHostnameSkipped(t *testing.T) {
-	a := New()
-	if err := a.AddPool("p", "192.168.0.1", "255.255.255.0", "192.168.0.254", nil, "", nil, []string{"not a valid hostname"}, 3600, "eth0"); err != nil {
-		t.Fatalf("AddPool: %v", err)
-	}
-
-	pool := a.GetPool("p")
-	if len(pool.NTP) != 0 {
-		t.Errorf("NTP entries = %v, want none for unresolvable hostname", pool.NTP)
+	if !pool.NTP[0].Equal(net.ParseIP("10.0.0.53")) {
+		t.Errorf("NTP = %v, want 10.0.0.53", pool.NTP)
 	}
 }
 
