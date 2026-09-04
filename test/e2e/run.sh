@@ -327,7 +327,11 @@ wait_for() { # <case-id> <seconds> <description> <predicate> [args...]
   local deadline=$((SECONDS + timeout))
   report_case_start "${case_id}" "${description}"
   while [ "${SECONDS}" -lt "${deadline}" ]; do
-    if run_pred_once "${E2E_PRED_SECONDS}" "$@"; then
+    # rc is captured from run_pred_once directly: an `if <cmd>; then ... fi`
+    # with no else resets $? to 0 on the false branch, which would silently
+    # downgrade a predicate exit code 2 (bug signature) to a plain failure.
+    run_pred_once "${E2E_PRED_SECONDS}" "$@" && rc=0 || rc=$?
+    if [ "${rc}" -eq 0 ]; then
       if [ "${SECONDS}" -lt "${deadline}" ]; then
         log "ok: ${description}"
         report_case_pass "satisfied $((SECONDS - start))s after the first attempt"
@@ -335,7 +339,6 @@ wait_for() { # <case-id> <seconds> <description> <predicate> [args...]
       fi
       break
     fi
-    rc=$?
     if [ "${rc}" -eq 2 ]; then
       die "bug signature detected: ${description} (owner DHCP lease destroyed by duplicate-cfg cleanup; lease release is keyed by MAC without ownership check)"
     fi
@@ -343,11 +346,17 @@ wait_for() { # <case-id> <seconds> <description> <predicate> [args...]
   done
   # One final probe outside the watchdog at the deadline: a predicate that
   # only needs one more event can still pass, and the pass then carries the
-  # grace detail instead of a timeout.
-  if "$@"; then
+  # grace detail instead of a timeout. The rc is captured the same way as in
+  # the polling loop so an exit code 2 bug signature still reports its
+  # attribution message rather than a generic timeout.
+  "$@" && rc=0 || rc=$?
+  if [ "${rc}" -eq 0 ]; then
     log "ok: ${description}"
     report_case_pass "satisfied via grace probe at the ${timeout}s deadline"
     return 0
+  fi
+  if [ "${rc}" -eq 2 ]; then
+    die "bug signature detected: ${description} (owner DHCP lease destroyed by duplicate-cfg cleanup; lease release is keyed by MAC without ownership check)"
   fi
   die "timed out after ${timeout}s: ${description}"
 }
@@ -365,12 +374,12 @@ wait_before_deadline() { # <case-id> <absolute SECONDS> <maximum seconds> <descr
   # The per-attempt watchdog applies here too, but never a grace probe:
   # absolute deadlines are window contracts and must not pass after expiry.
   while [ "${SECONDS}" -lt "${window}" ]; do
-    if run_pred_once "${E2E_PRED_SECONDS}" "$@"; then
+    run_pred_once "${E2E_PRED_SECONDS}" "$@" && rc=0 || rc=$?
+    if [ "${rc}" -eq 0 ]; then
       log "ok: ${description}"
       report_case_pass "satisfied $((SECONDS - start))s after the first attempt"
       return 0
     fi
-    rc=$?
     if [ "${rc}" -eq 2 ]; then
       die "bug signature detected: ${description} (owner DHCP lease destroyed by duplicate-cfg cleanup; lease release is keyed by MAC without ownership check)"
     fi
