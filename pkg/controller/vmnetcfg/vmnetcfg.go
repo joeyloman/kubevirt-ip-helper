@@ -167,7 +167,7 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 				oldNetcfg.MACAddress = v.MACAddress
 				oldNetcfg.IPAddress = lease.ClientIP.String()
 
-				if err := c.cleanupNetworkInterface(vmnetcfg, &oldNetcfg); err != nil {
+				if err := c.cleanupNetworkInterface(vmnetcfg, &oldNetcfg, false); err != nil {
 					return err
 				}
 			} else {
@@ -342,37 +342,62 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 	return
 }
 
-func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetworkConfig, netCfg *kihv1.NetworkConfig) (err error) {
+func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetworkConfig, netCfg *kihv1.NetworkConfig, deleting bool) (err error) {
 	log.Debugf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] cleaning interface with hwaddr=%s, networkname=%s, ipaddress=%s",
 		vmnetcfg.Namespace, vmnetcfg.Name, netCfg.MACAddress, netCfg.NetworkName, netCfg.IPAddress)
 
 	ref := fmt.Sprintf("%s/%s", vmnetcfg.Namespace, vmnetcfg.Spec.VMName)
 
 	// a delayed cleanup must not tear down allocations which were assigned
-	// to another vm in the meantime
+	// to another vm in the meantime. for a live vmnetcfg this aborts the
+	// sync so the changed state can be re-inspected on the next update;
+	// during deletion the foreign allocation is left to its owner and the
+	// remaining own allocations are cleaned so the finalizer completes
+	deleteMacLease := false
 	if c.dhcp.CheckLease(netCfg.MACAddress) {
 		lease := c.dhcp.GetLease(netCfg.MACAddress)
 		if lease.Reference != ref {
-			return fmt.Errorf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] hwaddr %s belongs to %s, aborting cleanup to preserve the allocation",
+			if !deleting {
+				return fmt.Errorf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] hwaddr %s belongs to %s, aborting cleanup to preserve the allocation",
+					vmnetcfg.Namespace, vmnetcfg.Name, netCfg.MACAddress, lease.Reference)
+			}
+
+			log.Warnf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] hwaddr %s belongs to %s, skipping the dhcp cleanup of it",
 				vmnetcfg.Namespace, vmnetcfg.Name, netCfg.MACAddress, lease.Reference)
+			c.metrics.UpdateLogStatus("warning")
+		} else {
+			deleteMacLease = true
 		}
 	}
 
+	// freeing an ip which is leased to another vm would leave the other
+	// lease serving an address ipam could reissue to a third client
+	releaseIP := false
 	if netCfg.IPAddress != "" {
+		releaseIP = true
+
 		if leaseHwAddr, lease, found := c.dhcp.GetLeaseByIP(netCfg.IPAddress); found && lease.Reference != ref {
-			return fmt.Errorf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] ip %s belongs to %s via hwaddr %s, aborting cleanup to preserve the allocation",
+			if !deleting {
+				return fmt.Errorf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] ip %s belongs to %s via hwaddr %s, aborting cleanup to preserve the allocation",
+					vmnetcfg.Namespace, vmnetcfg.Name, netCfg.IPAddress, lease.Reference, leaseHwAddr)
+			}
+
+			log.Warnf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] ip %s belongs to %s via hwaddr %s, skipping the ipam release of it",
 				vmnetcfg.Namespace, vmnetcfg.Name, netCfg.IPAddress, lease.Reference, leaseHwAddr)
+			c.metrics.UpdateLogStatus("warning")
+
+			releaseIP = false
 		}
 	}
 
-	if c.dhcp.CheckLease(netCfg.MACAddress) {
+	if deleteMacLease {
 		if err := c.dhcp.DeleteLease(netCfg.MACAddress); err != nil {
 			return fmt.Errorf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] error deleting lease from dhcp: %s",
 				vmnetcfg.Namespace, vmnetcfg.Name, err.Error())
 		}
 	}
 
-	if netCfg.IPAddress != "" {
+	if releaseIP {
 		if err := c.ipam.ReleaseIP(netCfg.NetworkName, netCfg.IPAddress); err != nil {
 			// already-free addresses are treated as done so a retried
 			// cleanup can converge
@@ -403,8 +428,17 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 		netCfg.MACAddress,
 		pool.(kihv1.IPPool).Name,
 	); err != nil {
-		return fmt.Errorf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] %s",
-			vmnetcfg.Namespace, vmnetcfg.Name, err.Error())
+		// the entry of another owner is not this vmnetcfg's to remove; a
+		// deleting object must still finish, so the entry is reported and
+		// kept
+		if deleting && isForeignOwnerStatusError(err) {
+			log.Warnf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] the allocation of ip %s in the %s status belongs to another owner, leaving the entry",
+				vmnetcfg.Namespace, vmnetcfg.Name, netCfg.IPAddress, pool.(kihv1.IPPool).Name)
+			c.metrics.UpdateLogStatus("warning")
+		} else {
+			return fmt.Errorf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] %s",
+				vmnetcfg.Namespace, vmnetcfg.Name, err.Error())
+		}
 	}
 
 	return
@@ -421,11 +455,19 @@ func isAlreadyReleased(err error) bool {
 		strings.Contains(msg, "not found in network")
 }
 
+// isForeignOwnerStatusError reports the updateIPPoolStatus rejection which
+// states that the status entry of the ip belongs to another owner.
+func isForeignOwnerStatusError(err error) bool {
+	msg := err.Error()
+
+	return strings.Contains(msg, "belongs to") && strings.Contains(msg, "not removing it from")
+}
+
 func (c *Controller) cleanupVirtualMachineNetworkConfig(vmnetcfg *kihv1.VirtualMachineNetworkConfig) (err error) {
 	log.Debugf("(vmnetcfg.cleanupVirtualMachineNetworkConfig) [%s/%s] starting cleanup for vmnetcfg",
 		vmnetcfg.Namespace, vmnetcfg.Name)
 	for i := range vmnetcfg.Spec.NetworkConfig {
-		if err := c.cleanupNetworkInterface(vmnetcfg, &vmnetcfg.Spec.NetworkConfig[i]); err != nil {
+		if err := c.cleanupNetworkInterface(vmnetcfg, &vmnetcfg.Spec.NetworkConfig[i], true); err != nil {
 			// the finalizers stay so a failed cleanup is retried
 			return fmt.Errorf("(vmnetcfg.cleanupVirtualMachineNetworkConfig) [%s/%s] %s",
 				vmnetcfg.Namespace, vmnetcfg.Name, err.Error())

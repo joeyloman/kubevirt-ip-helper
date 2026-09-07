@@ -850,11 +850,12 @@ func TestVMNetCfgDeletionFinalizerCleanup(t *testing.T) {
 			t.Error("lease must be deleted during cleanup")
 		}
 	})
-	t.Run("failed cleanup keeps the finalizers for a retry", func(t *testing.T) {
+	t.Run("a foreign allocation is left to its owner and the finalizer completes", func(t *testing.T) {
 		e := newTestEnv(t)
 		vmnetcfg := seedCleanupState(e)
-		// the lease is meanwhile owned by another vm, so the cleanup must
-		// refuse to tear the allocation down
+		// the leased address is meanwhile owned by another vm: the cleanup
+		// must leave that allocation untouched and still finish, so a
+		// deleting vmnetcfg cannot hang in the terminating state forever
 		if err := e.dhcp.DeleteLease(testMAC); err != nil {
 			e.t.Fatalf("replacing the seeded lease: %s", err)
 		}
@@ -863,12 +864,116 @@ func TestVMNetCfgDeletionFinalizerCleanup(t *testing.T) {
 		}
 		vmnetcfg.ObjectMeta.Finalizers = []string{"kubevirtiphelper.k8s.binbash.org/vmnetcfg-cleanup"}
 		e.seedVMNetCfg(vmnetcfg)
+
+		if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, vmnetcfg); err != nil {
+			t.Fatalf("unexpected error: %s", err)
+		}
+
+		stored := e.getStoredVMNetCfg()
+		if len(stored.ObjectMeta.Finalizers) != 0 {
+			t.Errorf("finalizers = %v, want empty (a foreign allocation must not strand the finalizer)", stored.ObjectMeta.Finalizers)
+		}
+
+		// the foreign allocation survives the cleanup attempt
+		lease := e.dhcp.GetLease(testMAC)
+		if lease.Reference != testNamespace+"/other-vm" {
+			t.Errorf("lease reference = %q, want the foreign owner preserved", lease.Reference)
+		}
+		if got := e.ipam.Used(testNetwork); got != 1 {
+			t.Errorf("ipam used = %d, want the foreign-owned address still allocated", got)
+		}
+
+		// the own ippool status entry must still be removed
+		if pool := e.getStoredPool(); len(pool.Status.IPv4.Allocated) != 0 {
+			t.Errorf("allocated = %v, want the own allocation removed", pool.Status.IPv4.Allocated)
+		}
+		if n := e.countRequests(http.MethodPut, vmnetcfgMainPath); n != 1 {
+			t.Errorf("main update requests = %d, want 1", n)
+		}
+	})
+
+	t.Run("a foreign owner of the recorded ip keeps it out of the ipam release", func(t *testing.T) {
+		e := newTestEnv(t)
+		vmnetcfg := seedCleanupState(e)
+		// the recorded ip is meanwhile leased to another vm through a
+		// different mac: only the ipam release is skipped, everything else
+		// of this interface is cleaned and the finalizer completes
+		if err := e.dhcp.DeleteLease(testMAC); err != nil {
+			e.t.Fatalf("clearing the seeded lease: %s", err)
+		}
+		if err := e.dhcp.AddLease("aa:bb:cc:00:00:99", testNetwork, "10.0.0.1", testNamespace+"/other-vm"); err != nil {
+			e.t.Fatalf("seeding foreign ip lease: %s", err)
+		}
+		vmnetcfg.ObjectMeta.Finalizers = []string{"kubevirtiphelper.k8s.binbash.org/vmnetcfg-cleanup"}
+		e.seedVMNetCfg(vmnetcfg)
+
+		if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, vmnetcfg); err != nil {
+			t.Fatalf("unexpected error: %s", err)
+		}
+
+		if got := e.ipam.Used(testNetwork); got != 1 {
+			t.Errorf("ipam used = %d, want the foreign-leased address still allocated", got)
+		}
+		if pool := e.getStoredPool(); len(pool.Status.IPv4.Allocated) != 0 {
+			t.Errorf("allocated = %v, want the own allocation removed", pool.Status.IPv4.Allocated)
+		}
+		stored := e.getStoredVMNetCfg()
+		if len(stored.ObjectMeta.Finalizers) != 0 {
+			t.Errorf("finalizers = %v, want empty", stored.ObjectMeta.Finalizers)
+		}
+	})
+
+	t.Run("a foreign status entry is left and the finalizer completes", func(t *testing.T) {
+		e := newTestEnv(t)
+		vmnetcfg := seedCleanupState(e)
+		// the status entry was meanwhile overwritten by another writer, so
+		// the deletion must not remove it and must still finish
+		e.api.mu.Lock()
+		e.api.ippools[testPoolName].Status.IPv4.Allocated = map[string]string{
+			"10.0.0.1": testNamespace + "/other-vm [aa:bb:cc:00:00:97]",
+		}
+		e.api.mu.Unlock()
+
+		vmnetcfg.ObjectMeta.Finalizers = []string{"kubevirtiphelper.k8s.binbash.org/vmnetcfg-cleanup"}
+		e.seedVMNetCfg(vmnetcfg)
+
+		if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, vmnetcfg); err != nil {
+			t.Fatalf("unexpected error: %s", err)
+		}
+
+		// the foreign status entry survives
+		pool := e.getStoredPool()
+		if got := pool.Status.IPv4.Allocated["10.0.0.1"]; got != testNamespace+"/other-vm [aa:bb:cc:00:00:97]" {
+			t.Errorf("allocated[10.0.0.1] = %q, want the foreign entry preserved", got)
+		}
+		stored := e.getStoredVMNetCfg()
+		if len(stored.ObjectMeta.Finalizers) != 0 {
+			t.Errorf("finalizers = %v, want empty", stored.ObjectMeta.Finalizers)
+		}
+
+		// the own lease and ipam allocation are still released, so no
+		// address serves a deleted vm
+		if e.dhcp.CheckLease(testMAC) {
+			t.Error("the own lease must still be deleted")
+		}
+		if got := e.ipam.Used(testNetwork); got != 0 {
+			t.Errorf("ipam used = %d, want the own allocation released", got)
+		}
+	})
+
+	t.Run("a transient failure still keeps the finalizers for a retry", func(t *testing.T) {
+		e := newTestEnv(t)
+		vmnetcfg := seedCleanupState(e)
+		vmnetcfg.ObjectMeta.Finalizers = []string{"kubevirtiphelper.k8s.binbash.org/vmnetcfg-cleanup"}
+		e.seedVMNetCfg(vmnetcfg)
+
+		// the ippool status update fails transiently: the stale status
+		// entry cannot be removed, so the cleanup must fail and retry later
+		e.api.poolStatusPutCode = http.StatusInternalServerError
+
 		err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, vmnetcfg)
 		if err == nil {
-			t.Fatal("want error for a cleanup against a foreign allocation")
-		}
-		if !strings.Contains(err.Error(), "belongs to") {
-			t.Errorf("error = %q, want foreign allocation message", err)
+			t.Fatal("want error for a transient cleanup failure")
 		}
 
 		stored := e.getStoredVMNetCfg()
@@ -879,16 +984,16 @@ func TestVMNetCfgDeletionFinalizerCleanup(t *testing.T) {
 			t.Errorf("main update requests = %d, want 0 (the finalizer removal must not happen)", n)
 		}
 
-		// the protected allocation must survive untouched
-		lease := e.dhcp.GetLease(testMAC)
-		if lease.Reference != testNamespace+"/other-vm" {
-			t.Errorf("lease reference = %q, want the foreign owner preserved", lease.Reference)
+		// the failed cleanup already released the lease and the ipam
+		// allocation; the retry only has to remove the stale status entry
+		if e.dhcp.CheckLease(testMAC) {
+			t.Error("the own lease was released before the status update failed")
 		}
-		if got := e.ipam.Used(testNetwork); got == 0 {
-			t.Errorf("ipam used = %d, want the occupied address to remain allocated", got)
+		if got := e.ipam.Used(testNetwork); got != 0 {
+			t.Errorf("ipam used = %d, want the own address released for the retry", got)
 		}
-		if pool := e.getStoredPool(); len(pool.Status.IPv4.Allocated) == 0 {
-			t.Error("the ippool status allocation must be preserved")
+		if got := e.getStoredPool().Status.IPv4.Allocated["10.0.0.1"]; got == "" {
+			t.Error("the own status entry must remain for the retrying cleanup")
 		}
 	})
 }
