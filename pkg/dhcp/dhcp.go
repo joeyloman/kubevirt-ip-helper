@@ -101,11 +101,18 @@ func (a *DHCPAllocator) AddPool(
 }
 
 func (a *DHCPAllocator) CheckPool(name string) bool {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
 	_, exists := a.pools[name]
+
 	return exists
 }
 
 func (a *DHCPAllocator) GetPool(name string) (pool DHCPPool) {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
 	return a.pools[name]
 }
 
@@ -113,7 +120,7 @@ func (a *DHCPAllocator) DeletePool(name string) (err error) {
 	a.mutex.Lock()
 	defer a.mutex.Unlock()
 
-	if !a.CheckPool(name) {
+	if _, exists := a.pools[name]; !exists {
 		return fmt.Errorf("pool %s does not exists", name)
 	}
 
@@ -232,6 +239,9 @@ func (a *DHCPAllocator) DeleteLease(hwAddr string) (err error) {
 }
 
 func (a *DHCPAllocator) Usage() {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
 	for hwaddr, lease := range a.leases {
 		pool := a.pools[lease.PoolName]
 		log.Infof("(dhcp.Usage) lease: hwaddr=%s, pool=%s, clientip=%s, netmask=%s, router=%s, dns=%+v, domain=%s, domainsearch=%+v, ntp=%+v, leasetime=%d, ref=%s, nic=%s",
@@ -284,7 +294,7 @@ func (a *DHCPAllocator) dhcpHandler(conn net.PacketConn, peer net.Addr, m *dhcpv
 
 		return
 	}
-	pool := a.pools[lease.PoolName]
+	pool := a.GetPool(lease.PoolName)
 
 	log.Debugf("(dhcp.dhcpHandler) LEASE FOUND: hwaddr=%s, serverip=%s, clientip=%s, mask=%s, router=%s, dns=%+v, domainname=%s, domainsearch=%+v, ntp=%+v, leasetime=%d, reference=%s, nic=%s",
 		m.ClientHWAddr.String(),
