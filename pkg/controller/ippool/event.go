@@ -136,7 +136,7 @@ func (e *EventHandler) EventListener() (err error) {
 			}
 		},
 		DeleteFunc: func(obj interface{}) {
-			pool, isPool := unwrapTombstone(obj).(*kihv1.IPPool)
+			pool, isPool := util.UnwrapTombstone(obj).(*kihv1.IPPool)
 			if !isPool {
 				return
 			}
@@ -163,14 +163,4 @@ func (e *EventHandler) EventListener() (err error) {
 		log.Infof("(ippool.EventListener) stopping the IPPool event listener")
 		return
 	}
-}
-
-// unwrapTombstone resolves the informer object for delete handlers: delayed
-// deletions arrive as cache.DeletedFinalStateUnknown instead of the object.
-func unwrapTombstone(obj interface{}) interface{} {
-	if tombstone, isTombstone := obj.(cache.DeletedFinalStateUnknown); isTombstone {
-		return tombstone.Obj
-	}
-
-	return obj
 }

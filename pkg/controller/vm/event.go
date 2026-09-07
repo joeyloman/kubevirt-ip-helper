@@ -137,7 +137,7 @@ func (e *EventHandler) EventListener() (err error) {
 			}
 		},
 		DeleteFunc: func(obj interface{}) {
-			virtualMachine, isVM := unwrapTombstone(obj).(*kubevirtv1.VirtualMachine)
+			virtualMachine, isVM := util.UnwrapTombstone(obj).(*kubevirtv1.VirtualMachine)
 			if !isVM {
 				return
 			}
@@ -164,14 +164,4 @@ func (e *EventHandler) EventListener() (err error) {
 		log.Infof("(vm.EventListener) stopping the VirtualMachine event listener")
 		return
 	}
-}
-
-// unwrapTombstone resolves the informer object for delete handlers: delayed
-// deletions arrive as cache.DeletedFinalStateUnknown instead of the object.
-func unwrapTombstone(obj interface{}) interface{} {
-	if tombstone, isTombstone := obj.(cache.DeletedFinalStateUnknown); isTombstone {
-		return tombstone.Obj
-	}
-
-	return obj
 }

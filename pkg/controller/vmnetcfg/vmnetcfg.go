@@ -3,13 +3,13 @@ package vmnetcfg
 import (
 	"context"
 	"fmt"
-	"net"
 	"strings"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/util"
 
 	log "github.com/sirupsen/logrus"
 )
@@ -460,16 +460,6 @@ func (c *Controller) cleanupVirtualMachineNetworkConfig(vmnetcfg *kihv1.VirtualM
 	return
 }
 
-// canonicalHWAddr normalizes mac address spellings to the canonical colon
-// form so lease and allocation identities do not depend on the formatting.
-func canonicalHWAddr(hwAddr string) string {
-	if hw, parseErr := net.ParseMAC(hwAddr); parseErr == nil {
-		return hw.String()
-	}
-
-	return hwAddr
-}
-
 func (c *Controller) updateIPPoolStatus(event string, vmnetcfgNamespace string, vmnetcfgVMName string, ip string, networkName string, hwAddr string, poolName string) (err error) {
 	// Retry max 10 attempts for conflicts
 	maxRetries := 10
@@ -486,7 +476,7 @@ func (c *Controller) updateIPPoolStatus(event string, vmnetcfgNamespace string, 
 
 		// allocation references carry the canonical mac address spelling so
 		// add and delete computations agree on the owner identity
-		ownerRef := fmt.Sprintf("%s/%s [%s]", vmnetcfgNamespace, vmnetcfgVMName, canonicalHWAddr(hwAddr))
+		ownerRef := fmt.Sprintf("%s/%s [%s]", vmnetcfgNamespace, vmnetcfgVMName, util.CanonicalHWAddr(hwAddr))
 
 		switch event {
 		case ADD:

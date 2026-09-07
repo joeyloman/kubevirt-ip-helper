@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net"
 	"reflect"
 	"strings"
 	"time"
@@ -17,6 +16,7 @@ import (
 	kubevirtV1 "kubevirt.io/api/core/v1"
 
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/util"
 )
 
 func (c *Controller) handleVirtualMachineObjectChange(vm *kubevirtV1.VirtualMachine) (err error) {
@@ -281,12 +281,19 @@ func (c *Controller) updateIPPoolStatus(event string, vmnetcfgNamespace string, 
 
 		// allocation references carry the canonical mac address spelling so
 		// add and delete computations agree on the owner identity
-		ownerRef := fmt.Sprintf("%s/%s [%s]", vmnetcfgNamespace, vmnetcfgVMName, canonicalHWAddr(hwAddr))
+		ownerRef := fmt.Sprintf("%s/%s [%s]", vmnetcfgNamespace, vmnetcfgVMName, util.CanonicalHWAddr(hwAddr))
 
 		switch event {
 		case ADD:
 			for k, v := range currentPool.Status.IPv4.Allocated {
 				if k == ip {
+					if v == ownerRef {
+						// the allocation reference is already recorded, so a
+						// retry after a partially applied update treats it as
+						// done
+						return nil
+					}
+
 					return fmt.Errorf("ip %s already found in IPPool status", ip)
 				}
 				updatedAllocated[k] = v
@@ -330,14 +337,4 @@ func (c *Controller) updateIPPoolStatus(event string, vmnetcfgNamespace string, 
 	}
 
 	return fmt.Errorf("cannot update status of IPPool %s after max retries: %s", poolName, err.Error())
-}
-
-// canonicalHWAddr normalizes mac address spellings to the canonical colon
-// form so lease and allocation identities do not depend on the formatting.
-func canonicalHWAddr(hwAddr string) string {
-	if hw, parseErr := net.ParseMAC(hwAddr); parseErr == nil {
-		return hw.String()
-	}
-
-	return hwAddr
 }

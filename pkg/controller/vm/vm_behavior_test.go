@@ -981,6 +981,24 @@ func TestUpdateIPPoolStatusAddRejectsDuplicateIP(t *testing.T) {
 	}
 }
 
+// a re-try of an allocation whose reference is already recorded must be a
+// no-op instead of failing with the duplicate-ip error
+func TestUpdateIPPoolStatusAddIsIdempotentForSameOwner(t *testing.T) {
+	c, f := vmBehaviorNewTestController(t)
+
+	storePool(t, c, f, "pool-a", "net-a", map[string]string{
+		"10.0.0.11": "ns1/vm1 [aa:bb:cc:00:00:01]",
+	})
+	addSubnetWithIP(t, c.ipam, "net-a", "10.0.0.11")
+
+	if err := c.updateIPPoolStatus(ADD, "ns1", "vm1", "10.0.0.11", "net-a", "AA-BB-CC-00-00-01", "pool-a"); err != nil {
+		t.Fatalf("re-adding the same allocation must succeed: %v", err)
+	}
+	if n := len(f.requestsFor(http.MethodPut, "/ippools/pool-a/status")); n != 0 {
+		t.Errorf("expected no status update for an already recorded identical owner, got %d", n)
+	}
+}
+
 func TestUpdateIPPoolStatusDelete(t *testing.T) {
 	c, f := vmBehaviorNewTestController(t)
 
