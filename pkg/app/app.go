@@ -84,6 +84,8 @@ func (h *handler) Init() {
 		h.kubeConfigFile = filepath.Join(homedir, ".kube", "config")
 	}
 
+	h.kubeContext = os.Getenv("KUBECONTEXT")
+
 	ns, nsErr := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
 	if nsErr != nil {
 		log.Errorf("(app.Run) cannot determine current namespace (using the default): %s", nsErr.Error())

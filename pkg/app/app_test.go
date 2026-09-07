@@ -729,12 +729,17 @@ func TestHandler_Init(t *testing.T) {
 		cfg := writeTestKubeconfig(t, srv.URL)
 		t.Setenv("KUBECONFIG", cfg)
 		clearInClusterEnv(t)
+		// select the fixture's own context so the override does not break Init
+		t.Setenv("KUBECONTEXT", "test")
 
 		h := Register()
 		h.Init()
 
 		if h.kubeConfigFile != cfg {
 			t.Errorf("kubeConfigFile = %q, want %q", h.kubeConfigFile, cfg)
+		}
+		if h.kubeContext != "test" {
+			t.Errorf("kubeContext = %q, want %q", h.kubeContext, "test")
 		}
 		if h.appStatus != APP_INIT {
 			t.Errorf("appStatus = %d, want %d (APP_INIT)", h.appStatus, APP_INIT)
