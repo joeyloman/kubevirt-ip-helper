@@ -153,7 +153,7 @@ func TestIpam(t *testing.T) {
 		{
 			subnetName: "default/not-existing-network-class",
 			ip:         "",
-			want:       fmt.Errorf("network default/not-existing-network-class does not exists"),
+			want:       fmt.Errorf("default/not-existing-network-class: network does not exists"),
 		},
 		{
 			subnetName: "default/network-class-c-ok",
@@ -225,7 +225,7 @@ func TestIpam(t *testing.T) {
 		{
 			subnetName: "default/not-existing-network-class",
 			ip:         "",
-			want:       fmt.Errorf("network default/not-existing-network-class does not exists"),
+			want:       fmt.Errorf("default/not-existing-network-class: network does not exists"),
 		},
 		{
 			subnetName: "default/network-class-b-ok",
@@ -245,12 +245,12 @@ func TestIpam(t *testing.T) {
 		{
 			subnetName: "default/network-class-b-ok",
 			ip:         "172.16.0.11",
-			want:       fmt.Errorf("given ip 172.16.0.11 was not allocated"),
+			want:       fmt.Errorf("given ip 172.16.0.11: ip was not allocated"),
 		},
 		{
 			subnetName: "default/network-class-b-ok",
 			ip:         "172.16.0.5",
-			want:       fmt.Errorf("given ip 172.16.0.5 not found in network default/network-class-b-ok"),
+			want:       fmt.Errorf("given ip 172.16.0.5 not found in network default/network-class-b-ok: ip was not allocated"),
 		},
 	}
 
@@ -283,7 +283,7 @@ func TestIpam(t *testing.T) {
 	_, got := ti.GetIP("default/network-class-c-ok", "")
 	if got == nil {
 		t.Errorf("network default/network-class-c-ok still exists")
-	} else if got.Error() != "network default/network-class-c-ok does not exists" {
+	} else if got.Error() != "default/network-class-c-ok: network does not exists" {
 		t.Errorf("got %q", got)
 	}
 }

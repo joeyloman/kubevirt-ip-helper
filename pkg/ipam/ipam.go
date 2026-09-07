@@ -1,12 +1,23 @@
 package ipam
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
 	"sync"
 
 	log "github.com/sirupsen/logrus"
+)
+
+var (
+	// ErrSubnetNotFound reports addressing a subnet name which has no
+	// registered allocation state.
+	ErrSubnetNotFound = errors.New("network does not exists")
+
+	// ErrIPAlreadyFree reports a release attempt for an address with no
+	// live allocation, so nothing is left to release.
+	ErrIPAlreadyFree = errors.New("ip was not allocated")
 )
 
 type IPSubnet struct {
@@ -110,7 +121,7 @@ func (a *IPAllocator) GetIP(name string, givenIP string) (string, error) {
 	defer a.mutex.Unlock()
 
 	if _, exists := a.ipam[name]; !exists {
-		return "", fmt.Errorf("network %s does not exists", name)
+		return "", fmt.Errorf("%s: %w", name, ErrSubnetNotFound)
 	}
 
 	if givenIP != "" {
@@ -154,7 +165,7 @@ func (a *IPAllocator) ReleaseIP(name string, givenIP string) (err error) {
 	defer a.mutex.Unlock()
 
 	if _, exists := a.ipam[name]; !exists {
-		return fmt.Errorf("network %s does not exists", name)
+		return fmt.Errorf("%s: %w", name, ErrSubnetNotFound)
 	}
 
 	if givenIP == "" {
@@ -176,12 +187,12 @@ func (a *IPAllocator) ReleaseIP(name string, givenIP string) (err error) {
 				a.ipam[name].ips[ip] = false
 				return
 			} else {
-				return fmt.Errorf("given ip %s was not allocated", givenIP)
+				return fmt.Errorf("given ip %s: %w", givenIP, ErrIPAlreadyFree)
 			}
 		}
 	}
 
-	return fmt.Errorf("given ip %s not found in network %s", givenIP, name)
+	return fmt.Errorf("given ip %s not found in network %s: %w", givenIP, name, ErrIPAlreadyFree)
 }
 
 func (a *IPAllocator) Used(name string) (i int) {

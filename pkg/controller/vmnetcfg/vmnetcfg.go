@@ -2,6 +2,7 @@ package vmnetcfg
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -9,6 +10,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/util"
 
 	log "github.com/sirupsen/logrus"
@@ -444,15 +446,13 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 	return
 }
 
-// isAlreadyReleased reports ipam errors which only state that nothing about
-// the given address is left to release.
+// isAlreadyReleased reports ipam outcomes which state that nothing about
+// the given address is left to release: a subnet name without allocation
+// state or an address without a live allocation. a plain empty ip is
+// deliberately excluded: that is a caller error and must surface.
 func isAlreadyReleased(err error) bool {
-	msg := err.Error()
-
-	return strings.Contains(msg, "does not exists") ||
-		strings.Contains(msg, "given ip is empty") ||
-		strings.Contains(msg, "was not allocated") ||
-		strings.Contains(msg, "not found in network")
+	return errors.Is(err, ipam.ErrSubnetNotFound) ||
+		errors.Is(err, ipam.ErrIPAlreadyFree)
 }
 
 // isForeignOwnerStatusError reports the updateIPPoolStatus rejection which
