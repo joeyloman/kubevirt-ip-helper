@@ -17,6 +17,11 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+// ErrForeignOwner reports an IPPool status entry whose allocation
+// reference belongs to another owner, so this controller must not remove
+// it. callers classify the updateIPPoolStatus rejection with errors.Is.
+var ErrForeignOwner = errors.New("allocation belongs to another owner")
+
 // allocatedNetworkConfig tracks one fully applied interface allocation of a
 // vmnetcfg object so it can be reverted if the durable object update fails.
 type allocatedNetworkConfig struct {
@@ -438,7 +443,7 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 		// the entry of another owner is not this vmnetcfg's to remove; a
 		// deleting object must still finish, so the entry is reported and
 		// kept
-		if deleting && isForeignOwnerStatusError(err) {
+		if deleting && errors.Is(err, ErrForeignOwner) {
 			log.Warnf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] the allocation of ip %s in the %s status belongs to another owner, leaving the entry",
 				vmnetcfg.Namespace, vmnetcfg.Name, netCfg.IPAddress, pool.(kihv1.IPPool).Name)
 			c.metrics.UpdateLogStatus("warning")
@@ -458,14 +463,6 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 func isAlreadyReleased(err error) bool {
 	return errors.Is(err, ipam.ErrSubnetNotFound) ||
 		errors.Is(err, ipam.ErrIPAlreadyFree)
-}
-
-// isForeignOwnerStatusError reports the updateIPPoolStatus rejection which
-// states that the status entry of the ip belongs to another owner.
-func isForeignOwnerStatusError(err error) bool {
-	msg := err.Error()
-
-	return strings.Contains(msg, "belongs to") && strings.Contains(msg, "not removing it from")
 }
 
 func (c *Controller) cleanupVirtualMachineNetworkConfig(vmnetcfg *kihv1.VirtualMachineNetworkConfig) (err error) {
@@ -549,7 +546,7 @@ func (c *Controller) updateIPPoolStatus(event string, vmnetcfgNamespace string, 
 			}
 
 			if existing, exists := currentPool.Status.IPv4.Allocated[ip]; exists && existing != ownerRef {
-				return fmt.Errorf("allocation for ip %s belongs to %s, not removing it from the %s status", ip, existing, poolName)
+				return fmt.Errorf("allocation for ip %s belongs to %s, not removing it from the %s status: %w", ip, existing, poolName, ErrForeignOwner)
 			}
 		default:
 			// any unknown event must never reach the persisted status:
