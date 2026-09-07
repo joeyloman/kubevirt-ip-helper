@@ -99,16 +99,19 @@ func (a *IPAllocator) NewSubnet(name string, subnet string, start string, end st
 }
 
 func (a *IPAllocator) DeleteSubnet(name string) {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
 	delete(a.ipam, name)
 }
 
 func (a *IPAllocator) GetIP(name string, givenIP string) (string, error) {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
 	if _, exists := a.ipam[name]; !exists {
 		return "", fmt.Errorf("network %s does not exists", name)
 	}
-
-	a.mutex.Lock()
-	defer a.mutex.Unlock()
 
 	if givenIP != "" {
 		gIP, err := netip.ParseAddr(givenIP)
@@ -147,12 +150,12 @@ func (a *IPAllocator) GetIP(name string, givenIP string) (string, error) {
 }
 
 func (a *IPAllocator) ReleaseIP(name string, givenIP string) (err error) {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
 	if _, exists := a.ipam[name]; !exists {
 		return fmt.Errorf("network %s does not exists", name)
 	}
-
-	a.mutex.Lock()
-	defer a.mutex.Unlock()
 
 	if givenIP == "" {
 		return fmt.Errorf("given ip is empty")
@@ -182,6 +185,9 @@ func (a *IPAllocator) ReleaseIP(name string, givenIP string) (err error) {
 }
 
 func (a *IPAllocator) Used(name string) (i int) {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
 	if _, exists := a.ipam[name]; !exists {
 		log.Warnf("(ipam.Used) network %s does not exists", name)
 
@@ -198,6 +204,9 @@ func (a *IPAllocator) Used(name string) (i int) {
 }
 
 func (a *IPAllocator) Available(name string) (i int) {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
 	if _, exists := a.ipam[name]; !exists {
 		log.Warnf("(ipam.Available) network %s does not exists", name)
 
@@ -214,6 +223,9 @@ func (a *IPAllocator) Available(name string) (i int) {
 }
 
 func (a *IPAllocator) Usage(name string) {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
 	if _, exists := a.ipam[name]; !exists {
 		log.Warnf("(ipam.Usage) network %s does not exists", name)
 

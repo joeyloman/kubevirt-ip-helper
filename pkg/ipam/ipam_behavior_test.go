@@ -244,6 +244,63 @@ func TestIPAMConcurrentAllocations(t *testing.T) {
 		t.Errorf("Available = %d, want 0", avail)
 	}
 }
+
+// the ippool reload and the vmnetcfg reconcile run on parallel workqueues:
+// the writer below models a reload deleting and recreating the subnet while
+// the reader workers model concurrent allocations and status counter reads.
+// every call path must share the subnet map safely, so this test panics
+// under -race (and crashes the test binary on an unsynchronized map) if a
+// call path is missing its lock. no result value is asserted: all lookup
+// failures are legitimate outcomes of the concurrent delete.
+func TestIPAMConcurrentSubnetLifecycleWithReaders(t *testing.T) {
+	a := New()
+	if err := a.NewSubnet("net", "192.168.51.0/27", "192.168.51.1", "192.168.51.30"); err != nil {
+		t.Fatalf("NewSubnet: %v", err)
+	}
+
+	level := log.GetLevel()
+	log.SetLevel(log.PanicLevel)
+	defer log.SetLevel(level)
+
+	const workers = 8
+	const rounds = 50
+
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for range rounds {
+			a.DeleteSubnet("net")
+
+			if err := a.NewSubnet("net", "192.168.51.0/27", "192.168.51.1", "192.168.51.30"); err != nil {
+				t.Errorf("recreating the subnet: %v", err)
+
+				return
+			}
+		}
+	}()
+
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range rounds {
+				ip, err := a.GetIP("net", "192.168.51.5")
+				if err == nil {
+					_ = a.ReleaseIP("net", ip)
+				}
+				_, _ = a.GetIP("net", "")
+				_ = a.Used("net")
+				_ = a.Available("net")
+				a.Usage("net")
+			}
+		}()
+	}
+
+	wg.Wait()
+}
+
 func captureLogrus(t *testing.T, fn func()) string {
 	t.Helper()
 	var buf bytes.Buffer
