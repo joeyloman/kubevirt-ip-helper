@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -610,6 +611,70 @@ func TestSyncAddReturnsErrorWhenPoolFailsToRegister(t *testing.T) {
 
 	if controller.dhcp.CheckPool("net-m") {
 		t.Errorf("dhcp pool registered although registerIPPool failed")
+	}
+	if v, ok := ippoolBehaviorMetricValue(t, controller.metrics, "kubevirtiphelper_app_logs", map[string]string{"loglevel": "error"}); !ok || v != 1 {
+		t.Errorf("app log status gauge: got value %v found %v, want exactly 1 error entry", v, ok)
+	}
+}
+
+// two IPPool objects sharing a networkname must not be able to tear down
+// the live sub-resources of the registered one: the ADD of the duplicate
+// is rejected before any pool state is created, so every failure path
+// of the registration stays scoped to its own keys
+func TestSyncAddDuplicateNetworkNameDoesNotTouchForeignState(t *testing.T) {
+	var appStatus int
+	foreignPool := testPool("pool-a", "net-dup", 60)
+
+	indexer := newTestIndexer()
+	if err := indexer.Add(foreignPool); err != nil {
+		t.Fatalf("seeding indexer: %v", err)
+	}
+	if err := indexer.Add(testPool("pool-b", "net-dup", 60)); err != nil {
+		t.Fatalf("seeding indexer: %v", err)
+	}
+
+	controller, cacheAllocator := newTestController(t, newTestQueue(), indexer, nil, &appStatus, new(int))
+
+	// a foreign pool registration already owns the net-dup keys and holds
+	// one live allocation
+	if err := controller.ipam.NewSubnet("net-dup", "192.168.1.0/24", "192.168.1.10", "192.168.1.100"); err != nil {
+		t.Fatalf("registering the foreign ipam subnet: %v", err)
+	}
+	if _, err := controller.ipam.GetIP("net-dup", "192.168.1.10"); err != nil {
+		t.Fatalf("allocating the foreign live ip: %v", err)
+	}
+	if err := controller.dhcp.AddPool("net-dup", "192.168.1.1", "255.255.255.0", "192.168.1.1", nil, "", nil, nil, 60, "test-fake-iface"); err != nil {
+		t.Fatalf("registering the foreign dhcp pool: %v", err)
+	}
+	if err := cacheAllocator.Add(foreignPool); err != nil {
+		t.Fatalf("caching the foreign pool: %v", err)
+	}
+
+	obj, _, _ := indexer.GetByKey("pool-b")
+	if cleanup, err := controller.registerIPPool(obj.(*kihv1.IPPool)); err == nil {
+		t.Fatal("registerIPPool accepted an already-claimed networkname")
+	} else if cleanup {
+		t.Error("registerIPPool requested cleanup for an already-claimed networkname, want the foreign state untouched")
+	}
+
+	if err := controller.sync(testPoolEvent("pool-b", ADD, "net-dup")); err == nil {
+		t.Fatal("sync(ADD) for an already-claimed networkname returned nil, want a rejection error")
+	} else if !strings.Contains(err.Error(), "already registered") {
+		t.Errorf("error = %v, want a networkname-claim rejection", err)
+	}
+
+	// the foreign registration must survive both rejections untouched
+	if used := controller.ipam.Used("net-dup"); used < 1 {
+		t.Errorf("foreign allocation state of net-dup wiped: used=%d, want >= 1", used)
+	}
+	if _, err := controller.ipam.GetIP("net-dup", ""); err != nil {
+		t.Errorf("GetIP on the foreign subnet failed: %v, want the subnet to stay live", err)
+	}
+	if !controller.dhcp.CheckPool("net-dup") {
+		t.Error("the foreign dhcp pool was removed by the rejected duplicate ADD")
+	}
+	if !cacheAllocator.Check(foreignPool) {
+		t.Error("the foreign pool was dropped from the cache by the rejected duplicate ADD")
 	}
 	if v, ok := ippoolBehaviorMetricValue(t, controller.metrics, "kubevirtiphelper_app_logs", map[string]string{"loglevel": "error"}); !ok || v != 1 {
 		t.Errorf("app log status gauge: got value %v found %v, want exactly 1 error entry", v, ok)

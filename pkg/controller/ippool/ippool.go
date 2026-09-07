@@ -34,6 +34,16 @@ func (c *Controller) registerIPPool(pool *kihv1.IPPool) (cleanup bool, err error
 		return cleanup, fmt.Errorf("error while parsing subnet [%s] for network [%s]: %s",
 			pool.Spec.IPv4Config.Subnet, pool.Spec.NetworkName, err.Error())
 	}
+	// the pool sub-resources (dhcp pool, ipam subnet, cache entry) are all
+	// keyed by the networkname, and the allocators start empty on every
+	// (re)start: a live dhcp pool under this networkname therefore belongs
+	// to another IPPool registration. any later failure path would tear
+	// down or silently replace its live allocations, so reject before
+	// any sub-resource of this pool is created.
+	if c.dhcp.CheckPool(pool.Spec.NetworkName) {
+		return cleanup, fmt.Errorf("networkname [%s] is already registered by another IPPool, not touching its live state", pool.Spec.NetworkName)
+	}
+
 	ip4 := fmt.Sprintf("%s/%d", pool.Spec.IPv4Config.ServerIP, ipnet.Bits())
 	if err := network.AddIpToNic(pool.Spec.BindInterface, ip4); err != nil {
 		return cleanup, fmt.Errorf("error while adding IP4 address [%s] to bind interface [%s] for network [%s]: %s",
