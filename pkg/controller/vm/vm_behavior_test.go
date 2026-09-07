@@ -1250,25 +1250,33 @@ func TestCleanupNetworkInterfaceLogsPoolStatusError(t *testing.T) {
 	}
 }
 
-func TestUpdateIPPoolStatusUnknownEventClearsAllocations(t *testing.T) {
-	// any event other than add/delete rebuilds the allocation map from
-	// scratch, which yields an empty map: document the current behavior
+func TestUpdateIPPoolStatusUnknownEventRejected(t *testing.T) {
+	// an event other than add/delete is a programmer error: it must be
+	// rejected instead of rebuilding the allocation map from scratch,
+	// which would erase every live allocation entry
 	c, f := vmBehaviorNewTestController(t)
 
 	storePool(t, c, f, "pool-a", "net-a", map[string]string{"10.0.0.11": "ns1/vm1 [aa:bb:cc:00:00:01]"})
+	seeded := f.storedPool("pool-a")
 
-	if err := c.updateIPPoolStatus("bogus", "ns1", "vm1", "10.0.0.11", "net-a", "aa:bb:cc:00:00:01", "pool-a"); err != nil {
-		t.Fatalf("updateIPPoolStatus: %v", err)
+	err := c.updateIPPoolStatus("bogus", "ns1", "vm1", "10.0.0.11", "net-a", "aa:bb:cc:00:00:01", "pool-a")
+	if err == nil {
+		t.Fatal("expected an unknown ippool status event to be rejected")
+	} else if !strings.Contains(err.Error(), "unsupported ippool status event") {
+		t.Errorf("error = %v, want an unsupported-event rejection", err)
 	}
 
 	pool := f.storedPool("pool-a")
 	if pool == nil {
 		t.Fatal("expected pool to remain stored")
 	}
-	if len(pool.Status.IPv4.Allocated) != 0 {
-		t.Errorf("expected allocations cleared, got %v", pool.Status.IPv4.Allocated)
+	if !reflect.DeepEqual(pool.Status.IPv4.Allocated, seeded.Status.IPv4.Allocated) {
+		t.Errorf("allocations changed to %v, want unchanged %v", pool.Status.IPv4.Allocated, seeded.Status.IPv4.Allocated)
 	}
-	if pool.Status.LastUpdate.IsZero() {
-		t.Error("expected LastUpdate to be set")
+	if !pool.Status.LastUpdate.Time.Equal(seeded.Status.LastUpdate.Time) {
+		t.Error("LastUpdate changed for a rejected event, status must stay untouched")
+	}
+	if n := len(f.requestsFor(http.MethodPut, "/ippools/pool-a/status")); n != 0 {
+		t.Errorf("expected no pool status attempts for an unknown event, got %d", n)
 	}
 }

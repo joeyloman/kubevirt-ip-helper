@@ -309,6 +309,11 @@ func (c *Controller) updateIPPoolStatus(event string, vmnetcfgNamespace string, 
 			if existing, exists := currentPool.Status.IPv4.Allocated[ip]; exists && existing != ownerRef {
 				return fmt.Errorf("allocation for ip %s belongs to %s, not removing it from the %s status", ip, existing, poolName)
 			}
+		default:
+			// any unknown event must never reach the persisted status:
+			// falling through would rebuild the allocation map from scratch
+			// and erase every live allocation entry
+			return fmt.Errorf("unsupported ippool status event %s for ip %s in pool %s", event, ip, poolName)
 		}
 		updatedPool.Status.IPv4.Allocated = updatedAllocated
 		updatedPool.Status.IPv4.Used = c.ipam.Used(networkName)
