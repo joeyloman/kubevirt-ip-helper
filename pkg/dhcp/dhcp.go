@@ -1,6 +1,7 @@
 package dhcp
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -11,6 +12,16 @@ import (
 	"github.com/insomniacslk/dhcp/dhcpv4"
 	"github.com/insomniacslk/dhcp/dhcpv4/server4"
 	"github.com/insomniacslk/dhcp/rfc1035label"
+)
+
+var (
+	// ErrLeaseNotFound reports lease operations on a hardware address
+	// which currently has no lease registered.
+	ErrLeaseNotFound = errors.New("lease does not exists")
+
+	// ErrLeaseForeignOwner reports a lease operation which would affect a
+	// lease registered for a different owner reference.
+	ErrLeaseForeignOwner = errors.New("lease belongs to another owner")
 )
 
 type DHCPPool struct {
@@ -234,6 +245,38 @@ func (a *DHCPAllocator) DeleteLease(hwAddr string) (err error) {
 	delete(a.leases, key)
 
 	log.Debugf("(dhcp.DeleteLease) lease deleted for hardware address: %s", key)
+
+	return
+}
+
+// DeleteLeaseOwnedBy removes the lease for the hardware address only while
+// the registered lease still references the given owner reference, so a
+// delayed cleanup cannot delete an allocation which a concurrent writer
+// reassigned to another vm in the meantime. the owner check and the
+// deletion run under one lock acquisition.
+func (a *DHCPAllocator) DeleteLeaseOwnedBy(hwAddr string, ref string) (err error) {
+	hw, err := net.ParseMAC(hwAddr)
+	if err != nil {
+		return fmt.Errorf("hwaddr %s is not valid", hwAddr)
+	}
+
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	key := hw.String()
+
+	lease, exists := a.leases[key]
+	if !exists {
+		return fmt.Errorf("%w: hwaddr %s", ErrLeaseNotFound, key)
+	}
+
+	if lease.Reference != ref {
+		return fmt.Errorf("%w: hwaddr %s is registered for %s", ErrLeaseForeignOwner, key, lease.Reference)
+	}
+
+	delete(a.leases, key)
+
+	log.Debugf("(dhcp.DeleteLeaseOwnedBy) lease deleted for hardware address: %s (%s)", key, ref)
 
 	return
 }

@@ -402,9 +402,10 @@ func TestAddPoolOverwritesExistingPool(t *testing.T) {
 	}
 }
 
-// mac addresses are stored under the canonical colon form, so alternative
-// but equal spellings resolve to the same lease and a duplicate spelling
-// must be rejected instead of creating a second independent identity.
+// mac addresses are stored under the canonical colon form, so every
+// spelling of the same address must resolve to the same lease and a
+// duplicate spelling must be rejected instead of creating a second
+// independent identity.
 func TestAddLeaseCanonicalizesIdentity(t *testing.T) {
 	a := New()
 	for _, hw := range []string{"aa-bb-cc-dd-ee-01", "aabbccddee02"} {
@@ -413,12 +414,19 @@ func TestAddLeaseCanonicalizesIdentity(t *testing.T) {
 		}
 	}
 
-	// both spellings resolve to the canonical colon key
+	// every spelling resolves to the canonical colon key
 	if !a.CheckLease("aa:bb:cc:dd:ee:01") {
 		t.Error("hyphen-form lease not resolvable in canonical colon form")
 	}
 	if !a.CheckLease("aabbccddee02") {
 		t.Error("bare-form lease not resolvable in canonical colon form")
+	}
+	if !a.CheckLease("AA-BB-CC-DD-EE-01") {
+		t.Error("uppercase hyphen-form lease not resolvable in canonical colon form")
+	}
+
+	if got := a.GetLease("AA:BB:CC:DD:EE:01"); got.ClientIP == nil || got.ClientIP.String() != "192.168.0.50" || got.Reference != "ref" {
+		t.Errorf("lease queried through an uppercase spelling = %+v, want the original allocation", got)
 	}
 
 	// the second spelling of the first address is rejected as duplicate
@@ -432,7 +440,46 @@ func TestAddLeaseCanonicalizesIdentity(t *testing.T) {
 	if !lease.ClientIP.Equal(net.ParseIP("192.168.0.50")) || lease.Reference != "ref" {
 		t.Errorf("lease = %+v, want the original allocation preserved", lease)
 	}
+
+	// deleting through another spelling must free the canonical identity
+	if err := a.DeleteLease("AA-BB-CC-DD-EE-01"); err != nil {
+		t.Fatalf("the canonical lease must be deletable via another spelling: %v", err)
+	}
+	if a.CheckLease("aa:bb:cc:dd:ee:01") {
+		t.Error("lease still exists after deleting it through another spelling")
+	}
 }
+
+// a lease deletion which validates the owner under the same lock is the
+// primitive the vmnetcfg cleanup uses to decide against a concurrent
+// reassignment: a foreign owner must not delete, and a missing lease must
+// converge.
+func TestDeleteLeaseOwnedBy(t *testing.T) {
+	a := New()
+	if err := a.AddLease("aa:bb:cc:dd:ee:01", "pool1", "192.168.0.50", "ns1/vm1"); err != nil {
+		t.Fatalf("AddLease: %v", err)
+	}
+
+	if err := a.DeleteLeaseOwnedBy("aa-bb-cc-dd-ee-01", "ns1/other-vm"); !errors.Is(err, ErrLeaseForeignOwner) {
+		t.Errorf("foreign-owner deletion = %v, want ErrLeaseForeignOwner", err)
+	}
+	if !a.CheckLease("aa:bb:cc:dd:ee:01") {
+		t.Error("the foreign owner must not delete the lease")
+	}
+
+	// the owner itself may delete through an alternative spelling
+	if err := a.DeleteLeaseOwnedBy("aa:bb:cc:dd:ee:01", "ns1/vm1"); err != nil {
+		t.Errorf("owner deletion = %v, want nil", err)
+	}
+	if a.CheckLease("aa:bb:cc:dd:ee:01") {
+		t.Error("lease must be gone after the owner deleted it")
+	}
+
+	if err := a.DeleteLeaseOwnedBy("aa:bb:cc:dd:ee:02", "ns1/vm1"); !errors.Is(err, ErrLeaseNotFound) {
+		t.Errorf("deletion without a lease = %v, want ErrLeaseNotFound", err)
+	}
+}
+
 func captureLogrus(t *testing.T, fn func()) string {
 	t.Helper()
 	var buf bytes.Buffer

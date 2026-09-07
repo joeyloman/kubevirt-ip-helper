@@ -209,18 +209,19 @@ func TestMetricsNewAlias(t *testing.T) {
 }
 
 func TestMetricsRunWithOccupiedPortReturnsAndStopSucceeds(t *testing.T) {
-	// production binds ":port" (the wildcard endpoint); reserving the same
-	// wildcard is the only fixture that guarantees the bind failure on every
-	// host. a loopback reservation does not block wildcard binds on systems
-	// where the v6 wildcard is v6-only, and Run would then block forever in
-	// ListenAndServe without ever reaching Stop.
+	// production binds ":port" (the wildcard endpoint); the reservation
+	// listener stays bound for the whole test, so the bind conflict is
+	// deterministic: no window remains in which another process could take
+	// the reserved port between releasing and rebinding it. (A loopback
+	// reservation would not block wildcard binds on systems where the v6
+	// wildcard is v6-only.)
 	ln, err := net.Listen("tcp", ":0")
 	if err != nil {
 		t.Fatalf("reserving ephemeral port: %v", err)
 	}
 	defer ln.Close()
-	port := ln.Addr().(*net.TCPAddr).Port
-	t.Setenv("METRICS_PORT", strconv.Itoa(port))
+
+	t.Setenv("METRICS_PORT", strconv.Itoa(ln.Addr().(*net.TCPAddr).Port))
 
 	var buf bytes.Buffer
 	origOut := log.StandardLogger().Out

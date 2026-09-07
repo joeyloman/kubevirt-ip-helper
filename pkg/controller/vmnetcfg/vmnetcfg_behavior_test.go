@@ -1402,3 +1402,36 @@ func TestVMNetCfgUpdateFailureRollsBackAllocations(t *testing.T) {
 		t.Errorf("ippool status allocations = %v, want empty after the rollback", pool.Status.IPv4.Allocated)
 	}
 }
+
+// the live path must still abort when the interface looks protected: the
+// delete validation under the dhcp lock reassigns the lease decision,
+// which aborts the sync instead of cutting the allocation of another vm.
+func TestVMNetCfgCleanupAbortsOnForeignLeaseWhileLive(t *testing.T) {
+	e := newTestEnv(t)
+	e.addSubnet("10.0.0.1", "10.0.0.1")
+	vmnetcfg := newVMNetCfg("10.0.0.1", testMAC)
+	e.seedPool(nil)
+	if err := e.dhcp.AddLease(testMAC, testNetwork, "10.0.0.1", "other-ns/other-vm"); err != nil {
+		e.t.Fatalf("seeding foreign lease: %s", err)
+	}
+
+	netCfg := kihv1.NetworkConfig{MACAddress: testMAC, NetworkName: testNetwork, IPAddress: "10.0.0.1"}
+	err := e.controller.cleanupNetworkInterface(vmnetcfg, &netCfg, false)
+	if err == nil || !strings.Contains(err.Error(), "belongs to") {
+		t.Fatalf("cleanup = %v, want the foreign-owner abort for a live vmnetcfg", err)
+	}
+
+	// the foreign allocation must be untouched
+	if lease := e.dhcp.GetLease(testMAC); lease.Reference != "other-ns/other-vm" {
+		t.Errorf("lease reference = %q, want the foreign owner preserved", lease.Reference)
+	}
+
+	// the abort must not have triggered any removal, let alone a status
+	// write: with a foreign lease even our own status entry is protected
+	if n := e.countRequests(http.MethodPut, ippoolStatusPath); n != 0 {
+		t.Errorf("ippool status updates = %d, want 0 (the abort happens before any removal)", n)
+	}
+	if n := e.countRequests(http.MethodPut, vmnetcfgMainPath); n != 0 {
+		t.Errorf("vmnetcfg updates = %d, want 0", n)
+	}
+}

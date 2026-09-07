@@ -166,8 +166,17 @@ func TestIPAMRejectsDuplicateSubnetName(t *testing.T) {
 	if _, err := a.GetIP("net", "192.168.1.1"); !strings.Contains(err.Error(), "already allocated") {
 		t.Errorf("original allocation must still be held, got %q", err)
 	}
-	if got := a.Used("net"); got != 1 {
-		t.Errorf("Used = %d, want 1 (the original allocation is kept)", got)
+
+	// repeated auto-allocation must not reissue the occupied address
+	followUpIP, err := a.GetIP("net", "")
+	if err != nil {
+		t.Fatalf("allocation after the rejected duplicate failed: %v", err)
+	}
+	if followUpIP == "192.168.1.1" {
+		t.Errorf("allocation %q reissued the already occupied first address", followUpIP)
+	}
+	if got := a.Used("net"); got != 2 {
+		t.Errorf("Used = %d, want 2 (the original allocation is kept, none added)", got)
 	}
 }
 
