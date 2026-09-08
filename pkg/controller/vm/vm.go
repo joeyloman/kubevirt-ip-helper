@@ -267,14 +267,14 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 		}
 	}
 
-	// freeing an ip which is leased to another vm would leave the other
-	// lease serving an address ipam could reissue to a third client; ipam
-	// itself holds no owner references, so this stays a snapshot check
-	// without an owner-validated release primitive. a lease under another
-	// networkname holds no claim on this network's allocation, so the
-	// release proceeds.
+	// freeing an ip which is leased to another vm of the same network
+	// would leave the other lease serving an address ipam could reissue to
+	// a third client; ipam itself holds no owner references, so this
+	// stays a network-scoped snapshot check without an owner-validated
+	// release primitive: the same numeric addresses of separate networks
+	// are no claim on this network's allocation
 	if netCfg.IPAddress != "" {
-		if leaseHwAddr, lease, found := c.dhcp.GetLeaseByIP(netCfg.IPAddress); found && lease.PoolName == netCfg.NetworkName && lease.Reference != ref {
+		if leaseHwAddr, lease, found := c.dhcp.GetLeaseByIPAndNetwork(netCfg.NetworkName, netCfg.IPAddress); found && lease.Reference != ref {
 			// the release already happened in an earlier attempt and a
 			// successor vm owns the ip now: this interface's cleanup
 			// converged

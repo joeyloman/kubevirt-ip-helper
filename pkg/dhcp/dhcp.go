@@ -207,15 +207,16 @@ func (a *DHCPAllocator) GetLease(hwAddr string) (lease DHCPLease) {
 	return a.leases[hw.String()]
 }
 
-// GetLeaseByIP returns the lease which currently holds the given client ip.
-// It is used to check whether an ip address was already reassigned to
-// another owner before releasing it.
-func (a *DHCPAllocator) GetLeaseByIP(clientIP string) (hwAddr string, lease DHCPLease, found bool) {
+// GetLeaseByIPAndNetwork returns the lease which currently holds the
+// given client ip within one network. ipam allocations are scoped by the
+// networkname, so an ownership check before releasing an address must
+// not collide with same numeric addresses served by another network.
+func (a *DHCPAllocator) GetLeaseByIPAndNetwork(networkName string, clientIP string) (hwAddr string, lease DHCPLease, found bool) {
 	a.mutex.Lock()
 	defer a.mutex.Unlock()
 
 	for hw, l := range a.leases {
-		if l.ClientIP != nil && l.ClientIP.String() == clientIP {
+		if l.PoolName == networkName && l.ClientIP != nil && l.ClientIP.String() == clientIP {
 			hwAddr = hw
 			lease = l
 			found = true

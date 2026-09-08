@@ -662,3 +662,36 @@ func TestDHCPPoolAccessesStaySynchronized(t *testing.T) {
 
 	wg.Wait()
 }
+
+// the ownership guard before a release compares leases within one
+// network only: identical numeric addresses served by separate networks
+// are different allocations and must not collide with each other
+func TestGetLeaseByIPAndNetworkIsNetworkScoped(t *testing.T) {
+	a := New()
+	if err := a.AddLease("aa:bb:cc:dd:ee:01", "net-a", "192.168.0.50", "ns/vm-a"); err != nil {
+		t.Fatalf("AddLease net-a: %v", err)
+	}
+	if err := a.AddLease("aa:bb:cc:dd:ee:02", "net-b", "192.168.0.50", "ns/vm-b"); err != nil {
+		t.Fatalf("AddLease net-b: %v", err)
+	}
+
+	hw, lease, found := a.GetLeaseByIPAndNetwork("net-a", "192.168.0.50")
+	if !found {
+		t.Fatal("want net-a's lease for the address")
+	}
+	if hw != "aa:bb:cc:dd:ee:01" || lease.Reference != "ns/vm-a" {
+		t.Errorf("net-a lookup = (%s, %+v), want net-a's own lease", hw, lease)
+	}
+
+	hw, lease, found = a.GetLeaseByIPAndNetwork("net-b", "192.168.0.50")
+	if !found {
+		t.Fatal("want net-b's lease for the address")
+	}
+	if hw != "aa:bb:cc:dd:ee:02" || lease.Reference != "ns/vm-b" {
+		t.Errorf("net-b lookup = (%s, %+v), want net-b's own lease", hw, lease)
+	}
+
+	if _, _, found := a.GetLeaseByIPAndNetwork("net-c", "192.168.0.50"); found {
+		t.Error("a lookup under an unregistered networkname must find nothing")
+	}
+}

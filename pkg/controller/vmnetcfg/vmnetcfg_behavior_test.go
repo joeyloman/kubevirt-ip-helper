@@ -1554,3 +1554,78 @@ func TestVMNetCfgLaterNICPoolLookupFailureUnwindsEarlierNICs(t *testing.T) {
 		t.Errorf("vmnetcfg updates = %d, want 0 (the failure is pre-commit)", n)
 	}
 }
+
+// during finalizer cleanup a same numeric lease in another network must
+// not skip the own ipam release: the reservations are network-scoped, so
+// the cleanup releases its own network's allocation and leaves the
+// foreign lease untouched
+func TestVMNetCfgDeletionReleasesAcrossForeignNetworkLease(t *testing.T) {
+	e := newTestEnv(t)
+	e.addSubnet("10.0.0.1", "10.0.0.1")
+	e.seedPool(map[string]string{"10.0.0.1": "default/vm-test [02:00:00:00:00:01]"})
+	if _, err := e.ipam.GetIP(testNetwork, "10.0.0.1"); err != nil {
+		t.Fatalf("allocating the own reservation: %s", err)
+	}
+
+	// the own dhcp lease is already gone after a first cleanup attempt,
+	// while a foreign network serves the same numeric address to another
+	// owner
+	if err := e.dhcp.AddLease(testMAC2, "net-other", "10.0.0.1", "ns-other/vm-b"); err != nil {
+		t.Fatalf("foreign network lease: %s", err)
+	}
+
+	vmnetcfg := newVMNetCfg("10.0.0.1", testMAC)
+	netCfg := kihv1.NetworkConfig{MACAddress: testMAC, NetworkName: testNetwork, IPAddress: "10.0.0.1"}
+
+	if err := e.controller.cleanupNetworkInterface(vmnetcfg, &netCfg, true); err != nil {
+		t.Fatalf("cleanup = %v, want the own release to proceed despite the foreign lease", err)
+	}
+
+	if used := e.ipam.Used(testNetwork); used != 0 {
+		t.Errorf("ipam used = %d, want 0 (the own reservation is released)", used)
+	}
+	if lease := e.dhcp.GetLease(testMAC2); lease.Reference != "ns-other/vm-b" {
+		t.Errorf("foreign lease reference = %q, want the other network's owner preserved", lease.Reference)
+	}
+
+	pool := e.getStoredPool()
+	if got, stillThere := pool.Status.IPv4.Allocated["10.0.0.1"]; stillThere {
+		t.Errorf("own status entry = %q, want removed so the finalizer converges", got)
+	}
+}
+
+// the live cleanup of an old interface address must not abort on a same
+// numeric lease of another network: the lookup is network-scoped, so the
+// own old lease and reservation are released within their own network
+func TestVMNetCfgOldAddressCleanupIgnoresForeignNetworkLease(t *testing.T) {
+	e := newTestEnv(t)
+	e.addSubnet("10.0.0.1", "10.0.0.1")
+	e.seedPool(map[string]string{"10.0.0.1": "default/vm-test [02:00:00:00:00:01]"})
+	if _, err := e.ipam.GetIP(testNetwork, "10.0.0.1"); err != nil {
+		t.Fatalf("allocating the own reservation: %s", err)
+	}
+
+	if err := e.dhcp.AddLease(testMAC, testNetwork, "10.0.0.1", "default/vm-test"); err != nil {
+		t.Fatalf("own lease: %s", err)
+	}
+	if err := e.dhcp.AddLease(testMAC2, "net-other", "10.0.0.1", "ns-other/vm-b"); err != nil {
+		t.Fatalf("foreign network lease: %s", err)
+	}
+
+	vmnetcfg := newVMNetCfg("10.0.0.1", testMAC)
+	netCfg := kihv1.NetworkConfig{MACAddress: testMAC, NetworkName: testNetwork, IPAddress: "10.0.0.1"}
+
+	if err := e.controller.cleanupNetworkInterface(vmnetcfg, &netCfg, false); err != nil {
+		t.Fatalf("cleanup = %v, want the own old-address cleanup to proceed", err)
+	}
+
+	if e.dhcp.CheckLease(testMAC) {
+		t.Error("expected the own old lease released")
+	}
+	if used := e.ipam.Used(testNetwork); used != 0 {
+		t.Errorf("ipam used = %d, want 0 (the own reservation is released)", used)
+	}
+	if lease := e.dhcp.GetLease(testMAC2); lease.Reference != "ns-other/vm-b" {
+		t.Errorf("foreign lease reference = %q, want the other network's owner preserved", lease.Reference)
+	}
+}

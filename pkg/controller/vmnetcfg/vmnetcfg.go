@@ -401,15 +401,17 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 		}
 	}
 
-	// freeing an ip which is leased to another vm would leave the other
-	// lease serving an address ipam could reissue to a third client; ipam
-	// itself holds no owner references, so this stays a snapshot check
-	// without an owner-validated release primitive
+	// freeing an ip which is leased to another vm of the same network
+	// would leave the other lease serving an address ipam could reissue to
+	// a third client; ipam itself holds no owner references, so this
+	// stays a network-scoped snapshot check without an owner-validated
+	// release primitive: the same numeric addresses of separate networks
+	// are no claim on this network's allocation
 	releaseIP := false
 	if netCfg.IPAddress != "" {
 		releaseIP = true
 
-		if leaseHwAddr, lease, found := c.dhcp.GetLeaseByIP(netCfg.IPAddress); found && lease.Reference != ref {
+		if leaseHwAddr, lease, found := c.dhcp.GetLeaseByIPAndNetwork(netCfg.NetworkName, netCfg.IPAddress); found && lease.Reference != ref {
 			if !deleting {
 				return fmt.Errorf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] ip %s belongs to %s via hwaddr %s, aborting cleanup to preserve the allocation",
 					vmnetcfg.Namespace, vmnetcfg.Name, netCfg.IPAddress, lease.Reference, leaseHwAddr)
