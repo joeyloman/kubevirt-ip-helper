@@ -2,6 +2,7 @@ package vmnetcfg
 
 import (
 	"context"
+	"time"
 
 	log "github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
@@ -27,6 +28,12 @@ const (
 	UPDATE = "update"
 	DELETE = "delete"
 )
+
+// resyncPeriod re-delivers every watched object periodically: objects
+// whose earlier event was dropped (a transient sync failure, or a network
+// which only became live later) get another reconciliation chance without
+// any external event or pod restart.
+const resyncPeriod = time.Minute
 
 type EventHandler struct {
 	ctx                  context.Context
@@ -107,7 +114,7 @@ func (e *EventHandler) EventListener() (err error) {
 
 	queue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
 
-	indexer, informer := cache.NewIndexerInformer(vmWatcher, &kihv1.VirtualMachineNetworkConfig{}, 0, cache.ResourceEventHandlerFuncs{
+	indexer, informer := cache.NewIndexerInformer(vmWatcher, &kihv1.VirtualMachineNetworkConfig{}, resyncPeriod, cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			key, err := cache.MetaNamespaceKeyFunc(obj)
 			if err == nil {

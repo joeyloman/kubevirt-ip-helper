@@ -2,6 +2,7 @@ package vm
 
 import (
 	"context"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/fields"
@@ -29,6 +30,11 @@ const (
 	UPDATE = "update"
 	DELETE = "delete"
 )
+
+// resyncPeriod re-delivers every watched object periodically: virtual
+// machines whose earlier event was dropped (a transient sync failure) get
+// another reconciliation chance without any external event or pod restart.
+const resyncPeriod = time.Minute
 
 type EventHandler struct {
 	ctx            context.Context
@@ -113,7 +119,7 @@ func (e *EventHandler) EventListener() (err error) {
 
 	queue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
 
-	indexer, informer := cache.NewIndexerInformer(vmWatcher, &kubevirtv1.VirtualMachine{}, 0, cache.ResourceEventHandlerFuncs{
+	indexer, informer := cache.NewIndexerInformer(vmWatcher, &kubevirtv1.VirtualMachine{}, resyncPeriod, cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			key, err := cache.MetaNamespaceKeyFunc(obj)
 			if err == nil {

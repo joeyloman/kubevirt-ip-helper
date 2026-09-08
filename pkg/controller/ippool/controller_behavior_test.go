@@ -286,9 +286,10 @@ func TestSyncDeleteSucceedsWhenPoolNotCached(t *testing.T) {
 }
 
 func TestSyncUpdateReturnsErrorWhenPoolNotCached(t *testing.T) {
-	// an UPDATE event whose pool is missing from the cache is an invariant
-	// violation: it must return the error so the queue retries, instead of
-	// silently forgetting the event
+	// an UPDATE event whose pool has no live registration becomes a
+	// registration attempt; in this environment the attempt fails at the
+	// netlink step (no test-fake-iface), which still returns an error so
+	// the queue retries instead of silently forgetting the event
 	var appStatus int
 	indexer := newTestIndexer()
 	indexer.Add(testPool("pool-i", "net-i", 60))
@@ -932,5 +933,96 @@ func TestMarkInitAttemptOnlyCountsDuringInit(t *testing.T) {
 		if countCurrent != 0 {
 			t.Errorf("ippool count = %d in phase %d, want 0: the gate is only evaluated during initialization", countCurrent, phase)
 		}
+	}
+}
+
+// an update whose pool has no live registration of its own (the first
+// registration was dropped, or the lookup resolved a foreign pool which
+// shares the networkname) becomes a registration attempt: a fixed
+// projection comes to life with the next event. the attempt is visible
+// through the once-per-object startup gate marking.
+func TestSyncUpdateAttemptsRegistrationForUnregisteredPool(t *testing.T) {
+	appStatus := APP_INIT
+	countCurrent := 0
+	indexer := newTestIndexer()
+	if err := indexer.Add(testPool("pool-r", "net-fresh", 60)); err != nil {
+		t.Fatalf("seeding indexer: %v", err)
+	}
+
+	controller, _ := newTestController(t, newTestQueue(), indexer, nil, &appStatus, &countCurrent)
+
+	event := testPoolEvent("pool-r", UPDATE, "net-fresh")
+
+	if err := controller.sync(event); err != nil {
+		if strings.Contains(err.Error(), "does not exists in cache") {
+			t.Errorf("the update resolved to the cache-miss invariant instead of attempting registration: %v", err)
+		}
+	}
+	if countCurrent != 1 {
+		t.Errorf("ippool count = %d, want 1: the update must reach a registration attempt", countCurrent)
+	}
+
+	// the retried event must not double count
+	if err := controller.sync(event); err != nil {
+		if strings.Contains(err.Error(), "does not exists in cache") {
+			t.Errorf("the retried update fell back to the cache-miss invariant: %v", err)
+		}
+	}
+	if countCurrent != 1 {
+		t.Errorf("ippool count = %d after the retried event, want 1", countCurrent)
+	}
+
+}
+
+// an update for a pool whose networkname is claimed by a LIVE pool must
+// not resolve to the live pool as the old configuration: that would tear
+// the whole application down for an unrelated update. the update re-
+// attempts the registration of its own pool instead, which the duplicate
+// networkname check rejects without touching the live state.
+func TestSyncUpdateForeignCacheEntryDoesNotCascadeRestart(t *testing.T) {
+	appStatus := APP_RUNNING
+	foreignPool := testPool("pool-a", "net-shared", 60)
+
+	indexer := newTestIndexer()
+	if err := indexer.Add(foreignPool); err != nil {
+		t.Fatalf("seeding indexer: %v", err)
+	}
+	if err := indexer.Add(testPool("pool-b", "net-shared", 60)); err != nil {
+		t.Fatalf("seeding indexer: %v", err)
+	}
+
+	controller, cacheAllocator := newTestController(t, newTestQueue(), indexer, nil, &appStatus, new(int))
+
+	// a live registration owns the net-shared keys and holds one allocation
+	if err := controller.ipam.NewSubnet("net-shared", "192.168.1.0/24", "192.168.1.10", "192.168.1.100"); err != nil {
+		t.Fatalf("registering the live pool's ipam subnet: %v", err)
+	}
+	if _, err := controller.ipam.GetIP("net-shared", "192.168.1.10"); err != nil {
+		t.Fatalf("allocating the live pool's ip: %v", err)
+	}
+	if err := controller.dhcp.AddPool("net-shared", "192.168.1.1", "255.255.255.0", "192.168.1.1", nil, "", nil, nil, 60, "test-fake-iface"); err != nil {
+		t.Fatalf("registering the live pool's dhcp pool: %v", err)
+	}
+	if err := cacheAllocator.Add(foreignPool); err != nil {
+		t.Fatalf("caching the live pool: %v", err)
+	}
+
+	if err := controller.sync(testPoolEvent("pool-b", UPDATE, "net-shared")); err == nil {
+		t.Fatal("sync(UPDATE) for a pool with a claimed networkname returned nil, want a rejection error")
+	} else if !strings.Contains(err.Error(), "already registered") {
+		t.Errorf("error = %v, want the duplicate networkname rejection", err)
+	}
+
+	if appStatus != APP_RUNNING {
+		t.Errorf("app status = %d after the rejected update, want %d: the foreign registration must not start an application restart", appStatus, APP_RUNNING)
+	}
+	if used := controller.ipam.Used("net-shared"); used < 1 {
+		t.Errorf("live allocation of net-shared wiped: used=%d, want >= 1", used)
+	}
+	if !controller.dhcp.CheckPool("net-shared") {
+		t.Error("the live pool's dhcp pool was removed by the unrelated update")
+	}
+	if !cacheAllocator.Check(foreignPool) {
+		t.Error("the live pool was dropped from the cache by the unrelated update")
 	}
 }

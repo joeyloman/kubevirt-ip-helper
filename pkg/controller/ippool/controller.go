@@ -150,11 +150,23 @@ func (c *Controller) sync(event Event) (err error) {
 			pool, poolErr = c.cache.Get("pool", event.oldPoolNetworkName)
 		}
 
-		if poolErr != nil {
-			log.Errorf("(ippool.sync) %s", poolErr)
-			c.metrics.UpdateLogStatus("error")
+		if poolErr != nil || pool.(kihv1.IPPool).Name != event.poolName {
+			// neither cache key resolves to THIS pool: the pool has no live
+			// registration (its first attempt was dropped, or the lookup
+			// resolved a different pool which shares the networkname). the
+			// update becomes a re-registration attempt instead, so a fixed
+			// projection comes to life with the next event without a pod
+			// restart. a still-unregistrable projection keeps failing and a
+			// claimed networkname is rejected without touching the live
+			// state of the pool which owns it.
+			_, err = c.registerIPPool(obj.(*kihv1.IPPool))
+			if err != nil {
+				log.Errorf("(ippool.sync) failed to register unregistered pool %s: %s",
+					event.poolName, err.Error())
+				c.metrics.UpdateLogStatus("error")
+			}
 
-			return poolErr
+			return err
 		}
 		oldPool := pool.(kihv1.IPPool)
 		err = c.handleIPPoolObjectChange(oldPool, obj.(*kihv1.IPPool))
