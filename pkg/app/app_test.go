@@ -498,10 +498,11 @@ func TestHandler_stopDHCPListeners(t *testing.T) {
 // podStore is a tiny in-memory pod API: GET and PUT against
 // /api/v1/namespaces/<ns>/pods/<name>.
 type podStore struct {
-	mu      sync.Mutex
-	gets    int
-	updates int
-	pods    map[string]*corev1.Pod
+	mu        sync.Mutex
+	gets      int
+	updates   int
+	pods      map[string]*corev1.Pod
+	conflicts int
 }
 
 func newPodStore(pods ...*corev1.Pod) *podStore {
@@ -540,6 +541,16 @@ func (s *podStore) handler() http.HandlerFunc {
 			writePodJSON(w, p.DeepCopy())
 		case http.MethodPut:
 			s.updates++
+			// simulate a concurrent modification: the next n replaces
+			// answer with a resource-version conflict so the caller's
+			// retry-on-conflict path is exercised
+			if s.conflicts > 0 {
+				s.conflicts--
+
+				writeKubeStatus(w, http.StatusConflict, metav1.StatusReasonConflict, "the object has been modified")
+
+				return
+			}
 			var p corev1.Pod
 			if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
 				w.WriteHeader(http.StatusBadRequest)
@@ -556,6 +567,18 @@ func (s *podStore) handler() http.HandlerFunc {
 func writePodJSON(w http.ResponseWriter, p *corev1.Pod) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(p)
+}
+
+func writeKubeStatus(w http.ResponseWriter, code int, reason metav1.StatusReason, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(&metav1.Status{
+		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"},
+		Status:   metav1.StatusFailure,
+		Reason:   reason,
+		Message:  message,
+		Code:     int32(code),
+	})
 }
 
 func (s *podStore) pod(name string) *corev1.Pod {
@@ -607,6 +630,38 @@ func TestHandler_addLeaderPodLabel(t *testing.T) {
 		}
 	})
 
+	t.Run("retries the label when the pod is concurrently modified", func(t *testing.T) {
+		hostname, err := os.Hostname()
+		if err != nil {
+			t.Fatalf("os.Hostname(): %s", err)
+		}
+		store := newPodStore(&corev1.Pod{
+			TypeMeta:   metav1.TypeMeta{Kind: "Pod", APIVersion: "v1"},
+			ObjectMeta: metav1.ObjectMeta{Name: hostname, Namespace: "testns", Labels: map[string]string{"app": "demo"}},
+		})
+		store.conflicts = 1
+		srv := httptest.NewServer(store.handler())
+		defer srv.Close()
+
+		h := &handler{
+			kubeConfigFile: writeTestKubeconfig(t, srv.URL),
+			namespace:      "testns",
+		}
+		h.addLeaderPodLabel()
+
+		p := store.pod(hostname)
+		if got := p.Labels[leaderLabel]; got != "active" {
+			t.Errorf("leader label = %q, want %q after the conflict retry", got, "active")
+		}
+		if got := p.Labels["app"]; got != "demo" {
+			t.Errorf("pre-existing label app = %q, want %q", got, "demo")
+		}
+		gets, updates := store.counts()
+		if gets != 2 || updates != 2 {
+			t.Errorf("got %d gets and %d updates, want 2 and 2 after one conflict retry", gets, updates)
+		}
+	})
+
 	t.Run("logs and continues when the pod cannot be fetched", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusInternalServerError)
@@ -620,8 +675,8 @@ func TestHandler_addLeaderPodLabel(t *testing.T) {
 		}
 		h.addLeaderPodLabel() // must not panic
 
-		if !hook.contains("cannot get current pod object") {
-			t.Errorf("expected an error about the pod fetch, got:\n%s", hook.entriesText())
+		if !hook.contains("cannot set the leader pod label") {
+			t.Errorf("expected an error about the label update, got:\n%s", hook.entriesText())
 		}
 	})
 
@@ -676,6 +731,42 @@ func TestHandler_RemoveLeaderPodLabel(t *testing.T) {
 		}
 	})
 
+	t.Run("retries the removal when the pod is concurrently modified", func(t *testing.T) {
+		hostname, err := os.Hostname()
+		if err != nil {
+			t.Fatalf("os.Hostname(): %s", err)
+		}
+		store := newPodStore(&corev1.Pod{
+			TypeMeta: metav1.TypeMeta{Kind: "Pod", APIVersion: "v1"},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      hostname,
+				Namespace: "testns",
+				Labels:    map[string]string{"app": "demo", leaderLabel: "active"},
+			},
+		})
+		store.conflicts = 1
+		srv := httptest.NewServer(store.handler())
+		defer srv.Close()
+
+		h := &handler{
+			kubeConfigFile: writeTestKubeconfig(t, srv.URL),
+			namespace:      "testns",
+		}
+		h.RemoveLeaderPodLabel()
+
+		p := store.pod(hostname)
+		if _, ok := p.Labels[leaderLabel]; ok {
+			t.Errorf("leader label was not removed after the conflict retry: %v", p.Labels)
+		}
+		if got := p.Labels["app"]; got != "demo" {
+			t.Errorf("pre-existing label app = %q, want %q", got, "demo")
+		}
+		gets, updates := store.counts()
+		if gets != 2 || updates != 2 {
+			t.Errorf("got %d gets and %d updates, want 2 and 2 after one conflict retry", gets, updates)
+		}
+	})
+
 	t.Run("leaves a pod without the leader label unchanged", func(t *testing.T) {
 		hostname, err := os.Hostname()
 		if err != nil {
@@ -716,8 +807,8 @@ func TestHandler_RemoveLeaderPodLabel(t *testing.T) {
 		}
 		h.RemoveLeaderPodLabel() // must not panic
 
-		if !hook.contains("cannot get current pod object") {
-			t.Errorf("expected an error about the pod fetch, got:\n%s", hook.entriesText())
+		if !hook.contains("cannot remove the leader pod label") {
+			t.Errorf("expected an error about the label update, got:\n%s", hook.entriesText())
 		}
 	})
 }

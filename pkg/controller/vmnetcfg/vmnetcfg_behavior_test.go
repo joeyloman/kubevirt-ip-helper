@@ -1132,6 +1132,34 @@ func TestVMNetCfgStatusAndMetricsProjection(t *testing.T) {
 			t.Errorf("vmnetcfg status metric series = %d, want 2", n)
 		}
 	})
+
+	t.Run("metrics mac labels use the canonical colon spelling", func(t *testing.T) {
+		e := newTestEnv(t)
+		// an uppercase hyphenated spelling from the vm spec must project
+		// into the canonical colon form, identical to the ippool status
+		// owner references
+		const foreignSpelling = "02-BB-CC-DD-EE-FF"
+		vmnetcfg := newVMNetCfg("10.0.0.9", foreignSpelling)
+		vmnetcfg.Status.NetworkConfig = []kihv1.NetworkConfigStatus{
+			{MACAddress: foreignSpelling, NetworkName: testNetwork, Status: "OK", Message: "IP address successfully allocated"},
+		}
+		e.seedVMNetCfg(vmnetcfg)
+
+		if err := e.controller.updateVirtualMachineNetworkConfigMetrics(testNamespace, testVMNetCfgName); err != nil {
+			t.Fatalf("unexpected error: %s", err)
+		}
+
+		wantLabel := map[string]string{
+			"vm":      testNamespace + "/" + testVMNetCfgName,
+			"network": testNetwork,
+			"mac":     "02:bb:cc:dd:ee:ff",
+			"ip":      "10.0.0.9",
+			"status":  "OK",
+		}
+		if v, ok := e.metricValue(metricVMNetCfgStatus, wantLabel); !ok || v != 1 {
+			t.Errorf("metric for %v = %v (present %v), want the canonical mac label", wantLabel, v, ok)
+		}
+	})
 }
 
 func TestUpdateIPPoolStatusBranches(t *testing.T) {

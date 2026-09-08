@@ -33,6 +33,7 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/leaderelection"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
+	"k8s.io/client-go/util/retry"
 )
 
 const (
@@ -456,28 +457,31 @@ func (h *handler) addLeaderPodLabel() {
 		return
 	}
 
-	curPod, err := k8sClientset.CoreV1().Pods(h.namespace).Get(context.TODO(), podName, metav1.GetOptions{})
-	if err != nil {
-		log.Errorf("(app.addLeaderPodLabel) cannot get current pod object: %s", err.Error())
+	// the pod is mutated by the kubelet and the label callbacks run during
+	// the startup phase: apply the label with a retry on resource-version
+	// conflicts so the first attempt does not lose the race
+	if err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		curPod, err := k8sClientset.CoreV1().Pods(h.namespace).Get(context.TODO(), podName, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+
+		newPod := curPod.DeepCopy()
+		newLabels := make(map[string]string)
+		for k, v := range newPod.Labels {
+			newLabels[k] = v
+		}
+		newLabels["kubevirtiphelper/leader"] = "active"
+		newPod.Labels = newLabels
+
+		_, err = k8sClientset.CoreV1().Pods(h.namespace).Update(context.TODO(), newPod, metav1.UpdateOptions{})
+
+		return err
+	}); err != nil {
+		log.Errorf("(app.addLeaderPodLabel) cannot set the leader pod label: %s", err.Error())
 
 		return
 	}
-
-	newPod := curPod.DeepCopy()
-	newLabels := make(map[string]string)
-	for k, v := range newPod.Labels {
-		newLabels[k] = v
-	}
-	newLabels["kubevirtiphelper/leader"] = "active"
-	newPod.Labels = newLabels
-
-	updatedPod, err := k8sClientset.CoreV1().Pods(h.namespace).Update(context.TODO(), newPod, metav1.UpdateOptions{})
-	if err != nil {
-		log.Errorf("(app.addLeaderPodLabel) cannot update the pod object: %s", err.Error())
-
-		return
-	}
-	_ = updatedPod
 }
 
 func (h *handler) RemoveLeaderPodLabel() {
@@ -502,29 +506,32 @@ func (h *handler) RemoveLeaderPodLabel() {
 		return
 	}
 
-	curPod, err := k8sClientset.CoreV1().Pods(h.namespace).Get(context.TODO(), podName, metav1.GetOptions{})
-	if err != nil {
-		log.Errorf("(app.RemoveLeaderPodLabel) cannot get current pod object: %s", err.Error())
-
-		return
-	}
-
-	newPod := curPod.DeepCopy()
-	newLabels := make(map[string]string)
-	for k, v := range newPod.Labels {
-		if k != "kubevirtiphelper/leader" {
-			newLabels[k] = v
+	// the pod is mutated by the kubelet and the label callbacks run during
+	// the startup phase: remove the label with a retry on resource-version
+	// conflicts so the first attempt does not lose the race
+	if err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		curPod, err := k8sClientset.CoreV1().Pods(h.namespace).Get(context.TODO(), podName, metav1.GetOptions{})
+		if err != nil {
+			return err
 		}
-	}
-	newPod.Labels = newLabels
 
-	updatedPod, err := k8sClientset.CoreV1().Pods(h.namespace).Update(context.TODO(), newPod, metav1.UpdateOptions{})
-	if err != nil {
-		log.Errorf("(app.RemoveLeaderPodLabel) cannot update the pod object: %s", err.Error())
+		newPod := curPod.DeepCopy()
+		newLabels := make(map[string]string)
+		for k, v := range newPod.Labels {
+			if k != "kubevirtiphelper/leader" {
+				newLabels[k] = v
+			}
+		}
+		newPod.Labels = newLabels
+
+		_, err = k8sClientset.CoreV1().Pods(h.namespace).Update(context.TODO(), newPod, metav1.UpdateOptions{})
+
+		return err
+	}); err != nil {
+		log.Errorf("(app.RemoveLeaderPodLabel) cannot remove the leader pod label: %s", err.Error())
 
 		return
 	}
-	_ = updatedPod
 }
 
 func handleErr(err error) {

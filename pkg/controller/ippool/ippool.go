@@ -23,7 +23,6 @@ const (
 )
 
 func (c *Controller) registerIPPool(pool *kihv1.IPPool) (cleanup bool, err error) {
-	log.Infof("(ippool.registerIPPool) [%s] new IPPool added", pool.Name)
 
 	// the startup gate counts registration attempts of this pool object
 	// exactly once per initialization phase; a definitively failing
@@ -110,6 +109,8 @@ func (c *Controller) registerIPPool(pool *kihv1.IPPool) (cleanup bool, err error
 	if err = c.cache.Add(rPool); err != nil {
 		return cleanup, fmt.Errorf("error while caching the IPPool for network [%s]: %s", pool.Spec.NetworkName, err.Error())
 	}
+
+	log.Infof("(ippool.registerIPPool) [%s] new IPPool registered", pool.Name)
 
 	return
 }

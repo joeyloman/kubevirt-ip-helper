@@ -648,7 +648,7 @@ func (c *Controller) updateVirtualMachineNetworkConfigMetrics(vmnetcfgNamespace 
 				c.metrics.UpdateVmNetCfgStatus(
 					fmt.Sprintf("%s/%s", vmnetcfgNamespace, vmnetcfgName),
 					netstat.NetworkName,
-					netstat.MACAddress,
+					util.CanonicalHWAddr(netstat.MACAddress),
 					netcfg.IPAddress,
 					netstat.Status,
 				)
