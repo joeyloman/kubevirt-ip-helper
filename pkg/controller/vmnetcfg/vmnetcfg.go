@@ -25,10 +25,25 @@ type allocatedNetworkConfig struct {
 	poolName    string
 }
 
-// rollbackNetworkAllocation reverts the allocation side effects of a single
-// network interface of a vmnetcfg object.
+// rollbackNetworkAllocation reverts the allocation side effects of a
+// single network interface of a vmnetcfg object. the releases run before
+// the pool status write, so the persisted counters are computed from an
+// ipam state which already excludes the unwound allocation, and the pool
+// metrics republish the settled accounting.
 func (c *Controller) rollbackNetworkAllocation(vmnetcfg *kihv1.VirtualMachineNetworkConfig, allocated allocatedNetworkConfig) {
 	ref := fmt.Sprintf("%s/%s", vmnetcfg.Namespace, vmnetcfg.Spec.VMName)
+
+	if err := c.dhcp.DeleteLeaseOwnedBy(allocated.macAddress, ref); err != nil && !errors.Is(err, dhcp.ErrLeaseNotFound) {
+		log.Errorf("(vmnetcfg.rollbackNetworkAllocation) [%s/%s] failed to revert the dhcp lease for hwaddr %s: %s",
+			vmnetcfg.Namespace, vmnetcfg.Name, allocated.macAddress, err)
+		c.metrics.UpdateLogStatus("error")
+	}
+
+	if err := c.ipam.ReleaseIP(allocated.networkName, allocated.ipAddress); err != nil && !util.IsAlreadyReleased(err) {
+		log.Errorf("(vmnetcfg.rollbackNetworkAllocation) [%s/%s] failed to revert the ipam allocation for ip %s: %s",
+			vmnetcfg.Namespace, vmnetcfg.Name, allocated.ipAddress, err)
+		c.metrics.UpdateLogStatus("error")
+	}
 
 	if err := c.updateIPPoolStatus(
 		DELETE,
@@ -44,15 +59,9 @@ func (c *Controller) rollbackNetworkAllocation(vmnetcfg *kihv1.VirtualMachineNet
 		c.metrics.UpdateLogStatus("error")
 	}
 
-	if err := c.dhcp.DeleteLeaseOwnedBy(allocated.macAddress, ref); err != nil && !errors.Is(err, dhcp.ErrLeaseNotFound) {
-		log.Errorf("(vmnetcfg.rollbackNetworkAllocation) [%s/%s] failed to revert the dhcp lease for hwaddr %s: %s",
-			vmnetcfg.Namespace, vmnetcfg.Name, allocated.macAddress, err)
-		c.metrics.UpdateLogStatus("error")
-	}
-
-	if err := c.ipam.ReleaseIP(allocated.networkName, allocated.ipAddress); err != nil && !util.IsAlreadyReleased(err) {
-		log.Errorf("(vmnetcfg.rollbackNetworkAllocation) [%s/%s] failed to revert the ipam allocation for ip %s: %s",
-			vmnetcfg.Namespace, vmnetcfg.Name, allocated.ipAddress, err)
+	if err := c.updateIPPoolMetrics(allocated.poolName); err != nil {
+		log.Errorf("(vmnetcfg.rollbackNetworkAllocation) [%s/%s] %s",
+			vmnetcfg.Namespace, vmnetcfg.Name, err)
 		c.metrics.UpdateLogStatus("error")
 	}
 }

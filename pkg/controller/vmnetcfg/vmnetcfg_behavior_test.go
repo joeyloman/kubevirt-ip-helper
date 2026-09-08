@@ -1711,3 +1711,51 @@ func TestVMNetCfgDeletionRefreshesPoolMetrics(t *testing.T) {
 		t.Errorf("available gauge after cleanup = %v (present %v), want 2", v, ok)
 	}
 }
+
+// the rollback of a failed durable update must publish accounting which
+// reflects ipam after the releases: a status write that runs before the
+// releases persisted used/available of the still-held address
+func TestVMNetCfgRollbackPublishesSettledAccounting(t *testing.T) {
+	e := newTestEnv(t)
+	e.addSubnet("10.0.0.1", "10.0.0.2")
+	e.seedPool(nil)
+	e.api.vmnetcfgPutCode = http.StatusInternalServerError
+
+	vmnetcfg := newVMNetCfg("", testMAC)
+	e.seedVMNetCfg(vmnetcfg)
+
+	err := e.controller.updateVirtualMachineNetworkConfig(ADD, vmnetcfg)
+	if err == nil {
+		t.Fatal("want the failed durable update to fail the sync")
+	}
+	if !strings.Contains(err.Error(), "cannot update VirtualMachineNetworkConfig object") {
+		t.Errorf("error = %q, want the update prefix", err)
+	}
+
+	// the unwind released the allocation side effects...
+	if e.dhcp.CheckLease(testMAC) {
+		t.Error("lease must be rolled back when the object update fails")
+	}
+	if used := e.ipam.Used(testNetwork); used != 0 {
+		t.Errorf("ipam used = %d, want 0 after the rollback", used)
+	}
+
+	// ...and the persisted accounting must reflect the settled state
+	pool := e.getStoredPool()
+	if len(pool.Status.IPv4.Allocated) != 0 {
+		t.Errorf("allocations = %v, want empty after the rollback", pool.Status.IPv4.Allocated)
+	}
+	if pool.Status.IPv4.Used != 0 {
+		t.Errorf("persisted used = %d, want 0 (counters must be computed after the releases)", pool.Status.IPv4.Used)
+	}
+	if pool.Status.IPv4.Available != 2 {
+		t.Errorf("persisted available = %d, want 2", pool.Status.IPv4.Available)
+	}
+
+	if v, ok := e.metricValue(metricIPPoolUsed, map[string]string{"ippool": testPoolName, "subnet": testSubnet, "network": testNetwork}); !ok || v != 0 {
+		t.Errorf("used gauge after rollback = %v (present %v), want 0", v, ok)
+	}
+	if v, ok := e.metricValue(metricIPPoolAvail, map[string]string{"ippool": testPoolName, "subnet": testSubnet, "network": testNetwork}); !ok || v != 2 {
+		t.Errorf("available gauge after rollback = %v (present %v), want 2", v, ok)
+	}
+}
