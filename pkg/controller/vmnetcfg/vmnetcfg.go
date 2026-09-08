@@ -66,10 +66,11 @@ func (c *Controller) rollbackNetworkAllocation(vmnetcfg *kihv1.VirtualMachineNet
 	}
 }
 
-// rollbackAppliedAllocations reverts every allocation which was applied
-// for the vmnetcfg object during this sync, newest first, so a
-// pre-commit failure cannot leave live allocations for a durable state
-// which was never persisted.
+// rollbackAppliedAllocations reverts the queued allocations of the vmnetcfg
+// object, newest first, so a pre-commit failure cannot leave live allocations
+// for a durable state which was never persisted. restores of assignments
+// which the stored spec already records are never queued by the caller and
+// stay applied: their addresses must remain reserved for the running guests.
 func (c *Controller) rollbackAppliedAllocations(vmnetcfg *kihv1.VirtualMachineNetworkConfig, applied []allocatedNetworkConfig) {
 	for i := len(applied) - 1; i >= 0; i-- {
 		c.rollbackNetworkAllocation(vmnetcfg, applied[i])
@@ -98,8 +99,39 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 	newNetCfgStatusList := []kihv1.NetworkConfigStatus{}
 
 	// allocations which are applied to dhcp/ipam/ippool status while
-	// processing this object; reverted when the object update fails
+	// processing this object; reverted when the object update fails.
+	// restores of addresses which the stored spec already records never
+	// enter this list: releasing them would free addresses which the
+	// guests still use while the durable object keeps claiming them
 	appliedAllocations := []allocatedNetworkConfig{}
+
+	// addresses which the stored spec already records (mac, networkname
+	// and ip): applying them again only restores the previous assignment
+	durableAllocations := make(map[string]bool)
+	for _, v := range vmnetcfg.Spec.NetworkConfig {
+		if v.IPAddress != "" {
+			durableAllocations[v.MACAddress+"/"+v.NetworkName+"/"+v.IPAddress] = true
+		}
+	}
+
+	// rememberApplied queues an allocation of this sync for the rollback
+	// unless the stored spec already records it: a failed sync unwinds only
+	// the not-yet-durable claims and keeps the reservations of already
+	// persisted assignments protected. a contested claim whose address the
+	// pool status records for another owner is invalid even when the spec
+	// requests it, so it is always queued for the release.
+	rememberApplied := func(poolName string, macAddress string, networkName string, ipAddress string, contested bool) {
+		if !contested && durableAllocations[macAddress+"/"+networkName+"/"+ipAddress] {
+			return
+		}
+
+		appliedAllocations = append(appliedAllocations, allocatedNetworkConfig{
+			macAddress:  macAddress,
+			networkName: networkName,
+			ipAddress:   ipAddress,
+			poolName:    poolName,
+		})
+	}
 
 	for _, v := range vmnetcfg.Spec.NetworkConfig {
 		pool, poolErr := c.cache.Get("pool", v.NetworkName)
@@ -251,12 +283,7 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 				vmnetcfg.Namespace, vmnetcfg.Name, err)
 			c.metrics.UpdateLogStatus("error")
 
-			appliedAllocations = append(appliedAllocations, allocatedNetworkConfig{
-				macAddress:  v.MACAddress,
-				networkName: v.NetworkName,
-				ipAddress:   ip,
-				poolName:    pool.(kihv1.IPPool).Name,
-			})
+			rememberApplied(pool.(kihv1.IPPool).Name, v.MACAddress, v.NetworkName, ip, false)
 			c.rollbackAppliedAllocations(vmnetcfg, appliedAllocations)
 
 			return fmt.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] cannot register the dhcp lease for hwaddr %s: %s",
@@ -289,12 +316,7 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 				vmnetcfg.Namespace, vmnetcfg.Name, err)
 			c.metrics.UpdateLogStatus("error")
 
-			appliedAllocations = append(appliedAllocations, allocatedNetworkConfig{
-				macAddress:  v.MACAddress,
-				networkName: v.NetworkName,
-				ipAddress:   ip,
-				poolName:    pool.(kihv1.IPPool).Name,
-			})
+			rememberApplied(pool.(kihv1.IPPool).Name, v.MACAddress, v.NetworkName, ip, errors.Is(err, util.ErrForeignOwner))
 			c.rollbackAppliedAllocations(vmnetcfg, appliedAllocations)
 
 			return fmt.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] cannot update the IPPool %s status for ip %s: %s",
@@ -307,12 +329,7 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 			c.metrics.UpdateLogStatus("error")
 		}
 
-		appliedAllocations = append(appliedAllocations, allocatedNetworkConfig{
-			macAddress:  v.MACAddress,
-			networkName: v.NetworkName,
-			ipAddress:   ip,
-			poolName:    pool.(kihv1.IPPool).Name,
-		})
+		rememberApplied(pool.(kihv1.IPPool).Name, v.MACAddress, v.NetworkName, ip, false)
 
 		networkChange = true
 	}
@@ -558,7 +575,7 @@ func (c *Controller) updateIPPoolStatus(event string, vmnetcfgNamespace string, 
 						return nil
 					}
 
-					return fmt.Errorf("ip %s already found in IPPool status", ip)
+					return fmt.Errorf("ip %s already found in IPPool status: %w", ip, util.ErrForeignOwner)
 				}
 				updatedAllocated[k] = v
 			}
