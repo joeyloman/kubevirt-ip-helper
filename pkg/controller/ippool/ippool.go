@@ -25,6 +25,11 @@ const (
 func (c *Controller) registerIPPool(pool *kihv1.IPPool) (cleanup bool, err error) {
 	log.Infof("(ippool.registerIPPool) [%s] new IPPool added", pool.Name)
 
+	// the startup gate counts registration attempts of this pool object
+	// exactly once per initialization phase; a definitively failing
+	// registration is counted as handled instead of blocking the gate
+	c.markInitAttempt(pool.Name)
+
 	// by default cleanup the pool sub resources
 	cleanup = false
 
@@ -104,11 +109,6 @@ func (c *Controller) registerIPPool(pool *kihv1.IPPool) (cleanup bool, err error
 	// cache the pool with an empty status
 	if err = c.cache.Add(rPool); err != nil {
 		return cleanup, fmt.Errorf("error while caching the IPPool for network [%s]: %s", pool.Spec.NetworkName, err.Error())
-	}
-
-	// increase the poolCountCurrent if the application is still initializing
-	if *c.appStatus == APP_INIT {
-		*c.ippoolCountCurrent++
 	}
 
 	return

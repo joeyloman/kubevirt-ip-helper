@@ -136,8 +136,8 @@ func TestProcessNextItemSucceedsForMissingIndexObject(t *testing.T) {
 	if n := queue.Len(); n != 0 {
 		t.Errorf("queue has %d items after a successful sync, want 0", n)
 	}
-	if countCurrent != 0 {
-		t.Errorf("counter incremented for a missing index object, want 0, got %d", countCurrent)
+	if countCurrent != 1 {
+		t.Errorf("counter for a missing index object: got %d, want 1; the vanished object counts as handled so it cannot block the startup gate", countCurrent)
 	}
 }
 
@@ -254,8 +254,8 @@ func TestSyncReturnsNilForMissingIndexObject(t *testing.T) {
 	if err := controller.sync(testEvent(ADD)); err != nil {
 		t.Errorf("sync() for a missing index object returned error %v, want nil", err)
 	}
-	if countCurrent != 0 {
-		t.Errorf("counter incremented for a missing index object, want 0, got %d", countCurrent)
+	if countCurrent != 1 {
+		t.Errorf("counter for a missing index object: got %d, want 1; the vanished object counts as handled so it cannot block the startup gate", countCurrent)
 	}
 }
 
@@ -347,10 +347,13 @@ func TestSyncUpdateDoesNotIncrementCounterWhileInitializing(t *testing.T) {
 	}
 }
 
-func TestSyncAddFailureReturnsErrorAndDoesNotCount(t *testing.T) {
-	// a failed update must return the error so the queue requeues the event
-	// rate-limited; the initialization counter only counts successful syncs,
-	// otherwise every requeued attempt would overcount past the target
+// a failed update returns the error so the queue requeues the event
+// rate-limited; during the initialization phase the object still counts
+// as handled for the startup gate exactly once: a vmnetcfg which cannot
+// complete its sync (its networkname has no live registration) must not
+// block the vm controller startup forever, and the doubled attempts of
+// the requeue must not overcount past the target
+func TestSyncAddFailureCountsAsHandledForStartupGate(t *testing.T) {
 	appStatus := APP_INIT
 	countCurrent := 0
 	indexer := newTestIndexer()
@@ -362,8 +365,16 @@ func TestSyncAddFailureReturnsErrorAndDoesNotCount(t *testing.T) {
 	if err := controller.sync(testEvent(ADD)); err == nil {
 		t.Error("sync(ADD) returned nil, want a rate-limited requeue error for the failed update")
 	}
-	if countCurrent != 0 {
-		t.Errorf("counter = %d after a failed update, want 0", countCurrent)
+	if countCurrent != 1 {
+		t.Errorf("counter = %d after a failed update, want 1: the startup gate counts handled objects once", countCurrent)
+	}
+
+	// the rate-limited retry of the same event must not double count
+	if err := controller.sync(testEvent(ADD)); err == nil {
+		t.Fatal("the retried sync(ADD) returned nil, want a sync error")
+	}
+	if countCurrent != 1 {
+		t.Errorf("counter = %d after the retried event, want 1", countCurrent)
 	}
 }
 

@@ -37,6 +37,11 @@ type Controller struct {
 	kihClientset       *kihclientset.Clientset
 	appStatus          *int
 	ippoolCountCurrent *int
+
+	// initAttempted tracks the IPPool objects which the current
+	// initialization phase already handled, so a pool which definitively
+	// cannot register is still counted by the startup gate
+	initAttempted map[string]bool
 }
 
 func NewController(
@@ -67,6 +72,29 @@ func NewController(
 	}
 }
 
+// markInitAttempt counts one synchronization attempt of an IPPool object
+// for the startup gate: a pool which definitively cannot register (its
+// subnet does not parse, or its networkname is claimed by a live pool)
+// must count as handled too, otherwise the vmnetcfg and vm controllers
+// never start until the offending object is removed first.
+func (c *Controller) markInitAttempt(name string) {
+	if *c.appStatus != APP_INIT {
+		return
+	}
+
+	if c.initAttempted == nil {
+		c.initAttempted = make(map[string]bool)
+	}
+
+	if _, exists := c.initAttempted[name]; exists {
+		return
+	}
+
+	c.initAttempted[name] = true
+
+	*c.ippoolCountCurrent++
+}
+
 func (c *Controller) processNextItem() bool {
 	event, quit := c.queue.Get()
 	if quit {
@@ -93,6 +121,7 @@ func (c *Controller) sync(event Event) (err error) {
 	if !exists && event.action != DELETE {
 		log.Warnf("(ippool.sync) IPPool %s does not exist anymore", event.key)
 		c.metrics.UpdateLogStatus("warning")
+		c.markInitAttempt(event.poolName)
 
 		return
 	}

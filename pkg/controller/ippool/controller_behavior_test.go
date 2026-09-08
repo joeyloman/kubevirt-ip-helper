@@ -852,3 +852,85 @@ func TestSyncUpdateRejectsNetworkNameChangeToClaimedNetwork(t *testing.T) {
 		t.Error("the rejected rename dropped the live registration from the cache")
 	}
 }
+
+// a definitively-failing registration counts the pool as handled for the
+// startup gate: the gate compares handled pools against the list of pool
+// objects, so a rejected pool (here: duplicate networkname) must not keep
+// the vmnetcfg/vm controllers from starting. the rate-limited retries of
+// the failing object must not double count.
+func TestSyncAddRejectedPoolCountsAsHandledDuringInit(t *testing.T) {
+	appStatus := APP_INIT
+	countCurrent := 0
+	foreignPool := testPool("pool-a", "net-dup", 60)
+
+	indexer := newTestIndexer()
+	if err := indexer.Add(foreignPool); err != nil {
+		t.Fatalf("seeding indexer: %v", err)
+	}
+	if err := indexer.Add(testPool("pool-b", "net-dup", 60)); err != nil {
+		t.Fatalf("seeding indexer: %v", err)
+	}
+
+	controller, cacheAllocator := newTestController(t, newTestQueue(), indexer, nil, &appStatus, &countCurrent)
+
+	// a live registration owns the net-dup keys and holds one allocation
+	if err := controller.ipam.NewSubnet("net-dup", "192.168.1.0/24", "192.168.1.10", "192.168.1.100"); err != nil {
+		t.Fatalf("registering the live pool's ipam subnet: %v", err)
+	}
+	if _, err := controller.ipam.GetIP("net-dup", "192.168.1.10"); err != nil {
+		t.Fatalf("allocating the live pool's ip: %v", err)
+	}
+	if err := controller.dhcp.AddPool("net-dup", "192.168.1.1", "255.255.255.0", "192.168.1.1", nil, "", nil, nil, 60, "test-fake-iface"); err != nil {
+		t.Fatalf("registering the live pool's dhcp pool: %v", err)
+	}
+	if err := cacheAllocator.Add(foreignPool); err != nil {
+		t.Fatalf("caching the live pool: %v", err)
+	}
+
+	if err := controller.sync(testPoolEvent("pool-b", ADD, "net-dup")); err == nil {
+		t.Fatal("sync(ADD) for an already-claimed networkname returned nil, want a rejection error")
+	}
+	if countCurrent != 1 {
+		t.Errorf("ippool count = %d, want 1: the rejected registration must count as handled", countCurrent)
+	}
+
+	// the rate-limited retries of the same event must not double count
+	if err := controller.sync(testPoolEvent("pool-b", ADD, "net-dup")); err == nil {
+		t.Fatal("the retried sync(ADD) returned nil, want a rejection error")
+	}
+	if countCurrent != 1 {
+		t.Errorf("ippool count = %d after the retried event, want 1", countCurrent)
+	}
+}
+
+// an add for an object which already vanished from the index counts as
+// handled: the pool cannot produce a registration anymore and the startup
+// gate must not wait for it
+func TestSyncAddVanishedPoolCountsAsHandledDuringInit(t *testing.T) {
+	appStatus := APP_INIT
+	var countCurrent int
+	controller, _ := newTestController(t, newTestQueue(), newTestIndexer(), nil, &appStatus, &countCurrent)
+
+	if err := controller.sync(testPoolEvent("pool-z", ADD, "net-z")); err != nil {
+		t.Fatalf("sync(ADD) for a vanished pool returned error %v, want nil", err)
+	}
+	if countCurrent != 1 {
+		t.Errorf("ippool count = %d, want 1: a vanished pool must not block the startup gate", countCurrent)
+	}
+}
+
+// only the initialization phase counts for the startup gate: registration
+// attempts in the running or restarting phases must not touch the counter
+func TestMarkInitAttemptOnlyCountsDuringInit(t *testing.T) {
+	for _, phase := range []int{APP_RUNNING, APP_RESTART} {
+		appStatus := phase
+		var countCurrent int
+		controller, _ := newTestController(t, newTestQueue(), newTestIndexer(), nil, &appStatus, &countCurrent)
+
+		controller.markInitAttempt("pool-x")
+
+		if countCurrent != 0 {
+			t.Errorf("ippool count = %d in phase %d, want 0: the gate is only evaluated during initialization", countCurrent, phase)
+		}
+	}
+}

@@ -35,6 +35,11 @@ type Controller struct {
 	kihClientset         *kihclientset.Clientset
 	appStatus            *int
 	vmnetcfgCountCurrent *int
+
+	// initAttempted tracks the vmnetcfg objects which the current
+	// initialization phase already handled, so an object which cannot
+	// complete its sync is still counted by the startup gate
+	initAttempted map[string]bool
 }
 
 func NewController(
@@ -63,6 +68,28 @@ func NewController(
 	}
 }
 
+// markInitAttempt counts one synchronization attempt of a
+// VirtualMachineNetworkConfig object for the startup gate: an object whose
+// sync cannot complete (for example its networkname points at a network
+// which has no live registration yet) must count as handled too, otherwise
+// the vm controller never starts until the offending object is removed.
+func (c *Controller) markInitAttempt(key string) {
+	if *c.appStatus != APP_INIT {
+		return
+	}
+
+	if c.initAttempted == nil {
+		c.initAttempted = make(map[string]bool)
+	}
+
+	if _, exists := c.initAttempted[key]; exists {
+		return
+	}
+
+	c.initAttempted[key] = true
+
+	*c.vmnetcfgCountCurrent++
+}
 func (c *Controller) processNextItem() bool {
 	event, quit := c.queue.Get()
 	if quit {
@@ -89,6 +116,9 @@ func (c *Controller) sync(event Event) (err error) {
 	if !exists && event.action != DELETE {
 		log.Warnf("(vmnetcfg.sync) VirtualMachineNetworkConfig %s does not exist anymore", event.key)
 		c.metrics.UpdateLogStatus("warning")
+		// the object is gone and cannot produce a sync anymore; the startup
+		// gate must not wait for it
+		c.markInitAttempt(event.key)
 
 		return
 	}
@@ -99,16 +129,15 @@ func (c *Controller) sync(event Event) (err error) {
 		if err != nil {
 			log.Errorf("(vmnetcfg.sync) failed to update vmnetcfg for %s: %s", event.key, err.Error())
 			c.metrics.UpdateLogStatus("error")
-
-			return
 		}
 
-		// increase the vmnetcfgCountCurrent if the application is still initializing
+		// increase the vmnetcfgCountCurrent if the application is still initializing:
 		// vmnetcfgs with nics in the ERROR status are counted as well because they
-		// were processed successfully, only real update failures are retried instead
-		// otherwise the application will not become operational
-		if event.action == ADD && *c.appStatus == APP_INIT {
-			*c.vmnetcfgCountCurrent++
+		// were processed successfully, and a sync which cannot complete is counted
+		// as handled too; the rate-limited retries keep trying, but they must not
+		// block the vm controller startup forever
+		if event.action == ADD {
+			c.markInitAttempt(event.key)
 		}
 
 		// case DELETE:
