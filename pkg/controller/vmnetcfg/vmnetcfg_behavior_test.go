@@ -1435,3 +1435,122 @@ func TestVMNetCfgCleanupAbortsOnForeignLeaseWhileLive(t *testing.T) {
 		t.Errorf("vmnetcfg updates = %d, want 0", n)
 	}
 }
+
+// a failing pool status update of a later nic must unwind the applied
+// allocations of the earlier nics too: leaving them registered while the
+// durable object never received the addresses leaks the ipam claims when
+// the object is deleted without spec ips to clean up from
+func TestVMNetCfgLaterNICPoolStatusFailureUnwindsEarlierNICs(t *testing.T) {
+	e := newTestEnv(t)
+
+	secondNetwork := "net-b"
+	const secondPoolName = "ippool-b"
+
+	e.addSubnet("10.0.0.1", "10.0.0.1")
+	e.seedPool(nil)
+
+	poolB := &kihv1.IPPool{
+		ObjectMeta: metav1.ObjectMeta{Name: secondPoolName},
+		Spec: kihv1.IPPoolSpec{
+			NetworkName: secondNetwork,
+			IPv4Config:  kihv1.IPv4Config{Subnet: testSubnet, ServerIP: "10.0.0.1"},
+		},
+		Status: kihv1.IPPoolStatus{
+			IPv4: kihv1.IPv4Status{Allocated: map[string]string{
+				"10.0.0.2": "another/vm [02:00:00:00:00:02]",
+			}},
+		},
+	}
+	e.seedPoolWith(poolB)
+	if err := e.ipam.NewSubnet(secondNetwork, testSubnet, "10.0.0.1", "10.0.0.2"); err != nil {
+		t.Fatalf("adding second subnet: %s", err)
+	}
+
+	vmnetcfg := newVMNetCfg("", testMAC)
+	vmnetcfg.Spec.NetworkConfig = []kihv1.NetworkConfig{
+		{MACAddress: testMAC, NetworkName: testNetwork},
+		{MACAddress: testMAC2, NetworkName: secondNetwork, IPAddress: "10.0.0.2"},
+	}
+	e.seedVMNetCfg(vmnetcfg)
+
+	err := e.controller.updateVirtualMachineNetworkConfig(ADD, vmnetcfg)
+	if err == nil {
+		t.Fatal("want the pool status failure of the second nic to fail the sync")
+	}
+	if !strings.Contains(err.Error(), "cannot update the IPPool") {
+		t.Errorf("error = %q, want the pool status rejection", err)
+	}
+
+	// nothing of the sync stayed applied when the second nic failed: the
+	// first nic was already registered when the failure hit
+	if e.dhcp.CheckLease(testMAC) || e.dhcp.CheckLease(testMAC2) {
+		t.Error("leases of earlier and failing interfaces must be released")
+	}
+	if used := e.ipam.Used(testNetwork); used != 0 {
+		t.Errorf("first nic's ipam allocation = %d used, want 0 after the unwind", used)
+	}
+	if used := e.ipam.Used(secondNetwork); used != 0 {
+		t.Errorf("failing nic's ipam allocation = %d used, want 0 after the unwind", used)
+	}
+
+	e.api.mu.Lock()
+	poolA := e.api.ippools[testPoolName].DeepCopy()
+	poolBStored := e.api.ippools[secondPoolName].DeepCopy()
+	e.api.mu.Unlock()
+
+	if got := poolA.Status.IPv4.Allocated["10.0.0.1"]; got != "" {
+		t.Errorf("first nic's status entry = %q, want removed by the unwind", got)
+	}
+	if got := poolBStored.Status.IPv4.Allocated["10.0.0.2"]; got != "another/vm [02:00:00:00:00:02]" {
+		t.Errorf("foreign entry of the second pool = %q, want preserved", got)
+	}
+
+	// the unwound sync must not have touched the durable object
+	if n := e.countRequests(http.MethodPut, vmnetcfgMainPath); n != 0 {
+		t.Errorf("vmnetcfg updates = %d, want 0 (the failure is pre-commit)", n)
+	}
+	if n := e.countRequests(http.MethodPut, vmnetcfgStatusPath); n != 0 {
+		t.Errorf("vmnetcfg status updates = %d, want 0 (the failure is pre-commit)", n)
+	}
+}
+
+// a pool lookup failing after an earlier nic was applied must unwind the
+// earlier allocation as well
+func TestVMNetCfgLaterNICPoolLookupFailureUnwindsEarlierNICs(t *testing.T) {
+	e := newTestEnv(t)
+	e.addSubnet("10.0.0.1", "10.0.0.1")
+	e.seedPool(nil)
+
+	vmnetcfg := newVMNetCfg("", testMAC)
+	vmnetcfg.Spec.NetworkConfig = []kihv1.NetworkConfig{
+		{MACAddress: testMAC, NetworkName: testNetwork},
+		{MACAddress: testMAC2, NetworkName: "net-missing"},
+	}
+	e.seedVMNetCfg(vmnetcfg)
+
+	err := e.controller.updateVirtualMachineNetworkConfig(ADD, vmnetcfg)
+	if err == nil {
+		t.Fatal("want the pool lookup failure of the second nic to fail the sync")
+	}
+	if !strings.Contains(err.Error(), "does not exists in cache") {
+		t.Errorf("error = %q, want the cache miss message", err)
+	}
+
+	if e.dhcp.CheckLease(testMAC) {
+		t.Error("the earlier nic's lease must be released by the unwind")
+	}
+	if used := e.ipam.Used(testNetwork); used != 0 {
+		t.Errorf("the earlier nic's ipam allocation = %d used, want 0 after the unwind", used)
+	}
+
+	e.api.mu.Lock()
+	poolA := e.api.ippools[testPoolName].DeepCopy()
+	e.api.mu.Unlock()
+	if got := poolA.Status.IPv4.Allocated["10.0.0.1"]; got != "" {
+		t.Errorf("the earlier nic's status entry = %q, want removed by the unwind", got)
+	}
+
+	if n := e.countRequests(http.MethodPut, vmnetcfgMainPath); n != 0 {
+		t.Errorf("vmnetcfg updates = %d, want 0 (the failure is pre-commit)", n)
+	}
+}
