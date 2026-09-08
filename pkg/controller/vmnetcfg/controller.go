@@ -1,6 +1,8 @@
 package vmnetcfg
 
 import (
+	"errors"
+	"net"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -16,6 +18,7 @@ import (
 	kihclientset "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/clientset/versioned"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/metrics"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/util"
 )
 
 const (
@@ -68,11 +71,13 @@ func NewController(
 	}
 }
 
-// markInitAttempt counts one synchronization attempt of a
-// VirtualMachineNetworkConfig object for the startup gate: an object whose
-// sync cannot complete (for example its networkname points at a network
-// which has no live registration yet) must count as handled too, otherwise
-// the vm controller never starts until the offending object is removed.
+// markInitAttempt counts one settled VirtualMachineNetworkConfig object
+// for the startup gate: its sync either completed (nics in the ERROR
+// status included, their object was processed) or was definitively
+// rejected. a transiently failed restore stays uncounted, so the retried
+// sync can still protect the existing reservation before the vm
+// controller opens new allocations; a definitively broken object still
+// counts so it does not block the controller startup until it is removed.
 func (c *Controller) markInitAttempt(key string) {
 	if *c.appStatus != APP_INIT {
 		return
@@ -90,6 +95,34 @@ func (c *Controller) markInitAttempt(key string) {
 
 	*c.vmnetcfgCountCurrent++
 }
+
+// initSyncSettled reports whether a failed sync can never succeed on a
+// retry during the initialization phase: a networkname without a live
+// pool registration cannot restore its reservation until the offending
+// IPPool is repaired, an invalid macaddress in the spec cannot register a
+// lease at all, and an ownership conflict (the pool status records the
+// claimed address for another owner) needs one of the claiming objects to
+// be edited. the startup gate must not wait for such objects, while every
+// other failure is transient and the retried sync must stay able to
+// settle the object for the gate.
+func (c *Controller) initSyncSettled(vmnetcfg *kihv1.VirtualMachineNetworkConfig, err error) bool {
+	if errors.Is(err, util.ErrForeignOwner) {
+		return true
+	}
+
+	for _, v := range vmnetcfg.Spec.NetworkConfig {
+		if _, cacheErr := c.cache.Get("pool", v.NetworkName); cacheErr != nil {
+			return true
+		}
+
+		if _, macErr := net.ParseMAC(v.MACAddress); macErr != nil {
+			return true
+		}
+	}
+
+	return false
+}
+
 func (c *Controller) processNextItem() bool {
 	event, quit := c.queue.Get()
 	if quit {
@@ -130,16 +163,18 @@ func (c *Controller) sync(event Event) (err error) {
 			log.Errorf("(vmnetcfg.sync) failed to update vmnetcfg for %s: %s", event.key, err.Error())
 			c.metrics.UpdateLogStatus("error")
 		}
-
-		// increase the vmnetcfgCountCurrent if the application is still initializing:
-		// vmnetcfgs with nics in the ERROR status are counted as well because they
-		// were processed successfully, and a sync which cannot complete is counted
-		// as handled too; the rate-limited retries keep trying, but they must not
-		// block the vm controller startup forever
-		if event.action == ADD {
+		// increase the vmnetcfgCountCurrent if the application is still
+		// initializing: the startup gate counts a vmnetcfg as handled once
+		// its sync settled. vmnetcfgs with nics in the ERROR status count
+		// as well because their sync completed, and a definitively rejected
+		// object counts so a broken vmnetcfg does not block the vm
+		// controller startup forever. a transiently failed restore stays
+		// uncounted instead: the rate-limited retry must stay able to
+		// protect the existing reservation before the vm controller opens
+		// new allocations
+		if event.action == ADD && (err == nil || c.initSyncSettled(obj.(*kihv1.VirtualMachineNetworkConfig), err)) {
 			c.markInitAttempt(event.key)
 		}
-
 		// case DELETE:
 		// 	log.Infof("(vmnetcfg.sync) delete action found!")
 	}

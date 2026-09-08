@@ -939,8 +939,10 @@ func TestMarkInitAttemptOnlyCountsDuringInit(t *testing.T) {
 // an update whose pool has no live registration of its own (the first
 // registration was dropped, or the lookup resolved a foreign pool which
 // shares the networkname) becomes a registration attempt: a fixed
-// projection comes to life with the next event. the attempt is visible
-// through the once-per-object startup gate marking.
+// projection comes to life with the next event. the attempt counts for
+// the startup gate only once it settles, so a transiently failing
+// re-registration (here: the bindinterface is missing on the host) must
+// keep the gate waiting for its retry.
 func TestSyncUpdateAttemptsRegistrationForUnregisteredPool(t *testing.T) {
 	appStatus := APP_INIT
 	countCurrent := 0
@@ -958,8 +960,8 @@ func TestSyncUpdateAttemptsRegistrationForUnregisteredPool(t *testing.T) {
 			t.Errorf("the update resolved to the cache-miss invariant instead of attempting registration: %v", err)
 		}
 	}
-	if countCurrent != 1 {
-		t.Errorf("ippool count = %d, want 1: the update must reach a registration attempt", countCurrent)
+	if countCurrent != 0 {
+		t.Errorf("ippool count = %d, want 0: a transiently failed re-registration must stay uncounted", countCurrent)
 	}
 
 	// the retried event must not double count
@@ -968,8 +970,8 @@ func TestSyncUpdateAttemptsRegistrationForUnregisteredPool(t *testing.T) {
 			t.Errorf("the retried update fell back to the cache-miss invariant: %v", err)
 		}
 	}
-	if countCurrent != 1 {
-		t.Errorf("ippool count = %d after the retried event, want 1", countCurrent)
+	if countCurrent != 0 {
+		t.Errorf("ippool count = %d after the retried event, want 0 until the registration settles", countCurrent)
 	}
 
 }

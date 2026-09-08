@@ -319,8 +319,8 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 			rememberApplied(pool.(kihv1.IPPool).Name, v.MACAddress, v.NetworkName, ip, errors.Is(err, util.ErrForeignOwner))
 			c.rollbackAppliedAllocations(vmnetcfg, appliedAllocations)
 
-			return fmt.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] cannot update the IPPool %s status for ip %s: %s",
-				vmnetcfg.Namespace, vmnetcfg.Name, pool.(kihv1.IPPool).Name, ip, err.Error())
+			return fmt.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] cannot update the IPPool %s status for ip %s: %w",
+				vmnetcfg.Namespace, vmnetcfg.Name, pool.(kihv1.IPPool).Name, ip, err)
 		}
 
 		if err := c.updateIPPoolMetrics(pool.(kihv1.IPPool).Name); err != nil {

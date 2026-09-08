@@ -72,11 +72,12 @@ func NewController(
 	}
 }
 
-// markInitAttempt counts one synchronization attempt of an IPPool object
-// for the startup gate: a pool which definitively cannot register (its
-// subnet does not parse, or its networkname is claimed by a live pool)
-// must count as handled too, otherwise the vmnetcfg and vm controllers
-// never start until the offending object is removed first.
+// markInitAttempt counts one settled IPPool object for the startup gate:
+// its registration is either live or definitively rejected (the pool
+// object can also be gone already). counting only settled pools keeps the
+// vmnetcfg controller from restoring bindings into pools which are not
+// registered yet, while rejected pools still count so a broken object
+// does not block the controller startup until it is removed first.
 func (c *Controller) markInitAttempt(name string) {
 	if *c.appStatus != APP_INIT {
 		return

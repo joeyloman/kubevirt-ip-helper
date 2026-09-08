@@ -2,6 +2,7 @@ package ippool
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -22,12 +23,29 @@ const (
 	IPPOOL_RESTART  = 2
 )
 
+// ErrPoolUnregistrable reports a registration rejection which cannot
+// succeed on a retry in its current form: the projection itself is
+// invalid (its subnet does not parse) or its networkname is claimed by
+// the live registration of another pool. the startup gate counts such
+// pools as handled so a broken object does not block the controller
+// startup, while every other registration failure stays retriable and
+// uncounted until the attempt settles.
+var ErrPoolUnregistrable = errors.New("the pool cannot be registered in its current form")
+
 func (c *Controller) registerIPPool(pool *kihv1.IPPool) (cleanup bool, err error) {
 
-	// the startup gate counts registration attempts of this pool object
-	// exactly once per initialization phase; a definitively failing
-	// registration is counted as handled instead of blocking the gate
-	c.markInitAttempt(pool.Name)
+	// the startup gate counts this pool as handled once its registration
+	// attempt settled: counting at the start would open the gate while the
+	// pool sub-resources are still being created, so the vmnetcfg
+	// controller could restore bindings before the pool registrations are
+	// live. a settled registration or a definitive rejection counts, while
+	// a transient failure stays uncounted so the requeued or resynced
+	// retry can still settle the pool for the gate.
+	defer func() {
+		if err == nil || errors.Is(err, ErrPoolUnregistrable) {
+			c.markInitAttempt(pool.Name)
+		}
+	}()
 
 	// by default cleanup the pool sub resources
 	cleanup = false
@@ -35,8 +53,8 @@ func (c *Controller) registerIPPool(pool *kihv1.IPPool) (cleanup bool, err error
 	// add the serverip to the bindinterface
 	ipnet, err := netip.ParsePrefix(pool.Spec.IPv4Config.Subnet)
 	if err != nil {
-		return cleanup, fmt.Errorf("error while parsing subnet [%s] for network [%s]: %s",
-			pool.Spec.IPv4Config.Subnet, pool.Spec.NetworkName, err.Error())
+		return cleanup, fmt.Errorf("error while parsing subnet [%s] for network [%s]: %s: %w",
+			pool.Spec.IPv4Config.Subnet, pool.Spec.NetworkName, err.Error(), ErrPoolUnregistrable)
 	}
 	// the pool sub-resources (dhcp pool, ipam subnet, cache entry) are all
 	// keyed by the networkname, and the allocators start empty on every
@@ -45,7 +63,7 @@ func (c *Controller) registerIPPool(pool *kihv1.IPPool) (cleanup bool, err error
 	// down or silently replace its live allocations, so reject before
 	// any sub-resource of this pool is created.
 	if c.dhcp.CheckPool(pool.Spec.NetworkName) {
-		return cleanup, fmt.Errorf("networkname [%s] is already registered by another IPPool, not touching its live state", pool.Spec.NetworkName)
+		return cleanup, fmt.Errorf("networkname [%s] is already registered by another IPPool, not touching its live state: %w", pool.Spec.NetworkName, ErrPoolUnregistrable)
 	}
 
 	ip4 := fmt.Sprintf("%s/%d", pool.Spec.IPv4Config.ServerIP, ipnet.Bits())
