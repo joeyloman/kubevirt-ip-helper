@@ -1629,3 +1629,42 @@ func TestVMNetCfgOldAddressCleanupIgnoresForeignNetworkLease(t *testing.T) {
 		t.Errorf("foreign lease reference = %q, want the other network's owner preserved", lease.Reference)
 	}
 }
+
+// a rejected, never-allocated address must not make the vmnetcfg
+// undeletable: the cleanup converges on the provably missing allocation
+// and removes the finalizers
+func TestVMNetCfgDeletionConvergesOnNeverAllocatedAddress(t *testing.T) {
+	e := newTestEnv(t)
+	e.addSubnet("10.0.0.1", "10.0.0.4")
+	e.seedPool(nil)
+
+	// 10.0.0.9 is outside the 10.0.0.0/29 subnet: the allocation pass
+	// registers the error status and never allocates anything
+	vmnetcfg := newVMNetCfg("10.0.0.9", testMAC)
+	e.seedVMNetCfg(vmnetcfg)
+	if err := e.controller.updateVirtualMachineNetworkConfig(ADD, vmnetcfg); err != nil {
+		t.Fatalf("unexpected error on the allocation pass: %s", err)
+	}
+
+	// mark the stored object for deletion like the controller would see it
+	stored := e.getStoredVMNetCfg()
+	now := metav1.Now()
+	stored.ObjectMeta.DeletionTimestamp = &now
+	stored.ObjectMeta.Finalizers = []string{"kubevirtiphelper.k8s.binbash.org/vmnetcfg-cleanup"}
+	e.seedVMNetCfg(stored)
+
+	if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, stored); err != nil {
+		t.Fatalf("deletion pass = %v, want convergence on the never-allocated address", err)
+	}
+
+	final := e.getStoredVMNetCfg()
+	if len(final.ObjectMeta.Finalizers) != 0 {
+		t.Errorf("finalizers = %v, want removed so the object can be deleted", final.ObjectMeta.Finalizers)
+	}
+	if used := e.ipam.Used(testNetwork); used != 0 {
+		t.Errorf("ipam used = %d, want nothing allocated", used)
+	}
+	if e.dhcp.CheckLease(testMAC) {
+		t.Error("no lease must exist")
+	}
+}

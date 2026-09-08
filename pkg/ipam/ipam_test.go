@@ -240,7 +240,7 @@ func TestIpam(t *testing.T) {
 		{
 			subnetName: "default/network-class-b-ok",
 			ip:         "172.18.128.129",
-			want:       fmt.Errorf("given ip 172.18.128.129 is not cidr 172.16.0.0/16"),
+			want:       fmt.Errorf("given ip 172.18.128.129 is not cidr 172.16.0.0/16: ip is not inside the subnet"),
 		},
 		{
 			subnetName: "default/network-class-b-ok",

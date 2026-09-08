@@ -18,6 +18,11 @@ var (
 	// ErrIPAlreadyFree reports a release attempt for an address with no
 	// live allocation, so nothing is left to release.
 	ErrIPAlreadyFree = errors.New("ip was not allocated")
+
+	// ErrIPNotInCidr reports a release attempt for an address outside the
+	// subnet of the named network: ipam never allocated such an address,
+	// so nothing is left to release and cleanup can converge.
+	ErrIPNotInCidr = errors.New("ip is not inside the subnet")
 )
 
 type IPSubnet struct {
@@ -178,7 +183,7 @@ func (a *IPAllocator) ReleaseIP(name string, givenIP string) (err error) {
 	}
 	gIPCheck := a.ipam[name].cidr.Contains(gIP)
 	if !gIPCheck {
-		return fmt.Errorf("given ip %s is not cidr %s", givenIP, a.ipam[name].cidr)
+		return fmt.Errorf("given ip %s is not cidr %s: %w", givenIP, a.ipam[name].cidr, ErrIPNotInCidr)
 	}
 
 	for ip, allocated := range a.ipam[name].ips {

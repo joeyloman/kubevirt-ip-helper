@@ -34,9 +34,11 @@ func TestIPAMReleaseOutcomesAreSentinelErrors(t *testing.T) {
 		t.Errorf("allocation on an unknown subnet = %v, want ErrSubnetNotFound", err)
 	}
 
-	// an out-of-subnet address is always a hard error, never a release case
-	if err := allocator.ReleaseIP("net", "192.168.54.4"); err == nil || errors.Is(err, ErrIPAlreadyFree) {
-		t.Errorf("out-of-subnet release = %v, want a plain failing error", err)
+	// an out-of-subnet address was never allocated by ipam: a release
+	// classifies through ErrIPNotInCidr and cleanup must converge on it,
+	// while it never silently passes as a free-already release
+	if err := allocator.ReleaseIP("net", "192.168.54.4"); !errors.Is(err, ErrIPNotInCidr) {
+		t.Errorf("out-of-subnet release = %v, want ErrIPNotInCidr", err)
 	}
 
 	// an empty ip is a caller error: the controllers must surface it
