@@ -133,6 +133,32 @@ func (c *Controller) registerIPPool(pool *kihv1.IPPool) (cleanup bool, err error
 	return
 }
 
+// registerPoolWithTeardown runs one registration attempt for the pool and
+// tears a partially applied registration back down when the attempt fails
+// midway: the leftover sub-resources (the server ip on the bind interface,
+// the dhcp pool and its listener) would otherwise claim the networkname,
+// so every retried attempt is rejected by the duplicate-networkname check
+// and the network stays unregistered until the process is restarted.
+// failLog prefixes the failure log line with the triggering event path.
+func (c *Controller) registerPoolWithTeardown(pool *kihv1.IPPool, failLog string) (err error) {
+	cleanup, err := c.registerIPPool(pool)
+	if err == nil {
+		return
+	}
+
+	log.Errorf("(ippool.sync) %s %s: %s", failLog, pool.Name, err.Error())
+	c.metrics.UpdateLogStatus("error")
+
+	if cleanup {
+		if cleanupErr := c.cleanupIPPoolObjects(pool); cleanupErr != nil {
+			log.Errorf("(ippool.sync) failed to cleanup pool %s: %s", pool.Name, cleanupErr.Error())
+			c.metrics.UpdateLogStatus("error")
+		}
+	}
+
+	return
+}
+
 func (c *Controller) handleIPPoolObjectChange(oldPool kihv1.IPPool, newPool *kihv1.IPPool) (err error) {
 	var updateAction int = IPPOOL_NOCHANGE
 

@@ -129,20 +129,7 @@ func (c *Controller) sync(event Event) (err error) {
 
 	switch event.action {
 	case ADD:
-		var cleanup bool
-
-		cleanup, err = c.registerIPPool(obj.(*kihv1.IPPool))
-		if err != nil {
-			log.Errorf("(ippool.sync) failed to allocate new pool for %s: %s", event.poolName, err.Error())
-			c.metrics.UpdateLogStatus("error")
-
-			if cleanup {
-				if cleanupErr := c.cleanupIPPoolObjects(obj.(*kihv1.IPPool)); cleanupErr != nil {
-					log.Errorf("(ippool.sync) failed to cleanup pool %s: %s", event.poolName, cleanupErr.Error())
-					c.metrics.UpdateLogStatus("error")
-				}
-			}
-		}
+		err = c.registerPoolWithTeardown(obj.(*kihv1.IPPool), "failed to allocate new pool for")
 	case UPDATE:
 		pool, poolErr := c.cache.Get("pool", event.poolNetworkName)
 		if poolErr != nil && event.oldPoolNetworkName != "" && event.oldPoolNetworkName != event.poolNetworkName {
@@ -159,13 +146,11 @@ func (c *Controller) sync(event Event) (err error) {
 			// projection comes to life with the next event without a pod
 			// restart. a still-unregistrable projection keeps failing and a
 			// claimed networkname is rejected without touching the live
-			// state of the pool which owns it.
-			_, err = c.registerIPPool(obj.(*kihv1.IPPool))
-			if err != nil {
-				log.Errorf("(ippool.sync) failed to register unregistered pool %s: %s",
-					event.poolName, err.Error())
-				c.metrics.UpdateLogStatus("error")
-			}
+			// state of the pool which owns it. a partially applied
+			// registration is torn back down, so the retried attempt is
+			// not rejected by the leftover sub-resources of its own
+			// previous attempt.
+			err = c.registerPoolWithTeardown(obj.(*kihv1.IPPool), "failed to register unregistered pool")
 
 			return err
 		}
