@@ -469,6 +469,15 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 		}
 	}
 
+	// the release above changed the pool accounting: republish the
+	// metrics so the gauges do not stay stale after the last allocation
+	// of a pool was cleaned
+	if err := c.updateIPPoolMetrics(pool.(kihv1.IPPool).Name); err != nil {
+		log.Errorf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] %s",
+			vmnetcfg.Namespace, vmnetcfg.Name, err)
+		c.metrics.UpdateLogStatus("error")
+	}
+
 	return
 }
 

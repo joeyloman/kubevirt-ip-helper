@@ -1668,3 +1668,46 @@ func TestVMNetCfgDeletionConvergesOnNeverAllocatedAddress(t *testing.T) {
 		t.Error("no lease must exist")
 	}
 }
+
+// deleting the recorded allocation must republish the pool accounting:
+// the gauges of a pool whose last allocation was cleaned stay stale
+// otherwise, because status-only ippool writes do not repair them
+func TestVMNetCfgDeletionRefreshesPoolMetrics(t *testing.T) {
+	e := newTestEnv(t)
+	e.addSubnet("10.0.0.1", "10.0.0.2")
+	e.seedPool(map[string]string{"10.0.0.1": "default/vm-test [02:00:00:00:00:01]"})
+	if _, err := e.ipam.GetIP(testNetwork, "10.0.0.1"); err != nil {
+		t.Fatalf("allocating the recorded address: %s", err)
+	}
+	if err := e.dhcp.AddLease(testMAC, testNetwork, "10.0.0.1", testNamespace+"/"+testVMName); err != nil {
+		t.Fatalf("seeding lease: %s", err)
+	}
+	e.metrics.UpdateIPPoolUsed(testPoolName, testSubnet, testNetwork, 1)
+	e.metrics.UpdateIPPoolAvailable(testPoolName, testSubnet, testNetwork, 1)
+
+	// the used gauge matches the live allocation before the cleanup
+	if v, ok := e.metricValue(metricIPPoolUsed, map[string]string{"ippool": testPoolName, "subnet": testSubnet, "network": testNetwork}); !ok || v != 1 {
+		t.Fatalf("used gauge before cleanup = %v (present %v), want 1", v, ok)
+	}
+
+	vmnetcfg := newVMNetCfg("10.0.0.1", testMAC)
+	now := metav1.Now()
+	vmnetcfg.ObjectMeta.DeletionTimestamp = &now
+	vmnetcfg.ObjectMeta.Finalizers = []string{"kubevirtiphelper.k8s.binbash.org/vmnetcfg-cleanup"}
+	e.seedVMNetCfg(vmnetcfg)
+
+	if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, vmnetcfg); err != nil {
+		t.Fatalf("deletion pass = %v", err)
+	}
+
+	pool := e.getStoredPool()
+	if got, stillThere := pool.Status.IPv4.Allocated["10.0.0.1"]; stillThere {
+		t.Errorf("released allocation = %q, want removed from the status", got)
+	}
+	if v, ok := e.metricValue(metricIPPoolUsed, map[string]string{"ippool": testPoolName, "subnet": testSubnet, "network": testNetwork}); !ok || v != 0 {
+		t.Errorf("used gauge after cleanup = %v (present %v), want 0", v, ok)
+	}
+	if v, ok := e.metricValue(metricIPPoolAvail, map[string]string{"ippool": testPoolName, "subnet": testSubnet, "network": testNetwork}); !ok || v != 2 {
+		t.Errorf("available gauge after cleanup = %v (present %v), want 2", v, ok)
+	}
+}
