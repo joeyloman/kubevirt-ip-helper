@@ -229,8 +229,7 @@ func TestDHCPHandlerRequestAddressing(t *testing.T) {
 			t.Errorf("YourIPAddr = %s, want 192.168.0.50", resp.YourIPAddr)
 		}
 	})
-
-	t.Run("mismatched requested ip is nacked", func(t *testing.T) {
+	t.Run("mismatched requested ip is nacked to the broadcast address", func(t *testing.T) {
 		a := newTestPooledAllocator(t)
 		conn := &recordingPacketConn{}
 
@@ -251,6 +250,44 @@ func TestDHCPHandlerRequestAddressing(t *testing.T) {
 		}
 		if !resp.YourIPAddr.IsUnspecified() {
 			t.Errorf("YourIPAddr = %s, want 0.0.0.0 for a nak", resp.YourIPAddr)
+		}
+
+		// rfc 2131 section 3.2: without a relay address the nak must be
+		// broadcast, never unicast to the rejected claim address, because
+		// the client may not hold a valid address and may not answer arp
+		dst, ok := conn.peers[0].(*net.UDPAddr)
+		if !ok || dst.IP.String() != "255.255.255.255" || dst.Port != dhcpv4.ClientPort {
+			t.Errorf("nak destination = %v, want 255.255.255.255:%d", conn.peers[0], dhcpv4.ClientPort)
+		}
+	})
+
+	t.Run("mismatched request through a relay is nacked to the relay agent", func(t *testing.T) {
+		a := newTestPooledAllocator(t)
+		conn := &recordingPacketConn{}
+
+		req := newBootRequest(t, mustHWAddr(t, "aa:bb:cc:dd:ee:01"), dhcpv4.MessageTypeRequest)
+		req.UpdateOption(dhcpv4.OptServerIdentifier(serverIP))
+		req.UpdateOption(dhcpv4.OptRequestedIPAddress(net.ParseIP("192.168.0.99")))
+		req.GatewayIPAddr = net.ParseIP("203.0.113.1")
+		a.dhcpHandler(conn, testPeer(), req)
+
+		if conn.len() != 1 {
+			t.Fatalf("expected 1 reply, got %d", conn.len())
+		}
+		resp, err := dhcpv4.FromBytes(conn.payloads[0])
+		if err != nil {
+			t.Fatalf("parsing reply: %v", err)
+		}
+		if mt := resp.MessageType(); mt != dhcpv4.MessageTypeNak {
+			t.Errorf("got message type %v, want Nak for a mismatched address", mt)
+		}
+
+		// rfc 2131 section 3.2: a relayed request gets the nak sent to the
+		// bootp relay agent, which forwards it to the client's hardware
+		// address
+		dst, ok := conn.peers[0].(*net.UDPAddr)
+		if !ok || !dst.IP.Equal(net.ParseIP("203.0.113.1")) || dst.Port != dhcpv4.ServerPort {
+			t.Errorf("nak destination = %v, want 203.0.113.1:%d", conn.peers[0], dhcpv4.ServerPort)
 		}
 	})
 

@@ -384,7 +384,7 @@ func (a *DHCPAllocator) dhcpHandler(conn net.PacketConn, peer net.Addr, m *dhcpv
 			log.Warnf("(dhcp.dhcpHandler) [txid=%s] DHCPREQUEST from %s via %s claims ip %s, but the lease holds %s, sending DHCPNAK",
 				m.TransactionID.String(), m.ClientHWAddr.String(), pool.Nic, claimIP, lease.ClientIP)
 
-			a.sendNak(conn, peer, m, pool.ServerIP)
+			a.sendNak(conn, m, pool.ServerIP)
 
 			return
 		}
@@ -470,8 +470,15 @@ func (a *DHCPAllocator) dhcpHandler(conn net.PacketConn, peer net.Addr, m *dhcpv
 }
 
 // sendNak tells the client that its request does not match the lease state,
-// so it restarts the discovery. A nak contains no lease options.
-func (a *DHCPAllocator) sendNak(conn net.PacketConn, peer net.Addr, m *dhcpv4.DHCPv4, serverIP net.IP) {
+// so it restarts the discovery. A nak contains no lease options. rfc 2131
+// section 3.2: a request which arrived without a relay address gets the nak
+// broadcast to the 0xffffffff address, because the client may not hold a
+// valid network address or subnet mask and may not answer arp requests;
+// unicasting to the rejected claim address would leave such a client
+// without the nak. a request which came through a bootp relay agent gets
+// the nak sent to the relay address, which forwards it to the client's
+// hardware address.
+func (a *DHCPAllocator) sendNak(conn net.PacketConn, m *dhcpv4.DHCPv4, serverIP net.IP) {
 	reply, err := dhcpv4.NewReplyFromRequest(m, dhcpv4.WithMessageType(dhcpv4.MessageTypeNak))
 	if err != nil {
 		log.Errorf("(dhcp.dhcpHandler) building DHCPNAK failed: %v", err)
@@ -481,8 +488,15 @@ func (a *DHCPAllocator) sendNak(conn net.PacketConn, peer net.Addr, m *dhcpv4.DH
 
 	reply.UpdateOption(dhcpv4.OptServerIdentifier(serverIP))
 
-	if _, err := conn.WriteTo(reply.ToBytes(), peer); err != nil {
-		log.Errorf("(dhcp.dhcpHandler) Cannot reply to client: %v", err)
+	dst := &net.UDPAddr{IP: net.IPv4bcast, Port: dhcpv4.ClientPort}
+	if !m.GatewayIPAddr.Equal(net.IPv4zero) {
+		// the request was relayed: the relay agent forwards the nak
+		// towards the client's hardware address
+		dst = &net.UDPAddr{IP: m.GatewayIPAddr, Port: dhcpv4.ServerPort}
+	}
+
+	if _, err := conn.WriteTo(reply.ToBytes(), dst); err != nil {
+		log.Errorf("(dhcp.dhcpHandler) Cannot send DHCPNAK to %s: %v", dst, err)
 	}
 }
 
