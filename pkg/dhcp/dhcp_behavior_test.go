@@ -405,10 +405,12 @@ func TestAddPoolOverwritesExistingPool(t *testing.T) {
 // mac addresses are stored under the canonical colon form, so every
 // spelling of the same address must resolve to the same lease and a
 // duplicate spelling must be rejected instead of creating a second
-// independent identity.
+// independent identity. the spellings stay within the delimiter forms
+// every toolchain parses: the delimiter-free form is only accepted by
+// standard libraries newer than the declared go version.
 func TestAddLeaseCanonicalizesIdentity(t *testing.T) {
 	a := New()
-	for _, hw := range []string{"aa-bb-cc-dd-ee-01", "aabbccddee02"} {
+	for _, hw := range []string{"aa-bb-cc-dd-ee-01", "aabb.ccdd.ee02"} {
 		if err := a.AddLease(hw, "pool1", "192.168.0.50", "ref"); err != nil {
 			t.Fatalf("AddLease(%q): %v", hw, err)
 		}
@@ -418,8 +420,8 @@ func TestAddLeaseCanonicalizesIdentity(t *testing.T) {
 	if !a.CheckLease("aa:bb:cc:dd:ee:01") {
 		t.Error("hyphen-form lease not resolvable in canonical colon form")
 	}
-	if !a.CheckLease("aabbccddee02") {
-		t.Error("bare-form lease not resolvable in canonical colon form")
+	if !a.CheckLease("aabb.ccdd.ee02") {
+		t.Error("cisco-form lease not resolvable in canonical colon form")
 	}
 	if !a.CheckLease("AA-BB-CC-DD-EE-01") {
 		t.Error("uppercase hyphen-form lease not resolvable in canonical colon form")
@@ -430,7 +432,7 @@ func TestAddLeaseCanonicalizesIdentity(t *testing.T) {
 	}
 
 	// the second spelling of the first address is rejected as duplicate
-	if err := a.AddLease("aabbccddee01", "pool1", "192.168.0.51", "other-ref"); err == nil {
+	if err := a.AddLease("aabb.ccdd.ee01", "pool1", "192.168.0.51", "other-ref"); err == nil {
 		t.Fatal("a duplicate spelling of an existing lease was accepted")
 	} else if !strings.Contains(err.Error(), "already exists") {
 		t.Errorf("duplicate error = %q, want already-exists message", err)
