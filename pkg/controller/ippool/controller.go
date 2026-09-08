@@ -143,6 +143,20 @@ func (c *Controller) sync(event Event) (err error) {
 		}
 
 		p := pool.(kihv1.IPPool)
+		if p.Name != event.poolName {
+			// the cache is keyed by the networkname, so this lookup returns
+			// the pool which lives under the deleted object's networkname.
+			// a pool which was never registered under its own networkname
+			// (for example one whose ADD was rejected because a live pool
+			// already claims it) therefore resolves to that live pool.
+			// freeing the live pool's registration because an unrelated
+			// object was deleted is incorrect, so this delete stays a no-op.
+			log.Warnf("(ippool.sync) IPPool %s [networkname %s] was never registered; skipping cleanup of the live state",
+				event.poolName, event.poolNetworkName)
+			c.metrics.UpdateLogStatus("warning")
+
+			return
+		}
 		if err = c.cleanupIPPoolObjects(&p); err != nil {
 			log.Errorf("(ippool.sync) failed to cleanup pool %s: %s", event.poolName, err.Error())
 			c.metrics.UpdateLogStatus("error")

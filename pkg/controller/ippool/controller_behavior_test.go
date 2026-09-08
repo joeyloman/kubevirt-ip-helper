@@ -681,6 +681,110 @@ func TestSyncAddDuplicateNetworkNameDoesNotTouchForeignState(t *testing.T) {
 	}
 }
 
+// deleting an IPPool object which was never registered under its own
+// networkname (for example a duplicate-networkname pool whose ADD was
+// rejected) must not resolve to the live pool in the cache, which shares
+// that networkname, and free the live pool's state
+func TestSyncDeleteForeignCacheEntryKeepsLivePoolState(t *testing.T) {
+	var appStatus int
+	foreignPool := testPool("pool-a", "net-dup", 60)
+
+	indexer := newTestIndexer()
+	if err := indexer.Add(foreignPool); err != nil {
+		t.Fatalf("seeding indexer: %v", err)
+	}
+
+	controller, cacheAllocator := newTestController(t, newTestQueue(), indexer, nil, &appStatus, new(int))
+
+	// a live registration owns the net-dup keys and holds one allocation
+	if err := controller.ipam.NewSubnet("net-dup", "192.168.1.0/24", "192.168.1.10", "192.168.1.100"); err != nil {
+		t.Fatalf("registering the live pool's ipam subnet: %v", err)
+	}
+	if _, err := controller.ipam.GetIP("net-dup", "192.168.1.10"); err != nil {
+		t.Fatalf("allocating the live pool's ip: %v", err)
+	}
+	if err := controller.dhcp.AddPool("net-dup", "192.168.1.1", "255.255.255.0", "192.168.1.1", nil, "", nil, nil, 60, "test-fake-iface"); err != nil {
+		t.Fatalf("registering the live pool's dhcp pool: %v", err)
+	}
+	if err := cacheAllocator.Add(foreignPool); err != nil {
+		t.Fatalf("caching the live pool: %v", err)
+	}
+	controller.metrics.UpdateIPPoolUsed("pool-a", "192.168.1.0/24", "net-dup", 1)
+	controller.metrics.UpdateIPPoolAvailable("pool-a", "192.168.1.0/24", "net-dup", 90)
+
+	// pool-b was rejected at registration time and shares networkname
+	// net-dup with the live pool-a; deleting it is a no-op
+	if err := controller.sync(testPoolEvent("pool-b", DELETE, "net-dup")); err != nil {
+		t.Fatalf("sync(DELETE) for an unregistered pool returned error %v, want nil", err)
+	}
+
+	if used := controller.ipam.Used("net-dup"); used < 1 {
+		t.Errorf("live allocation state of net-dup wiped by the unrelated delete: used=%d, want >= 1", used)
+	}
+	if !controller.dhcp.CheckPool("net-dup") {
+		t.Error("the live pool's dhcp pool was removed by the unrelated delete")
+	}
+	if !cacheAllocator.Check(foreignPool) {
+		t.Error("the live pool was dropped from the cache by the unrelated delete")
+	}
+	if v, ok := ippoolBehaviorMetricValue(t, controller.metrics, "kubevirtiphelper_ippool_used", map[string]string{"ippool": "pool-a", "subnet": "192.168.1.0/24", "network": "net-dup"}); !ok || v != 1 {
+		t.Errorf("ippool_used metric after the unrelated delete: got value %v found %v, want 1", v, ok)
+	}
+	if v, ok := ippoolBehaviorMetricValue(t, controller.metrics, "kubevirtiphelper_app_logs", map[string]string{"loglevel": "warning"}); !ok || v != 1 {
+		t.Errorf("app log status gauge: got value %v found %v, want exactly 1 warning entry", v, ok)
+	}
+}
+
+// a delete whose networkname lookup resolves to the deleted pool itself
+// must free exactly that registration: dhcp pool, ipam subnet, cache entry
+// and both pool gauges
+func TestSyncDeleteRegisteredPoolFreesItsState(t *testing.T) {
+	var appStatus int
+	storedPool := testPool("pool-a", "net-dup", 60)
+
+	indexer := newTestIndexer()
+	if err := indexer.Add(storedPool); err != nil {
+		t.Fatalf("seeding indexer: %v", err)
+	}
+
+	controller, cacheAllocator := newTestController(t, newTestQueue(), indexer, nil, &appStatus, new(int))
+
+	if err := controller.ipam.NewSubnet("net-dup", "192.168.1.0/24", "192.168.1.10", "192.168.1.100"); err != nil {
+		t.Fatalf("registering the ipam subnet: %v", err)
+	}
+	if _, err := controller.ipam.GetIP("net-dup", "192.168.1.10"); err != nil {
+		t.Fatalf("allocating the live ip: %v", err)
+	}
+	if err := controller.dhcp.AddPool("net-dup", "192.168.1.1", "255.255.255.0", "192.168.1.1", nil, "", nil, nil, 60, "test-fake-iface"); err != nil {
+		t.Fatalf("registering the dhcp pool: %v", err)
+	}
+	if err := cacheAllocator.Add(storedPool); err != nil {
+		t.Fatalf("caching the pool: %v", err)
+	}
+	controller.metrics.UpdateIPPoolUsed("pool-a", "192.168.1.0/24", "net-dup", 1)
+	controller.metrics.UpdateIPPoolAvailable("pool-a", "192.168.1.0/24", "net-dup", 90)
+
+	if err := controller.sync(testPoolEvent("pool-a", DELETE, "net-dup")); err != nil {
+		t.Fatalf("sync(DELETE) for a registered pool returned error %v, want nil", err)
+	}
+
+	if used := controller.ipam.Used("net-dup"); used != 0 {
+		t.Errorf("ipam allocation state after the own delete: used=%d, want 0", used)
+	}
+	if controller.dhcp.CheckPool("net-dup") {
+		t.Error("the deleted pool's dhcp pool survived the delete")
+	}
+	if cacheAllocator.Check(storedPool) {
+		t.Error("the deleted pool's cache entry survived the delete")
+	}
+	if _, found := ippoolBehaviorMetricValue(t, controller.metrics, "kubevirtiphelper_ippool_used", map[string]string{"ippool": "pool-a", "subnet": "192.168.1.0/24", "network": "net-dup"}); found {
+		t.Error("the deleted pool's ippool_used metric survived the delete")
+	}
+	if _, found := ippoolBehaviorMetricValue(t, controller.metrics, "kubevirtiphelper_ippool_available", map[string]string{"ippool": "pool-a", "subnet": "192.168.1.0/24", "network": "net-dup"}); found {
+		t.Error("the deleted pool's ippool_available metric survived the delete")
+	}
+}
+
 // a pool whose networkname changed keeps its cache entry under the old key:
 // its update event must still reach the restart handling through it
 func TestSyncUpdateReachesRestartAfterNetworkNameChange(t *testing.T) {
