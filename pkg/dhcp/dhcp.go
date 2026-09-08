@@ -1,6 +1,7 @@
 package dhcp
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -47,6 +48,11 @@ type DHCPAllocator struct {
 	leases  map[string]DHCPLease
 	servers map[string]*server4.Server
 	mutex   sync.Mutex
+
+	// resolver resolves ntp hostname entries during pool registrations;
+	// a nil resolver uses net.DefaultResolver. the field lets tests
+	// observe and shortcut resolution without swapping the global.
+	resolver *net.Resolver
 }
 
 func NewDHCPAllocator() *DHCPAllocator {
@@ -61,6 +67,41 @@ func NewDHCPAllocator() *DHCPAllocator {
 	}
 }
 
+// resolveNTPServers normalizes the ntp server entries into ip addresses,
+// resolving hostname entries through the resolver of the allocator.
+// AddPool runs it before taking the allocator lock: the dhcp packet
+// handler reads the pools and leases under the same mutex, so a slow or
+// broken resolver during one pool registration must not stall packet
+// processing on every pool. entries which cannot be resolved are logged
+// and skipped, so a pool with a broken ntp hostname still registers.
+func (a *DHCPAllocator) resolveNTPServers(NTPServers []string) (ntp []net.IP) {
+	resolver := a.resolver
+	if resolver == nil {
+		resolver = net.DefaultResolver
+	}
+
+	for _, entry := range NTPServers {
+		hostip := net.ParseIP(entry)
+		if hostip.To4() != nil {
+			ntp = append(ntp, hostip)
+
+			continue
+		}
+
+		hostips, err := resolver.LookupIP(context.Background(), "ip", entry)
+		if err != nil {
+			log.Errorf("(dhcp.AddPool) cannot get any ip addresses from ntp domainname entry %s: %s", entry, err)
+		}
+		for _, ip := range hostips {
+			if ip.To4() != nil {
+				ntp = append(ntp, ip)
+			}
+		}
+	}
+
+	return
+}
+
 func (a *DHCPAllocator) AddPool(
 	name string,
 	serverIP string,
@@ -73,6 +114,10 @@ func (a *DHCPAllocator) AddPool(
 	leaseTime int,
 	nic string,
 ) (err error) {
+	// resolve the ntp hostnames before taking the lock, the packet
+	// handler must not wait behind a slow resolver
+	ntp := a.resolveNTPServers(NTPServers)
+
 	a.mutex.Lock()
 	defer a.mutex.Unlock()
 
@@ -80,27 +125,12 @@ func (a *DHCPAllocator) AddPool(
 	pool.ServerIP = net.ParseIP(serverIP)
 	pool.SubnetMask = net.IPMask(net.ParseIP(subnetMask).To4())
 	pool.Router = net.ParseIP(routerIP)
-	for i := 0; i < len(DNSServers); i++ {
-		pool.DNS = append(pool.DNS, net.ParseIP(DNSServers[i]))
+	for _, dnsServer := range DNSServers {
+		pool.DNS = append(pool.DNS, net.ParseIP(dnsServer))
 	}
 	pool.DomainName = domainName
 	pool.DomainSearch = domainSearch
-	for i := 0; i < len(NTPServers); i++ {
-		hostip := net.ParseIP(NTPServers[i])
-		if hostip.To4() != nil {
-			pool.NTP = append(pool.NTP, net.ParseIP(NTPServers[i]))
-		} else {
-			hostips, err := net.LookupIP(NTPServers[i])
-			if err != nil {
-				log.Errorf("(dhcp.AddPool) cannot get any ip addresses from ntp domainname entry %s: %s", NTPServers[i], err)
-			}
-			for _, ip := range hostips {
-				if ip.To4() != nil {
-					pool.NTP = append(pool.NTP, ip)
-				}
-			}
-		}
-	}
+	pool.NTP = ntp
 	pool.LeaseTime = leaseTime
 	pool.Nic = nic
 

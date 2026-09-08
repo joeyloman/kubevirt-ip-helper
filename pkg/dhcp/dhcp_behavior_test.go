@@ -2,6 +2,7 @@ package dhcp
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"net"
 	"strings"
@@ -732,5 +733,51 @@ func TestGetLeaseByIPAndNetworkIsNetworkScoped(t *testing.T) {
 
 	if _, _, found := a.GetLeaseByIPAndNetwork("net-c", "192.168.0.50"); found {
 		t.Error("a lookup under an unregistered networkname must find nothing")
+	}
+}
+
+// ntp hostnames must be resolved outside the allocator lock: the dhcp
+// packet handler reads the pools and leases under the same mutex, so
+// resolving inside the lock lets one pool with a slow or broken ntp
+// hostname stall renewals on every other pool.
+func TestAddPoolResolvesNTPHostnamesOutsideTheAllocatorLock(t *testing.T) {
+	a := New()
+
+	var lockFreeDuringResolve []bool
+	a.resolver = &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			// the resolver runs on the AddPool goroutine: if the allocator
+			// lock is already held there, the resolution happens under it
+			free := a.mutex.TryLock()
+			if free {
+				a.mutex.Unlock()
+			}
+			lockFreeDuringResolve = append(lockFreeDuringResolve, free)
+
+			// fail fast: an unresolvable hostname is logged and skipped, so
+			// the pool registers without ntp servers like before
+			return nil, errors.New("no dns server in tests")
+		},
+	}
+
+	if err := a.AddPool("net-a", "192.168.0.1", "255.255.255.0", "192.168.0.1", nil, "", nil, []string{"192.168.0.10", "ntp.example.invalid"}, 60, "lo"); err != nil {
+		t.Fatalf("AddPool: %v", err)
+	}
+
+	if len(lockFreeDuringResolve) == 0 {
+		t.Fatal("the ntp hostname was not resolved, want the resolver to run during AddPool")
+	}
+	for _, free := range lockFreeDuringResolve {
+		if !free {
+			t.Error("the ntp hostname was resolved while the allocator lock was held: packet processing would stall behind the resolver")
+		}
+	}
+
+	// literal ips register without resolution, the unresolvable entry is
+	// skipped and the pool still comes up
+	pool := a.GetPool("net-a")
+	if len(pool.NTP) != 1 || !pool.NTP[0].Equal(net.ParseIP("192.168.0.10")) {
+		t.Errorf("pool ntp = %v, want only the literal 192.168.0.10", pool.NTP)
 	}
 }
