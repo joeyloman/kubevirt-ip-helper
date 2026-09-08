@@ -684,3 +684,59 @@ func TestInitFailsForMalformedKubeconfig(t *testing.T) {
 		t.Error("expected kihClientset to stay nil after a failed Init")
 	}
 }
+
+// a retried vm deletion must not tear down the vmnetcfg object of a
+// same-name replacement: the informer removes an object from the store
+// before delivering its delete event, so an object under the deleted key
+// at processing time (or at a rate-limited retry) is a new virtual
+// machine whose configuration the cleanup must leave alone.
+func TestSyncDeleteSkippedWhenReplacementExists(t *testing.T) {
+	var log requestLog
+	server := newFakeServer(t, &log, func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, vmnetcfgBodyJSON)
+	})
+
+	// the replacement virtual machine already sits in the store under the
+	// same key while the deletion of the old object is retried
+	indexer := newTestIndexer()
+	if err := indexer.Add(testVirtualMachine(true)); err != nil {
+		t.Fatalf("seeding indexer: %v", err)
+	}
+	controller := newTestController(t, newTestQueue(), indexer, nil, newTestClientset(t, server))
+
+	if err := controller.sync(testEvent(DELETE)); err != nil {
+		t.Errorf("sync(DELETE) returned error %v, want nil for the skipped cleanup", err)
+	}
+
+	// the abort must happen before any api interaction: neither the
+	// existence lookup nor the delete may reach the replacement's object
+	if log.seenRequest("GET", "/virtualmachinenetworkconfigs/vm-test") {
+		t.Error("the existence lookup ran although a replacement exists")
+	}
+	if log.seenRequest("DELETE", "/virtualmachinenetworkconfigs/vm-test") {
+		t.Error("the vmnetcfg object of the replacement must not be deleted")
+	}
+}
+
+// without a replacement in the store the deletion proceeds normally
+func TestSyncDeleteStillProceedsWithoutReplacement(t *testing.T) {
+	var log requestLog
+	server := newFakeServer(t, &log, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			writeJSON(w, http.StatusOK, vmnetcfgBodyJSON)
+		default:
+			writeJSON(w, http.StatusNotFound, vmnetcfgNotFoundJSON)
+		}
+	})
+
+	controller := newTestController(t, newTestQueue(), newTestIndexer(), nil, newTestClientset(t, server))
+
+	if err := controller.sync(testEvent(DELETE)); err != nil {
+		t.Errorf("sync(DELETE) returned error %v, want nil", err)
+	}
+
+	if !log.seenRequest("DELETE", "/virtualmachinenetworkconfigs/vm-test") {
+		t.Error("expected the vmnetcfg cleanup to proceed without a replacement")
+	}
+}

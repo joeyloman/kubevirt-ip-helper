@@ -86,6 +86,20 @@ func (c *Controller) sync(event Event) (err error) {
 	case ADD, UPDATE:
 		err = c.handleVirtualMachineObjectChange(obj.(*kubevirtv1.VirtualMachine))
 	case DELETE:
+		if exists {
+			// the informer removes an object from the store before
+			// delivering its delete event, so an object under this key is
+			// a same-name replacement created while the deletion (or its
+			// rate-limited retry) was in flight: tearing down the vmnetcfg
+			// object now would destroy the replacement's network
+			// configuration. the cleanup is dropped and the replacement's
+			// own events manage the object.
+			log.Warnf("(vm.sync) VirtualMachine %s was deleted but a same-name replacement exists, skipping the vmnetcfg cleanup", event.key)
+			c.metrics.UpdateLogStatus("warning")
+
+			return
+		}
+
 		err = c.deleteVirtualMachineNetworkConfigObject(event.vmNamespace, event.vmName)
 	}
 
