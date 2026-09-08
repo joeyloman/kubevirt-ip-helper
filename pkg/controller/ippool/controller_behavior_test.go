@@ -813,3 +813,42 @@ func TestSyncUpdateReachesRestartAfterNetworkNameChange(t *testing.T) {
 		t.Errorf("app status = %d, want %d after a networkname change", appStatus, APP_RESTART)
 	}
 }
+
+// renaming a pool into a networkname which a live registration already
+// claims would tear the whole application down and then fail during the
+// re-registration: that update must be rejected before any teardown, so
+// the currently registered configuration keeps serving
+func TestSyncUpdateRejectsNetworkNameChangeToClaimedNetwork(t *testing.T) {
+	appStatus := APP_RUNNING
+	oldPool := testPool("pool-n", "net-old", 60)
+	newPool := testPool("pool-n", "net-claimed", 60)
+
+	indexer := newTestIndexer()
+	if err := indexer.Add(newPool); err != nil {
+		t.Fatalf("seeding indexer: %v", err)
+	}
+
+	controller, cacheAllocator := newTestController(t, newTestQueue(), indexer, nil, &appStatus, new(int))
+	if err := cacheAllocator.Add(oldPool); err != nil {
+		t.Fatalf("seeding cache: %v", err)
+	}
+
+	// a live registration already owns the target networkname
+	if err := controller.dhcp.AddPool("net-claimed", "192.168.2.1", "255.255.255.0", "192.168.2.1", nil, "", nil, nil, 60, "test-fake-iface-2"); err != nil {
+		t.Fatalf("registering the claimant dhcp pool: %v", err)
+	}
+
+	event := testPoolEvent("pool-n", UPDATE, "net-claimed")
+	event.oldPoolNetworkName = "net-old"
+
+	if err := controller.sync(event); err == nil {
+		t.Fatal("sync(UPDATE) accepted a networkname change into an already claimed networkname")
+	}
+
+	if appStatus != APP_RUNNING {
+		t.Errorf("the rejected rename started an application restart: app status got %d, want %d", appStatus, APP_RUNNING)
+	}
+	if !cacheAllocator.Check(oldPool) {
+		t.Error("the rejected rename dropped the live registration from the cache")
+	}
+}

@@ -431,16 +431,10 @@ func TestHandleIPPoolObjectChangeReloadAddsNewCacheEntry(t *testing.T) {
 func TestHandleIPPoolObjectChangeRejectedInvalidSubnet(t *testing.T) {
 	c, _, d, ca, _ := ippoolBehaviorNewTestController(t, nil)
 
-	// both pool versions carry the same (invalid) subnet textually, so the
-	// change classifies as a reload and rejects in the dhcp projection
-	oldPool := ippoolBehaviorNewTestPool("pool1", "net-a")
-	oldPool.Spec.IPv4Config.Subnet = "not-a-subnet"
-	oldPool.Spec.IPv4Config.LeaseTime = 3600
-	if err := ca.Add(oldPool); err != nil {
-		t.Fatalf("failed to seed cache: %s", err.Error())
-	}
-	// a dhcp pool already exists for the network; the rejected reload must
-	// leave it intact
+	// both pool versions carry the same (invalid) subnet textually: the
+	// unparseable-subnet guard rejects every update carrying such a
+	// projection before the change even classifies as reload or restart,
+	// so serving state must remain untouched
 	if err := d.AddPool(
 		"net-a",
 		"10.10.10.1",
@@ -455,6 +449,12 @@ func TestHandleIPPoolObjectChangeRejectedInvalidSubnet(t *testing.T) {
 	); err != nil {
 		t.Fatalf("failed to seed dhcp pool: %s", err.Error())
 	}
+	oldPool := ippoolBehaviorNewTestPool("pool1", "net-a")
+	oldPool.Spec.IPv4Config.Subnet = "not-a-subnet"
+	oldPool.Spec.IPv4Config.LeaseTime = 3600
+	if err := ca.Add(oldPool); err != nil {
+		t.Fatalf("failed to seed cache: %s", err.Error())
+	}
 
 	newPool := ippoolBehaviorNewTestPool("pool1", "net-a")
 	newPool.Spec.IPv4Config.Subnet = "not-a-subnet"
@@ -464,7 +464,7 @@ func TestHandleIPPoolObjectChangeRejectedInvalidSubnet(t *testing.T) {
 	if err == nil {
 		t.Fatal("reload with an invalid subnet must return an error")
 	}
-	if !strings.Contains(err.Error(), "invalid subnet") {
+	if !strings.Contains(err.Error(), "not-a-subnet") {
 		t.Error("the returned error must name the invalid subnet projection")
 	}
 
@@ -485,6 +485,65 @@ func TestHandleIPPoolObjectChangeRejectedInvalidSubnet(t *testing.T) {
 	}
 	if *c.appStatus != APP_RUNNING {
 		t.Errorf("app status changed: got %d, want %d", *c.appStatus, APP_RUNNING)
+	}
+}
+
+// an update which would restart the application must be rejected while the
+// new subnet does not parse: the crd schema accepts lengths up to two
+// digits, so spellings such as 10.10.10.0/33 reach the controller. the
+// registered configuration must keep serving and the restored spec must
+// reconcile as a no-change update afterwards, without a restart cycle.
+func TestHandleIPPoolObjectChangeRejectsUnparseableSubnetUpdate(t *testing.T) {
+	c, _, d, ca, _ := ippoolBehaviorNewTestController(t, nil)
+
+	oldPool := ippoolBehaviorNewTestPool("pool1", "net-a")
+	if err := ca.Add(oldPool); err != nil {
+		t.Fatalf("failed to cache the registered pool: %s", err.Error())
+	}
+
+	if err := d.AddPool(
+		"net-a",
+		"10.10.10.1",
+		"255.255.255.0",
+		"10.10.10.254",
+		[]string{"10.10.10.2", "10.10.10.3"},
+		"example.local",
+		[]string{"example.local"},
+		[]string{"10.10.10.4"},
+		3600,
+		"eth-test",
+	); err != nil {
+		t.Fatalf("failed to seed the active dhcp pool: %s", err.Error())
+	}
+
+	newPool := ippoolBehaviorNewTestPool("pool1", "net-a")
+	newPool.Spec.IPv4Config.Subnet = "10.10.10.0/33"
+
+	if err := c.handleIPPoolObjectChange(*oldPool, newPool); err == nil {
+		t.Fatal("handleIPPoolObjectChange accepted an unparseable subnet update")
+	}
+
+	if *c.appStatus != APP_RUNNING {
+		t.Errorf("the rejected update started an application restart: app status got %d, want %d", *c.appStatus, APP_RUNNING)
+	}
+	if plc := d.CheckPool("net-a"); !plc {
+		t.Error("the rejected update removed the active dhcp pool")
+	}
+	if !ca.Check(oldPool) {
+		t.Error("the rejected update touched the cache")
+	}
+
+	// restoring the previously registered subnet reconciles as no-change:
+	// the registration keeps serving without a restart cycle
+	restored := ippoolBehaviorNewTestPool("pool1", "net-a")
+	if err := c.handleIPPoolObjectChange(*oldPool, restored); err != nil {
+		t.Errorf("handleIPPoolObjectChange rejected the restored spec: %v", err)
+	}
+	if *c.appStatus != APP_RUNNING {
+		t.Errorf("the restored spec started an application restart: app status got %d, want %d", *c.appStatus, APP_RUNNING)
+	}
+	if !d.CheckPool("net-a") {
+		t.Error("the restored spec removed the active dhcp pool")
 	}
 }
 

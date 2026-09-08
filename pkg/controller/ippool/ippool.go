@@ -123,6 +123,24 @@ func (c *Controller) handleIPPoolObjectChange(oldPool kihv1.IPPool, newPool *kih
 		return
 	}
 
+	// a restart tears every live service down and re-registers all pools
+	// during the reinitialization phase: an update whose new projection
+	// cannot produce a live registration again must be rejected before any
+	// teardown, so the registered configuration keeps serving. the crd
+	// schema accepts spellings the controller cannot parse (for example a
+	// subnet length of two digits such as 10.10.10.0/33); without this
+	// guard such an update drains every dhcp listener and leaves its
+	// network unregistered until the object is repaired by hand.
+	if _, parseErr := netip.ParsePrefix(newPool.Spec.IPv4Config.Subnet); parseErr != nil {
+		return fmt.Errorf("(ippool.handleIPPoolObjectChange) rejecting update for networkname [%s]: the subnet [%s] does not parse, keeping the currently registered configuration: %s",
+			newPool.Spec.NetworkName, newPool.Spec.IPv4Config.Subnet, parseErr.Error())
+	}
+
+	if oldPool.Spec.NetworkName != newPool.Spec.NetworkName && c.dhcp.CheckPool(newPool.Spec.NetworkName) {
+		return fmt.Errorf("(ippool.handleIPPoolObjectChange) rejecting update for [%s]: the networkname [%s] is already registered by another IPPool, keeping the currently registered configuration",
+			oldPool.Spec.NetworkName, newPool.Spec.NetworkName)
+	}
+
 	for {
 		if *c.appStatus != APP_RESTART {
 			break
