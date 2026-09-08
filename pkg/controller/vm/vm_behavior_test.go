@@ -881,7 +881,9 @@ func TestCleanupNetworkInterfaceReleasesAllState(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "vm1", Namespace: "ns1"},
 		Spec:       kihv1.VirtualMachineNetworkConfigSpec{VMName: "vm1"},
 	}
-	c.cleanupNetworkInterface(vmnetcfg, &kihv1.NetworkConfig{MACAddress: mac, NetworkName: networkName, IPAddress: ip})
+	if err := c.cleanupNetworkInterface(vmnetcfg, &kihv1.NetworkConfig{MACAddress: mac, NetworkName: networkName, IPAddress: ip}); err != nil {
+		t.Fatalf("cleanupNetworkInterface: %v", err)
+	}
 
 	if c.dhcp.CheckLease(mac) {
 		t.Error("expected dhcp lease to be deleted")
@@ -923,13 +925,169 @@ func TestCleanupNetworkInterfaceSkipsPoolStatusWhenPoolUnknown(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "vm1", Namespace: "ns1"},
 		Spec:       kihv1.VirtualMachineNetworkConfigSpec{VMName: "vm1"},
 	}
-	c.cleanupNetworkInterface(vmnetcfg, &kihv1.NetworkConfig{MACAddress: mac, NetworkName: networkName, IPAddress: ip})
+	if err := c.cleanupNetworkInterface(vmnetcfg, &kihv1.NetworkConfig{MACAddress: mac, NetworkName: networkName, IPAddress: ip}); err != nil {
+		t.Fatalf("cleanupNetworkInterface: %v", err)
+	}
 
 	if c.dhcp.CheckLease(mac) {
 		t.Error("expected dhcp lease to be deleted")
 	}
 	if n := len(f.requestsFor(http.MethodPut, "/status")); n != 0 {
 		t.Errorf("expected no pool status update when pool is unknown, got %d", n)
+	}
+}
+
+// a retried cleanup must not free an ip a successor vm owns: the first
+// attempt releases the interface state, the durable update fails, and by
+// the time the cleanup replays the address was acquired by another vm
+func TestCleanupNetworkInterfaceSkipsSuccessorAllocationOnRetry(t *testing.T) {
+	c, f := vmBehaviorNewTestController(t)
+
+	mac := "aa:bb:cc:00:00:01"
+	successorMac := "aa:bb:cc:00:00:02"
+	networkName := "default/net-a"
+	ip := "10.0.0.11"
+
+	if err := c.dhcp.AddLease(mac, networkName, ip, "ns1/vm1"); err != nil {
+		t.Fatalf("own lease: %v", err)
+	}
+	addSubnetWithIP(t, c.ipam, networkName, ip)
+	storePool(t, c, f, "pool-a", networkName, map[string]string{
+		ip: "ns1/vm1 [" + mac + "]",
+	})
+
+	vmnetcfg := &kihv1.VirtualMachineNetworkConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: "vm1", Namespace: "ns1"},
+		Spec:       kihv1.VirtualMachineNetworkConfigSpec{VMName: "vm1"},
+	}
+	netCfg := testNetCfg(mac, networkName, ip)
+
+	if err := c.cleanupNetworkInterface(vmnetcfg, &netCfg); err != nil {
+		t.Fatalf("first cleanup: %v", err)
+	}
+
+	// the durable update of the vmnetcfg object failed, so in the meantime
+	// a successor vm acquired the freed address
+	if _, err := c.ipam.GetIP(networkName, ip); err != nil {
+		t.Fatalf("successor allocating %s: %v", ip, err)
+	}
+	if err := c.dhcp.AddLease(successorMac, networkName, ip, "ns1/vm2"); err != nil {
+		t.Fatalf("successor lease: %v", err)
+	}
+
+	// the successor's vmnetcfg controller recorded its allocation in the
+	// pool status while our stale entry was already removed
+	f.mu.Lock()
+	f.pools["pool-a"].Status.IPv4.Allocated = map[string]string{
+		ip: "ns1/vm2 [" + successorMac + "]",
+	}
+	f.mu.Unlock()
+
+	// the replay must converge instead of freeing the successor's claim
+	if err := c.cleanupNetworkInterface(vmnetcfg, &netCfg); err != nil {
+		t.Fatalf("retried cleanup: %v", err)
+	}
+
+	if used := c.ipam.Used(networkName); used != 1 {
+		t.Errorf("expected the successor's ipam allocation preserved, used=%d", used)
+	}
+	if !c.dhcp.CheckLease(successorMac) {
+		t.Error("expected the successor's dhcp lease preserved")
+	}
+
+	pool := f.storedPool("pool-a")
+	if got := pool.Status.IPv4.Allocated[ip]; got != "ns1/vm2 ["+successorMac+"]" {
+		t.Errorf("expected the successor's status entry preserved, got %q", got)
+	}
+	if n := len(f.requestsFor(http.MethodPut, "/ippools/pool-a/status")); n != 1 {
+		t.Errorf("expected the replay to write no pool status, got %d puts", n)
+	}
+}
+
+// a mac reassigned to another vm must not be released by a cleanup: the
+// whole interface state belongs to the successor by then and the own
+// reservation is gone
+func TestCleanupNetworkInterfaceLeavesReassignedMac(t *testing.T) {
+	c, f := vmBehaviorNewTestController(t)
+
+	mac := "aa:bb:cc:00:00:01"
+	networkName := "default/net-a"
+	ip := "10.0.0.11"
+
+	// the interface state belongs to a successor vm which took over the mac
+	if err := c.dhcp.AddLease(mac, networkName, ip, "ns1/vm2"); err != nil {
+		t.Fatalf("successor lease: %v", err)
+	}
+	addSubnetWithIP(t, c.ipam, networkName, ip)
+	storePool(t, c, f, "pool-a", networkName, map[string]string{
+		ip: "ns1/vm2 [" + mac + "]",
+	})
+
+	vmnetcfg := &kihv1.VirtualMachineNetworkConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: "vm1", Namespace: "ns1"},
+		Spec:       kihv1.VirtualMachineNetworkConfigSpec{VMName: "vm1"},
+	}
+
+	err := c.cleanupNetworkInterface(vmnetcfg, &kihv1.NetworkConfig{MACAddress: mac, NetworkName: networkName, IPAddress: ip})
+	if err != nil {
+		t.Fatalf("cleanup of a reassigned mac must converge: %v", err)
+	}
+
+	if !c.dhcp.CheckLease(mac) {
+		t.Error("expected the successor's dhcp lease preserved")
+	}
+	if used := c.ipam.Used(networkName); used != 1 {
+		t.Errorf("expected the successor's ipam allocation preserved, used=%d", used)
+	}
+
+	pool := f.storedPool("pool-a")
+	if got := pool.Status.IPv4.Allocated[ip]; got != "ns1/vm2 ["+mac+"]" {
+		t.Errorf("expected the successor's status entry preserved, got %q", got)
+	}
+}
+
+// a lease under another networkname holding the same numeric ip holds no
+// claim on this network's allocation: the own release must proceed while
+// the foreign lease stays untouched
+func TestCleanupNetworkInterfaceReleasesAcrossForeignNetworkLease(t *testing.T) {
+	c, f := vmBehaviorNewTestController(t)
+
+	mac := "aa:bb:cc:00:00:01"
+	networkName := "default/net-a"
+	otherNetworkName := "default/net-b"
+	ip := "10.0.0.11"
+
+	addSubnetWithIP(t, c.ipam, networkName, ip)
+	storePool(t, c, f, "pool-a", networkName, map[string]string{
+		ip: "ns1/vm1 [" + mac + "]",
+	})
+
+	// a second network serves the same numeric address space and its lease
+	// for that address exists while this network's reservation is still live
+	if err := c.dhcp.AddLease("aa:bb:cc:00:00:02", otherNetworkName, ip, "ns1/vm2"); err != nil {
+		t.Fatalf("foreign network lease: %v", err)
+	}
+
+	vmnetcfg := &kihv1.VirtualMachineNetworkConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: "vm1", Namespace: "ns1"},
+		Spec:       kihv1.VirtualMachineNetworkConfigSpec{VMName: "vm1"},
+	}
+
+	err := c.cleanupNetworkInterface(vmnetcfg, &kihv1.NetworkConfig{MACAddress: mac, NetworkName: networkName, IPAddress: ip})
+	if err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+
+	if used := c.ipam.Used(networkName); used != 0 {
+		t.Errorf("expected the own ipam allocation released, used=%d", used)
+	}
+	if !c.dhcp.CheckLease("aa:bb:cc:00:00:02") {
+		t.Error("expected the other network's dhcp lease preserved")
+	}
+
+	pool := f.storedPool("pool-a")
+	if _, stillThere := pool.Status.IPv4.Allocated[ip]; stillThere {
+		t.Errorf("expected own status entry removed, got %v", pool.Status.IPv4.Allocated)
 	}
 }
 
@@ -1198,9 +1356,9 @@ func TestUpdateVirtualMachineNetworkConfigObjectRemovesAllInterfaces(t *testing.
 	}
 }
 
-func TestCleanupNetworkInterfaceLogsMissingLeaseAndIP(t *testing.T) {
-	// cleaning an interface that has neither a dhcp lease nor an ipam
-	// allocation must log the errors and still finish the pool bookkeeping
+// cleaning an interface that has neither a dhcp lease nor an ipam
+// allocation must converge and still finish the pool bookkeeping
+func TestCleanupNetworkInterfaceConvergesWithoutLeaseAndIP(t *testing.T) {
 	c, f := vmBehaviorNewTestController(t)
 
 	storePool(t, c, f, "pool-a", "default/net-a", map[string]string{})
@@ -1210,7 +1368,9 @@ func TestCleanupNetworkInterfaceLogsMissingLeaseAndIP(t *testing.T) {
 		Spec:       kihv1.VirtualMachineNetworkConfigSpec{VMName: "vm1"},
 	}
 	// no lease registered for the mac, no subnet registered for the network
-	c.cleanupNetworkInterface(vmnetcfg, &kihv1.NetworkConfig{MACAddress: "aa:bb:cc:00:00:01", NetworkName: "default/net-a", IPAddress: "10.0.0.11"})
+	if err := c.cleanupNetworkInterface(vmnetcfg, &kihv1.NetworkConfig{MACAddress: "aa:bb:cc:00:00:01", NetworkName: "default/net-a", IPAddress: "10.0.0.11"}); err != nil {
+		t.Fatalf("cleanupNetworkInterface: %v", err)
+	}
 
 	if c.dhcp.CheckLease("aa:bb:cc:00:00:01") {
 		t.Error("expected no lease after cleanup")
@@ -1220,16 +1380,16 @@ func TestCleanupNetworkInterfaceLogsMissingLeaseAndIP(t *testing.T) {
 	}
 }
 
-func TestCleanupNetworkInterfaceLogsPoolStatusError(t *testing.T) {
-	// when the pool exists but its status cannot be updated the error is
-	// logged and cleanup still completes
+// when the pool exists but its status cannot be updated the cleanup aborts
+// so the sync retries: the release always happens first, so the retry
+// converges instead of repeating a destructive step
+func TestCleanupNetworkInterfacePropagatesPoolStatusError(t *testing.T) {
 	c, f := vmBehaviorNewTestController(t)
 
 	mac := "aa:bb:cc:00:00:01"
 	networkName := "default/net-a"
 	ip := "10.0.0.11"
 
-	addSimpleLease(t, c.dhcp, mac, ip, "ns1/vm1")
 	addSubnetWithIP(t, c.ipam, networkName, ip)
 	storePool(t, c, f, "pool-a", networkName, map[string]string{ip: "ns1/vm1 [" + mac + "]"})
 	f.ippoolStatusUpdateStatus = http.StatusInternalServerError
@@ -1239,11 +1399,21 @@ func TestCleanupNetworkInterfaceLogsPoolStatusError(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "vm1", Namespace: "ns1"},
 		Spec:       kihv1.VirtualMachineNetworkConfigSpec{VMName: "vm1"},
 	}
-	// must not panic: the pool status error is logged only
-	c.cleanupNetworkInterface(vmnetcfg, &kihv1.NetworkConfig{MACAddress: mac, NetworkName: networkName, IPAddress: ip})
+	err := c.cleanupNetworkInterface(vmnetcfg, &kihv1.NetworkConfig{MACAddress: mac, NetworkName: networkName, IPAddress: ip})
+	if err == nil {
+		t.Fatal("expected the pool status error to propagate")
+	}
+	if !strings.Contains(err.Error(), "boom") {
+		t.Errorf("error = %q, want it to carry the underlying failure", err)
+	}
 
+	// the release finished before the abort: a retry converges instead of
+	// repeating a destructive step
 	if c.dhcp.CheckLease(mac) {
-		t.Error("expected dhcp lease to be deleted")
+		t.Error("expected the lease to be released before the abort")
+	}
+	if used := c.ipam.Used(networkName); used != 0 {
+		t.Errorf("expected the ipam allocation released before the abort, used=%d", used)
 	}
 	if n := len(f.requestsFor(http.MethodPut, "/ippools/pool-a/status")); n != 1 {
 		t.Errorf("expected 1 pool status attempt, got %d", n)

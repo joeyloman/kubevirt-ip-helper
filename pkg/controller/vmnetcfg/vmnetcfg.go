@@ -11,16 +11,10 @@ import (
 
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/dhcp"
-	"github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/util"
 
 	log "github.com/sirupsen/logrus"
 )
-
-// ErrForeignOwner reports an IPPool status entry whose allocation
-// reference belongs to another owner, so this controller must not remove
-// it. callers classify the updateIPPoolStatus rejection with errors.Is.
-var ErrForeignOwner = errors.New("allocation belongs to another owner")
 
 // allocatedNetworkConfig tracks one fully applied interface allocation of a
 // vmnetcfg object so it can be reverted if the durable object update fails.
@@ -56,7 +50,7 @@ func (c *Controller) rollbackNetworkAllocation(vmnetcfg *kihv1.VirtualMachineNet
 		c.metrics.UpdateLogStatus("error")
 	}
 
-	if err := c.ipam.ReleaseIP(allocated.networkName, allocated.ipAddress); err != nil && !isAlreadyReleased(err) {
+	if err := c.ipam.ReleaseIP(allocated.networkName, allocated.ipAddress); err != nil && !util.IsAlreadyReleased(err) {
 		log.Errorf("(vmnetcfg.rollbackNetworkAllocation) [%s/%s] failed to revert the ipam allocation for ip %s: %s",
 			vmnetcfg.Namespace, vmnetcfg.Name, allocated.ipAddress, err)
 		c.metrics.UpdateLogStatus("error")
@@ -413,7 +407,7 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 		if err := c.ipam.ReleaseIP(netCfg.NetworkName, netCfg.IPAddress); err != nil {
 			// already-free addresses are treated as done so a retried
 			// cleanup can converge
-			if !isAlreadyReleased(err) {
+			if !util.IsAlreadyReleased(err) {
 				return fmt.Errorf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] error releasing ip from ipam: %s",
 					vmnetcfg.Namespace, vmnetcfg.Name, err.Error())
 			}
@@ -443,7 +437,7 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 		// the entry of another owner is not this vmnetcfg's to remove; a
 		// deleting object must still finish, so the entry is reported and
 		// kept
-		if deleting && errors.Is(err, ErrForeignOwner) {
+		if deleting && errors.Is(err, util.ErrForeignOwner) {
 			log.Warnf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] the allocation of ip %s in the %s status belongs to another owner, leaving the entry",
 				vmnetcfg.Namespace, vmnetcfg.Name, netCfg.IPAddress, pool.(kihv1.IPPool).Name)
 			c.metrics.UpdateLogStatus("warning")
@@ -454,15 +448,6 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 	}
 
 	return
-}
-
-// isAlreadyReleased reports ipam outcomes which state that nothing about
-// the given address is left to release: a subnet name without allocation
-// state or an address without a live allocation. a plain empty ip is
-// deliberately excluded: that is a caller error and must surface.
-func isAlreadyReleased(err error) bool {
-	return errors.Is(err, ipam.ErrSubnetNotFound) ||
-		errors.Is(err, ipam.ErrIPAlreadyFree)
 }
 
 func (c *Controller) cleanupVirtualMachineNetworkConfig(vmnetcfg *kihv1.VirtualMachineNetworkConfig) (err error) {
@@ -546,7 +531,7 @@ func (c *Controller) updateIPPoolStatus(event string, vmnetcfgNamespace string, 
 			}
 
 			if existing, exists := currentPool.Status.IPv4.Allocated[ip]; exists && existing != ownerRef {
-				return fmt.Errorf("allocation for ip %s belongs to %s, not removing it from the %s status: %w", ip, existing, poolName, ErrForeignOwner)
+				return fmt.Errorf("allocation for ip %s belongs to %s, not removing it from the %s status: %w", ip, existing, poolName, util.ErrForeignOwner)
 			}
 		default:
 			// any unknown event must never reach the persisted status:
