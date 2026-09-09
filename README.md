@@ -1,6 +1,9 @@
 # kubevirt-ip-helper
 
-The kubevirt-ip-helper is a static DHCP solution for KubeVirt Virtual Machines which are attached to a bridged network using Multus. 
+> [!NOTE]
+> This branch (`release/v0.9.x`) follows the v0.9.x codebase as is and will only be updated with security fixes.
+
+The kubevirt-ip-helper is a static DHCP solution for KubeVirt Virtual Machines which are attached to a bridged network using Multus.
 It stores it's IP reservations in Kubernetes/ETCD using it's own Custom Resource Definition (CRD) and serve them using it's 
 internal DHCP service.
 
@@ -166,7 +169,7 @@ Metrics are exported on port 8080 by default. This can be changed by adding the 
 
 # License
 
-Copyright (c) 2025 Joey Loman <joey@binbash.org>
+Copyright (c) 2026 Joey Loman <joey@binbash.org>
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
