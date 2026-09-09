@@ -270,9 +270,9 @@ func TestSyncReturnsIndexerError(t *testing.T) {
 	}
 }
 
-func TestSyncDeleteIsANoopWithPresentObject(t *testing.T) {
-	// the controller has no DELETE branch: a delete event for an object that
-	// still exists in the index is processed without any side effects
+func TestSyncDeleteCountsObjectForStartupGate(t *testing.T) {
+	// a delete event for an object that still exists in the index settles
+	// the startup gate: the object can never produce a settled sync again
 	appStatus := APP_INIT
 	countCurrent := 0
 	indexer := newTestIndexer()
@@ -282,14 +282,14 @@ func TestSyncDeleteIsANoopWithPresentObject(t *testing.T) {
 	if err := controller.sync(testEvent(DELETE)); err != nil {
 		t.Errorf("sync(DELETE) returned error %v, want nil", err)
 	}
-	if countCurrent != 0 {
-		t.Errorf("counter incremented for a delete event, want 0, got %d", countCurrent)
+	if countCurrent != 1 {
+		t.Errorf("counter = %d after a delete event, want 1 (the object settles the gate exactly once)", countCurrent)
 	}
 }
 
-func TestSyncDeleteSnapshotIsANoop(t *testing.T) {
-	// a delete snapshot (object already gone from the index) is also a
-	// no-op
+func TestSyncDeleteSnapshotCountsObjectForStartupGate(t *testing.T) {
+	// a delete snapshot (object already gone from the index) settles the
+	// startup gate too: the object can never sync anymore
 	appStatus := APP_INIT
 	countCurrent := 0
 	controller := newTestController(t, newTestQueue(), newTestIndexer(), nil, &appStatus, &countCurrent, nil)
@@ -297,8 +297,8 @@ func TestSyncDeleteSnapshotIsANoop(t *testing.T) {
 	if err := controller.sync(testEvent(DELETE)); err != nil {
 		t.Errorf("sync(DELETE) returned error %v, want nil", err)
 	}
-	if countCurrent != 0 {
-		t.Errorf("counter incremented for a delete snapshot, want 0, got %d", countCurrent)
+	if countCurrent != 1 {
+		t.Errorf("counter = %d after a delete snapshot, want 1", countCurrent)
 	}
 }
 
@@ -332,7 +332,10 @@ func TestSyncAddDoesNotCountWhileRunning(t *testing.T) {
 	}
 }
 
-func TestSyncUpdateDoesNotIncrementCounterWhileInitializing(t *testing.T) {
+func TestSyncUpdateSuccessCountsForStartupGate(t *testing.T) {
+	// a successful sync settles the startup gate also when it arrived as a
+	// resynced UPDATE: an object whose initial ADD failed transiently must
+	// not leave the gate waiting forever after its recovery
 	appStatus := APP_INIT
 	countCurrent := 0
 	indexer := newTestIndexer()
@@ -342,8 +345,8 @@ func TestSyncUpdateDoesNotIncrementCounterWhileInitializing(t *testing.T) {
 	if err := controller.sync(testEvent(UPDATE)); err != nil {
 		t.Errorf("sync(UPDATE) returned error %v, want nil", err)
 	}
-	if countCurrent != 0 {
-		t.Errorf("counter = %d after an update while initializing, want 0", countCurrent)
+	if countCurrent != 1 {
+		t.Errorf("counter = %d after an update while initializing, want 1", countCurrent)
 	}
 }
 

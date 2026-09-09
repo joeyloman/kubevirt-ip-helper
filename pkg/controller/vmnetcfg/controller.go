@@ -163,20 +163,24 @@ func (c *Controller) sync(event Event) (err error) {
 			log.Errorf("(vmnetcfg.sync) failed to update vmnetcfg for %s: %s", event.key, err.Error())
 			c.metrics.UpdateLogStatus("error")
 		}
-		// increase the vmnetcfgCountCurrent if the application is still
-		// initializing: the startup gate counts a vmnetcfg as handled once
-		// its sync settled. vmnetcfgs with nics in the ERROR status count
-		// as well because their sync completed, and a definitively rejected
-		// object counts so a broken vmnetcfg does not block the vm
-		// controller startup forever. a transiently failed restore stays
-		// uncounted instead: the rate-limited retry must stay able to
-		// protect the existing reservation before the vm controller opens
-		// new allocations
-		if event.action == ADD && (err == nil || c.initSyncSettled(obj.(*kihv1.VirtualMachineNetworkConfig), err)) {
+		// the startup gate counts a vmnetcfg as handled once its sync
+		// settled, whether the settled sync was the initial ADD or a
+		// resynced UPDATE: an object whose ADD failed transiently recovers
+		// through the resync and must not leave the gate waiting forever.
+		// vmnetcfgs with nics in the ERROR status count as well because
+		// their sync completed, and a definitively rejected ADD counts so a
+		// broken vmnetcfg does not block the vm controller startup forever.
+		// a transiently failed restore stays uncounted instead: the
+		// rate-limited retry must stay able to protect the existing
+		// reservation before the vm controller opens new allocations
+		if err == nil || (event.action == ADD && c.initSyncSettled(obj.(*kihv1.VirtualMachineNetworkConfig), err)) {
 			c.markInitAttempt(event.key)
 		}
-		// case DELETE:
-		// 	log.Infof("(vmnetcfg.sync) delete action found!")
+	case DELETE:
+		// an object which is gone can never produce a settled sync anymore:
+		// the gate counts it so a startup-time deletion does not block the
+		// controller startup forever
+		c.markInitAttempt(event.key)
 	}
 
 	return
@@ -201,6 +205,13 @@ func (c *Controller) handleErr(err error, key interface{}) {
 
 	log.Errorf("(vmnetcfg.handleErr) dropping VirtualMachineNetworkConfig %q out of the queue: %v", key, err)
 	c.metrics.UpdateLogStatus("error")
+
+	// an exhausted key can never settle through its own retries anymore:
+	// the gate counts it so the app startup does not wait forever for an
+	// object which keeps failing (marked exactly once via initAttempted)
+	if ev, ok := key.(Event); ok {
+		c.markInitAttempt(ev.key)
+	}
 }
 
 func (c *Controller) Run(workers int, stopCh chan struct{}) {

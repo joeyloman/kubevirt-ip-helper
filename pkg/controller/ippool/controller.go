@@ -161,6 +161,12 @@ func (c *Controller) sync(event Event) (err error) {
 			c.metrics.UpdateLogStatus("error")
 		}
 	case DELETE:
+		// a pool which is deleted can never settle a registration for the
+		// gate anymore (it may have failed its attempts during startup):
+		// count it so a startup-time deletion does not block the controller
+		// startup forever. counted pools are deduplicated by name.
+		c.markInitAttempt(event.poolName)
+
 		pool, poolErr := c.cache.Get("pool", event.poolNetworkName)
 		if poolErr != nil {
 			log.Errorf("(ippool.sync) %s", poolErr)
@@ -216,6 +222,13 @@ func (c *Controller) handleErr(err error, key interface{}) {
 
 	log.Errorf("(ippool.handleErr) dropping IPPool %q out of the queue: %v", key, err)
 	c.metrics.UpdateLogStatus("error")
+
+	// an exhausted key can never settle through its own retries anymore:
+	// the gate counts it so the app startup does not wait forever for an
+	// object which keeps failing (marked exactly once via initAttempted)
+	if ev, ok := key.(Event); ok {
+		c.markInitAttempt(ev.poolName)
+	}
 }
 
 func (c *Controller) Run(workers int, stopCh chan struct{}) {

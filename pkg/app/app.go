@@ -236,7 +236,7 @@ func (h *handler) RunServices(ctx context.Context) {
 	// this prevents race conditions
 	logStartupStateCheck = 0
 	for {
-		if h.ippoolCountCurrent != h.ippoolCountTarget {
+		if h.ippoolCountCurrent < h.ippoolCountTarget {
 			time.Sleep(time.Second * 5)
 
 			if logStartupStateCheck == 12 {
@@ -294,7 +294,7 @@ func (h *handler) RunServices(ctx context.Context) {
 	// this prevents race conditions
 	logStartupStateCheck = 0
 	for {
-		if h.vmnetcfgCountCurrent != h.vmnetcfgCountTarget {
+		if h.vmnetcfgCountCurrent < h.vmnetcfgCountTarget {
 			time.Sleep(time.Second * 10)
 
 			if logStartupStateCheck == 30 {
