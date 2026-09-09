@@ -1,6 +1,9 @@
 package vmnetcfg
 
 import (
+	"errors"
+	"net"
+	"sync"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -16,6 +19,7 @@ import (
 	kihclientset "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/clientset/versioned"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/metrics"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/util"
 )
 
 const (
@@ -35,6 +39,19 @@ type Controller struct {
 	kihClientset         *kihclientset.Clientset
 	appStatus            *int
 	vmnetcfgCountCurrent *int
+
+	// initAttempted tracks the vmnetcfg objects which the current
+	// initialization phase already handled, so an object which cannot
+	// complete its sync is still counted by the startup gate
+	initAttempted map[string]bool
+
+	mutex sync.Mutex
+	// deferredInitAllocations records the vmnetcfg keys whose startup
+	// sync deferred a fresh allocation until the initialization replay
+	// of every object settled: a pending nic must not take an address
+	// whose persisted assignment is still waiting in another object's
+	// spec during the startup replay
+	deferredInitAllocations map[string]bool
 }
 
 func NewController(
@@ -60,6 +77,125 @@ func NewController(
 		kihClientset:         kihClientset,
 		appStatus:            appStatus,
 		vmnetcfgCountCurrent: vmnetcfgCountCurrent,
+	}
+}
+
+// markInitAttempt counts one settled VirtualMachineNetworkConfig object
+// for the startup gate: its sync either completed (nics in the ERROR
+// status included, their object was processed) or was definitively
+// rejected. a transiently failed restore stays uncounted, so the retried
+// sync can still protect the existing reservation before the vm
+// controller opens new allocations; a definitively broken object still
+// counts so it does not block the controller startup until it is removed.
+func (c *Controller) markInitAttempt(key string) {
+	if *c.appStatus != APP_INIT {
+		return
+	}
+
+	if c.initAttempted == nil {
+		c.initAttempted = make(map[string]bool)
+	}
+
+	if _, exists := c.initAttempted[key]; exists {
+		return
+	}
+
+	c.initAttempted[key] = true
+
+	*c.vmnetcfgCountCurrent++
+}
+
+// initSyncSettled reports whether a failed sync can never succeed on a
+// retry during the initialization phase: a networkname without a live
+// pool registration cannot restore its reservation until the offending
+// IPPool is repaired, an invalid macaddress in the spec cannot register a
+// lease at all, and an ownership conflict (the pool status records the
+// claimed address for another owner) needs one of the claiming objects to
+// be edited. the startup gate must not wait for such objects, while every
+// other failure is transient and the retried sync must stay able to
+// settle the object for the gate.
+func (c *Controller) initSyncSettled(vmnetcfg *kihv1.VirtualMachineNetworkConfig, err error) bool {
+	if errors.Is(err, util.ErrForeignOwner) {
+		return true
+	}
+
+	for _, v := range vmnetcfg.Spec.NetworkConfig {
+		if _, cacheErr := c.cache.Get("pool", v.NetworkName); cacheErr != nil {
+			return true
+		}
+
+		if _, macErr := net.ParseMAC(v.MACAddress); macErr != nil {
+			return true
+		}
+	}
+
+	return false
+}
+
+// deferInitAllocation records one vmnetcfg key whose startup sync
+// deferred a fresh allocation until the initialization replay settled:
+// the controller requeues the key after the startup gate counted every
+// object, so the pending nic is served by a sync which cannot overtake
+// the restored assignments of the other objects anymore.
+func (c *Controller) deferInitAllocation(key string) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	if c.deferredInitAllocations == nil {
+		c.deferredInitAllocations = make(map[string]bool)
+	}
+
+	c.deferredInitAllocations[key] = true
+}
+
+// releaseDeferredInitAllocations drains the recorded keys after the
+// initialization replay finished: every object's durable assignments are
+// restored or persisted as settled by then, so the fresh allocations of
+// the pending nics can no longer take a recorded address.
+func (c *Controller) releaseDeferredInitAllocations() (keys []string) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	for key := range c.deferredInitAllocations {
+		keys = append(keys, key)
+	}
+
+	c.deferredInitAllocations = make(map[string]bool)
+
+	return keys
+}
+
+// runDeferredInitAllocations waits until the application left its
+// initialization phase - every vmnetcfg object's startup sync then
+// settled, durable assignments included - and requeues the deferred keys
+// so the pending nics allocate from the settled state.
+func (c *Controller) runDeferredInitAllocations(stopCh chan struct{}) {
+	for {
+		select {
+		case <-stopCh:
+			return
+		case <-time.After(time.Second):
+		}
+
+		if *c.appStatus != APP_INIT {
+			break
+		}
+	}
+
+	c.requeueDeferredInitAllocations()
+}
+
+// requeueDeferredInitAllocations requeues the recorded keys as UPDATE
+// events: the fresh allocations of the pending nics run through the
+// regular reconciliation, which cannot overtake the restored assignments
+// of the other objects anymore because the initialization replay
+// finished. a key which was deleted during the initialization settles
+// through the missing-object handling.
+func (c *Controller) requeueDeferredInitAllocations() {
+	for _, key := range c.releaseDeferredInitAllocations() {
+		log.Infof("(vmnetcfg.requeueDeferredInitAllocations) requeueing %s for the deferred fresh allocation after the initialization finished", key)
+
+		c.queue.Add(Event{key: key, action: UPDATE})
 	}
 }
 
@@ -89,32 +225,38 @@ func (c *Controller) sync(event Event) (err error) {
 	if !exists && event.action != DELETE {
 		log.Warnf("(vmnetcfg.sync) VirtualMachineNetworkConfig %s does not exist anymore", event.key)
 		c.metrics.UpdateLogStatus("warning")
+		// the object is gone and cannot produce a sync anymore; the startup
+		// gate must not wait for it
+		c.markInitAttempt(event.key)
 
 		return
 	}
 
 	switch event.action {
-	case ADD:
-		err := c.updateVirtualMachineNetworkConfig(event.action, obj.(*kihv1.VirtualMachineNetworkConfig))
+	case ADD, UPDATE:
+		err = c.updateVirtualMachineNetworkConfig(event.action, obj.(*kihv1.VirtualMachineNetworkConfig))
 		if err != nil {
-			log.Errorf("(vmnetcfg.sync) failed to update vmnetcfg for %s: %s", obj.(*kihv1.VirtualMachineNetworkConfig).GetName(), err.Error())
+			log.Errorf("(vmnetcfg.sync) failed to update vmnetcfg for %s: %s", event.key, err.Error())
 			c.metrics.UpdateLogStatus("error")
 		}
-
-		// increase the vmnetcfgCountCurrent if the application is still initializing
-		// it's important that all processed vmnetcfgs are count, even if they are in error state
-		// otherwise the application will not become operational
-		if *c.appStatus == APP_INIT {
-			*c.vmnetcfgCountCurrent++
+		// the startup gate counts a vmnetcfg as handled once its sync
+		// settled, whether the settled sync was the initial ADD or a
+		// resynced UPDATE: an object whose ADD failed transiently recovers
+		// through the resync and must not leave the gate waiting forever.
+		// vmnetcfgs with nics in the ERROR status count as well because
+		// their sync completed, and a definitively rejected ADD counts so a
+		// broken vmnetcfg does not block the vm controller startup forever.
+		// a transiently failed restore stays uncounted instead: the
+		// rate-limited retry must stay able to protect the existing
+		// reservation before the vm controller opens new allocations
+		if err == nil || (event.action == ADD && c.initSyncSettled(obj.(*kihv1.VirtualMachineNetworkConfig), err)) {
+			c.markInitAttempt(event.key)
 		}
-	case UPDATE:
-		err := c.updateVirtualMachineNetworkConfig(event.action, obj.(*kihv1.VirtualMachineNetworkConfig))
-		if err != nil {
-			log.Errorf("(vmnetcfg.sync) failed to update vmnetcfg for %s: %s", obj.(*kihv1.VirtualMachineNetworkConfig).GetName(), err.Error())
-			c.metrics.UpdateLogStatus("error")
-		}
-		// case DELETE:
-		// 	log.Infof("(vmnetcfg.sync) delete action found!")
+	case DELETE:
+		// an object which is gone can never produce a settled sync anymore:
+		// the gate counts it so a startup-time deletion does not block the
+		// controller startup forever
+		c.markInitAttempt(event.key)
 	}
 
 	return
@@ -139,6 +281,13 @@ func (c *Controller) handleErr(err error, key interface{}) {
 
 	log.Errorf("(vmnetcfg.handleErr) dropping VirtualMachineNetworkConfig %q out of the queue: %v", key, err)
 	c.metrics.UpdateLogStatus("error")
+
+	// an exhausted key can never settle through its own retries anymore:
+	// the gate counts it so the app startup does not wait forever for an
+	// object which keeps failing (marked exactly once via initAttempted)
+	if ev, ok := key.(Event); ok {
+		c.markInitAttempt(ev.key)
+	}
 }
 
 func (c *Controller) Run(workers int, stopCh chan struct{}) {
@@ -158,6 +307,11 @@ func (c *Controller) Run(workers int, stopCh chan struct{}) {
 	for i := 0; i < workers; i++ {
 		go wait.Until(c.runWorker, time.Second, stopCh)
 	}
+
+	// requeue the pending nics deferred during the startup replay once
+	// the initialization phase settled every object's durable
+	// assignments
+	go c.runDeferredInitAllocations(stopCh)
 
 	<-stopCh
 	log.Infof("(vmnetcfg.Run) stopping the VirtualMachineNetworkConfig controller")

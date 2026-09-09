@@ -37,6 +37,11 @@ type Controller struct {
 	kihClientset       *kihclientset.Clientset
 	appStatus          *int
 	ippoolCountCurrent *int
+
+	// initAttempted tracks the IPPool objects which the current
+	// initialization phase already handled, so a pool which definitively
+	// cannot register is still counted by the startup gate
+	initAttempted map[string]bool
 }
 
 func NewController(
@@ -67,6 +72,30 @@ func NewController(
 	}
 }
 
+// markInitAttempt counts one settled IPPool object for the startup gate:
+// its registration is either live or definitively rejected (the pool
+// object can also be gone already). counting only settled pools keeps the
+// vmnetcfg controller from restoring bindings into pools which are not
+// registered yet, while rejected pools still count so a broken object
+// does not block the controller startup until it is removed first.
+func (c *Controller) markInitAttempt(name string) {
+	if *c.appStatus != APP_INIT {
+		return
+	}
+
+	if c.initAttempted == nil {
+		c.initAttempted = make(map[string]bool)
+	}
+
+	if _, exists := c.initAttempted[name]; exists {
+		return
+	}
+
+	c.initAttempted[name] = true
+
+	*c.ippoolCountCurrent++
+}
+
 func (c *Controller) processNextItem() bool {
 	event, quit := c.queue.Get()
 	if quit {
@@ -93,48 +122,85 @@ func (c *Controller) sync(event Event) (err error) {
 	if !exists && event.action != DELETE {
 		log.Warnf("(ippool.sync) IPPool %s does not exist anymore", event.key)
 		c.metrics.UpdateLogStatus("warning")
+		c.markInitAttempt(event.poolName)
 
 		return
 	}
 
 	switch event.action {
 	case ADD:
-		cleanup, err := c.registerIPPool(obj.(*kihv1.IPPool))
-		if err != nil {
-			log.Errorf("(ippool.sync) failed to allocate new pool for %s: %s", event.poolName, err.Error())
-			c.metrics.UpdateLogStatus("error")
-
-			if cleanup {
-				if err := c.cleanupIPPoolObjects(obj.(*kihv1.IPPool)); err != nil {
-					log.Errorf("(ippool.sync) failed to cleanup pool %s: %s", event.poolName, err.Error())
-					c.metrics.UpdateLogStatus("error")
-				}
-			}
-		}
+		err = c.registerPoolWithTeardown(obj.(*kihv1.IPPool), "failed to allocate new pool for")
 	case UPDATE:
-		pool, err := c.cache.Get("pool", event.poolNetworkName)
+		pool, poolErr := c.cache.Get("pool", event.poolNetworkName)
+		if poolErr != nil && event.oldPoolNetworkName != "" && event.oldPoolNetworkName != event.poolNetworkName {
+			// the networkname changed: the cache still holds the pool under
+			// the old key, so the restart handling sees the old configuration
+			pool, poolErr = c.cache.Get("pool", event.oldPoolNetworkName)
+		}
+
+		if poolErr != nil || pool.(kihv1.IPPool).Name != event.poolName {
+			// neither cache key resolves to THIS pool: the pool has no live
+			// registration (its first attempt was dropped, or the lookup
+			// resolved a different pool which shares the networkname). the
+			// update becomes a re-registration attempt instead, so a fixed
+			// projection comes to life with the next event without a pod
+			// restart. a still-unregistrable projection keeps failing and a
+			// claimed networkname is rejected without touching the live
+			// state of the pool which owns it. a partially applied
+			// registration is torn back down, so the retried attempt is
+			// not rejected by the leftover sub-resources of its own
+			// previous attempt.
+			err = c.registerPoolWithTeardown(obj.(*kihv1.IPPool), "failed to register unregistered pool")
+
+			return err
+		}
+		oldPool := pool.(kihv1.IPPool)
+		err = c.handleIPPoolObjectChange(oldPool, obj.(*kihv1.IPPool))
 		if err != nil {
-			log.Errorf("(ippool.sync) %s", err)
+			log.Errorf("(ippool.sync) failed to handle IPPool update for %s: %s", event.poolName, err.Error())
 			c.metrics.UpdateLogStatus("error")
-		} else {
-			oldPool := pool.(kihv1.IPPool)
-			err := c.handleIPPoolObjectChange(oldPool, obj.(*kihv1.IPPool))
-			if err != nil {
-				log.Errorf("(ippool.sync) failed to handle IPPool update for %s: %s", event.poolName, err.Error())
-				c.metrics.UpdateLogStatus("error")
-			}
 		}
 	case DELETE:
-		pool, err := c.cache.Get("pool", event.poolNetworkName)
-		if err != nil {
-			log.Errorf("(ippool.sync) %s", err)
+		// a pool which is deleted can never settle a registration for the
+		// gate anymore (it may have failed its attempts during startup):
+		// count it so a startup-time deletion does not block the controller
+		// startup forever. counted pools are deduplicated by name.
+		c.markInitAttempt(event.poolName)
+
+		pool, poolErr := c.cache.Get("pool", event.poolNetworkName)
+		if poolErr != nil {
+			// no live registration exists under this networkname: the pool
+			// was never registered in this process era (its ADD was
+			// rejected, or its attempts failed and a partial registration
+			// was torn back down), so the deletion has no live state to
+			// clean up. this is the converged outcome of a never-registered
+			// pool, not a failure, so it is reported like the name-mismatch
+			// case below instead of counting as an error.
+			log.Warnf("(ippool.sync) IPPool %s [networkname %s] was never registered; skipping cleanup of the live state",
+				event.poolName, event.poolNetworkName)
+			c.metrics.UpdateLogStatus("warning")
+
+			return
+		}
+
+		p := pool.(kihv1.IPPool)
+		if p.Name != event.poolName {
+			// the cache is keyed by the networkname, so this lookup returns
+			// the pool which lives under the deleted object's networkname.
+			// a pool which was never registered under its own networkname
+			// (for example one whose ADD was rejected because a live pool
+			// already claims it) therefore resolves to that live pool.
+			// freeing the live pool's registration because an unrelated
+			// object was deleted is incorrect, so this delete stays a no-op.
+			log.Warnf("(ippool.sync) IPPool %s [networkname %s] was never registered; skipping cleanup of the live state",
+				event.poolName, event.poolNetworkName)
+			c.metrics.UpdateLogStatus("warning")
+
+			return
+		}
+		if err = c.cleanupIPPoolObjects(&p); err != nil {
+			log.Errorf("(ippool.sync) failed to cleanup pool %s: %s", event.poolName, err.Error())
 			c.metrics.UpdateLogStatus("error")
-		} else {
-			p := pool.(kihv1.IPPool)
-			if err := c.cleanupIPPoolObjects(&p); err != nil {
-				log.Errorf("(ippool.sync) failed to cleanup pool %s: %s", event.poolName, err.Error())
-				c.metrics.UpdateLogStatus("error")
-			}
 		}
 
 		// decreasing the ippoolCountCurrent is not necessary during application initialization, because:
@@ -164,6 +230,13 @@ func (c *Controller) handleErr(err error, key interface{}) {
 
 	log.Errorf("(ippool.handleErr) dropping IPPool %q out of the queue: %v", key, err)
 	c.metrics.UpdateLogStatus("error")
+
+	// an exhausted key can never settle through its own retries anymore:
+	// the gate counts it so the app startup does not wait forever for an
+	// object which keeps failing (marked exactly once via initAttempted)
+	if ev, ok := key.(Event); ok {
+		c.markInitAttempt(ev.poolName)
+	}
 }
 
 func (c *Controller) Run(workers int, stopCh chan struct{}) {

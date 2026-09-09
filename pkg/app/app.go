@@ -6,12 +6,14 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	log "github.com/sirupsen/logrus"
 
 	v1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
+
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/cache"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/controller/ippool"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/controller/vm"
@@ -31,6 +33,7 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/leaderelection"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
+	"k8s.io/client-go/util/retry"
 )
 
 const (
@@ -84,13 +87,14 @@ func (h *handler) Init() {
 
 	h.kubeContext = os.Getenv("KUBECONTEXT")
 
-	ns, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
-	if err != nil {
-		log.Errorf("(app.Run) cannot determine current namespace (using the default): %s", err.Error())
+	ns, nsErr := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+	if nsErr != nil {
+		log.Errorf("(app.Run) cannot determine current namespace (using the default): %s", nsErr.Error())
 
 		h.namespace = "kubevirt-ip-helper"
+	} else {
+		h.namespace = strings.TrimSpace(string(ns))
 	}
-	h.namespace = string(ns)
 
 	// make sure the leader label is removed in case the pod crashed
 	h.RemoveLeaderPodLabel()
@@ -175,6 +179,14 @@ func (h *handler) Run(mainCtx context.Context) {
 	})
 }
 
+// initGateOpen reports whether the startup gate has counted enough objects
+// to proceed: the comparison tolerates an overshoot (an object created after
+// the startup snapshot counts too), so the gate opens when no object is
+// still waiting instead of requiring an exact match.
+func initGateOpen(current int, target int) bool {
+	return current >= target
+}
+
 func (h *handler) RunServices(ctx context.Context) {
 	var logStartupStateCheck int
 
@@ -232,7 +244,7 @@ func (h *handler) RunServices(ctx context.Context) {
 	// this prevents race conditions
 	logStartupStateCheck = 0
 	for {
-		if h.ippoolCountCurrent != h.ippoolCountTarget {
+		if !initGateOpen(h.ippoolCountCurrent, h.ippoolCountTarget) {
 			time.Sleep(time.Second * 5)
 
 			if logStartupStateCheck == 12 {
@@ -290,7 +302,7 @@ func (h *handler) RunServices(ctx context.Context) {
 	// this prevents race conditions
 	logStartupStateCheck = 0
 	for {
-		if h.vmnetcfgCountCurrent != h.vmnetcfgCountTarget {
+		if !initGateOpen(h.vmnetcfgCountCurrent, h.vmnetcfgCountTarget) {
 			time.Sleep(time.Second * 10)
 
 			if logStartupStateCheck == 30 {
@@ -453,28 +465,31 @@ func (h *handler) addLeaderPodLabel() {
 		return
 	}
 
-	curPod, err := k8sClientset.CoreV1().Pods(h.namespace).Get(context.TODO(), podName, metav1.GetOptions{})
-	if err != nil {
-		log.Errorf("(app.addLeaderPodLabel) cannot get current pod object: %s", err.Error())
+	// the pod is mutated by the kubelet and the label callbacks run during
+	// the startup phase: apply the label with a retry on resource-version
+	// conflicts so the first attempt does not lose the race
+	if err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		curPod, err := k8sClientset.CoreV1().Pods(h.namespace).Get(context.TODO(), podName, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+
+		newPod := curPod.DeepCopy()
+		newLabels := make(map[string]string)
+		for k, v := range newPod.Labels {
+			newLabels[k] = v
+		}
+		newLabels["kubevirtiphelper/leader"] = "active"
+		newPod.Labels = newLabels
+
+		_, err = k8sClientset.CoreV1().Pods(h.namespace).Update(context.TODO(), newPod, metav1.UpdateOptions{})
+
+		return err
+	}); err != nil {
+		log.Errorf("(app.addLeaderPodLabel) cannot set the leader pod label: %s", err.Error())
 
 		return
 	}
-
-	newPod := curPod.DeepCopy()
-	newLabels := make(map[string]string)
-	for k, v := range newPod.Labels {
-		newLabels[k] = v
-	}
-	newLabels["kubevirtiphelper/leader"] = "active"
-	newPod.Labels = newLabels
-
-	updatedPod, err := k8sClientset.CoreV1().Pods(h.namespace).Update(context.TODO(), newPod, metav1.UpdateOptions{})
-	if err != nil {
-		log.Errorf("(app.addLeaderPodLabel) cannot update the pod object: %s", err.Error())
-
-		return
-	}
-	_ = updatedPod
 }
 
 func (h *handler) RemoveLeaderPodLabel() {
@@ -499,29 +514,32 @@ func (h *handler) RemoveLeaderPodLabel() {
 		return
 	}
 
-	curPod, err := k8sClientset.CoreV1().Pods(h.namespace).Get(context.TODO(), podName, metav1.GetOptions{})
-	if err != nil {
-		log.Errorf("(app.RemoveLeaderPodLabel) cannot get current pod object: %s", err.Error())
-
-		return
-	}
-
-	newPod := curPod.DeepCopy()
-	newLabels := make(map[string]string)
-	for k, v := range newPod.Labels {
-		if k != "kubevirtiphelper/leader" {
-			newLabels[k] = v
+	// the pod is mutated by the kubelet and the label callbacks run during
+	// the startup phase: remove the label with a retry on resource-version
+	// conflicts so the first attempt does not lose the race
+	if err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		curPod, err := k8sClientset.CoreV1().Pods(h.namespace).Get(context.TODO(), podName, metav1.GetOptions{})
+		if err != nil {
+			return err
 		}
-	}
-	newPod.Labels = newLabels
 
-	updatedPod, err := k8sClientset.CoreV1().Pods(h.namespace).Update(context.TODO(), newPod, metav1.UpdateOptions{})
-	if err != nil {
-		log.Errorf("(app.RemoveLeaderPodLabel) cannot update the pod object: %s", err.Error())
+		newPod := curPod.DeepCopy()
+		newLabels := make(map[string]string)
+		for k, v := range newPod.Labels {
+			if k != "kubevirtiphelper/leader" {
+				newLabels[k] = v
+			}
+		}
+		newPod.Labels = newLabels
+
+		_, err = k8sClientset.CoreV1().Pods(h.namespace).Update(context.TODO(), newPod, metav1.UpdateOptions{})
+
+		return err
+	}); err != nil {
+		log.Errorf("(app.RemoveLeaderPodLabel) cannot remove the leader pod label: %s", err.Error())
 
 		return
 	}
-	_ = updatedPod
 }
 
 func handleErr(err error) {

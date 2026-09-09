@@ -2,6 +2,7 @@ package ippool
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -11,7 +12,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/network"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/util"
 
 	log "github.com/sirupsen/logrus"
 )
@@ -22,8 +25,43 @@ const (
 	IPPOOL_RESTART  = 2
 )
 
+// ErrPoolUnregistrable reports a registration rejection which cannot
+// succeed on a retry in its current form: the projection itself is
+// invalid (its subnet does not parse) or its networkname is claimed by
+// the live registration of another pool. the startup gate counts such
+// pools as handled so a broken object does not block the controller
+// startup, while every other registration failure stays retriable and
+// uncounted until the attempt settles.
+var ErrPoolUnregistrable = errors.New("the pool cannot be registered in its current form")
+
+// subnetRegistrationError classifies a NewSubnet failure for the startup
+// gate: a range configuration which can never become valid is a definitive
+// rejection (unregistrable, so the gate counts the pool as handled instead
+// of waiting forever), while every other error - including the retryable
+// 'already exists' state conflict of a half-cleaned registration - keeps
+// its plain error so the retried attempt can still settle it.
+func subnetRegistrationError(networkName string, err error) error {
+	if errors.Is(err, ipam.ErrSubnetInvalid) {
+		return fmt.Errorf("error while allocating a new subnet in IPAM for network [%s]: %s: %w", networkName, err.Error(), ErrPoolUnregistrable)
+	}
+
+	return fmt.Errorf("error while allocating a new subnet in IPAM for network [%s]: %s", networkName, err.Error())
+}
+
 func (c *Controller) registerIPPool(pool *kihv1.IPPool) (cleanup bool, err error) {
-	log.Infof("(ippool.registerIPPool) [%s] new IPPool added", pool.Name)
+
+	// the startup gate counts this pool as handled once its registration
+	// attempt settled: counting at the start would open the gate while the
+	// pool sub-resources are still being created, so the vmnetcfg
+	// controller could restore bindings before the pool registrations are
+	// live. a settled registration or a definitive rejection counts, while
+	// a transient failure stays uncounted so the requeued or resynced
+	// retry can still settle the pool for the gate.
+	defer func() {
+		if err == nil || errors.Is(err, ErrPoolUnregistrable) {
+			c.markInitAttempt(pool.Name)
+		}
+	}()
 
 	// by default cleanup the pool sub resources
 	cleanup = false
@@ -31,9 +69,19 @@ func (c *Controller) registerIPPool(pool *kihv1.IPPool) (cleanup bool, err error
 	// add the serverip to the bindinterface
 	ipnet, err := netip.ParsePrefix(pool.Spec.IPv4Config.Subnet)
 	if err != nil {
-		return cleanup, fmt.Errorf("error while parsing subnet [%s] for network [%s]: %s",
-			pool.Spec.IPv4Config.Subnet, pool.Spec.NetworkName, err.Error())
+		return cleanup, fmt.Errorf("error while parsing subnet [%s] for network [%s]: %s: %w",
+			pool.Spec.IPv4Config.Subnet, pool.Spec.NetworkName, err.Error(), ErrPoolUnregistrable)
 	}
+	// the pool sub-resources (dhcp pool, ipam subnet, cache entry) are all
+	// keyed by the networkname, and the allocators start empty on every
+	// (re)start: a live dhcp pool under this networkname therefore belongs
+	// to another IPPool registration. any later failure path would tear
+	// down or silently replace its live allocations, so reject before
+	// any sub-resource of this pool is created.
+	if c.dhcp.CheckPool(pool.Spec.NetworkName) {
+		return cleanup, fmt.Errorf("networkname [%s] is already registered by another IPPool, not touching its live state: %w", pool.Spec.NetworkName, ErrPoolUnregistrable)
+	}
+
 	ip4 := fmt.Sprintf("%s/%d", pool.Spec.IPv4Config.ServerIP, ipnet.Bits())
 	if err := network.AddIpToNic(pool.Spec.BindInterface, ip4); err != nil {
 		return cleanup, fmt.Errorf("error while adding IP4 address [%s] to bind interface [%s] for network [%s]: %s",
@@ -63,25 +111,28 @@ func (c *Controller) registerIPPool(pool *kihv1.IPPool) (cleanup bool, err error
 		pool.Spec.IPv4Config.Pool.Start,
 		pool.Spec.IPv4Config.Pool.End,
 	); err != nil {
-		return cleanup, fmt.Errorf("error while allocating a new subnet in IPAM for network [%s]: %s", pool.Spec.NetworkName, err.Error())
+		return cleanup, subnetRegistrationError(pool.Spec.NetworkName, err)
 	}
 
 	// mark the exclude ips as used
 	for _, v := range pool.Spec.IPv4Config.Pool.Exclude {
-		ip, err := c.ipam.GetIP(pool.Spec.NetworkName, v)
-		if err != nil {
+		if _, err := c.ipam.ReclaimIP(pool.Spec.NetworkName, v, ipam.ExcludedOwner); err != nil {
 			return cleanup, fmt.Errorf("error while excluding ip [%s] in IPAM for network [%s]: %s", v, pool.Spec.NetworkName, err.Error())
-		}
-
-		// maybe unnecesarry check, but just to make sure
-		if ip != v {
-			return cleanup, fmt.Errorf("error got ip [%s] from IPAM, but it doesn't match the exclude ip [%s] for network [%s]",
-				ip, v, pool.Spec.NetworkName)
 		}
 	}
 
+	// pin the persisted claims of the pool in the fresh allocator before
+	// the pool becomes visible to fresh allocations: a registration which
+	// only succeeds after the startup gate dropped its retries (an UPDATE
+	// resync recovery) must not re-create the race where a new vm snapshot
+	// takes an address of the still-ownerless bindings
+	protectedClaims, err := c.protectPersistedClaims(pool)
+	if err != nil {
+		return cleanup, fmt.Errorf("error while protecting the persisted claims of the pool for network [%s]: %s", pool.Spec.NetworkName, err.Error())
+	}
+
 	// rebuild the pool status after restarting the process
-	rPool, err := c.resetIPPoolStatus(pool)
+	rPool, err := c.resetIPPoolStatus(pool, protectedClaims)
 	if err != nil {
 		return cleanup, fmt.Errorf("error while restting IPPool status for network [%s]: %s", pool.Spec.NetworkName, err.Error())
 	}
@@ -91,14 +142,38 @@ func (c *Controller) registerIPPool(pool *kihv1.IPPool) (cleanup bool, err error
 		return cleanup, fmt.Errorf("error while restting IPPool metrics for network [%s]: %s", pool.Spec.NetworkName, err.Error())
 	}
 
-	// cache the pool with an empty status
+	// cache the pool with a status carrying the protected claims and the
+	// excluded addresses
 	if err = c.cache.Add(rPool); err != nil {
 		return cleanup, fmt.Errorf("error while caching the IPPool for network [%s]: %s", pool.Spec.NetworkName, err.Error())
 	}
 
-	// increase the poolCountCurrent if the application is still initializing
-	if *c.appStatus == APP_INIT {
-		*c.ippoolCountCurrent++
+	log.Infof("(ippool.registerIPPool) [%s] new IPPool registered", pool.Name)
+
+	return
+}
+
+// registerPoolWithTeardown runs one registration attempt for the pool and
+// tears a partially applied registration back down when the attempt fails
+// midway: the leftover sub-resources (the server ip on the bind interface,
+// the dhcp pool and its listener) would otherwise claim the networkname,
+// so every retried attempt is rejected by the duplicate-networkname check
+// and the network stays unregistered until the process is restarted.
+// failLog prefixes the failure log line with the triggering event path.
+func (c *Controller) registerPoolWithTeardown(pool *kihv1.IPPool, failLog string) (err error) {
+	cleanup, err := c.registerIPPool(pool)
+	if err == nil {
+		return
+	}
+
+	log.Errorf("(ippool.sync) %s %s: %s", failLog, pool.Name, err.Error())
+	c.metrics.UpdateLogStatus("error")
+
+	if cleanup {
+		if cleanupErr := c.cleanupIPPoolObjects(pool); cleanupErr != nil {
+			log.Errorf("(ippool.sync) failed to cleanup pool %s: %s", pool.Name, cleanupErr.Error())
+			c.metrics.UpdateLogStatus("error")
+		}
 	}
 
 	return
@@ -111,6 +186,24 @@ func (c *Controller) handleIPPoolObjectChange(oldPool kihv1.IPPool, newPool *kih
 	if *c.appStatus == APP_INIT {
 		log.Debugf("(ippool.handleIPPoolObjectChange) application is still in initializing state, ignoring updates until it's running..")
 		return
+	}
+
+	// a restart tears every live service down and re-registers all pools
+	// during the reinitialization phase: an update whose new projection
+	// cannot produce a live registration again must be rejected before any
+	// teardown, so the registered configuration keeps serving. the crd
+	// schema accepts spellings the controller cannot parse (for example a
+	// subnet length of two digits such as 10.10.10.0/33); without this
+	// guard such an update drains every dhcp listener and leaves its
+	// network unregistered until the object is repaired by hand.
+	if _, parseErr := netip.ParsePrefix(newPool.Spec.IPv4Config.Subnet); parseErr != nil {
+		return fmt.Errorf("(ippool.handleIPPoolObjectChange) rejecting update for networkname [%s]: the subnet [%s] does not parse, keeping the currently registered configuration: %s",
+			newPool.Spec.NetworkName, newPool.Spec.IPv4Config.Subnet, parseErr.Error())
+	}
+
+	if oldPool.Spec.NetworkName != newPool.Spec.NetworkName && c.dhcp.CheckPool(newPool.Spec.NetworkName) {
+		return fmt.Errorf("(ippool.handleIPPoolObjectChange) rejecting update for [%s]: the networkname [%s] is already registered by another IPPool, keeping the currently registered configuration",
+			oldPool.Spec.NetworkName, newPool.Spec.NetworkName)
 	}
 
 	for {
@@ -173,10 +266,11 @@ func (c *Controller) handleIPPoolObjectChange(oldPool kihv1.IPPool, newPool *kih
 		return
 	} else if updateAction == IPPOOL_RELOAD {
 		log.Infof("(ippool.handleIPPoolObjectChange) IPPool configuration changes detected, updating the dhcppool")
-
 		if err := c.createOrUpdateDHCPPool(newPool); err != nil {
-			log.Errorf("(ippool.handleIPPoolObjectChange) error while updating dhcppool [%s]: %s", newPool.Spec.NetworkName, err.Error())
-			c.metrics.UpdateLogStatus("error")
+			// a rejected reload must not enter the invalid configuration
+			// into the cache either: keep the previously cached pool
+			return fmt.Errorf("(ippool.handleIPPoolObjectChange) error while updating dhcppool [%s]: %s",
+				newPool.Spec.NetworkName, err.Error())
 		}
 	}
 
@@ -221,20 +315,22 @@ func (c *Controller) cleanupIPPoolObjects(pool *kihv1.IPPool) (err error) {
 }
 
 func (c *Controller) createOrUpdateDHCPPool(pool *kihv1.IPPool) (err error) {
+	// validate the projection first: only a subnet which parses may replace
+	// the active dhcp pool, otherwise a rejected update would destroy the
+	// working configuration
+	ipnet, err := netip.ParsePrefix(pool.Spec.IPv4Config.Subnet)
+	if err != nil {
+		return fmt.Errorf("(ippool.createOrUpdateDHCPPool) invalid subnet [%s] for network [%s]: %s",
+			pool.Spec.IPv4Config.Subnet, pool.Spec.NetworkName, err.Error())
+	}
+	subnetMask := net.CIDRMask(ipnet.Bits(), 32)
+
 	if c.dhcp.CheckPool(pool.Spec.NetworkName) {
 		if err := c.dhcp.DeletePool(pool.Spec.NetworkName); err != nil {
 			log.Errorf("(ippool.createOrUpdateDHCPPool) while deleting dhcppool [%s]: %s", pool.Spec.NetworkName, err.Error())
 			c.metrics.UpdateLogStatus("error")
 		}
 	}
-
-	// convert the subnetmask
-	ipnet, err := netip.ParsePrefix(pool.Spec.IPv4Config.Subnet)
-	if err != nil {
-		// abort update
-		return
-	}
-	subnetMask := net.CIDRMask(ipnet.Bits(), 32)
 
 	// register the new subnet in dhcp
 	c.dhcp.AddPool(
@@ -253,7 +349,230 @@ func (c *Controller) createOrUpdateDHCPPool(pool *kihv1.IPPool) (err error) {
 	return
 }
 
-func (c *Controller) resetIPPoolStatus(pool *kihv1.IPPool) (uPool *kihv1.IPPool, err error) {
+// protectPersistedClaims pins every durable claim of the pool into the
+// fresh ipam allocator before the registration publishes it: a recovering
+// pool which registers again after the startup gate dropped its retries
+// must never expose an allocator state which offers the bound addresses
+// of live bindings to fresh allocations. the durable claims come from two
+// sources:
+//
+//   - the ownership ledger the pool status survived with. its records are
+//     the authoritative owner decisions of the previous process era, so
+//     they are pinned first and a spec claim which disagrees with them is
+//     a genuine conflict which must not overwrite the recorded owner.
+//     parseable references are normalized to the canonical spelling of
+//     util.AllocationRef before they are pinned and republished: main-era
+//     records such as "ns/vm [02-AA-BB-CC-DD-01]" describe the same owner
+//     as the restoring binding's "ns/vm [02:aa:bb:cc:dd:01]", and only the
+//     canonical spelling keeps the ipam owner identity, the republished
+//     ledger entry and the binding's identity in agreement. unparseable
+//     references keep their conservative protection: the address is pinned
+//     without an owner identity (never reclaimable, so never double-bound)
+//     and the original record is republished verbatim.
+//
+//   - the recorded assignments of the vmnetcfg objects (an authoritative
+//     cluster-wide snapshot). the ledger alone is not a complete inventory:
+//     main could persist a vmnetcfg assignment after the pool status write
+//     failed, so an existing vm can claim an address with no ledger entry
+//     at all. every persisted nonempty ip of every nic of every namespace
+//     referencing this network is pinned under its canonical owner
+//     reference, so the protection does not depend on which binding
+//     reconciles first or on the ledger having survived.
+//
+// the snapshot is taken through the api before the pool is published: the
+// publication point of the registration is the cache add, and fresh
+// allocations require the cached pool, so every claim is pinned strictly
+// before any fresh allocation can see the allocator. a snapshot which
+// cannot be obtained fails the registration instead of publishing an
+// allocator which may hand bound addresses to new vms.
+func (c *Controller) protectPersistedClaims(pool *kihv1.IPPool) (map[string]string, error) {
+	cPool, err := c.kihClientset.KubevirtiphelperV1().IPPools().Get(
+		context.TODO(), pool.Name, metav1.GetOptions{},
+	)
+	if err != nil {
+		// without the persisted status the claims cannot be known: fail
+		// the registration instead of publishing an unprotected allocator
+		return nil, fmt.Errorf("error while getting IPPool %s: %w", pool.Name, err)
+	}
+
+	claims := make(map[string]string)
+	for ip, ref := range cPool.Status.IPv4.Allocated {
+		if ref == ipam.ExcludedOwner {
+			continue
+		}
+
+		namespace, vmName, hwAddr, ok := util.ParseAllocationRef(ref)
+		if !ok {
+			// an unparseable claim cannot be attributed to an owner: while
+			// it stays inside the pool range the address is protected
+			// unconditionally (a wasted address never double-binds one),
+			// and outside the range the allocator cannot hand it out at
+			// all. the original record is republished either way
+			log.Warnf("(ippool.protectPersistedClaims) IPPool %s carries the unparseable allocation reference %q for ip %s",
+				pool.Name, ref, ip)
+
+			claims[ip] = ref
+
+			if ipWithinPoolRange(pool, ip) {
+				if _, err := c.ipam.GetIP(pool.Spec.NetworkName, ip); err != nil {
+					return nil, fmt.Errorf("error while protecting the unparseable claim of ip [%s] of IPPool %s in IPAM for network [%s]: %s",
+						ip, pool.Name, pool.Spec.NetworkName, err.Error())
+				}
+			}
+
+			continue
+		}
+
+		// the canonical spelling of the parsed owner: the ipam owner token
+		// and the republished ledger entry must both agree with the
+		// reference the restoring binding constructs, otherwise the same
+		// logical owner of a legacy record is rejected as a foreign owner
+		ownerRef := util.AllocationRef(namespace, vmName, hwAddr)
+		if ownerRef != ref {
+			log.Warnf("(ippool.protectPersistedClaims) IPPool %s carries the allocation reference %q for ip %s in a legacy spelling, normalizing it to %q",
+				pool.Name, ref, ip, ownerRef)
+		}
+
+		// a claim outside the pool range can never be handed out by the
+		// allocator, so publishing it keeps the durable record without an
+		// exposure window; the range may grow back (which triggers an
+		// application reinitialization) and the next registration pins it
+		if !ipWithinPoolRange(pool, ip) {
+			log.Warnf("(ippool.protectPersistedClaims) IPPool %s carries the allocation record %q for ip %s outside its pool range, skipping the pin",
+				pool.Name, ownerRef, ip)
+
+			claims[ip] = ownerRef
+
+			continue
+		}
+
+		if _, err := c.ipam.ReclaimIP(pool.Spec.NetworkName, ip, ownerRef); err != nil {
+			// a claim which fights the exclude pass or an already-reclaimed
+			// address must surface: publishing the allocator in this state
+			// would offer or drop a bound address
+			return nil, fmt.Errorf("error while protecting ip [%s] of IPPool %s in IPAM for network [%s]: %s",
+				ip, pool.Name, pool.Spec.NetworkName, err.Error())
+		}
+
+		claims[ip] = ownerRef
+	}
+
+	// the ledger is not a complete inventory of the durable claims: pin the
+	// assignments the vmnetcfg objects record for this network as well. the
+	// list is the authoritative cluster-wide snapshot, so the sweep covers
+	// every namespace and every nic, and a claim whose ledger entry was
+	// lost (a historical partial write) is protected like any other
+	vmnetcfgList, err := c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs("").List(
+		context.TODO(), metav1.ListOptions{},
+	)
+	if err != nil {
+		// an incomplete snapshot must not publish the pool: an unseen claim
+		// would be handed to a fresh allocation. the registration fails and
+		// its retry re-runs the whole protection
+		return nil, fmt.Errorf("error while listing the VirtualMachineNetworkConfigs for the claims of IPPool %s: %w", pool.Name, err)
+	}
+
+	for i := range vmnetcfgList.Items {
+		vmnetcfg := &vmnetcfgList.Items[i]
+
+		for _, v := range vmnetcfg.Spec.NetworkConfig {
+			if v.IPAddress == "" || v.NetworkName != pool.Spec.NetworkName {
+				continue
+			}
+
+			// the ledger already decided this address: a spec claim which
+			// disagrees with a recorded owner is a genuine conflict which
+			// stays with the recorded owner (the binding restore surfaces
+			// it visibly), and an agreeing claim is already pinned
+			if _, done := claims[v.IPAddress]; done {
+				continue
+			}
+
+			// an invalid macaddress cannot form an owner identity, so the
+			// binding could never reclaim the address either: protect it
+			// unconditionally without an owner (never double-bound, and a
+			// corrected object recovers through the next restart) instead
+			// of leaving it to a fresh allocation while the guest may
+			// still run with it
+			if _, macErr := net.ParseMAC(v.MACAddress); macErr != nil {
+				if !ipWithinPoolRange(pool, v.IPAddress) {
+					// outside the pool range the allocator can never hand
+					// the address out anyway
+					continue
+				}
+
+				log.Warnf("(ippool.protectPersistedClaims) VirtualMachineNetworkConfig %s/%s records ip %s for the invalid macaddress %q of network %s, protecting the address without an owner identity",
+					vmnetcfg.Namespace, vmnetcfg.Name, v.IPAddress, v.MACAddress, v.NetworkName)
+
+				if _, err := c.ipam.GetIP(pool.Spec.NetworkName, v.IPAddress); err != nil {
+					log.Warnf("(ippool.protectPersistedClaims) cannot protect the recorded ip %s of VirtualMachineNetworkConfig %s/%s: %s",
+						v.IPAddress, vmnetcfg.Namespace, vmnetcfg.Name, err.Error())
+				}
+
+				continue
+			}
+
+			if !ipWithinPoolRange(pool, v.IPAddress) {
+				// outside the pool range the allocator can never hand the
+				// address out, and the binding restore of such a claim
+				// fails visibly on its own
+				log.Warnf("(ippool.protectPersistedClaims) VirtualMachineNetworkConfig %s/%s records the ip %s outside the pool range of network %s, skipping the pin",
+					vmnetcfg.Namespace, vmnetcfg.Name, v.IPAddress, v.NetworkName)
+
+				continue
+			}
+
+			ownerRef := util.AllocationRef(vmnetcfg.Namespace, vmnetcfg.Spec.VMName, v.MACAddress)
+
+			if _, err := c.ipam.ReclaimIP(pool.Spec.NetworkName, v.IPAddress, ownerRef); err != nil {
+				// a claim which fights the exclude pass, the ledger pin or
+				// another spec claim must not overwrite that ownership and
+				// must not block the protection of the remaining claims:
+				// the conflicting binding surfaces the conflict visibly
+				// when it restores
+				log.Warnf("(ippool.protectPersistedClaims) cannot pin the recorded ip %s of VirtualMachineNetworkConfig %s/%s under the owner %q: %s",
+					v.IPAddress, vmnetcfg.Namespace, vmnetcfg.Name, ownerRef, err.Error())
+
+				continue
+			}
+
+			// the pinned spec claim becomes a ledger entry, so the
+			// restoring binding finds its own record again and the next
+			// registration no longer depends on the spec sweep for it
+			claims[v.IPAddress] = ownerRef
+		}
+	}
+
+	return claims, nil
+}
+
+// ipWithinPoolRange reports whether an address lies inside the inclusive
+// start..end range of the pool specification.
+func ipWithinPoolRange(pool *kihv1.IPPool, ip string) bool {
+	ipAddr, err := netip.ParseAddr(ip)
+	if err != nil {
+		return false
+	}
+
+	startAddr, err := netip.ParseAddr(pool.Spec.IPv4Config.Pool.Start)
+	if err != nil {
+		return false
+	}
+
+	endAddr, err := netip.ParseAddr(pool.Spec.IPv4Config.Pool.End)
+	if err != nil {
+		return false
+	}
+
+	return startAddr.Compare(ipAddr) <= 0 && ipAddr.Compare(endAddr) <= 0
+}
+
+// resetIPPoolStatus republishes the pool status after a registration: the
+// allocation map carries the excluded addresses and the claimed addresses
+// protected by the fresh allocator, so restored bindings find their
+// ownership records again while the addresses stay unavailable to fresh
+// allocations.
+func (c *Controller) resetIPPoolStatus(pool *kihv1.IPPool, protectedClaims map[string]string) (uPool *kihv1.IPPool, err error) {
 	cPool, err := c.kihClientset.KubevirtiphelperV1().IPPools().Get(context.TODO(), pool.Name, metav1.GetOptions{})
 	if err != nil {
 		return uPool, err
@@ -271,7 +590,10 @@ func (c *Controller) resetIPPoolStatus(pool *kihv1.IPPool) (uPool *kihv1.IPPool,
 
 	allocatedExcludes := make(map[string]string)
 	for _, v := range pool.Spec.IPv4Config.Pool.Exclude {
-		allocatedExcludes[v] = "EXCLUDED"
+		allocatedExcludes[v] = ipam.ExcludedOwner
+	}
+	for ip, ref := range protectedClaims {
+		allocatedExcludes[ip] = ref
 	}
 	cPool.Status.IPv4.Allocated = allocatedExcludes
 	cPool.Status.IPv4.Used = c.ipam.Used(pool.Spec.NetworkName)

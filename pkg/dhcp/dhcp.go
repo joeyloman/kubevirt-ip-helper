@@ -1,6 +1,8 @@
 package dhcp
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -11,6 +13,16 @@ import (
 	"github.com/insomniacslk/dhcp/dhcpv4"
 	"github.com/insomniacslk/dhcp/dhcpv4/server4"
 	"github.com/insomniacslk/dhcp/rfc1035label"
+)
+
+var (
+	// ErrLeaseNotFound reports lease operations on a hardware address
+	// which currently has no lease registered.
+	ErrLeaseNotFound = errors.New("lease does not exists")
+
+	// ErrLeaseForeignOwner reports a lease operation which would affect a
+	// lease registered for a different owner reference.
+	ErrLeaseForeignOwner = errors.New("lease belongs to another owner")
 )
 
 type DHCPPool struct {
@@ -36,6 +48,11 @@ type DHCPAllocator struct {
 	leases  map[string]DHCPLease
 	servers map[string]*server4.Server
 	mutex   sync.Mutex
+
+	// resolver resolves ntp hostname entries during pool registrations;
+	// a nil resolver uses net.DefaultResolver. the field lets tests
+	// observe and shortcut resolution without swapping the global.
+	resolver *net.Resolver
 }
 
 func NewDHCPAllocator() *DHCPAllocator {
@@ -50,6 +67,41 @@ func NewDHCPAllocator() *DHCPAllocator {
 	}
 }
 
+// resolveNTPServers normalizes the ntp server entries into ip addresses,
+// resolving hostname entries through the resolver of the allocator.
+// AddPool runs it before taking the allocator lock: the dhcp packet
+// handler reads the pools and leases under the same mutex, so a slow or
+// broken resolver during one pool registration must not stall packet
+// processing on every pool. entries which cannot be resolved are logged
+// and skipped, so a pool with a broken ntp hostname still registers.
+func (a *DHCPAllocator) resolveNTPServers(NTPServers []string) (ntp []net.IP) {
+	resolver := a.resolver
+	if resolver == nil {
+		resolver = net.DefaultResolver
+	}
+
+	for _, entry := range NTPServers {
+		hostip := net.ParseIP(entry)
+		if hostip.To4() != nil {
+			ntp = append(ntp, hostip)
+
+			continue
+		}
+
+		hostips, err := resolver.LookupIP(context.Background(), "ip", entry)
+		if err != nil {
+			log.Errorf("(dhcp.AddPool) cannot get any ip addresses from ntp domainname entry %s: %s", entry, err)
+		}
+		for _, ip := range hostips {
+			if ip.To4() != nil {
+				ntp = append(ntp, ip)
+			}
+		}
+	}
+
+	return
+}
+
 func (a *DHCPAllocator) AddPool(
 	name string,
 	serverIP string,
@@ -62,6 +114,10 @@ func (a *DHCPAllocator) AddPool(
 	leaseTime int,
 	nic string,
 ) (err error) {
+	// resolve the ntp hostnames before taking the lock, the packet
+	// handler must not wait behind a slow resolver
+	ntp := a.resolveNTPServers(NTPServers)
+
 	a.mutex.Lock()
 	defer a.mutex.Unlock()
 
@@ -69,27 +125,12 @@ func (a *DHCPAllocator) AddPool(
 	pool.ServerIP = net.ParseIP(serverIP)
 	pool.SubnetMask = net.IPMask(net.ParseIP(subnetMask).To4())
 	pool.Router = net.ParseIP(routerIP)
-	for i := 0; i < len(DNSServers); i++ {
-		pool.DNS = append(pool.DNS, net.ParseIP(DNSServers[i]))
+	for _, dnsServer := range DNSServers {
+		pool.DNS = append(pool.DNS, net.ParseIP(dnsServer))
 	}
 	pool.DomainName = domainName
 	pool.DomainSearch = domainSearch
-	for i := 0; i < len(NTPServers); i++ {
-		hostip := net.ParseIP(NTPServers[i])
-		if hostip.To4() != nil {
-			pool.NTP = append(pool.NTP, net.ParseIP(NTPServers[i]))
-		} else {
-			hostips, err := net.LookupIP(NTPServers[i])
-			if err != nil {
-				log.Errorf("(dhcp.AddPool) cannot get any ip addresses from ntp domainname entry %s: %s", NTPServers[i], err)
-			}
-			for _, ip := range hostips {
-				if ip.To4() != nil {
-					pool.NTP = append(pool.NTP, ip)
-				}
-			}
-		}
-	}
+	pool.NTP = ntp
 	pool.LeaseTime = leaseTime
 	pool.Nic = nic
 
@@ -101,11 +142,18 @@ func (a *DHCPAllocator) AddPool(
 }
 
 func (a *DHCPAllocator) CheckPool(name string) bool {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
 	_, exists := a.pools[name]
+
 	return exists
 }
 
 func (a *DHCPAllocator) GetPool(name string) (pool DHCPPool) {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
 	return a.pools[name]
 }
 
@@ -113,7 +161,7 @@ func (a *DHCPAllocator) DeletePool(name string) (err error) {
 	a.mutex.Lock()
 	defer a.mutex.Unlock()
 
-	if !a.CheckPool(name) {
+	if _, exists := a.pools[name]; !exists {
 		return fmt.Errorf("pool %s does not exists", name)
 	}
 
@@ -137,12 +185,18 @@ func (a *DHCPAllocator) AddLease(
 		return fmt.Errorf("hwaddr is empty")
 	}
 
-	if _, err := net.ParseMAC(hwAddr); err != nil {
+	hw, err := net.ParseMAC(hwAddr)
+	if err != nil {
 		return fmt.Errorf("hwaddr %s is not valid", hwAddr)
 	}
 
-	if a.CheckLease(hwAddr) {
-		return fmt.Errorf("lease for hwaddr %s already exists", hwAddr)
+	// leases are stored under the canonical colon form of the mac address,
+	// so hyphen and uppercase spellings of the same hardware address map to
+	// the same lease key
+	key := hw.String()
+
+	if _, exists := a.leases[key]; exists {
+		return fmt.Errorf("lease for hwaddr %s already exists", key)
 	}
 
 	lease := DHCPLease{}
@@ -150,38 +204,167 @@ func (a *DHCPAllocator) AddLease(
 	lease.ClientIP = net.ParseIP(clientIP)
 	lease.Reference = ref
 
-	a.leases[hwAddr] = lease
+	a.leases[key] = lease
 
-	log.Debugf("(dhcp.AddLease) lease added for hardware address: %s", hwAddr)
+	log.Debugf("(dhcp.AddLease) lease added for hardware address: %s", key)
 
 	return
 }
 
 func (a *DHCPAllocator) CheckLease(hwAddr string) bool {
-	_, exists := a.leases[hwAddr]
+	hw, err := net.ParseMAC(hwAddr)
+	if err != nil {
+		return false
+	}
+
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	_, exists := a.leases[hw.String()]
+
 	return exists
 }
 
 func (a *DHCPAllocator) GetLease(hwAddr string) (lease DHCPLease) {
-	return a.leases[hwAddr]
+	hw, err := net.ParseMAC(hwAddr)
+	if err != nil {
+		return
+	}
+
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	return a.leases[hw.String()]
+}
+
+// GetLeaseByIPAndNetwork returns the lease which currently holds the
+// given client ip within one network. ipam allocations are scoped by the
+// networkname, so an ownership check before releasing an address must
+// not collide with same numeric addresses served by another network.
+func (a *DHCPAllocator) GetLeaseByIPAndNetwork(networkName string, clientIP string) (hwAddr string, lease DHCPLease, found bool) {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	for hw, l := range a.leases {
+		if l.PoolName == networkName && l.ClientIP != nil && l.ClientIP.String() == clientIP {
+			hwAddr = hw
+			lease = l
+			found = true
+
+			return
+		}
+	}
+
+	return
 }
 
 func (a *DHCPAllocator) DeleteLease(hwAddr string) (err error) {
 	a.mutex.Lock()
 	defer a.mutex.Unlock()
 
-	if !a.CheckLease(hwAddr) {
-		return fmt.Errorf("lease for hwaddr %s does not exists", hwAddr)
+	hw, err := net.ParseMAC(hwAddr)
+	if err != nil {
+		return fmt.Errorf("hwaddr %s is not valid", hwAddr)
 	}
 
-	delete(a.leases, hwAddr)
+	key := hw.String()
 
-	log.Debugf("(dhcp.DeleteLease) lease deleted for hardware address: %s", hwAddr)
+	if _, exists := a.leases[key]; !exists {
+		return fmt.Errorf("lease for hwaddr %s does not exists", key)
+	}
+
+	delete(a.leases, key)
+
+	log.Debugf("(dhcp.DeleteLease) lease deleted for hardware address: %s", key)
+
+	return
+}
+
+// DeleteLeaseOwnedBy removes the lease for the hardware address only while
+// the registered lease still references the given owner reference, so a
+// delayed cleanup cannot delete an allocation which a concurrent writer
+// reassigned to another vm in the meantime. the owner check and the
+// deletion run under one lock acquisition.
+func (a *DHCPAllocator) DeleteLeaseOwnedBy(hwAddr string, ref string) (err error) {
+	hw, err := net.ParseMAC(hwAddr)
+	if err != nil {
+		return fmt.Errorf("hwaddr %s is not valid", hwAddr)
+	}
+
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	key := hw.String()
+
+	lease, exists := a.leases[key]
+	if !exists {
+		return fmt.Errorf("%w: hwaddr %s", ErrLeaseNotFound, key)
+	}
+
+	if lease.Reference != ref {
+		return fmt.Errorf("%w: hwaddr %s is registered for %s", ErrLeaseForeignOwner, key, lease.Reference)
+	}
+
+	delete(a.leases, key)
+
+	log.Debugf("(dhcp.DeleteLeaseOwnedBy) lease deleted for hardware address: %s (%s)", key, ref)
+
+	return
+}
+
+// WithOwnedLease runs fn with the client ip of the lease only while the
+// lease still exists and references the given owner reference: the
+// validation and the callback run under one lock acquisition, so a
+// concurrent cleanup cannot remove the lease between the check and the
+// claim mutation fn performs (the adoption of the leased address into the
+// ipam allocator). the snapshot-based lease checks of a reconciliation
+// cannot provide this guarantee on their own - there is always a window
+// between an unsynchronized check and the allocator mutation.
+//
+// fn must stay fast and in-memory: it runs while the dhcp allocator lock
+// is held, so it must not make network or kubernetes api calls, and it
+// must only acquire locks which are always taken after the dhcp lock. the
+// ipam allocator lock qualifies: nothing in this codebase takes the dhcp
+// lock while holding the ipam lock.
+func (a *DHCPAllocator) WithOwnedLease(hwAddr string, ref string, fn func(clientIP string) error) (err error) {
+	hw, err := net.ParseMAC(hwAddr)
+	if err != nil {
+		return fmt.Errorf("hwaddr %s is not valid", hwAddr)
+	}
+
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	key := hw.String()
+
+	lease, exists := a.leases[key]
+	if !exists {
+		return fmt.Errorf("%w: hwaddr %s", ErrLeaseNotFound, key)
+	}
+
+	if lease.Reference != ref {
+		return fmt.Errorf("%w: hwaddr %s is registered for %s", ErrLeaseForeignOwner, key, lease.Reference)
+	}
+
+	if lease.ClientIP == nil {
+		return fmt.Errorf("lease of hwaddr %s carries no client ip", key)
+	}
+
+	clientIP := lease.ClientIP.String()
+
+	if err := fn(clientIP); err != nil {
+		return fmt.Errorf("the guarded lease update of hwaddr %s failed: %w", key, err)
+	}
+
+	log.Debugf("(dhcp.WithOwnedLease) guarded lease update for hardware address: %s (%s)", key, ref)
 
 	return
 }
 
 func (a *DHCPAllocator) Usage() {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
 	for hwaddr, lease := range a.leases {
 		pool := a.pools[lease.PoolName]
 		log.Infof("(dhcp.Usage) lease: hwaddr=%s, pool=%s, clientip=%s, netmask=%s, router=%s, dns=%+v, domain=%s, domainsearch=%+v, ntp=%+v, leasetime=%d, ref=%s, nic=%s",
@@ -208,6 +391,7 @@ func New() *DHCPAllocator {
 func (a *DHCPAllocator) dhcpHandler(conn net.PacketConn, peer net.Addr, m *dhcpv4.DHCPv4) {
 	if m == nil {
 		log.Errorf("(dhcp.dhcpHandler) packet is nil!")
+
 		return
 	}
 
@@ -215,16 +399,12 @@ func (a *DHCPAllocator) dhcpHandler(conn net.PacketConn, peer net.Addr, m *dhcpv
 
 	if m.OpCode != dhcpv4.OpcodeBootRequest {
 		log.Errorf("(dhcp.dhcpHandler) not a BootRequest!")
+
 		return
 	}
 
-	reply, err := dhcpv4.NewReplyFromRequest(m)
-	if err != nil {
-		log.Errorf("(dhcp.dhcpHandler) NewReplyFromRequest failed: %v", err)
-		return
-	}
-
-	lease := a.leases[m.ClientHWAddr.String()]
+	// lease lookups use the canonical colon form of the mac address
+	lease := a.GetLease(m.ClientHWAddr.String())
 
 	if lease.ClientIP == nil {
 		log.Warnf("(dhcp.dhcpHandler) NO LEASE FOUND: hwaddr=%s", m.ClientHWAddr.String())
@@ -237,7 +417,7 @@ func (a *DHCPAllocator) dhcpHandler(conn net.PacketConn, peer net.Addr, m *dhcpv
 
 		return
 	}
-	pool := a.pools[lease.PoolName]
+	pool := a.GetPool(lease.PoolName)
 
 	log.Debugf("(dhcp.dhcpHandler) LEASE FOUND: hwaddr=%s, serverip=%s, clientip=%s, mask=%s, router=%s, dns=%+v, domainname=%s, domainsearch=%+v, ntp=%+v, leasetime=%d, reference=%s, nic=%s",
 		m.ClientHWAddr.String(),
@@ -254,14 +434,80 @@ func (a *DHCPAllocator) dhcpHandler(conn net.PacketConn, peer net.Addr, m *dhcpv
 		pool.Nic,
 	)
 
-	reply.ClientIPAddr = lease.ClientIP
+	var replyType dhcpv4.MessageType
+	var sendReply bool
+
+	switch mt := m.MessageType(); mt {
+	case dhcpv4.MessageTypeDiscover:
+		log.Infof("(dhcp.dhcpHandler) [txid=%s] DHCPDISCOVER from %s via %s", m.TransactionID.String(), m.ClientHWAddr.String(), pool.Nic)
+
+		replyType = dhcpv4.MessageTypeOffer
+		sendReply = true
+	case dhcpv4.MessageTypeRequest:
+		// a request must reference the offered address, either through the
+		// requested-ip/server-identifier options (address selection) or
+		// through the client address field (renewal)
+		if serverID := m.ServerIdentifier(); len(serverID) > 0 && !serverID.Equal(pool.ServerIP) {
+			log.Infof("(dhcp.dhcpHandler) [txid=%s] DHCPREQUEST from %s via %s ignored: server identifier %s does not match this server",
+				m.TransactionID.String(), m.ClientHWAddr.String(), pool.Nic, serverID.String())
+
+			return
+		}
+
+		claimIP := m.RequestedIPAddress()
+		if len(claimIP) == 0 || claimIP.Equal(net.IPv4zero) {
+			claimIP = m.ClientIPAddr
+		}
+
+		if len(claimIP) == 0 || !claimIP.Equal(lease.ClientIP) {
+			log.Warnf("(dhcp.dhcpHandler) [txid=%s] DHCPREQUEST from %s via %s claims ip %s, but the lease holds %s, sending DHCPNAK",
+				m.TransactionID.String(), m.ClientHWAddr.String(), pool.Nic, claimIP, lease.ClientIP)
+
+			a.sendNak(conn, m, pool.ServerIP)
+
+			return
+		}
+
+		log.Infof("(dhcp.dhcpHandler) [txid=%s] DHCPREQUEST for %s from %s via %s", m.TransactionID.String(), lease.ClientIP, m.ClientHWAddr.String(), pool.Nic)
+
+		replyType = dhcpv4.MessageTypeAck
+		sendReply = true
+	case dhcpv4.MessageTypeRelease:
+		// rfc 2131 4.3.4: a release is a one-way notification without a reply
+		log.Infof("(dhcp.dhcpHandler) [txid=%s] DHCPRELEASE for %s from %s via %s", m.TransactionID.String(), lease.ClientIP, m.ClientHWAddr.String(), pool.Nic)
+
+		return
+	default:
+		log.Warnf("(dhcp.dhcpHandler) [txid=%s] Unhandled message type for %s via %s: %v", m.TransactionID.String(), m.ClientHWAddr.String(), pool.Nic, mt)
+
+		return
+	}
+
+	if !sendReply {
+		return
+	}
+
+	reply, err := dhcpv4.NewReplyFromRequest(m)
+	if err != nil {
+		log.Errorf("(dhcp.dhcpHandler) NewReplyFromRequest failed: %v", err)
+
+		return
+	}
+
+	// rfc 2131 figure 3: an offer always carries a zero ciaddr and the
+	// offered address in yiaddr; an ack copies the client address of its
+	// request, which is set during renewal and zero during address selection
 	reply.ServerIPAddr = pool.ServerIP
 	reply.YourIPAddr = lease.ClientIP
 	reply.TransactionID = m.TransactionID
 	reply.ClientHWAddr = m.ClientHWAddr
 	reply.Flags = m.Flags
 	reply.GatewayIPAddr = m.GatewayIPAddr
+	if replyType == dhcpv4.MessageTypeAck {
+		reply.ClientIPAddr = m.ClientIPAddr
+	}
 
+	reply.UpdateOption(dhcpv4.OptMessageType(replyType))
 	reply.UpdateOption(dhcpv4.OptServerIdentifier(pool.ServerIP))
 	reply.UpdateOption(dhcpv4.OptSubnetMask(pool.SubnetMask))
 	reply.UpdateOption(dhcpv4.OptRouter(pool.Router))
@@ -291,26 +537,52 @@ func (a *DHCPAllocator) dhcpHandler(conn net.PacketConn, peer net.Addr, m *dhcpv
 		// default lease time: 1 year
 		reply.UpdateOption(dhcpv4.OptIPAddressLeaseTime(31536000 * time.Second))
 	}
-
-	switch mt := m.MessageType(); mt {
-	case dhcpv4.MessageTypeDiscover:
-		log.Infof("(dhcp.dhcpHandler) [txid=%s] DHCPDISCOVER from %s via %s", m.TransactionID.String(), m.ClientHWAddr.String(), pool.Nic)
-		reply.UpdateOption(dhcpv4.OptMessageType(dhcpv4.MessageTypeOffer))
+	if replyType == dhcpv4.MessageTypeOffer {
 		log.Infof("(dhcp.dhcpHandler) [txid=%s] DHCPOFFER on %s to %s via %s", m.TransactionID.String(), lease.ClientIP, m.ClientHWAddr.String(), pool.Nic)
-	case dhcpv4.MessageTypeRequest:
-		log.Infof("(dhcp.dhcpHandler) [txid=%s] DHCPREQUEST for %s from %s via %s", m.TransactionID.String(), lease.ClientIP, m.ClientHWAddr.String(), pool.Nic)
-		reply.UpdateOption(dhcpv4.OptMessageType(dhcpv4.MessageTypeAck))
+	} else {
 		log.Infof("(dhcp.dhcpHandler) [txid=%s] DHCPACK on %s to %s via %s", m.TransactionID.String(), lease.ClientIP, m.ClientHWAddr.String(), pool.Nic)
-	case dhcpv4.MessageTypeRelease:
-		// only informational
-		log.Infof("(dhcp.dhcpHandler) [txid=%s] DHCPRELEASE for %s from %s via %s", m.TransactionID.String(), lease.ClientIP, m.ClientHWAddr.String(), pool.Nic)
-	default:
-		log.Warnf("(dhcp.dhcpHandler) [txid=%s] Unhandled message type for %s via %s: %v", m.TransactionID.String(), m.ClientHWAddr.String(), pool.Nic, mt)
-		return
 	}
 
 	if _, err := conn.WriteTo(reply.ToBytes(), peer); err != nil {
 		log.Errorf("(dhcp.dhcpHandler) Cannot reply to client: %v", err)
+	}
+}
+
+// sendNak tells the client that its request does not match the lease state,
+// so it restarts the discovery. A nak contains no lease options. rfc 2131
+// section 3.2: a request which arrived without a relay address gets the nak
+// broadcast to the 0xffffffff address, because the client may not hold a
+// valid network address or subnet mask and may not answer arp requests;
+// unicasting to the rejected claim address would leave such a client
+// without the nak. a request which came through a bootp relay agent gets
+// the nak sent to the relay address, which forwards it to the client's
+// hardware address.
+func (a *DHCPAllocator) sendNak(conn net.PacketConn, m *dhcpv4.DHCPv4, serverIP net.IP) {
+	reply, err := dhcpv4.NewReplyFromRequest(m, dhcpv4.WithMessageType(dhcpv4.MessageTypeNak))
+	if err != nil {
+		log.Errorf("(dhcp.dhcpHandler) building DHCPNAK failed: %v", err)
+
+		return
+	}
+
+	reply.UpdateOption(dhcpv4.OptServerIdentifier(serverIP))
+
+	dst := &net.UDPAddr{IP: net.IPv4bcast, Port: dhcpv4.ClientPort}
+	if !m.GatewayIPAddr.Equal(net.IPv4zero) {
+		// rfc 2131 section 4.3.2: a relayed client may not hold a valid
+		// network address or subnet mask and may not answer arp requests:
+		// the server MUST set the broadcast bit in the nak so the relay
+		// agent broadcasts it to the client (the request's own flags are
+		// copied by the reply builder, but the bit is set regardless)
+		reply.SetBroadcast()
+
+		// the relay agent forwards the nak towards the client's hardware
+		// address
+		dst = &net.UDPAddr{IP: m.GatewayIPAddr, Port: dhcpv4.ServerPort}
+	}
+
+	if _, err := conn.WriteTo(reply.ToBytes(), dst); err != nil {
+		log.Errorf("(dhcp.dhcpHandler) Cannot send DHCPNAK to %s: %v", dst, err)
 	}
 }
 
@@ -330,7 +602,9 @@ func (a *DHCPAllocator) Run(nic string, serverip string) (err error) {
 
 	go server.Serve()
 
+	a.mutex.Lock()
 	a.servers[nic] = server
+	a.mutex.Unlock()
 
 	return
 }
@@ -338,5 +612,16 @@ func (a *DHCPAllocator) Run(nic string, serverip string) (err error) {
 func (a *DHCPAllocator) Stop(nic string) (err error) {
 	log.Infof("(dhcp.Stop) stopping DHCP service on nic %s", nic)
 
-	return a.servers[nic].Close()
+	a.mutex.Lock()
+	server, exists := a.servers[nic]
+	delete(a.servers, nic)
+	a.mutex.Unlock()
+
+	if !exists || server == nil {
+		log.Debugf("(dhcp.Stop) no running dhcp service on nic %s, nothing to stop", nic)
+
+		return
+	}
+
+	return server.Close()
 }

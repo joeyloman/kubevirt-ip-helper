@@ -3,6 +3,7 @@ package vm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -10,11 +11,14 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	kubevirtV1 "kubevirt.io/api/core/v1"
 
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/dhcp"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/util"
 )
 
 func (c *Controller) handleVirtualMachineObjectChange(vm *kubevirtV1.VirtualMachine) (err error) {
@@ -97,7 +101,11 @@ func (c *Controller) updateVirtualMachineNetworkConfigObject(vm *kubevirtV1.Virt
 			}
 		}
 		if nicCleanup {
-			c.cleanupNetworkInterface(vmnetcfg, &curNetCfg)
+			// a failed cleanup aborts the sync: the durable update must not
+			// proceed on half-freed interface state
+			if err := c.cleanupNetworkInterface(vmnetcfg, &curNetCfg); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -121,7 +129,17 @@ func (c *Controller) deleteVirtualMachineNetworkConfigObject(vmNamespace string,
 		return
 	}
 
-	if err := c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs(vmNamespace).Delete(context.TODO(), vmName, metav1.DeleteOptions{}); err != nil {
+	if err = c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs(vmNamespace).Delete(context.TODO(), vmName, metav1.DeleteOptions{}); err != nil {
+		if apierrors.IsNotFound(err) {
+			// another worker or a concurrent cleanup already removed the object
+			log.Debugf("(vm.deleteVirtualMachineNetworkConfigObject) [%s/%s] vmnetcfg object already deleted",
+				vmNamespace, vmName)
+
+			err = nil
+
+			return
+		}
+
 		return fmt.Errorf("(vm.deleteVirtualMachineNetworkConfigObject) [%s/%s] cannot delete VirtualMachineNetworkConfig object for vm: %s",
 			vmNamespace, vmName, err.Error())
 	}
@@ -215,42 +233,104 @@ func (c *Controller) getNetworkConfigs(vm *kubevirtV1.VirtualMachine, curNetCfg 
 	return
 }
 
-func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetworkConfig, netCfg *kihv1.NetworkConfig) {
+// cleanupNetworkInterface frees the dhcp lease, the ipam reservation and
+// the ippool status entry of a network interface which the vm no longer
+// has. the release is ownership-safe, so a retried cleanup after a failed
+// durable update cannot free state another vm acquired in the meantime:
+// own leases are removed under an owner check, and an ip whose lease is
+// already held by another vm in the same network is left to that vm.
+func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetworkConfig, netCfg *kihv1.NetworkConfig) (err error) {
 	log.Debugf("(vm.cleanupNetworkInterface) [%s/%s] cleaning interface with hwaddr=%s, networkname=%s, ipaddress=%s",
 		vmnetcfg.Namespace, vmnetcfg.Name, netCfg.MACAddress, netCfg.NetworkName, netCfg.IPAddress)
 
-	if err := c.dhcp.DeleteLease(netCfg.MACAddress); err != nil {
-		log.Errorf("(vm.cleanupNetworkInterface) [%s/%s] error deleting lease from dhcp: %s",
-			vmnetcfg.Namespace, vmnetcfg.Name, err)
-		c.metrics.UpdateLogStatus("error")
-	}
+	ref := fmt.Sprintf("%s/%s", vmnetcfg.Namespace, vmnetcfg.Spec.VMName)
 
-	if err := c.ipam.ReleaseIP(netCfg.NetworkName, netCfg.IPAddress); err != nil {
-		log.Errorf("(vm.cleanupNetworkInterface) [%s/%s] error releasing ip from ipam: %s",
-			vmnetcfg.Namespace, vmnetcfg.Name, err)
-		c.metrics.UpdateLogStatus("error")
-	}
+	// the owner check and the deletion run under one lock acquisition, so
+	// a delayed cleanup cannot delete a lease which a concurrent writer
+	// reassigned to another vm
+	if err := c.dhcp.DeleteLeaseOwnedBy(netCfg.MACAddress, ref); err != nil {
+		switch {
+		case errors.Is(err, dhcp.ErrLeaseNotFound):
+			// no lease left for this interface: the cleanup already
+			// converged, nothing to replay
 
-	pool, err := c.cache.Get("pool", netCfg.NetworkName)
-	if err != nil {
-		log.Errorf("(vm.cleanupNetworkInterface) [%s/%s] %s",
-			vmnetcfg.Namespace, vmnetcfg.Name, err)
-		c.metrics.UpdateLogStatus("error")
-	} else {
-		if err := c.updateIPPoolStatus(
-			DELETE,
-			vmnetcfg.Namespace,
-			vmnetcfg.Spec.VMName,
-			netCfg.IPAddress,
-			netCfg.NetworkName,
-			netCfg.MACAddress,
-			pool.(kihv1.IPPool).Name,
-		); err != nil {
-			log.Errorf("(vm.cleanupNetworkInterface) [%s/%s] %s",
-				vmnetcfg.Namespace, vmnetcfg.Name, err)
-			c.metrics.UpdateLogStatus("error")
+		case errors.Is(err, dhcp.ErrLeaseForeignOwner):
+			// the mac was reassigned to another vm which owns the whole
+			// interface state by now
+			log.Warnf("(vm.cleanupNetworkInterface) [%s/%s] %s",
+				vmnetcfg.Namespace, vmnetcfg.Name, err.Error())
+			c.metrics.UpdateLogStatus("warning")
+
+		default:
+			return fmt.Errorf("(vm.cleanupNetworkInterface) [%s/%s] error deleting lease from dhcp: %s",
+				vmnetcfg.Namespace, vmnetcfg.Name, err.Error())
 		}
 	}
+
+	// freeing an ip which is leased to another vm of the same network
+	// would leave the other lease serving an address ipam could reissue to
+	// a third client; ipam itself holds no owner references, so this
+	// stays a network-scoped snapshot check without an owner-validated
+	// release primitive: the same numeric addresses of separate networks
+	// are no claim on this network's allocation
+	if netCfg.IPAddress != "" {
+		if leaseHwAddr, lease, found := c.dhcp.GetLeaseByIPAndNetwork(netCfg.NetworkName, netCfg.IPAddress); found && lease.Reference != ref {
+			// the release already happened in an earlier attempt and a
+			// successor vm owns the ip now: this interface's cleanup
+			// converged
+			log.Warnf("(vm.cleanupNetworkInterface) [%s/%s] ip %s belongs to %s via hwaddr %s, skipping the release of it",
+				vmnetcfg.Namespace, vmnetcfg.Name, netCfg.IPAddress, lease.Reference, leaseHwAddr)
+			c.metrics.UpdateLogStatus("warning")
+
+			return
+		}
+
+		if err := c.ipam.ReleaseIP(netCfg.NetworkName, netCfg.IPAddress); err != nil {
+			// already-free addresses are treated as done so a retried
+			// cleanup can converge
+			if !util.IsAlreadyReleased(err) {
+				return fmt.Errorf("(vm.cleanupNetworkInterface) [%s/%s] error releasing ip from ipam: %s",
+					vmnetcfg.Namespace, vmnetcfg.Name, err.Error())
+			}
+		}
+	}
+
+	pool, poolErr := c.cache.Get("pool", netCfg.NetworkName)
+	if poolErr != nil {
+		// without the pool object the status entry cannot be removed; the
+		// cleanup of the reached state still continues so the durable
+		// update for the remaining interfaces can proceed
+		log.Errorf("(vm.cleanupNetworkInterface) [%s/%s] %s",
+			vmnetcfg.Namespace, vmnetcfg.Name, poolErr)
+		c.metrics.UpdateLogStatus("error")
+
+		return
+	}
+
+	if statusErr := c.updateIPPoolStatus(
+		DELETE,
+		vmnetcfg.Namespace,
+		vmnetcfg.Spec.VMName,
+		netCfg.IPAddress,
+		netCfg.NetworkName,
+		netCfg.MACAddress,
+		pool.(kihv1.IPPool).Name,
+	); statusErr != nil {
+		// the status entry of another owner is not this vm's to remove;
+		// replaying the cleanup must not abort the durable update over it
+		if errors.Is(statusErr, util.ErrForeignOwner) {
+			log.Warnf("(vm.cleanupNetworkInterface) [%s/%s] the allocation of ip %s in the %s status belongs to another owner, leaving the entry",
+				vmnetcfg.Namespace, vmnetcfg.Name, netCfg.IPAddress, pool.(kihv1.IPPool).Name)
+			c.metrics.UpdateLogStatus("warning")
+
+			return
+		}
+
+		return fmt.Errorf("(vm.cleanupNetworkInterface) [%s/%s] %s",
+			vmnetcfg.Namespace, vmnetcfg.Name, statusErr.Error())
+	}
+
+	return
 }
 
 func (c *Controller) updateIPPoolStatus(event string, vmnetcfgNamespace string, vmnetcfgVMName string, ip string, networkName string, hwAddr string, poolName string) (err error) {
@@ -266,21 +346,42 @@ func (c *Controller) updateIPPoolStatus(event string, vmnetcfgNamespace string, 
 
 		updatedPool := currentPool.DeepCopy()
 		updatedAllocated := make(map[string]string)
+
+		// allocation references carry the canonical mac address spelling so
+		// add and delete computations agree on the owner identity
+		ownerRef := util.AllocationRef(vmnetcfgNamespace, vmnetcfgVMName, hwAddr)
+
 		switch event {
 		case ADD:
 			for k, v := range currentPool.Status.IPv4.Allocated {
 				if k == ip {
+					if v == ownerRef {
+						// the allocation reference is already recorded, so a
+						// retry after a partially applied update treats it as
+						// done
+						return nil
+					}
+
 					return fmt.Errorf("ip %s already found in IPPool status", ip)
 				}
 				updatedAllocated[k] = v
 			}
-			updatedAllocated[ip] = fmt.Sprintf("%s/%s [%s]", vmnetcfgNamespace, vmnetcfgVMName, hwAddr)
+			updatedAllocated[ip] = ownerRef
 		case DELETE:
 			for k, v := range currentPool.Status.IPv4.Allocated {
 				if k != ip {
 					updatedAllocated[k] = v
 				}
 			}
+
+			if existing, exists := currentPool.Status.IPv4.Allocated[ip]; exists && existing != ownerRef {
+				return fmt.Errorf("allocation for ip %s belongs to %s, not removing it from the %s status: %w", ip, existing, poolName, util.ErrForeignOwner)
+			}
+		default:
+			// any unknown event must never reach the persisted status:
+			// falling through would rebuild the allocation map from scratch
+			// and erase every live allocation entry
+			return fmt.Errorf("unsupported ippool status event %s for ip %s in pool %s", event, ip, poolName)
 		}
 		updatedPool.Status.IPv4.Allocated = updatedAllocated
 		updatedPool.Status.IPv4.Used = c.ipam.Used(networkName)
