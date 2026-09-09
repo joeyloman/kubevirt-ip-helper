@@ -266,6 +266,23 @@ func TestDHCPHandlerRequestAddressing(t *testing.T) {
 		if !ok || dst.IP.String() != "255.255.255.255" || dst.Port != dhcpv4.ClientPort {
 			t.Errorf("nak destination = %v, want 255.255.255.255:%d", conn.peers[0], dhcpv4.ClientPort)
 		}
+
+		// the complementary case: a client which sent no broadcast bit must
+		// not have one forced onto the non-relayed nak (only relayed naks
+		// set the bit, rfc 2131 section 4.3.2)
+		conn2 := &recordingPacketConn{}
+		req.Flags = 0
+		a.dhcpHandler(conn2, testPeer(), req)
+		if conn2.len() != 1 {
+			t.Fatalf("expected 1 reply, got %d", conn2.len())
+		}
+		resp2, err := dhcpv4.FromBytes(conn2.payloads[0])
+		if err != nil {
+			t.Fatalf("parsing reply: %v", err)
+		}
+		if resp2.IsBroadcast() {
+			t.Errorf("nak flags = %#x, want the client's zero flags echoed", resp2.Flags)
+		}
 	})
 
 	t.Run("mismatched request through a relay is nacked to the relay agent", func(t *testing.T) {
