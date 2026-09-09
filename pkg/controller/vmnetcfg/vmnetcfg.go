@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"time"
 
@@ -133,15 +134,15 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 		})
 	}
 
-	// missingPoolErr records the first pool lookup failure of this sync while
-	// the remaining interfaces are still processed: a network without a
-	// registered pool cannot restore or allocate that interface, but its
-	// failure must never block the restoration of the other interfaces
-	// (their assignments are protected through this same sync). the error
-	// is reported after every interface was handled; the startup gate counts
-	// the object through its settled classification and the resynced retry
-	// restores this interface once its pool registers.
-	var missingPoolErr error
+	// restoreErr records the first per-interface failure of this sync whose
+	// repair needs a retry (a network without a registered pool, or an
+	// unusable macaddress), while the remaining interfaces are still
+	// processed: one interface's failure must never block the restoration
+	// of the other interfaces (their assignments are protected through this
+	// same sync). the error is reported after every interface was handled;
+	// the startup gate counts the object through its settled classification
+	// and the resynced retry converges once the failure is repaired.
+	var restoreErr error
 
 	for _, v := range vmnetcfg.Spec.NetworkConfig {
 		// create a fresh nic status
@@ -153,8 +154,8 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 		if poolErr != nil {
 			// keep the durable spec and the previous status entry untouched,
 			// skip this interface and continue with the next one
-			if missingPoolErr == nil {
-				missingPoolErr = poolErr
+			if restoreErr == nil {
+				restoreErr = poolErr
 			}
 
 			newVmNetCfgs = append(newVmNetCfgs, v)
@@ -233,6 +234,37 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 			c.metrics.UpdateLogStatus("error")
 
 			newVmNetCfgs = append(newVmNetCfgs, v)
+
+			continue
+		}
+
+		// validate the hardware identity before the address is claimed: an
+		// unusable macaddress must never consume a reservation, otherwise
+		// the corrected object could not be served anymore (the previous
+		// claim would sit in the bitmap without an owner able to release
+		// it). the interface is skipped, its durable spec entry and the
+		// previous status are kept, and the sync reports the failure so
+		// the retried resync converges once the identity is corrected.
+		if _, macErr := net.ParseMAC(v.MACAddress); macErr != nil {
+			log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] invalid macaddress %q for network %s, skipping interface",
+				vmnetcfg.Namespace, vmnetcfg.Name, v.MACAddress, v.NetworkName)
+			c.metrics.UpdateLogStatus("error")
+
+			newVmNetCfgs = append(newVmNetCfgs, v)
+
+			for _, nic := range vmnetcfg.Status.NetworkConfig {
+				if v.MACAddress == nic.MACAddress && v.NetworkName == nic.NetworkName {
+					netcfgStatus.Status = nic.Status
+					netcfgStatus.Message = nic.Message
+					newNetCfgStatusList = append(newNetCfgStatusList, netcfgStatus)
+
+					break
+				}
+			}
+
+			if restoreErr == nil {
+				restoreErr = fmt.Errorf("invalid macaddress %q for network %s", v.MACAddress, v.NetworkName)
+			}
 
 			continue
 		}
@@ -357,7 +389,7 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 		networkChange = true
 	}
 
-	if missingPoolErr != nil {
+	if restoreErr != nil {
 		// the interfaces of this sync which were applied while the object
 		// is not committed yet must be unwound, so no live allocation is
 		// left for a never-persisted state; restored durable assignments
@@ -365,7 +397,7 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 		c.rollbackAppliedAllocations(vmnetcfg, appliedAllocations)
 
 		return fmt.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] %w",
-			vmnetcfg.Namespace, vmnetcfg.Name, missingPoolErr)
+			vmnetcfg.Namespace, vmnetcfg.Name, restoreErr)
 	}
 
 	newVmnetCfgStatus := kihv1.VirtualMachineNetworkConfigStatus{}

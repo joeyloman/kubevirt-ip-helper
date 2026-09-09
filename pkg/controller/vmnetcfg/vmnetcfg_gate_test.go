@@ -132,4 +132,7 @@ func TestSyncAddInvalidMacCountsAsHandledDuringInit(t *testing.T) {
 	if *count != 1 {
 		t.Errorf("gate count = %d, want 1: a definitively broken object must count as handled", *count)
 	}
+	if used := e.ipam.Used(testNetwork); used != 0 {
+		t.Errorf("ipam used = %d, want 0: an unusable macaddress must not consume a reservation", used)
+	}
 }
