@@ -1,0 +1,33 @@
+name: Build, tag, and push v0.9.x tag image to GHCR
+
+on:
+  push:
+    tags:
+      - 'v0.9.*'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-v0-9-x-tag:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build the container with the tag version and push it
+        id: build-image
+        run: |
+          docker build -t $REGISTRY/$IMAGE_NAME:$GITHUB_REF_NAME .
+          docker push $REGISTRY/$IMAGE_NAME:$GITHUB_REF_NAME
