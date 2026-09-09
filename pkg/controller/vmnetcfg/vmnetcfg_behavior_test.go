@@ -984,16 +984,33 @@ func TestVMNetCfgDeletionFinalizerCleanup(t *testing.T) {
 			t.Errorf("main update requests = %d, want 0 (the finalizer removal must not happen)", n)
 		}
 
-		// the failed cleanup already released the lease and the ipam
-		// allocation; the retry only has to remove the stale status entry
+		// the lease was released, but the failed status delete re-marks the
+		// reservation (fail closed): the address stays non-reissuable while
+		// the deletion is half-done and the vm's pod may still be terminating
 		if e.dhcp.CheckLease(testMAC) {
 			t.Error("the own lease was released before the status update failed")
 		}
-		if got := e.ipam.Used(testNetwork); got != 0 {
-			t.Errorf("ipam used = %d, want the own address released for the retry", got)
+		if got := e.ipam.Used(testNetwork); got != 1 {
+			t.Errorf("ipam used = %d, want 1: the released address must be re-marked until the retry", got)
 		}
 		if got := e.getStoredPool().Status.IPv4.Allocated["10.0.0.1"]; got == "" {
 			t.Error("the own status entry must remain for the retrying cleanup")
+		}
+
+		// the retried cleanup converges: the re-marked reservation is
+		// released, the status entry removed and the finalizer gone
+		e.api.poolStatusPutCode = 0
+		if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, vmnetcfg); err != nil {
+			t.Fatalf("the retried cleanup must converge: %s", err)
+		}
+		if used := e.ipam.Used(testNetwork); used != 0 {
+			t.Errorf("ipam used = %d after the retry, want 0", used)
+		}
+		if pool := e.getStoredPool(); len(pool.Status.IPv4.Allocated) != 0 {
+			t.Errorf("allocated = %v after the retry, want empty", pool.Status.IPv4.Allocated)
+		}
+		if stored := e.getStoredVMNetCfg(); len(stored.ObjectMeta.Finalizers) != 0 {
+			t.Errorf("finalizers = %v after the retry, want removed", stored.ObjectMeta.Finalizers)
 		}
 	})
 }

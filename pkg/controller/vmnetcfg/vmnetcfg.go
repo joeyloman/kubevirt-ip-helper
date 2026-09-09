@@ -581,6 +581,7 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 		}
 	}
 
+	released := false
 	if releaseIP {
 		if err := c.ipam.ReleaseIP(netCfg.NetworkName, netCfg.IPAddress); err != nil {
 			// already-free addresses are treated as done so a retried
@@ -589,6 +590,8 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 				return fmt.Errorf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] error releasing ip from ipam: %s",
 					vmnetcfg.Namespace, vmnetcfg.Name, err.Error())
 			}
+		} else {
+			released = true
 		}
 	}
 
@@ -620,6 +623,21 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 				vmnetcfg.Namespace, vmnetcfg.Name, netCfg.IPAddress, pool.(kihv1.IPPool).Name)
 			c.metrics.UpdateLogStatus("warning")
 		} else {
+			// the pool status record could not be removed although the
+			// address was already released: the transition stays half-done
+			// and the address must not stay free for a fresh allocation, so
+			// the reservation is re-marked before the retry. the single
+			// controller worker serializes allocations, so the mark is
+			// still claimable; it stays held until a process restart
+			// rebuilds the status from the specs (fail closed).
+			if released {
+				if _, markErr := c.ipam.GetIP(netCfg.NetworkName, netCfg.IPAddress); markErr != nil {
+					log.Errorf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] cannot re-mark the released address %s: %s",
+						vmnetcfg.Namespace, vmnetcfg.Name, netCfg.IPAddress, markErr)
+					c.metrics.UpdateLogStatus("error")
+				}
+			}
+
 			return fmt.Errorf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] %s",
 				vmnetcfg.Namespace, vmnetcfg.Name, err.Error())
 		}
