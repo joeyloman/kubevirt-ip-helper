@@ -644,7 +644,10 @@ func TestResetIPPoolStatusReconstructsStatus(t *testing.T) {
 	pool := ippoolBehaviorNewTestPool("pool1", "net-a")
 	pool.Spec.IPv4Config.Pool.Exclude = []string{"10.10.10.20", "10.10.10.21"}
 
-	uPool, err := c.resetIPPoolStatus(pool)
+	uPool, err := c.resetIPPoolStatus(pool, map[string]string{
+		"10.10.10.10": "default/vm-a [02:00:00:00:00:01]",
+		"10.10.10.30": "USED",
+	})
 	if err != nil {
 		t.Fatalf("unexpected error: %s", err.Error())
 	}
@@ -676,8 +679,10 @@ func TestResetIPPoolStatusReconstructsStatus(t *testing.T) {
 			upd.Status.LastUpdateBeforeStart.Time, prevLastUpdate.Time)
 	}
 	wantAllocated := map[string]string{
+		"10.10.10.10": "default/vm-a [02:00:00:00:00:01]",
 		"10.10.10.20": "EXCLUDED",
 		"10.10.10.21": "EXCLUDED",
+		"10.10.10.30": "USED",
 	}
 	if !reflect.DeepEqual(upd.Status.IPv4.Allocated, wantAllocated) {
 		t.Errorf("allocated map: got %v, want %v", upd.Status.IPv4.Allocated, wantAllocated)
@@ -698,7 +703,7 @@ func TestResetIPPoolStatusFirstStartSetsLastUpdateBeforeStart(t *testing.T) {
 	c, _, _, _, _ := ippoolBehaviorNewTestController(t, srv)
 
 	pool := ippoolBehaviorNewTestPool("pool1", "net-a")
-	uPool, err := c.resetIPPoolStatus(pool)
+	uPool, err := c.resetIPPoolStatus(pool, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %s", err.Error())
 	}
@@ -731,7 +736,7 @@ func TestResetIPPoolStatusGetErrorIsReturned(t *testing.T) {
 
 	c, _, _, _, _ := ippoolBehaviorNewTestController(t, srv)
 
-	uPool, err := c.resetIPPoolStatus(ippoolBehaviorNewTestPool("pool1", "net-a"))
+	uPool, err := c.resetIPPoolStatus(ippoolBehaviorNewTestPool("pool1", "net-a"), nil)
 	if err == nil {
 		t.Fatalf("expected the GET failure to be returned")
 	}
@@ -748,7 +753,7 @@ func TestResetIPPoolStatusUpdateStatusErrorIsReturned(t *testing.T) {
 
 	c, _, _, _, _ := ippoolBehaviorNewTestController(t, srv)
 
-	uPool, err := c.resetIPPoolStatus(ippoolBehaviorNewTestPool("pool1", "net-a"))
+	uPool, err := c.resetIPPoolStatus(ippoolBehaviorNewTestPool("pool1", "net-a"), nil)
 	if err == nil {
 		t.Fatalf("expected the status update failure to be returned")
 	}

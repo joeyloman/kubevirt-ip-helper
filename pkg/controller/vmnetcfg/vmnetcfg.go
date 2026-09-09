@@ -12,6 +12,7 @@ import (
 
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/dhcp"
+	ipam "github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/util"
 
 	log "github.com/sirupsen/logrus"
@@ -325,6 +326,34 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 						break
 					}
 				}
+				// pin the lease's address in the allocator under the
+				// verified owner reference: a binding whose lease survived
+				// but whose ipam claim was lost keeps the address
+				// unavailable to fresh allocations. the lease was already
+				// checked to reference this vmnetcfg, so the verified adopt
+				// is idempotent for the own claim and promotes an anonymous
+				// allocation of a failed earlier sync; a foreign named
+				// allocation fails the sync visibly like the conflicting
+				// ownership record does.
+				if err := c.ipam.AdoptIP(v.NetworkName, lease.ClientIP.String(), util.AllocationRef(vmnetcfg.Namespace, vmnetcfg.Spec.VMName, v.MACAddress)); err != nil {
+					// without the subnet in the allocator no fresh
+					// allocation is possible either, so there is no
+					// unprotected window: leave the pin to the converging
+					// registration retry instead of failing a binding which
+					// keeps serving by its lease
+					if errors.Is(err, ipam.ErrSubnetNotFound) {
+						log.Warnf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] cannot pin the leased address %s: %s",
+							vmnetcfg.Namespace, vmnetcfg.Name, lease.ClientIP.String(), err)
+					} else {
+						log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] ipam re-claim error: %s, skipping interface",
+							vmnetcfg.Namespace, vmnetcfg.Name, err)
+						c.metrics.UpdateLogStatus("error")
+
+						if restoreErr == nil {
+							restoreErr = err
+						}
+					}
+				}
 
 				// the reservation is already applied: repair the durable
 				// pool ownership record, which an earlier status write
@@ -360,8 +389,19 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 			}
 		}
 
-		// if v.IPAddress is not empty we register it else we get a new one
-		ip, err := c.ipam.GetIP(v.NetworkName, v.IPAddress)
+		// if v.IPAddress is not empty we re-claim it else we get a new one.
+		// the re-claim carries the owner reference so a registration which
+		// pinned the persisted pool-status claims into a fresh allocator
+		// accepts the restore of the recorded owner idempotently, while a
+		// foreign fresh or seeded allocation is rejected instead of being
+		// silently taken.
+		var ip string
+		var err error
+		if v.IPAddress != "" {
+			ip, err = c.ipam.ReclaimIP(v.NetworkName, v.IPAddress, util.AllocationRef(vmnetcfg.Namespace, vmnetcfg.Spec.VMName, v.MACAddress))
+		} else {
+			ip, err = c.ipam.GetIP(v.NetworkName, "")
+		}
 		if err != nil {
 			log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] ipam error: %s, skipping interface",
 				vmnetcfg.Namespace, vmnetcfg.Name, err)
@@ -717,7 +757,7 @@ func (c *Controller) updateIPPoolStatus(event string, vmnetcfgNamespace string, 
 
 		// allocation references carry the canonical mac address spelling so
 		// add and delete computations agree on the owner identity
-		ownerRef := fmt.Sprintf("%s/%s [%s]", vmnetcfgNamespace, vmnetcfgVMName, util.CanonicalHWAddr(hwAddr))
+		ownerRef := util.AllocationRef(vmnetcfgNamespace, vmnetcfgVMName, hwAddr)
 
 		switch event {
 		case ADD:

@@ -14,6 +14,7 @@ import (
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/network"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/util"
 
 	log "github.com/sirupsen/logrus"
 )
@@ -115,20 +116,23 @@ func (c *Controller) registerIPPool(pool *kihv1.IPPool) (cleanup bool, err error
 
 	// mark the exclude ips as used
 	for _, v := range pool.Spec.IPv4Config.Pool.Exclude {
-		ip, err := c.ipam.GetIP(pool.Spec.NetworkName, v)
-		if err != nil {
+		if _, err := c.ipam.ReclaimIP(pool.Spec.NetworkName, v, ipam.ExcludedOwner); err != nil {
 			return cleanup, fmt.Errorf("error while excluding ip [%s] in IPAM for network [%s]: %s", v, pool.Spec.NetworkName, err.Error())
-		}
-
-		// maybe unnecesarry check, but just to make sure
-		if ip != v {
-			return cleanup, fmt.Errorf("error got ip [%s] from IPAM, but it doesn't match the exclude ip [%s] for network [%s]",
-				ip, v, pool.Spec.NetworkName)
 		}
 	}
 
+	// pin the persisted claims of the pool in the fresh allocator before
+	// the pool becomes visible to fresh allocations: a registration which
+	// only succeeds after the startup gate dropped its retries (an UPDATE
+	// resync recovery) must not re-create the race where a new vm snapshot
+	// takes an address of the still-ownerless bindings
+	protectedClaims, err := c.protectPersistedClaims(pool)
+	if err != nil {
+		return cleanup, fmt.Errorf("error while protecting the persisted claims of the pool for network [%s]: %s", pool.Spec.NetworkName, err.Error())
+	}
+
 	// rebuild the pool status after restarting the process
-	rPool, err := c.resetIPPoolStatus(pool)
+	rPool, err := c.resetIPPoolStatus(pool, protectedClaims)
 	if err != nil {
 		return cleanup, fmt.Errorf("error while restting IPPool status for network [%s]: %s", pool.Spec.NetworkName, err.Error())
 	}
@@ -138,7 +142,8 @@ func (c *Controller) registerIPPool(pool *kihv1.IPPool) (cleanup bool, err error
 		return cleanup, fmt.Errorf("error while restting IPPool metrics for network [%s]: %s", pool.Spec.NetworkName, err.Error())
 	}
 
-	// cache the pool with an empty status
+	// cache the pool with a status carrying the protected claims and the
+	// excluded addresses
 	if err = c.cache.Add(rPool); err != nil {
 		return cleanup, fmt.Errorf("error while caching the IPPool for network [%s]: %s", pool.Spec.NetworkName, err.Error())
 	}
@@ -344,7 +349,104 @@ func (c *Controller) createOrUpdateDHCPPool(pool *kihv1.IPPool) (err error) {
 	return
 }
 
-func (c *Controller) resetIPPoolStatus(pool *kihv1.IPPool) (uPool *kihv1.IPPool, err error) {
+// protectPersistedClaims pins the ownership records the pool status
+// survived with into the fresh ipam allocator: a recovering pool which
+// registers again after the startup gate dropped its retries must never
+// publish an allocator state which offers the bound addresses of live
+// bindings to fresh allocations. every claim reference the status carries
+// is re-used verbatim, so the restoring vmnetcfg binding reclaims its own
+// recorded address idempotently while a foreign allocation is rejected.
+func (c *Controller) protectPersistedClaims(pool *kihv1.IPPool) (map[string]string, error) {
+	cPool, err := c.kihClientset.KubevirtiphelperV1().IPPools().Get(
+		context.TODO(), pool.Name, metav1.GetOptions{},
+	)
+	if err != nil {
+		// without the persisted status the claims cannot be known: fail
+		// the registration instead of publishing an unprotected allocator
+		return nil, fmt.Errorf("error while getting IPPool %s: %w", pool.Name, err)
+	}
+
+	claims := make(map[string]string)
+	for ip, ref := range cPool.Status.IPv4.Allocated {
+		if ref == ipam.ExcludedOwner {
+			continue
+		}
+
+		if _, _, _, ok := util.ParseAllocationRef(ref); !ok {
+			// an unparseable claim cannot be attributed to an owner: while
+			// it stays inside the pool range the address is protected
+			// unconditionally (a wasted address never double-binds one),
+			// and outside the range the allocator cannot hand it out at
+			// all. the original record is republished either way
+			log.Warnf("(ippool.protectPersistedClaims) IPPool %s carries the unparseable allocation reference %q for ip %s",
+				pool.Name, ref, ip)
+
+			claims[ip] = ref
+
+			if ipWithinPoolRange(pool, ip) {
+				if _, err := c.ipam.GetIP(pool.Spec.NetworkName, ip); err != nil {
+					return nil, fmt.Errorf("error while protecting the unparseable claim of ip [%s] of IPPool %s in IPAM for network [%s]: %s",
+						ip, pool.Name, pool.Spec.NetworkName, err.Error())
+				}
+			}
+
+			continue
+		}
+
+		// a claim outside the pool range can never be handed out by the
+		// allocator, so publishing it keeps the durable record without an
+		// exposure window; the range may grow back (which triggers an
+		// application reinitialization) and the next registration pins it
+		if !ipWithinPoolRange(pool, ip) {
+			log.Warnf("(ippool.protectPersistedClaims) IPPool %s carries the allocation record %q for ip %s outside its pool range, skipping the pin",
+				pool.Name, ref, ip)
+
+			claims[ip] = ref
+
+			continue
+		}
+
+		if _, err := c.ipam.ReclaimIP(pool.Spec.NetworkName, ip, ref); err != nil {
+			// a claim which fights the exclude pass or an already-reclaimed
+			// address must surface: publishing the allocator in this state
+			// would offer or drop a bound address
+			return nil, fmt.Errorf("error while protecting ip [%s] of IPPool %s in IPAM for network [%s]: %s",
+				ip, pool.Name, pool.Spec.NetworkName, err.Error())
+		}
+
+		claims[ip] = ref
+	}
+
+	return claims, nil
+}
+
+// ipWithinPoolRange reports whether an address lies inside the inclusive
+// start..end range of the pool specification.
+func ipWithinPoolRange(pool *kihv1.IPPool, ip string) bool {
+	ipAddr, err := netip.ParseAddr(ip)
+	if err != nil {
+		return false
+	}
+
+	startAddr, err := netip.ParseAddr(pool.Spec.IPv4Config.Pool.Start)
+	if err != nil {
+		return false
+	}
+
+	endAddr, err := netip.ParseAddr(pool.Spec.IPv4Config.Pool.End)
+	if err != nil {
+		return false
+	}
+
+	return startAddr.Compare(ipAddr) <= 0 && ipAddr.Compare(endAddr) <= 0
+}
+
+// resetIPPoolStatus republishes the pool status after a registration: the
+// allocation map carries the excluded addresses and the claimed addresses
+// protected by the fresh allocator, so restored bindings find their
+// ownership records again while the addresses stay unavailable to fresh
+// allocations.
+func (c *Controller) resetIPPoolStatus(pool *kihv1.IPPool, protectedClaims map[string]string) (uPool *kihv1.IPPool, err error) {
 	cPool, err := c.kihClientset.KubevirtiphelperV1().IPPools().Get(context.TODO(), pool.Name, metav1.GetOptions{})
 	if err != nil {
 		return uPool, err
@@ -362,7 +464,10 @@ func (c *Controller) resetIPPoolStatus(pool *kihv1.IPPool) (uPool *kihv1.IPPool,
 
 	allocatedExcludes := make(map[string]string)
 	for _, v := range pool.Spec.IPv4Config.Pool.Exclude {
-		allocatedExcludes[v] = "EXCLUDED"
+		allocatedExcludes[v] = ipam.ExcludedOwner
+	}
+	for ip, ref := range protectedClaims {
+		allocatedExcludes[ip] = ref
 	}
 	cPool.Status.IPv4.Allocated = allocatedExcludes
 	cPool.Status.IPv4.Used = c.ipam.Used(pool.Spec.NetworkName)

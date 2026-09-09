@@ -19,6 +19,12 @@ var (
 	// live allocation, so nothing is left to release.
 	ErrIPAlreadyFree = errors.New("ip was not allocated")
 
+	// ErrIPForeignOwner reports a reclaim attempt for an address whose
+	// recorded owner differs from the claiming identity, or a claim
+	// landing on the exclude pseudo-owner. registration seeding and the
+	// binding restore path rely on the same-owner case staying idempotent.
+	ErrIPForeignOwner = errors.New("ip is allocated by another owner")
+
 	// ErrIPNotInCidr reports a release attempt for an address outside the
 	// subnet of the named network: ipam never allocated such an address,
 	// so nothing is left to release and cleanup can converge.
@@ -37,7 +43,18 @@ type IPSubnet struct {
 	end       net.IP
 	broadcast net.IP
 	ips       map[string]bool
+	// owners records which allocation reference holds an allocated
+	// address: an empty token is a plain allocation without reclaim
+	// semantics, a reference is produced by util.AllocationRef and
+	// survives as the persisted claim. reclaim semantics keep the
+	// registration seeding and the binding restore path idempotent.
+	owners map[string]string
 }
+
+// ExcludedOwner is the pseudo-owner marking an address reserved by a
+// pool's exclude specification; no vm binding can ever claim such an
+// address.
+const ExcludedOwner = "EXCLUDED"
 
 type IPAllocator struct {
 	ipam  map[string]IPSubnet
@@ -114,6 +131,7 @@ func (a *IPAllocator) NewSubnet(name string, subnet string, start string, end st
 		allocatedIPs[ip.Unmap().String()] = false
 	}
 	s.ips = allocatedIPs
+	s.owners = make(map[string]string)
 
 	a.ipam[name] = s
 
@@ -157,18 +175,134 @@ func (a *IPAllocator) GetIP(name string, givenIP string) (string, error) {
 					return "", fmt.Errorf("given ip %s is already allocated", givenIP)
 				} else {
 					a.ipam[name].ips[ip] = true
+					// a plain allocation carries no reclaim identity: it
+					// blocks every later owner-specific reclaim
+					delete(a.ipam[name].owners, ip)
 					return ip, nil
 				}
 			}
 		} else {
 			if !allocated {
 				a.ipam[name].ips[ip] = true
+				delete(a.ipam[name].owners, ip)
 				return ip, nil
 			}
 		}
 	}
 
 	return "", fmt.Errorf("no more ips left in network %s", name)
+}
+
+// ReclaimIP allocates the exact address for the given allocation reference
+// and makes a re-claim from the same owner idempotent: the registration
+// seeding pins the persisted claims of a pool before the bindings can be
+// restored, and the resynchronized binding reclaims its own recorded
+// address without fighting the pin. an address held by another owner - or
+// one whose plain allocation carries no reclaim identity - is rejected, so
+// a fresh allocation can never take a still-owned address silently.
+func (a *IPAllocator) ReclaimIP(name string, givenIP string, owner string) (string, error) {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	if _, exists := a.ipam[name]; !exists {
+		return "", fmt.Errorf("%s: %w", name, ErrSubnetNotFound)
+	}
+
+	if owner == "" {
+		return "", fmt.Errorf("empty owner for the reclaim of ip %s in network %s", givenIP, name)
+	}
+
+	gIP, err := netip.ParseAddr(givenIP)
+	if err != nil {
+		return "", err
+	}
+	gIPCheck := a.ipam[name].cidr.Contains(gIP)
+	if !gIPCheck {
+		return "", fmt.Errorf("given ip %s is not cidr %s", givenIP, a.ipam[name].cidr)
+	}
+
+	if a.ipam[name].broadcast.Equal(gIP.Unmap().AsSlice()) {
+		return "", fmt.Errorf("given ip %s equals the broadcast address %s", givenIP, a.ipam[name].broadcast.String())
+	}
+
+	givenIP = gIP.Unmap().String()
+
+	// only the pool range is part of the allocation bitmap: an address
+	// between the subnet and pool boundaries exists but cannot be handed
+	// out by ipam
+	if allocated, withinRange := a.ipam[name].ips[givenIP]; !withinRange {
+		return "", fmt.Errorf("given ip %s is not between the pool range of network %s", givenIP, name)
+	} else if allocated {
+		if current := a.ipam[name].owners[givenIP]; current != owner {
+			return "", fmt.Errorf("given ip %s is already allocated by %s: %w", givenIP, current, ErrIPForeignOwner)
+		}
+
+		return givenIP, nil
+	}
+
+	a.ipam[name].ips[givenIP] = true
+	a.ipam[name].owners[givenIP] = owner
+
+	return givenIP, nil
+}
+
+// AdoptIP retags an existing allocation under a verified owner: the lease
+// idempotent path proves the binding owns the address, so an allocation
+// this process previously made without a reclaim identity (the anonymous
+// auto-allocation of an earlier sync whose durable write failed) is
+// promoted to the named owner while a allocation named by another owner
+// is rejected. a free address becomes owned by the caller, which covers a
+// binding whose lease survived the restart but whose allocator claim was
+// lost with the previous process.
+func (a *IPAllocator) AdoptIP(name string, givenIP string, owner string) (err error) {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	if _, exists := a.ipam[name]; !exists {
+		return fmt.Errorf("%s: %w", name, ErrSubnetNotFound)
+	}
+
+	if owner == "" {
+		return fmt.Errorf("empty owner for the adopt of ip %s in network %s", givenIP, name)
+	}
+
+	gIP, err := netip.ParseAddr(givenIP)
+	if err != nil {
+		return err
+	}
+	gIPCheck := a.ipam[name].cidr.Contains(gIP)
+	if !gIPCheck {
+		return fmt.Errorf("given ip %s is not cidr %s: %w", givenIP, a.ipam[name].cidr, ErrIPNotInCidr)
+	}
+
+	if a.ipam[name].broadcast.Equal(gIP.Unmap().AsSlice()) {
+		return fmt.Errorf("given ip %s equals the broadcast address %s", givenIP, a.ipam[name].broadcast.String())
+	}
+
+	ip := gIP.Unmap().String()
+
+	if allocated, withinRange := a.ipam[name].ips[ip]; !withinRange {
+		return fmt.Errorf("given ip %s is not between the pool range of network %s", ip, name)
+	} else if allocated {
+		current := a.ipam[name].owners[ip]
+		if current == owner {
+			return nil
+		}
+
+		if current != "" {
+			return fmt.Errorf("given ip %s is already allocated by %s: %w", ip, current, ErrIPForeignOwner)
+		}
+
+		// promote the anonymous allocation to the verified owner
+		a.ipam[name].owners[ip] = owner
+
+		return nil
+	}
+
+	a.ipam[name].ips[ip] = true
+	a.ipam[name].owners[ip] = owner
+
+	return nil
 }
 
 func (a *IPAllocator) ReleaseIP(name string, givenIP string) (err error) {
@@ -196,6 +330,10 @@ func (a *IPAllocator) ReleaseIP(name string, givenIP string) (err error) {
 		if ip == givenIP {
 			if allocated {
 				a.ipam[name].ips[ip] = false
+				// a released address forgets its owner: a later reclaim
+				// starts over instead of matching a stale identity
+				delete(a.ipam[name].owners, ip)
+
 				return
 			} else {
 				return fmt.Errorf("given ip %s: %w", givenIP, ErrIPAlreadyFree)

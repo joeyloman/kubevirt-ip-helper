@@ -349,7 +349,7 @@ func (c *Controller) updateIPPoolStatus(event string, vmnetcfgNamespace string, 
 
 		// allocation references carry the canonical mac address spelling so
 		// add and delete computations agree on the owner identity
-		ownerRef := fmt.Sprintf("%s/%s [%s]", vmnetcfgNamespace, vmnetcfgVMName, util.CanonicalHWAddr(hwAddr))
+		ownerRef := util.AllocationRef(vmnetcfgNamespace, vmnetcfgVMName, hwAddr)
 
 		switch event {
 		case ADD:
