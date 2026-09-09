@@ -454,6 +454,38 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 		if v.IPAddress != "" {
 			ip, err = c.ipam.ReclaimIP(v.NetworkName, v.IPAddress, util.AllocationRef(vmnetcfg.Namespace, vmnetcfg.Spec.VMName, v.MACAddress))
 		} else {
+			if *c.appStatus == APP_INIT {
+				// two-phase startup replay: a pending nic without a
+				// recorded address must not allocate during the
+				// initialization replay, because the recorded
+				// assignments of the other objects are still waiting
+				// for their own sync and the pool status does not pin
+				// an address whose record write was lost before the
+				// restart. the object still settles for the gate and
+				// the controller requeues it once every object's
+				// durable assignments are restored.
+				log.Infof("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] deferring the fresh allocation of hwaddr %s until the initialization replay finished",
+					vmnetcfg.Namespace, vmnetcfg.Name, v.MACAddress)
+				c.metrics.UpdateLogStatus("warning")
+				c.deferInitAllocation(fmt.Sprintf("%s/%s", vmnetcfg.Namespace, vmnetcfg.Name))
+
+				newVmNetCfgs = append(newVmNetCfgs, v)
+
+				// a pending nic carries no previous status entry; a
+				// deferred nic with one keeps it untouched
+				for _, nic := range vmnetcfg.Status.NetworkConfig {
+					if v.MACAddress == nic.MACAddress && v.NetworkName == nic.NetworkName {
+						netcfgStatus.Status = nic.Status
+						netcfgStatus.Message = nic.Message
+						newNetCfgStatusList = append(newNetCfgStatusList, netcfgStatus)
+
+						break
+					}
+				}
+
+				continue
+			}
+
 			ip, err = c.ipam.GetIP(v.NetworkName, "")
 		}
 		if err != nil {

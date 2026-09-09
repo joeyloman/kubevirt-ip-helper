@@ -109,6 +109,11 @@ func TestVMNetCfgClearedAddressRecoversAfterCleanupFailure(t *testing.T) {
 	}
 	e.seedVMNetCfg(vmnetcfg)
 
+	// steady state: the cleared-address reset is a live transition of a
+	// running application (the startup replay defers fresh allocations
+	// instead, covered by the finding-4 tests)
+	*e.appStatus = APP_RUNNING
+
 	// the transient cleanup failure during the address reset
 	e.api.poolStatusPutCode = http.StatusInternalServerError
 	if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, vmnetcfg); err == nil {

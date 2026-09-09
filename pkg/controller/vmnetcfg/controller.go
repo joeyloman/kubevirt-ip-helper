@@ -3,6 +3,7 @@ package vmnetcfg
 import (
 	"errors"
 	"net"
+	"sync"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -43,6 +44,14 @@ type Controller struct {
 	// initialization phase already handled, so an object which cannot
 	// complete its sync is still counted by the startup gate
 	initAttempted map[string]bool
+
+	mutex sync.Mutex
+	// deferredInitAllocations records the vmnetcfg keys whose startup
+	// sync deferred a fresh allocation until the initialization replay
+	// of every object settled: a pending nic must not take an address
+	// whose persisted assignment is still waiting in another object's
+	// spec during the startup replay
+	deferredInitAllocations map[string]bool
 }
 
 func NewController(
@@ -121,6 +130,73 @@ func (c *Controller) initSyncSettled(vmnetcfg *kihv1.VirtualMachineNetworkConfig
 	}
 
 	return false
+}
+
+// deferInitAllocation records one vmnetcfg key whose startup sync
+// deferred a fresh allocation until the initialization replay settled:
+// the controller requeues the key after the startup gate counted every
+// object, so the pending nic is served by a sync which cannot overtake
+// the restored assignments of the other objects anymore.
+func (c *Controller) deferInitAllocation(key string) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	if c.deferredInitAllocations == nil {
+		c.deferredInitAllocations = make(map[string]bool)
+	}
+
+	c.deferredInitAllocations[key] = true
+}
+
+// releaseDeferredInitAllocations drains the recorded keys after the
+// initialization replay finished: every object's durable assignments are
+// restored or persisted as settled by then, so the fresh allocations of
+// the pending nics can no longer take a recorded address.
+func (c *Controller) releaseDeferredInitAllocations() (keys []string) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	for key := range c.deferredInitAllocations {
+		keys = append(keys, key)
+	}
+
+	c.deferredInitAllocations = make(map[string]bool)
+
+	return keys
+}
+
+// runDeferredInitAllocations waits until the application left its
+// initialization phase - every vmnetcfg object's startup sync then
+// settled, durable assignments included - and requeues the deferred keys
+// so the pending nics allocate from the settled state.
+func (c *Controller) runDeferredInitAllocations(stopCh chan struct{}) {
+	for {
+		select {
+		case <-stopCh:
+			return
+		case <-time.After(time.Second):
+		}
+
+		if *c.appStatus != APP_INIT {
+			break
+		}
+	}
+
+	c.requeueDeferredInitAllocations()
+}
+
+// requeueDeferredInitAllocations requeues the recorded keys as UPDATE
+// events: the fresh allocations of the pending nics run through the
+// regular reconciliation, which cannot overtake the restored assignments
+// of the other objects anymore because the initialization replay
+// finished. a key which was deleted during the initialization settles
+// through the missing-object handling.
+func (c *Controller) requeueDeferredInitAllocations() {
+	for _, key := range c.releaseDeferredInitAllocations() {
+		log.Infof("(vmnetcfg.requeueDeferredInitAllocations) requeueing %s for the deferred fresh allocation after the initialization finished", key)
+
+		c.queue.Add(Event{key: key, action: UPDATE})
+	}
 }
 
 func (c *Controller) processNextItem() bool {
@@ -231,6 +307,11 @@ func (c *Controller) Run(workers int, stopCh chan struct{}) {
 	for i := 0; i < workers; i++ {
 		go wait.Until(c.runWorker, time.Second, stopCh)
 	}
+
+	// requeue the pending nics deferred during the startup replay once
+	// the initialization phase settled every object's durable
+	// assignments
+	go c.runDeferredInitAllocations(stopCh)
 
 	<-stopCh
 	log.Infof("(vmnetcfg.Run) stopping the VirtualMachineNetworkConfig controller")

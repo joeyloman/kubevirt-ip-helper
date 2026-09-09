@@ -63,8 +63,10 @@ func TestFreshAllocationAfterRecoverySkipsThePinnedClaim(t *testing.T) {
 	if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, restored); err != nil {
 		t.Fatalf("the restored binding must reclaim its recorded address: %s", err)
 	}
-
-	// a second vm arrives and asks for an automatic address
+	// a second vm arrives and asks for an automatic address: steady state
+	// (a running application serves fresh allocations immediately; the
+	// startup replay defers them, covered by the finding-4 tests)
+	*e.appStatus = APP_RUNNING
 	fresh := &kihv1.VirtualMachineNetworkConfig{
 		ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: "vm-fresh"},
 		Spec:       kihv1.VirtualMachineNetworkConfigSpec{VMName: "vm-fresh"},
@@ -143,6 +145,11 @@ func TestBarrierHoldsBeforeTheRestoration(t *testing.T) {
 		{NetworkName: testNetwork, MACAddress: testMAC2},
 	}
 	e.seedVMNetCfg(fresh)
+
+	// the recorded binding's vmnetcfg object is not processed yet at this
+	// point, but the vmnetcfg controller of a running application - the
+	// startup replay defers instead and is covered by the finding-4 tests
+	*e.appStatus = APP_RUNNING
 
 	if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, fresh); err != nil {
 		t.Fatalf("the fresh vm must receive a free address: %s", err)

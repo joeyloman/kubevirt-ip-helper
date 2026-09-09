@@ -56,7 +56,11 @@ func TestVMNetCfgFailedSyncKeepsRestoredDurableAllocation(t *testing.T) {
 	}
 
 	// the freed address must not be handed to a competing vm: a fresh
-	// allocation on the same network must skip the reserved address
+	// allocation on the same network must skip the reserved address. the
+	// competing sync runs in the steady state; the startup replay defers
+	// fresh allocations instead (covered by the finding-4 tests)
+	*e.appStatus = APP_RUNNING
+
 	hijacker := newVMNetCfg("", "02:00:00:00:00:99")
 	hijacker.Name = "vm-hijacker"
 	hijacker.Spec.VMName = "vm-hijacker"
@@ -110,7 +114,9 @@ func TestVMNetCfgPoolStatusFailureKeepsRestoredDurableAllocation(t *testing.T) {
 // assignment of another nic stays applied
 func TestVMNetCfgFailedSyncUnwindsOnlyFreshAllocations(t *testing.T) {
 	e := newTestEnv(t)
-
+	// steady state: a running application's sync failure unwinds only
+	// the fresh allocations of this sync
+	*e.appStatus = APP_RUNNING
 	secondNetwork := "net-b"
 	const secondPoolName = "ippool-b"
 

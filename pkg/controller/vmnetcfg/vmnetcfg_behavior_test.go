@@ -14,6 +14,8 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/workqueue"
 
 	prom "github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
@@ -74,7 +76,15 @@ type testEnv struct {
 	ipam       *ipam.IPAllocator
 	dhcp       *dhcp.DHCPAllocator
 	metrics    *metrics.MetricsAllocator
+	indexer    cache.Indexer
 	controller *Controller
+	// queue exposes the workqueue of the controller so the deferred-key
+	// requeue tests can process requeued events through processNextItem
+	queue workqueue.RateLimitingInterface
+	// appStatus exposes the application phase so tests can switch
+	// between the startup replay (APP_INIT, fresh allocations deferred)
+	// and the steady state (APP_RUNNING)
+	appStatus *int
 }
 
 func newTestEnv(t *testing.T) *testEnv {
@@ -101,7 +111,12 @@ func newTestEnv(t *testing.T) *testEnv {
 		dhcp:    dhcp.NewDHCPAllocator(),
 		metrics: metrics.NewMetricsAllocator(),
 	}
-	e.controller = NewController(nil, nil, nil, e.cache, e.ipam, e.dhcp, e.metrics, e.client, &appStatus, &count)
+	// a real queue and indexer so the startup-replay tests can drive
+	// requeued events through the controller
+	e.indexer = newTestIndexer()
+	e.queue = newTestQueue()
+	e.controller = NewController(e.queue, e.indexer, nil, e.cache, e.ipam, e.dhcp, e.metrics, e.client, &appStatus, &count)
+	e.appStatus = &appStatus
 
 	return e
 }
@@ -555,6 +570,9 @@ func decodeBody(r *http.Request, obj interface{}) error {
 func TestVMNetCfgFreshAllocation(t *testing.T) {
 	t.Run("automatic", func(t *testing.T) {
 		e := newTestEnv(t)
+		// steady state: a running application serves fresh allocations
+		// immediately; the startup replay defers them instead
+		*e.appStatus = APP_RUNNING
 		e.addSubnet("10.0.0.1", "10.0.0.1")
 		e.seedPool(nil)
 		vmnetcfg := newVMNetCfg("", testMAC)
@@ -1099,6 +1117,11 @@ func TestVMNetCfgStartupTimestampGate(t *testing.T) {
 		vmnetcfg.ObjectMeta.CreationTimestamp = metav1.NewTime(base.Add(5 * time.Minute))
 		e.seedVMNetCfg(vmnetcfg)
 
+		// steady state: the timestamp gate rejects only the objects
+		// created inside the restart window; in the running application
+		// the pending nic of a pre-restart object allocates normally
+		*e.appStatus = APP_RUNNING
+
 		if err := e.controller.updateVirtualMachineNetworkConfig(ADD, vmnetcfg); err != nil {
 			t.Fatalf("unexpected error: %s", err)
 		}
@@ -1109,6 +1132,43 @@ func TestVMNetCfgStartupTimestampGate(t *testing.T) {
 		}
 		if !e.dhcp.CheckLease(testMAC) {
 			t.Error("lease must be created")
+		}
+	})
+
+	t.Run("the startup replay defers the legitimate pending nic", func(t *testing.T) {
+		e := newTestEnv(t)
+		e.addSubnet("10.0.0.1", "10.0.0.1")
+		base := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+		pool := &kihv1.IPPool{
+			ObjectMeta: metav1.ObjectMeta{Name: testPoolName},
+			Spec: kihv1.IPPoolSpec{
+				NetworkName: testNetwork,
+				IPv4Config:  kihv1.IPv4Config{Subnet: testSubnet},
+			},
+			Status: kihv1.IPPoolStatus{
+				LastUpdateBeforeStart: metav1.NewTime(base.Add(10 * time.Minute)),
+				LastUpdate:            metav1.NewTime(base.Add(20 * time.Minute)),
+			},
+		}
+		e.seedPoolWith(pool)
+		vmnetcfg := newVMNetCfg("", testMAC)
+		vmnetcfg.ObjectMeta.CreationTimestamp = metav1.NewTime(base.Add(5 * time.Minute))
+		e.seedVMNetCfg(vmnetcfg)
+
+		if err := e.controller.updateVirtualMachineNetworkConfig(ADD, vmnetcfg); err != nil {
+			t.Fatalf("unexpected error: %s", err)
+		}
+
+		// the allocation is deferred: nothing is served or recorded yet
+		if e.dhcp.CheckLease(testMAC) {
+			t.Error("the deferred pending nic must not hold a lease")
+		}
+		if used := e.ipam.Used(testNetwork); used != 0 {
+			t.Errorf("ipam used = %d, want 0 until the replay finished", used)
+		}
+		deferred := e.controller.releaseDeferredInitAllocations()
+		if len(deferred) != 1 || deferred[0] != testNamespace+"/"+testVMNetCfgName {
+			t.Errorf("deferred keys = %v, want the vmnetcfg key", deferred)
 		}
 	})
 }
@@ -1442,6 +1502,8 @@ func TestVMNetCfgIPAMErrorSetsErrorStatus(t *testing.T) {
 // may not keep serving an address the durable vmnetcfg object never recorded.
 func TestVMNetCfgUpdateFailureRollsBackAllocations(t *testing.T) {
 	e := newTestEnv(t)
+	// steady state: the failed-commit rollback of a fresh allocation
+	*e.appStatus = APP_RUNNING
 	e.addSubnet("10.0.0.1", "10.0.0.1")
 	e.seedPool(nil)
 	e.api.vmnetcfgPutCode = http.StatusInternalServerError
@@ -1511,6 +1573,9 @@ func TestVMNetCfgCleanupAbortsOnForeignLeaseWhileLive(t *testing.T) {
 // the object is deleted without spec ips to clean up from
 func TestVMNetCfgLaterNICPoolStatusFailureUnwindsEarlierNICs(t *testing.T) {
 	e := newTestEnv(t)
+	// steady state: a running application's sync failure unwinds the
+	// nics allocated within the same sync
+	*e.appStatus = APP_RUNNING
 
 	secondNetwork := "net-b"
 	const secondPoolName = "ippool-b"
@@ -1587,6 +1652,9 @@ func TestVMNetCfgLaterNICPoolStatusFailureUnwindsEarlierNICs(t *testing.T) {
 // earlier allocation as well
 func TestVMNetCfgLaterNICPoolLookupFailureUnwindsEarlierNICs(t *testing.T) {
 	e := newTestEnv(t)
+	// steady state: a running application's sync failure unwinds the
+	// nics allocated within the same sync
+	*e.appStatus = APP_RUNNING
 	e.addSubnet("10.0.0.1", "10.0.0.1")
 	e.seedPool(nil)
 
@@ -1786,6 +1854,8 @@ func TestVMNetCfgDeletionRefreshesPoolMetrics(t *testing.T) {
 // releases persisted used/available of the still-held address
 func TestVMNetCfgRollbackPublishesSettledAccounting(t *testing.T) {
 	e := newTestEnv(t)
+	// steady state: the failed-commit rollback of a fresh allocation
+	*e.appStatus = APP_RUNNING
 	e.addSubnet("10.0.0.1", "10.0.0.2")
 	e.seedPool(nil)
 	e.api.vmnetcfgPutCode = http.StatusInternalServerError

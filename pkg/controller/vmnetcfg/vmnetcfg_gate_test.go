@@ -47,8 +47,11 @@ func TestSyncAddTransientFailureStaysUncountedUntilTheRestoreSucceeds(t *testing
 	e.addSubnet("10.0.0.1", "10.0.0.2")
 	e.seedPool(nil)
 
-	vmnetcfg := newVMNetCfg("", testMAC)
-	e.seedVMNetCfg(vmnetcfg)
+	// the recorded address restores during the initialization: this is
+	// the transient-failure-retry contract of the restore path itself
+	// (a pending nic without a recorded address defers instead and is
+	// covered by the finding-4 replay tests)
+	vmnetcfg := newVMNetCfg("10.0.0.1", testMAC)
 	if err := controller.indexer.Add(vmnetcfg); err != nil {
 		t.Fatalf("seeding indexer: %s", err)
 	}
