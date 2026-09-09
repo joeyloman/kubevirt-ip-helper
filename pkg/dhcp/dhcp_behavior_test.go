@@ -237,6 +237,9 @@ func TestDHCPHandlerRequestAddressing(t *testing.T) {
 		req := newBootRequest(t, mustHWAddr(t, "aa:bb:cc:dd:ee:01"), dhcpv4.MessageTypeRequest)
 		req.UpdateOption(dhcpv4.OptServerIdentifier(serverIP))
 		req.UpdateOption(dhcpv4.OptRequestedIPAddress(net.ParseIP("192.168.0.99")))
+		// the client requires a broadcast reply: the non-relayed nak must
+		// preserve that bit, not force or clear flags on its own
+		req.Flags = 0x8000
 		a.dhcpHandler(conn, testPeer(), req)
 
 		if conn.len() != 1 {
@@ -251,6 +254,9 @@ func TestDHCPHandlerRequestAddressing(t *testing.T) {
 		}
 		if !resp.YourIPAddr.IsUnspecified() {
 			t.Errorf("YourIPAddr = %s, want 0.0.0.0 for a nak", resp.YourIPAddr)
+		}
+		if !resp.IsBroadcast() {
+			t.Errorf("nak flags = %#x, want the client's broadcast bit preserved", resp.Flags)
 		}
 
 		// rfc 2131 section 3.2: without a relay address the nak must be
@@ -269,7 +275,10 @@ func TestDHCPHandlerRequestAddressing(t *testing.T) {
 		req := newBootRequest(t, mustHWAddr(t, "aa:bb:cc:dd:ee:01"), dhcpv4.MessageTypeRequest)
 		req.UpdateOption(dhcpv4.OptServerIdentifier(serverIP))
 		req.UpdateOption(dhcpv4.OptRequestedIPAddress(net.ParseIP("192.168.0.99")))
+		// the client cannot receive unicast yet (init-reboot), but the
+		// request itself carries no broadcast bit: the server must set it
 		req.GatewayIPAddr = net.ParseIP("203.0.113.1")
+		req.Flags = 0
 		a.dhcpHandler(conn, testPeer(), req)
 
 		if conn.len() != 1 {
@@ -281,6 +290,13 @@ func TestDHCPHandlerRequestAddressing(t *testing.T) {
 		}
 		if mt := resp.MessageType(); mt != dhcpv4.MessageTypeNak {
 			t.Errorf("got message type %v, want Nak for a mismatched address", mt)
+		}
+
+		// rfc 2131 section 4.3.2: a relayed init-reboot client may not
+		// hold a valid address and may not answer arp, so the nak must set
+		// the broadcast bit for the relay agent to broadcast it
+		if !resp.IsBroadcast() {
+			t.Errorf("nak flags = %#x, want the broadcast bit set", resp.Flags)
 		}
 
 		// rfc 2131 section 3.2: a relayed request gets the nak sent to the
