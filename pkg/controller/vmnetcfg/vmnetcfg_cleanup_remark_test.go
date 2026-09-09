@@ -1,28 +1,30 @@
 package vmnetcfg
 
-// P2-3 regression tests: during an ip change the old address must never
-// stay free in ipam while the transition is half-done. The cleanup releases
-// the ipam mark before the pool status record is removed, so a failing
-// status write must re-mark the reservation (fail closed) instead of
-// leaving the address reissuable to a fresh allocation.
+// P2-2 regression tests: an interrupted address transition must recover
+// the owner's networking. The cleanup un-records the pool status entry
+// before it releases anything locally, so a failed status write leaves
+// the lease, the ipam claim and the record fully consistent: the owner
+// keeps serving, the retried cleanup converges, and no sticky error
+// status bricks the vm behind a re-marked anonymous reservation.
 
 import (
 	"net/http"
 	"testing"
 
-	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
 )
 
-// TestVMNetCfgOldAddressCleanupStatusFailureReMarks: the status delete fails
-// after the old address was released - the reservation is re-marked, stays
-// non-reissuable, and the converged retry accounts for both the retained
-// old mark and the new address.
-func TestVMNetCfgOldAddressCleanupStatusFailureReMarks(t *testing.T) {
+// TestVMNetCfgOldAddressCleanupStatusFailureStaysConsistent: the status
+// delete fails before any local release - the old lease, the old claim and
+// the old record stay fully intact, and the retried sync completes the
+// transition to the recorded new address.
+func TestVMNetCfgOldAddressCleanupStatusFailureStaysConsistent(t *testing.T) {
 	e := newTestEnv(t)
 	e.addSubnet("10.0.0.1", "10.0.0.2")
 	e.seedPool(map[string]string{"10.0.0.1": canonicalLegacy})
-	if _, err := e.ipam.GetIP(testNetwork, "10.0.0.1"); err != nil {
+	if _, err := e.ipam.ReclaimIP(testNetwork, "10.0.0.1", canonicalLegacy); err != nil {
 		t.Fatalf("occupying the old address: %s", err)
 	}
 	if err := e.dhcp.AddLease(testMAC, testNetwork, "10.0.0.1", legacyVMRef); err != nil {
@@ -37,48 +39,114 @@ func TestVMNetCfgOldAddressCleanupStatusFailureReMarks(t *testing.T) {
 	}
 	e.seedVMNetCfg(vmnetcfg)
 
-	// the status write fails after the old address was released
+	// the status write fails
 	e.api.poolStatusPutCode = http.StatusInternalServerError
 	err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, vmnetcfg)
 	if err == nil {
 		t.Fatal("want the status failure to fail the sync")
 	}
-	if e.dhcp.CheckLease(testMAC) {
-		t.Error("the old lease must be gone (the transition was started)")
+
+	// nothing was released: the owner keeps serving the old address
+	lease := e.dhcp.GetLease(testMAC)
+	if lease.ClientIP == nil || lease.ClientIP.String() != "10.0.0.1" {
+		t.Fatalf("lease = %v, want the old 10.0.0.1 kept (the cleanup aborted before touching it)", lease.ClientIP)
 	}
 	if used := e.ipam.Used(testNetwork); used != 1 {
-		t.Fatalf("ipam used = %d, want 1: the released address must be re-marked", used)
+		t.Errorf("ipam used = %d, want 1 (the old claim stays held, not re-marked anonymously)", used)
 	}
-	if _, err := e.ipam.GetIP(testNetwork, "10.0.0.1"); err == nil {
-		t.Fatal("the re-marked old address must not be reissuable")
+	if _, err := e.ipam.ReclaimIP(testNetwork, "10.0.0.1", canonicalLegacy); err != nil {
+		t.Error("the old address must still belong to its owner (idempotent own reclaim)")
 	}
 	if got := e.getStoredPool().Status.IPv4.Allocated["10.0.0.1"]; got != canonicalLegacy {
 		t.Errorf("old status entry = %q, want preserved after the failed delete", got)
 	}
 
 	// the retried sync converges: the new address is allocated and served
-	// while the old mark and record stay held (fail-closed until a restart
-	// rebuilds the status from the specs)
+	// and the old one is honestly freed by the completed cleanup
 	e.api.poolStatusPutCode = 0
 	if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, vmnetcfg); err != nil {
 		t.Fatalf("the retried sync must converge: %s", err)
 	}
-	lease := e.dhcp.GetLease(testMAC)
+	lease = e.dhcp.GetLease(testMAC)
 	if lease.ClientIP == nil || lease.ClientIP.String() != "10.0.0.2" {
 		t.Fatalf("lease = %v, want the new 10.0.0.2", lease)
 	}
-	if used := e.ipam.Used(testNetwork); used != 2 {
-		t.Errorf("ipam used = %d, want 2 (retained old mark + new address)", used)
+	if used := e.ipam.Used(testNetwork); used != 1 {
+		t.Errorf("ipam used = %d, want 1 (old released, new held)", used)
 	}
-	if _, err := e.ipam.GetIP(testNetwork, "10.0.0.1"); err == nil {
-		t.Error("the old address must not be reissuable after the converged retry")
+	if _, err := e.ipam.GetIP(testNetwork, "10.0.0.1"); err != nil {
+		t.Errorf("the freed old address must be reissuable after the converged cleanup: %s", err)
 	}
 	pool := e.getStoredPool()
 	if got := pool.Status.IPv4.Allocated["10.0.0.2"]; got != canonicalLegacy {
-		t.Errorf("new status entry = %q, want recorded", got)
+		t.Errorf("new status entry = %q, want recorded for the owner", got)
 	}
-	if _, exists := pool.Status.IPv4.Allocated["10.0.0.1"]; !exists {
-		t.Error("old status entry must be retained (fail closed)")
+	if _, exists := pool.Status.IPv4.Allocated["10.0.0.1"]; exists {
+		t.Error("old status entry must be gone after the converged cleanup")
+	}
+}
+
+// The reviewer's brick scenario: a one-address pool serves an existing vm,
+// the desired ip is cleared to request automatic allocation again, and the
+// pool status un-record fails transiently. The vm must keep serving until
+// the api recovers, and then rebind its address - never a sticky error
+// status with a used one-address pool and no lease.
+func TestVMNetCfgClearedAddressRecoversAfterCleanupFailure(t *testing.T) {
+	e := newTestEnv(t)
+	e.addSubnet("10.0.0.1", "10.0.0.1")
+	e.seedPool(map[string]string{"10.0.0.1": canonicalLegacy})
+	if _, err := e.ipam.ReclaimIP(testNetwork, "10.0.0.1", canonicalLegacy); err != nil {
+		t.Fatalf("occupying the address: %s", err)
+	}
+	if err := e.dhcp.AddLease(testMAC, testNetwork, "10.0.0.1", legacyVMRef); err != nil {
+		t.Fatalf("seeding the lease: %s", err)
+	}
+
+	// the desired ip was cleared: the binding requests automatic allocation
+	vmnetcfg := newVMNetCfg("", testMAC)
+	vmnetcfg.Status.NetworkConfig = []kihv1.NetworkConfigStatus{
+		{MACAddress: testMAC, NetworkName: testNetwork, Status: "OK", Message: "IP address successfully allocated"},
+	}
+	e.seedVMNetCfg(vmnetcfg)
+
+	// the transient cleanup failure during the address reset
+	e.api.poolStatusPutCode = http.StatusInternalServerError
+	if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, vmnetcfg); err == nil {
+		t.Fatal("want the status failure to fail the sync")
+	}
+
+	// fail closed without bricking: the vm still serves
+	lease := e.dhcp.GetLease(testMAC)
+	if lease.ClientIP == nil || lease.ClientIP.String() != "10.0.0.1" {
+		t.Fatalf("lease = %v, want the address kept through the failed reset", lease.ClientIP)
+	}
+	if used := e.ipam.Used(testNetwork); used != 1 {
+		t.Fatalf("ipam used = %d, want 1 (the own claim, not an anonymous re-mark)", used)
+	}
+	stored := e.getStoredVMNetCfg()
+	if got := stored.Status.NetworkConfig[0].Status; got != "OK" {
+		t.Errorf("nic status = %q, want the preserved OK (no sticky error)", got)
+	}
+
+	// the api recovers and the binding reclaims its address
+	e.api.poolStatusPutCode = 0
+	if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, vmnetcfg); err != nil {
+		t.Fatalf("the recovered sync must succeed: %s", err)
+	}
+	lease = e.dhcp.GetLease(testMAC)
+	if lease.ClientIP == nil || lease.ClientIP.String() != "10.0.0.1" {
+		t.Fatalf("lease = %v, want the rebound 10.0.0.1 (the one-address pool hands it back to its owner)", lease.ClientIP)
+	}
+	if used := e.ipam.Used(testNetwork); used != 1 {
+		t.Errorf("ipam used = %d, want 1 after the recovery", used)
+	}
+	pool := e.getStoredPool()
+	if got := pool.Status.IPv4.Allocated["10.0.0.1"]; got != canonicalLegacy {
+		t.Errorf("status entry = %q, want the owner record rebuilt", got)
+	}
+	stored = e.getStoredVMNetCfg()
+	if got := stored.Status.NetworkConfig[0].Status; got != "OK" {
+		t.Errorf("nic status after recovery = %q, want OK", got)
 	}
 }
 

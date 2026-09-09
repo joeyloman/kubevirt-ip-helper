@@ -569,40 +569,12 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 	ref := fmt.Sprintf("%s/%s", vmnetcfg.Namespace, vmnetcfg.Spec.VMName)
 
 	// a delayed cleanup must not tear down allocations which were assigned
-	// to another vm in the meantime: the lease deletion re-validates the
-	// owner under the same lock, so the decision cannot race a concurrent
-	// reassignment. for a live vmnetcfg a foreign owner aborts the sync so
-	// the changed state is re-inspected on the next update; during deletion
-	// the foreign allocation is left to its owner and the remaining own
+	// to another vm in the meantime: the foreign snapshot check is
+	// read-only and decides before any durable or local state is mutated.
+	// for a live vmnetcfg a foreign owner aborts the sync so the changed
+	// state is re-inspected on the next update; during deletion the
+	// foreign allocation is left to its owner and the remaining own
 	// allocations are cleaned so the finalizer completes
-	if err := c.dhcp.DeleteLeaseOwnedBy(netCfg.MACAddress, ref); err != nil {
-		switch {
-		case errors.Is(err, dhcp.ErrLeaseForeignOwner):
-			if !deleting {
-				return fmt.Errorf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] %s",
-					vmnetcfg.Namespace, vmnetcfg.Name, err.Error())
-			}
-
-			log.Warnf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] %s, skipping the dhcp cleanup of it",
-				vmnetcfg.Namespace, vmnetcfg.Name, err.Error())
-			c.metrics.UpdateLogStatus("warning")
-
-		case errors.Is(err, dhcp.ErrLeaseNotFound):
-			// no lease left for this interface: the cleanup already
-			// converged, nothing to revert
-
-		default:
-			return fmt.Errorf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] error deleting lease from dhcp: %s",
-				vmnetcfg.Namespace, vmnetcfg.Name, err.Error())
-		}
-	}
-
-	// freeing an ip which is leased to another vm of the same network
-	// would leave the other lease serving an address ipam could reissue to
-	// a third client; ipam itself holds no owner references, so this
-	// stays a network-scoped snapshot check without an owner-validated
-	// release primitive: the same numeric addresses of separate networks
-	// are no claim on this network's allocation
 	releaseIP := false
 	if netCfg.IPAddress != "" {
 		releaseIP = true
@@ -621,8 +593,43 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 		}
 	}
 
-	released := false
-	if releaseIP {
+	// the lease deletion re-validates the owner under the dhcp lock: the
+	// by-ip snapshot decision above cannot race a concurrent reassignment
+	// acting between the checks
+	removeLease := func() error {
+		if err := c.dhcp.DeleteLeaseOwnedBy(netCfg.MACAddress, ref); err != nil {
+			switch {
+			case errors.Is(err, dhcp.ErrLeaseForeignOwner):
+				if !deleting {
+					return fmt.Errorf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] %s",
+						vmnetcfg.Namespace, vmnetcfg.Name, err.Error())
+				}
+
+				log.Warnf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] %s, skipping the dhcp cleanup of it",
+					vmnetcfg.Namespace, vmnetcfg.Name, err.Error())
+				c.metrics.UpdateLogStatus("warning")
+
+			case errors.Is(err, dhcp.ErrLeaseNotFound):
+				// no lease left for this interface: the cleanup already
+				// converged, nothing to revert
+
+			default:
+				return fmt.Errorf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] error deleting lease from dhcp: %s",
+					vmnetcfg.Namespace, vmnetcfg.Name, err.Error())
+			}
+		}
+
+		return nil
+	}
+
+	// the release runs under the validated ownership decisions above, so a
+	// same numeric lease of another network is no claim against this
+	// network's allocation
+	releaseAllocation := func() error {
+		if !releaseIP {
+			return nil
+		}
+
 		if err := c.ipam.ReleaseIP(netCfg.NetworkName, netCfg.IPAddress); err != nil {
 			// already-free addresses are treated as done so a retried
 			// cleanup can converge
@@ -630,15 +637,29 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 				return fmt.Errorf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] error releasing ip from ipam: %s",
 					vmnetcfg.Namespace, vmnetcfg.Name, err.Error())
 			}
-		} else {
-			released = true
+		}
+
+		return nil
+	}
+
+	if deleting {
+		// immediate release on VM delete stays the documented behavior: the
+		// lease and the allocation are freed first and the finalizer retry
+		// re-runs the whole cleanup until the status entry converges
+		if err := removeLease(); err != nil {
+			return err
+		}
+
+		if err := releaseAllocation(); err != nil {
+			return err
 		}
 	}
 
 	pool, poolErr := c.cache.Get("pool", netCfg.NetworkName)
 	if poolErr != nil {
-		// without the pool object the status entry cannot be removed; the
-		// cleanup of the reached state still continues
+		// without the pool object the status entry cannot be removed: no
+		// local allocation was touched yet, so the failing cleanup stays
+		// fully consistent (lease, claim and record intact) for its retry
 		log.Errorf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] %s",
 			vmnetcfg.Namespace, vmnetcfg.Name, poolErr)
 		c.metrics.UpdateLogStatus("error")
@@ -663,30 +684,29 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 				vmnetcfg.Namespace, vmnetcfg.Name, netCfg.IPAddress, pool.(kihv1.IPPool).Name)
 			c.metrics.UpdateLogStatus("warning")
 		} else {
-			// the pool status record could not be removed although the
-			// address was already released: during a live ip change the
-			// transition stays half-done and the address must not stay free
-			// for a fresh allocation, so the reservation is re-marked before
-			// the retry. the only other in-process allocator is the ippool
-			// worker's Exclude pass during a pool registration, which must
-			// not name this exact address; if it ever does, the re-mark
-			// reports 'already allocated' loudly below (and is invalidated
-			// if the vmnetcfg controller ever runs with more than one
-			// worker). during deletion the release stays immediate like
-			// before - immediate release on VM delete is the documented
-			// behavior - and the finalizer retry re-runs the whole cleanup
-			// (lease already converged, release succeeds, status delete
-			// retried).
-			if released && !deleting {
-				if _, markErr := c.ipam.GetIP(netCfg.NetworkName, netCfg.IPAddress); markErr != nil {
-					log.Errorf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] cannot re-mark the released address %s: %s",
-						vmnetcfg.Namespace, vmnetcfg.Name, netCfg.IPAddress, markErr)
-					c.metrics.UpdateLogStatus("error")
-				}
-			}
-
+			// during a live transition the durable un-record happens
+			// before any local release: a failed status write leaves the
+			// lease, the ipam claim and the record fully intact, so the
+			// owner keeps serving and the retried cleanup converges from
+			// a consistent state. releasing before the un-record would
+			// need a re-mark band-aid, whose anonymous re-mark cannot
+			// idempotently recover the owner-mapped reservation and
+			// bricks a one-address pool behind the sticky error status.
 			return fmt.Errorf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] %s",
 				vmnetcfg.Namespace, vmnetcfg.Name, err.Error())
+		}
+	}
+
+	if !deleting {
+		// the live transition releases only after the durable un-record:
+		// the address is never locally freed while its ownership record
+		// is still written
+		if err := removeLease(); err != nil {
+			return err
+		}
+
+		if err := releaseAllocation(); err != nil {
+			return err
 		}
 	}
 
@@ -840,8 +860,12 @@ func (c *Controller) updateIPPoolMetrics(poolName string) (err error) {
 		return fmt.Errorf("cannot get IPPool %s: %s", poolName, err.Error())
 	}
 
-	c.metrics.UpdateIPPoolUsed(pool.Name, pool.Spec.IPv4Config.Subnet, pool.Spec.NetworkName, pool.Status.IPv4.Used)
-	c.metrics.UpdateIPPoolAvailable(pool.Name, pool.Spec.IPv4Config.Subnet, pool.Spec.NetworkName, pool.Status.IPv4.Available)
+	// the gauges are computed from the live allocator state, not from the
+	// persisted pool status: the cleanup un-records the status entry
+	// before it releases the address, so a status write can carry the
+	// counters of the not-yet-released allocation
+	c.metrics.UpdateIPPoolUsed(pool.Name, pool.Spec.IPv4Config.Subnet, pool.Spec.NetworkName, c.ipam.Used(pool.Spec.NetworkName))
+	c.metrics.UpdateIPPoolAvailable(pool.Name, pool.Spec.IPv4Config.Subnet, pool.Spec.NetworkName, c.ipam.Available(pool.Spec.NetworkName))
 
 	return
 }
