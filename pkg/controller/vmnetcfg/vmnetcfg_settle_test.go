@@ -107,10 +107,11 @@ func TestHandleErrDropSettlesStartupCount(t *testing.T) {
 	}
 }
 
-// A transient failure (pool status write 500) on one interface must leave
-// every interface of the object protected when the sync fails, and the
-// protection must survive the retry-exhaustion settle: the gate may open,
-// but no recorded address becomes reissuable.
+// A persistent pool-status conflict on one interface must not expose the
+// durable assignment of another interface: the failing nic's write is
+// exhausted, the peer nic on its own pool fully succeeds (status entry
+// included), and after the retry-exhaustion settle the gate may open but
+// no recorded address becomes reissuable.
 func TestGateDropSettleKeepsInterfacesProtected(t *testing.T) {
 	e, controller, count := newGateTestEnv(t)
 	seedHealthyPool(e)
@@ -133,20 +134,36 @@ func TestGateDropSettleKeepsInterfacesProtected(t *testing.T) {
 	}
 	key := testNamespace + "/" + testVMNetCfgName
 
-	// every pool status write fails transiently: the sync still processes
-	// the later interface and retains its durable reservation
-	e.api.poolStatusPutCode = http.StatusInternalServerError
+	// only the first pool's status path conflicts persistently: the second
+	// interface (its own pool) must complete its restore fully
+	e.api.conflictPath = ippoolStatusPath
+	e.api.conflictCount = 100
+
 	if err := controller.sync(Event{key: key, action: ADD}); err == nil {
-		t.Fatal("want the transient status failure to fail the sync")
+		t.Fatal("want the status conflict on the first pool to fail the sync")
 	}
 	if *count != 0 {
-		t.Fatalf("gate count = %d after the transient failure, want 0", *count)
+		t.Fatalf("gate count = %d after the failed sync, want 0 (transient, uncounted)", *count)
 	}
 	if !e.dhcp.CheckLease("02:00:00:00:00:02") {
-		t.Fatal("the later interface must stay restored after the failed sync")
+		t.Fatal("the second interface must be fully restored")
 	}
 	if used := e.ipam.Used(healthyNet2); used != 1 {
 		t.Fatalf("healthy network used = %d, want 1", used)
+	}
+	pool2 := e.api.ippools["ippool-test-2"].DeepCopy()
+	if got := pool2.Status.IPv4.Allocated["10.0.1.2"]; got != legacyVMRef+" [02:00:00:00:00:02]" {
+		t.Errorf("the second interface's status entry = %q, want recorded after a successful write", got)
+	}
+	// the conflicting interface's durable claim must stay retained as well
+	if used := e.ipam.Used(testNetwork); used != 1 {
+		t.Errorf("first network used = %d, want 1 (durable claim retained)", used)
+	}
+	if !e.dhcp.CheckLease("02:00:00:00:00:01") {
+		t.Error("the conflicting interface's lease must be retained")
+	}
+	if _, err := e.ipam.GetIP(testNetwork, "10.0.0.1"); err == nil {
+		t.Error("the conflicting interface's recorded address must not be reissuable")
 	}
 	if _, err := e.ipam.GetIP(healthyNet2, "10.0.1.2"); err == nil {
 		t.Fatal("the recorded address must not be reissuable")
@@ -176,12 +193,21 @@ func TestGateDropSettleKeepsInterfacesProtected(t *testing.T) {
 		t.Fatalf("gate count = %d after the drop, want 1", *count)
 	}
 	if !e.dhcp.CheckLease("02:00:00:00:00:02") {
-		t.Error("the later interface's lease must survive the gate settle")
+		t.Error("the second interface's lease must survive the gate settle")
 	}
 	if used := e.ipam.Used(healthyNet2); used != 1 {
 		t.Errorf("healthy network used = %d after the gate settle, want 1", used)
 	}
 	if _, err := e.ipam.GetIP(healthyNet2, "10.0.1.2"); err == nil {
 		t.Error("the recorded address must not become reissuable after the gate settle")
+	}
+	if !e.dhcp.CheckLease("02:00:00:00:00:01") {
+		t.Error("the conflicting interface's lease must survive the gate settle")
+	}
+	if used := e.ipam.Used(testNetwork); used != 1 {
+		t.Errorf("first network used = %d after the gate settle, want 1", used)
+	}
+	if _, err := e.ipam.GetIP(testNetwork, "10.0.0.1"); err == nil {
+		t.Error("the conflicting interface's recorded address must not become reissuable after the gate settle")
 	}
 }

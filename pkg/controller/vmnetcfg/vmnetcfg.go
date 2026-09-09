@@ -404,8 +404,6 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 
 			rememberApplied(pool.(kihv1.IPPool).Name, v.MACAddress, v.NetworkName, ip, errors.Is(err, util.ErrForeignOwner))
 
-			newVmNetCfgs = append(newVmNetCfgs, v)
-
 			if restoreErr == nil {
 				restoreErr = fmt.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] cannot update the IPPool %s status for ip %s: %w",
 					vmnetcfg.Namespace, vmnetcfg.Name, pool.(kihv1.IPPool).Name, ip, err)
