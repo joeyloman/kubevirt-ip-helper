@@ -12,6 +12,8 @@ import (
 	"sync"
 	"testing"
 
+	log "github.com/sirupsen/logrus"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/rest"
 
@@ -99,6 +101,21 @@ func addSubnetWithIP(t *testing.T, alloc *ipam.IPAllocator, name, ip string) {
 	}
 	if _, err := alloc.GetIP(name, ip); err != nil {
 		t.Fatalf("allocating ip %s in %s: %v", ip, name, err)
+	}
+}
+
+// addSubnetWithOwnedIP registers an ipam subnet and reserves the given ip
+// as a named allocation of the owner: a binding's own live allocation is
+// a named reservation (the owner-validated cleanups release exactly that
+// state), while an anonymous allocation models a foreign or successor
+// state which no cleanup of this owner may free.
+func addSubnetWithOwnedIP(t *testing.T, alloc *ipam.IPAllocator, name, ip, ownerRef string) {
+	t.Helper()
+	if err := alloc.NewSubnet(name, "10.0.0.0/24", "10.0.0.10", "10.0.0.12"); err != nil {
+		t.Fatalf("adding subnet %s: %v", name, err)
+	}
+	if _, err := alloc.ReclaimIP(name, ip, ownerRef); err != nil {
+		t.Fatalf("reserving ip %s in %s for %s: %v", ip, name, ownerRef, err)
 	}
 }
 
@@ -628,7 +645,7 @@ func TestHandleVirtualMachineObjectChangeUpdatesExisting(t *testing.T) {
 
 	// Lease, ip allocation and pool backing the old interface so cleanup can complete.
 	addSimpleLease(t, c.dhcp, oldMAC, oldIP, "ns1/vm1")
-	addSubnetWithIP(t, c.ipam, networkName, oldIP)
+	addSubnetWithOwnedIP(t, c.ipam, networkName, oldIP, "ns1/vm1 ["+oldMAC+"]")
 	storePool(t, c, f, "pool-a", networkName, map[string]string{
 		oldIP:       "ns1/vm1 [" + oldMAC + "]",
 		"10.0.0.12": "other",
@@ -871,7 +888,7 @@ func TestCleanupNetworkInterfaceReleasesAllState(t *testing.T) {
 	ip := "10.0.0.11"
 
 	addSimpleLease(t, c.dhcp, mac, ip, "ns1/vm1")
-	addSubnetWithIP(t, c.ipam, networkName, ip)
+	addSubnetWithOwnedIP(t, c.ipam, networkName, ip, "ns1/vm1 ["+mac+"]")
 	storePool(t, c, f, "pool-a", networkName, map[string]string{
 		ip:          "ns1/vm1 [" + mac + "]",
 		"10.0.0.12": "other",
@@ -919,7 +936,7 @@ func TestCleanupNetworkInterfaceSkipsPoolStatusWhenPoolUnknown(t *testing.T) {
 	ip := "10.0.0.11"
 
 	addSimpleLease(t, c.dhcp, mac, ip, "ns1/vm1")
-	addSubnetWithIP(t, c.ipam, networkName, ip)
+	addSubnetWithOwnedIP(t, c.ipam, networkName, ip, "ns1/vm1 ["+mac+"]")
 
 	vmnetcfg := &kihv1.VirtualMachineNetworkConfig{
 		ObjectMeta: metav1.ObjectMeta{Name: "vm1", Namespace: "ns1"},
@@ -951,7 +968,7 @@ func TestCleanupNetworkInterfaceSkipsSuccessorAllocationOnRetry(t *testing.T) {
 	if err := c.dhcp.AddLease(mac, networkName, ip, "ns1/vm1"); err != nil {
 		t.Fatalf("own lease: %v", err)
 	}
-	addSubnetWithIP(t, c.ipam, networkName, ip)
+	addSubnetWithOwnedIP(t, c.ipam, networkName, ip, "ns1/vm1 ["+mac+"]")
 	storePool(t, c, f, "pool-a", networkName, map[string]string{
 		ip: "ns1/vm1 [" + mac + "]",
 	})
@@ -1057,7 +1074,7 @@ func TestCleanupNetworkInterfaceReleasesAcrossForeignNetworkLease(t *testing.T) 
 	otherNetworkName := "default/net-b"
 	ip := "10.0.0.11"
 
-	addSubnetWithIP(t, c.ipam, networkName, ip)
+	addSubnetWithOwnedIP(t, c.ipam, networkName, ip, "ns1/vm1 ["+mac+"]")
 	storePool(t, c, f, "pool-a", networkName, map[string]string{
 		ip: "ns1/vm1 [" + mac + "]",
 	})
@@ -1322,7 +1339,7 @@ func TestUpdateVirtualMachineNetworkConfigObjectRemovesAllInterfaces(t *testing.
 	f.mu.Unlock()
 
 	addSimpleLease(t, c.dhcp, oldMAC, oldIP, "ns1/vm1")
-	addSubnetWithIP(t, c.ipam, networkName, oldIP)
+	addSubnetWithOwnedIP(t, c.ipam, networkName, oldIP, "ns1/vm1 ["+oldMAC+"]")
 	storePool(t, c, f, "pool-a", networkName, map[string]string{oldIP: "ns1/vm1 [" + oldMAC + "]"})
 
 	existing := f.storedVMNetCfg("ns1/vm1")
@@ -1390,7 +1407,7 @@ func TestCleanupNetworkInterfacePropagatesPoolStatusError(t *testing.T) {
 	networkName := "default/net-a"
 	ip := "10.0.0.11"
 
-	addSubnetWithIP(t, c.ipam, networkName, ip)
+	addSubnetWithOwnedIP(t, c.ipam, networkName, ip, "ns1/vm1 ["+mac+"]")
 	storePool(t, c, f, "pool-a", networkName, map[string]string{ip: "ns1/vm1 [" + mac + "]"})
 	f.ippoolStatusUpdateStatus = http.StatusInternalServerError
 	f.ippoolStatusUpdateErr = "boom"
@@ -1448,5 +1465,112 @@ func TestUpdateIPPoolStatusUnknownEventRejected(t *testing.T) {
 	}
 	if n := len(f.requestsFor(http.MethodPut, "/ippools/pool-a/status")); n != 0 {
 		t.Errorf("expected no pool status attempts for an unknown event, got %d", n)
+	}
+}
+
+// vmBehaviorLogHookFunc adapts a function to the logrus hook interface.
+type vmBehaviorLogHookFunc func(entry *log.Entry) error
+
+func (f vmBehaviorLogHookFunc) Levels() []log.Level { return log.AllLevels }
+
+func (f vmBehaviorLogHookFunc) Fire(entry *log.Entry) error { return f(entry) }
+
+// TestCleanupNetworkInterfaceDoesNotReleaseTheSuccessorAfterDelayedResume:
+// the delayed-cleanup regression. The cleanup of a removed nic passes its
+// lease snapshot check and pauses right before its ipam release; inside
+// that window the removed nic's own binding notices the vanished lease
+// and compensates by releasing its claim, and the successor binding
+// obtains the freed address as a named reservation with its lease and
+// ownership record. The resumed cleanup must not free the successor's
+// allocation: the release is owner-validated, so a reservation which no
+// longer carries this nic's owner reference stays untouched and the
+// cleanup converges on the foreign ownership record instead.
+func TestCleanupNetworkInterfaceDoesNotReleaseTheSuccessorAfterDelayedResume(t *testing.T) {
+	c, f := vmBehaviorNewTestController(t)
+
+	macA := "aa:bb:cc:00:00:01"
+	macB := "aa:bb:cc:00:00:02"
+	networkName := "default/net-a"
+	ip := "10.0.0.11"
+	ownerA := "ns1/vm1 [" + macA + "]"
+	ownerB := "ns1/vm2 [" + macB + "]"
+
+	// binding A is fully applied: named reservation, lease, record
+	addSubnetWithOwnedIP(t, c.ipam, networkName, ip, ownerA)
+	addSimpleLease(t, c.dhcp, macA, ip, "ns1/vm1")
+	storePool(t, c, f, "pool-a", networkName, map[string]string{ip: ownerA})
+
+	vmnetcfgA := &kihv1.VirtualMachineNetworkConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: "vm1", Namespace: "ns1"},
+		Spec: kihv1.VirtualMachineNetworkConfigSpec{
+			VMName:        "vm1",
+			NetworkConfig: []kihv1.NetworkConfig{testNetCfg(macA, networkName, ip)},
+		},
+	}
+
+	// the interleaving runs inside the window between the cleanup's lease
+	// snapshot check and its ipam release, scheduled deterministically at
+	// the pre-release debug message of the real cleanup function
+	oldLevel := log.GetLevel()
+	oldHooks := log.StandardLogger().ReplaceHooks(make(log.LevelHooks))
+	fired := false
+	log.AddHook(vmBehaviorLogHookFunc(func(entry *log.Entry) error {
+		if strings.Contains(entry.Message, "releasing the ipam reservation") && !fired {
+			fired = true
+
+			// the removed nic's binding notices the vanished lease and
+			// compensates: the owner-validated release of its own claim
+			// and the owner-checked removal of its record
+			if err := c.ipam.ReleaseIPOwnedBy(networkName, ip, ownerA); err != nil {
+				t.Errorf("the binding's compensating release: %v", err)
+			}
+			if err := c.updateIPPoolStatus(DELETE, "ns1", "vm1", ip, networkName, macA, "pool-a"); err != nil {
+				t.Errorf("the binding's record removal: %v", err)
+			}
+
+			// the successor binding obtains the freed address as a named
+			// reservation with its lease and its ownership record
+			if _, err := c.ipam.ReclaimIP(networkName, ip, ownerB); err != nil {
+				t.Errorf("the successor taking the freed address: %v", err)
+			}
+			if err := c.dhcp.AddLease(macB, networkName, ip, "ns1/vm2"); err != nil {
+				t.Errorf("the successor lease: %v", err)
+			}
+			if err := c.updateIPPoolStatus(ADD, "ns1", "vm2", ip, networkName, macB, "pool-a"); err != nil {
+				t.Errorf("the successor record: %v", err)
+			}
+		}
+		return nil
+	}))
+	log.SetLevel(log.DebugLevel)
+
+	t.Cleanup(func() {
+		log.SetLevel(oldLevel)
+		log.StandardLogger().ReplaceHooks(oldHooks)
+	})
+
+	netCfg := testNetCfg(macA, networkName, ip)
+	if err := c.cleanupNetworkInterface(vmnetcfgA, &netCfg); err != nil {
+		t.Fatalf("the delayed cleanup must converge: %v", err)
+	}
+
+	// the successor keeps its whole allocation
+	if used := c.ipam.Used(networkName); used != 1 {
+		t.Errorf("ipam used = %d, want 1 (the successor's reservation preserved)", used)
+	}
+	if !c.dhcp.CheckLease(macB) {
+		t.Error("the successor's dhcp lease must stay")
+	}
+	if got := f.storedPool("pool-a").Status.IPv4.Allocated[ip]; got != ownerB {
+		t.Errorf("pool record = %q, want the successor's ownership preserved", got)
+	}
+
+	// nothing of the removed nic survives
+	if c.dhcp.CheckLease(macA) {
+		t.Error("the removed nic must not hold a lease")
+	}
+	// the successor's exact address is not handed to a third vm
+	if _, err := c.ipam.GetIP(networkName, ip); err == nil {
+		t.Error("the preserved reservation must not be allocatable")
 	}
 }

@@ -18,6 +18,7 @@ import (
 
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/dhcp"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/util"
 )
 
@@ -235,10 +236,13 @@ func (c *Controller) getNetworkConfigs(vm *kubevirtV1.VirtualMachine, curNetCfg 
 
 // cleanupNetworkInterface frees the dhcp lease, the ipam reservation and
 // the ippool status entry of a network interface which the vm no longer
-// has. the release is ownership-safe, so a retried cleanup after a failed
-// durable update cannot free state another vm acquired in the meantime:
-// own leases are removed under an owner check, and an ip whose lease is
-// already held by another vm in the same network is left to that vm.
+// has. the release is ownership-safe, so a delayed or retried cleanup can
+// never free state another vm acquired in the meantime: the lease is
+// removed under an owner check, an ip whose lease is already held by
+// another vm in the same network is left to that vm, and the ipam release
+// only frees the address while its reservation still carries this nic's
+// owner reference - a successor's named allocation and a registration
+// protection pin both stay untouched.
 func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetworkConfig, netCfg *kihv1.NetworkConfig) (err error) {
 	log.Debugf("(vm.cleanupNetworkInterface) [%s/%s] cleaning interface with hwaddr=%s, networkname=%s, ipaddress=%s",
 		vmnetcfg.Namespace, vmnetcfg.Name, netCfg.MACAddress, netCfg.NetworkName, netCfg.IPAddress)
@@ -285,10 +289,30 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 			return
 		}
 
-		if err := c.ipam.ReleaseIP(netCfg.NetworkName, netCfg.IPAddress); err != nil {
-			// already-free addresses are treated as done so a retried
-			// cleanup can converge
-			if !util.IsAlreadyReleased(err) {
+		// the release is owner-validated: a binding's fresh allocation is
+		// a named reservation, so the release only frees the address while
+		// it still carries this nic's owner reference. a successor which
+		// took the address over in the meantime - after this cleanup's own
+		// lease snapshot check passed, or after the removed nic's binding
+		// compensated a raced cleanup by releasing its claim - is never
+		// freed with it, while an ownerless protection pin of the
+		// registration (an unusable-mac claim or an unknown historical
+		// reference) is not this cleanup's to release either
+		ownerRef := util.AllocationRef(vmnetcfg.Namespace, vmnetcfg.Spec.VMName, netCfg.MACAddress)
+
+		log.Debugf("(vm.cleanupNetworkInterface) [%s/%s] releasing the ipam reservation of ip %s for hwaddr %s under the owner %q",
+			vmnetcfg.Namespace, vmnetcfg.Name, netCfg.IPAddress, netCfg.MACAddress, ownerRef)
+
+		if err := c.ipam.ReleaseIPOwnedBy(netCfg.NetworkName, netCfg.IPAddress, ownerRef); err != nil {
+			if errors.Is(err, ipam.ErrIPForeignOwner) {
+				// the address belongs to a successor or to a conservative
+				// registration pin: converged, nothing left to release
+				log.Warnf("(vm.cleanupNetworkInterface) [%s/%s] ip %s is allocated by another owner, skipping the release of it",
+					vmnetcfg.Namespace, vmnetcfg.Name, netCfg.IPAddress)
+				c.metrics.UpdateLogStatus("warning")
+			} else if !util.IsAlreadyReleased(err) {
+				// already-free addresses are treated as done so a retried
+				// cleanup can converge
 				return fmt.Errorf("(vm.cleanupNetworkInterface) [%s/%s] error releasing ip from ipam: %s",
 					vmnetcfg.Namespace, vmnetcfg.Name, err.Error())
 			}

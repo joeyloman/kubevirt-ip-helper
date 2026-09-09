@@ -41,7 +41,13 @@ func (c *Controller) rollbackNetworkAllocation(vmnetcfg *kihv1.VirtualMachineNet
 		c.metrics.UpdateLogStatus("error")
 	}
 
-	if err := c.ipam.ReleaseIP(allocated.networkName, allocated.ipAddress); err != nil && !util.IsAlreadyReleased(err) {
+	// the release is owner-validated: an allocation this sync made carries
+	// this binding's owner reference, while an address which a successor
+	// took over in the meantime (or which this sync never claimed, a
+	// contested restore) is never freed with it
+	ownerRef := util.AllocationRef(vmnetcfg.Namespace, vmnetcfg.Spec.VMName, allocated.macAddress)
+	if err := c.ipam.ReleaseIPOwnedBy(allocated.networkName, allocated.ipAddress, ownerRef); err != nil &&
+		!errors.Is(err, ipam.ErrIPForeignOwner) && !util.IsAlreadyReleased(err) {
 		log.Errorf("(vmnetcfg.rollbackNetworkAllocation) [%s/%s] failed to revert the ipam allocation for ip %s: %s",
 			vmnetcfg.Namespace, vmnetcfg.Name, allocated.ipAddress, err)
 		c.metrics.UpdateLogStatus("error")
@@ -508,11 +514,19 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 		// pinned the persisted pool-status claims into a fresh allocator
 		// accepts the restore of the recorded owner idempotently, while a
 		// foreign fresh or seeded allocation is rejected instead of being
-		// silently taken.
+		// silently taken. the claimant identity additionally accepts the
+		// own ownerless protection pin of the registration sweep: the sweep
+		// pins the recorded address of a claim whose macaddress was
+		// unusable at registration time, so the binding of that vm retakes
+		// its own pin once the identity is corrected, while a pin of
+		// another vm and an unattributed pin stay rejected.
+		ownerRef := util.AllocationRef(vmnetcfg.Namespace, vmnetcfg.Spec.VMName, v.MACAddress)
+		vmRef := fmt.Sprintf("%s/%s", vmnetcfg.Namespace, vmnetcfg.Spec.VMName)
+
 		var ip string
 		var err error
 		if v.IPAddress != "" {
-			ip, err = c.ipam.ReclaimIP(v.NetworkName, v.IPAddress, util.AllocationRef(vmnetcfg.Namespace, vmnetcfg.Spec.VMName, v.MACAddress))
+			ip, err = c.ipam.ReclaimIPClaimant(v.NetworkName, v.IPAddress, ownerRef, vmRef)
 		} else {
 			if *c.appStatus == APP_INIT {
 				// two-phase startup replay: a pending nic without a
@@ -546,7 +560,11 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 				continue
 			}
 
-			ip, err = c.ipam.GetIP(v.NetworkName, "")
+			// the fresh allocation is a named reservation of this binding:
+			// the delayed cleanup of a removed nic can release it through
+			// the owner-validated release, while no other owner can ever
+			// displace it
+			ip, err = c.ipam.AllocateIP(v.NetworkName, ownerRef)
 		}
 		if err != nil {
 			log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] ipam error: %s, skipping interface",
@@ -562,12 +580,11 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 			continue
 		}
 
-		ref := fmt.Sprintf("%s/%s", vmnetcfg.Namespace, vmnetcfg.Spec.VMName)
 		if err := c.dhcp.AddLease(
 			v.MACAddress,
 			pool.(kihv1.IPPool).Spec.NetworkName,
 			ip,
-			ref,
+			vmRef,
 		); err != nil {
 			// dhcp must not serve the address when its owner reference
 			// cannot be registered: queue this interface's claim for the
@@ -768,18 +785,26 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 		return nil
 	}
 
-	// the release runs under the validated ownership decisions above, so a
-	// same numeric lease of another network is no claim against this
-	// network's allocation
+	// the release runs under the validated ownership decisions above and
+	// is owner-validated in ipam: a same numeric lease of another network
+	// is no claim against this network's allocation, and a successor which
+	// took the address over in the meantime keeps it
 	releaseAllocation := func() error {
 		if !releaseIP {
 			return nil
 		}
 
-		if err := c.ipam.ReleaseIP(netCfg.NetworkName, netCfg.IPAddress); err != nil {
-			// already-free addresses are treated as done so a retried
-			// cleanup can converge
-			if !util.IsAlreadyReleased(err) {
+		ownerRef := util.AllocationRef(vmnetcfg.Namespace, vmnetcfg.Spec.VMName, netCfg.MACAddress)
+		if err := c.ipam.ReleaseIPOwnedBy(netCfg.NetworkName, netCfg.IPAddress, ownerRef); err != nil {
+			if errors.Is(err, ipam.ErrIPForeignOwner) {
+				// the address belongs to a successor or to a conservative
+				// registration pin: converged, nothing left to release
+				log.Warnf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] ip %s is allocated by another owner, skipping the ipam release of it",
+					vmnetcfg.Namespace, vmnetcfg.Name, netCfg.IPAddress)
+				c.metrics.UpdateLogStatus("warning")
+			} else if !util.IsAlreadyReleased(err) {
+				// already-free addresses are treated as done so a retried
+				// cleanup can converge
 				return fmt.Errorf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] error releasing ip from ipam: %s",
 					vmnetcfg.Namespace, vmnetcfg.Name, err.Error())
 			}

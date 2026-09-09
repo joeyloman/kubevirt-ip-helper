@@ -49,6 +49,15 @@ type IPSubnet struct {
 	// survives as the persisted claim. reclaim semantics keep the
 	// registration seeding and the binding restore path idempotent.
 	owners map[string]string
+	// attributed records the vm-level reference ("namespace/vmname") of
+	// the object whose recorded claim an ownerless protection pin was
+	// made for: the registration sweep pins the address of an
+	// unusable-mac claim without a reclaim identity (no valid mac means
+	// no owner reference), and the attribution lets the binding of that
+	// same vm retake its own pin once its identity is corrected, while
+	// every other binding, fresh allocation and unattributed pin stays
+	// rejected. an empty token is an unattributed pin which nothing can
+	attributed map[string]string
 }
 
 // ExcludedOwner is the pseudo-owner marking an address reserved by a
@@ -132,6 +141,7 @@ func (a *IPAllocator) NewSubnet(name string, subnet string, start string, end st
 	}
 	s.ips = allocatedIPs
 	s.owners = make(map[string]string)
+	s.attributed = make(map[string]string)
 
 	a.ipam[name] = s
 
@@ -178,6 +188,7 @@ func (a *IPAllocator) GetIP(name string, givenIP string) (string, error) {
 					// a plain allocation carries no reclaim identity: it
 					// blocks every later owner-specific reclaim
 					delete(a.ipam[name].owners, ip)
+					delete(a.ipam[name].attributed, ip)
 					return ip, nil
 				}
 			}
@@ -185,12 +196,95 @@ func (a *IPAllocator) GetIP(name string, givenIP string) (string, error) {
 			if !allocated {
 				a.ipam[name].ips[ip] = true
 				delete(a.ipam[name].owners, ip)
+				delete(a.ipam[name].attributed, ip)
 				return ip, nil
 			}
 		}
 	}
 
 	return "", fmt.Errorf("no more ips left in network %s", name)
+}
+
+// AllocateIP hands out the next free address of the network as a named
+// reservation of the given allocation reference: a binding's fresh
+// allocation is durably owned from the moment it exists, so the delayed
+// cleanup of a removed nic can release it through the owner-validated
+// release without ever being able to touch an address which a successor
+// took over in the meantime. the reservation carries the same identity
+// the binding's restore path reclaims with, so a resynchronized binding
+// stays idempotent.
+func (a *IPAllocator) AllocateIP(name string, owner string) (string, error) {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	if _, exists := a.ipam[name]; !exists {
+		return "", fmt.Errorf("%s: %w", name, ErrSubnetNotFound)
+	}
+
+	if owner == "" {
+		return "", fmt.Errorf("empty owner for the allocation in network %s", name)
+	}
+
+	for ip, allocated := range a.ipam[name].ips {
+		if !allocated {
+			a.ipam[name].ips[ip] = true
+			a.ipam[name].owners[ip] = owner
+			delete(a.ipam[name].attributed, ip)
+
+			return ip, nil
+		}
+	}
+
+	return "", fmt.Errorf("no more ips left in network %s", name)
+}
+
+// ProtectIP pins the exact address without a reclaim identity: no fresh
+// allocation and no binding can take it while the object whose recorded
+// claim it protects may still need it. claimant carries the vm-level
+// reference ("namespace/vmname") of the object the pin was made for, so
+// the binding of that same vm can retake its own pin once its identity is
+// corrected (ReclaimIPClaimant); an empty claimant is an unattributed pin
+// which nothing can ever reclaim, which keeps unknown historical
+// references conservative.
+func (a *IPAllocator) ProtectIP(name string, givenIP string, claimant string) error {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	if _, exists := a.ipam[name]; !exists {
+		return fmt.Errorf("%s: %w", name, ErrSubnetNotFound)
+	}
+
+	gIP, err := netip.ParseAddr(givenIP)
+	if err != nil {
+		return err
+	}
+	gIPCheck := a.ipam[name].cidr.Contains(gIP)
+	if !gIPCheck {
+		return fmt.Errorf("given ip %s is not cidr %s", givenIP, a.ipam[name].cidr)
+	}
+
+	if a.ipam[name].broadcast.Equal(gIP.Unmap().AsSlice()) {
+		return fmt.Errorf("given ip %s equals the broadcast address %s", givenIP, a.ipam[name].broadcast.String())
+	}
+
+	ip := gIP.Unmap().String()
+
+	allocated, withinRange := a.ipam[name].ips[ip]
+	if !withinRange {
+		return fmt.Errorf("given ip %s is not between the pool range of network %s", ip, name)
+	}
+	if allocated {
+		return fmt.Errorf("given ip %s is already allocated", ip)
+	}
+
+	a.ipam[name].ips[ip] = true
+	// the pin deliberately carries no owner identity; the attribution
+	// records which object's claim it protects
+	if claimant != "" {
+		a.ipam[name].attributed[ip] = claimant
+	}
+
+	return nil
 }
 
 // ReclaimIP allocates the exact address for the given allocation reference
@@ -201,6 +295,19 @@ func (a *IPAllocator) GetIP(name string, givenIP string) (string, error) {
 // one whose plain allocation carries no reclaim identity - is rejected, so
 // a fresh allocation can never take a still-owned address silently.
 func (a *IPAllocator) ReclaimIP(name string, givenIP string, owner string) (string, error) {
+	return a.ReclaimIPClaimant(name, givenIP, owner, "")
+}
+
+// ReclaimIPClaimant reclaims like ReclaimIP, and additionally accepts an
+// ownerless protection pin which the registration sweep attributed to the
+// claiming vm-level reference: the sweep pins the recorded address of a
+// claim with an unusable macaddress without an owner identity (no valid
+// mac means no owner reference), so the binding of that same vm retakes
+// its own pin once the identity is corrected, while a pin attributed to
+// another vm, an unattributed pin and a foreign named owner all stay
+// rejected. the decision runs under one lock acquisition, so a successor
+// which takes the address over in the meantime can never be displaced.
+func (a *IPAllocator) ReclaimIPClaimant(name string, givenIP string, owner string, claimant string) (string, error) {
 	a.mutex.Lock()
 	defer a.mutex.Unlock()
 
@@ -233,15 +340,27 @@ func (a *IPAllocator) ReclaimIP(name string, givenIP string, owner string) (stri
 	if allocated, withinRange := a.ipam[name].ips[givenIP]; !withinRange {
 		return "", fmt.Errorf("given ip %s is not between the pool range of network %s", givenIP, name)
 	} else if allocated {
-		if current := a.ipam[name].owners[givenIP]; current != owner {
-			return "", fmt.Errorf("given ip %s is already allocated by %s: %w", givenIP, current, ErrIPForeignOwner)
+		current := a.ipam[name].owners[givenIP]
+		if current == owner {
+			return givenIP, nil
 		}
 
-		return givenIP, nil
+		if current == "" && claimant != "" && a.ipam[name].attributed[givenIP] == claimant {
+			// the own protection pin of a claim which could not form its
+			// owner identity at registration time: promote it now that
+			// the corrected identity claims it
+			a.ipam[name].owners[givenIP] = owner
+			delete(a.ipam[name].attributed, givenIP)
+
+			return givenIP, nil
+		}
+
+		return "", fmt.Errorf("given ip %s is already allocated by %s: %w", givenIP, current, ErrIPForeignOwner)
 	}
 
 	a.ipam[name].ips[givenIP] = true
 	a.ipam[name].owners[givenIP] = owner
+	delete(a.ipam[name].attributed, givenIP)
 
 	return givenIP, nil
 }
@@ -295,12 +414,14 @@ func (a *IPAllocator) AdoptIP(name string, givenIP string, owner string) (err er
 
 		// promote the anonymous allocation to the verified owner
 		a.ipam[name].owners[ip] = owner
+		delete(a.ipam[name].attributed, ip)
 
 		return nil
 	}
 
 	a.ipam[name].ips[ip] = true
 	a.ipam[name].owners[ip] = owner
+	delete(a.ipam[name].attributed, ip)
 
 	return nil
 }
@@ -333,6 +454,7 @@ func (a *IPAllocator) ReleaseIP(name string, givenIP string) (err error) {
 				// a released address forgets its owner: a later reclaim
 				// starts over instead of matching a stale identity
 				delete(a.ipam[name].owners, ip)
+				delete(a.ipam[name].attributed, ip)
 
 				return
 			} else {
@@ -389,11 +511,11 @@ func (a *IPAllocator) ReleaseIPOwnedBy(name string, givenIP string, owner string
 	if current := a.ipam[name].owners[ip]; current != owner {
 		return fmt.Errorf("given ip %s is allocated by %s: %w", ip, current, ErrIPForeignOwner)
 	}
-
 	a.ipam[name].ips[ip] = false
 	// a released address forgets its owner: a later reclaim starts over
 	// instead of matching a stale identity
 	delete(a.ipam[name].owners, ip)
+	delete(a.ipam[name].attributed, ip)
 
 	return
 }

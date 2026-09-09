@@ -119,7 +119,7 @@ func TestMainEraReplayNormalizesNonCanonicalMAC(t *testing.T) {
 func TestMainEraDeleteReleases(t *testing.T) {
 	e := newTestEnv(t)
 	e.addSubnet("10.0.0.1", "10.0.0.2")
-	if _, err := e.ipam.GetIP(testNetwork, "10.0.0.1"); err != nil {
+	if _, err := e.ipam.ReclaimIP(testNetwork, "10.0.0.1", canonicalLegacy); err != nil {
 		t.Fatalf("occupying ip: %s", err)
 	}
 	if err := e.dhcp.AddLease(testMAC, testNetwork, "10.0.0.1", legacyVMRef); err != nil {
@@ -154,7 +154,7 @@ func TestMainEraDeleteReleases(t *testing.T) {
 func TestMainEraDeleteNonCanonicalAfterNormalization(t *testing.T) {
 	e := newTestEnv(t)
 	e.addSubnet("10.0.0.1", "10.0.0.2")
-	if _, err := e.ipam.GetIP(testNetwork, "10.0.0.1"); err != nil {
+	if _, err := e.ipam.ReclaimIP(testNetwork, "10.0.0.1", canonicalLegacy); err != nil {
 		t.Fatalf("occupying ip: %s", err)
 	}
 	if err := e.dhcp.AddLease(testMAC, testNetwork, "10.0.0.1", legacyVMRef); err != nil {

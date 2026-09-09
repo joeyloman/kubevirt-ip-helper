@@ -160,7 +160,7 @@ func TestVMNetCfgClearedAddressRecoversAfterCleanupFailure(t *testing.T) {
 func TestVMNetCfgDeleteForeignStatusEntryStillConverges(t *testing.T) {
 	e := newTestEnv(t)
 	e.addSubnet("10.0.0.1", "10.0.0.1")
-	if _, err := e.ipam.GetIP(testNetwork, "10.0.0.1"); err != nil {
+	if _, err := e.ipam.ReclaimIP(testNetwork, "10.0.0.1", canonicalLegacy); err != nil {
 		t.Fatalf("occupying the address: %s", err)
 	}
 	if err := e.dhcp.AddLease(testMAC, testNetwork, "10.0.0.1", legacyVMRef); err != nil {

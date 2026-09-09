@@ -782,7 +782,7 @@ func TestVMNetCfgExistingLeaseIdempotency(t *testing.T) {
 func TestVMNetCfgRequestedIPTransition(t *testing.T) {
 	e := newTestEnv(t)
 	e.addSubnet("10.0.0.1", "10.0.0.2")
-	if _, err := e.ipam.GetIP(testNetwork, "10.0.0.1"); err != nil {
+	if _, err := e.ipam.ReclaimIP(testNetwork, "10.0.0.1", "default/vm-test [02:00:00:00:00:01]"); err != nil {
 		t.Fatalf("occupying old ip: %s", err)
 	}
 	if err := e.dhcp.AddLease(testMAC, testNetwork, "10.0.0.1", testNamespace+"/"+testVMName); err != nil {
@@ -837,7 +837,7 @@ func TestVMNetCfgRequestedIPTransition(t *testing.T) {
 func TestVMNetCfgDeletionFinalizerCleanup(t *testing.T) {
 	seedCleanupState := func(e *testEnv) *kihv1.VirtualMachineNetworkConfig {
 		e.addSubnet("10.0.0.1", "10.0.0.1")
-		if _, err := e.ipam.GetIP(testNetwork, "10.0.0.1"); err != nil {
+		if _, err := e.ipam.ReclaimIP(testNetwork, "10.0.0.1", "default/vm-test [02:00:00:00:00:01]"); err != nil {
 			e.t.Fatalf("occupying ip: %s", err)
 		}
 		if err := e.dhcp.AddLease(testMAC, testNetwork, "10.0.0.1", testNamespace+"/"+testVMName); err != nil {
@@ -1720,7 +1720,7 @@ func TestVMNetCfgDeletionReleasesAcrossForeignNetworkLease(t *testing.T) {
 	e := newTestEnv(t)
 	e.addSubnet("10.0.0.1", "10.0.0.1")
 	e.seedPool(map[string]string{"10.0.0.1": "default/vm-test [02:00:00:00:00:01]"})
-	if _, err := e.ipam.GetIP(testNetwork, "10.0.0.1"); err != nil {
+	if _, err := e.ipam.ReclaimIP(testNetwork, "10.0.0.1", "default/vm-test [02:00:00:00:00:01]"); err != nil {
 		t.Fatalf("allocating the own reservation: %s", err)
 	}
 
@@ -1758,7 +1758,7 @@ func TestVMNetCfgOldAddressCleanupIgnoresForeignNetworkLease(t *testing.T) {
 	e := newTestEnv(t)
 	e.addSubnet("10.0.0.1", "10.0.0.1")
 	e.seedPool(map[string]string{"10.0.0.1": "default/vm-test [02:00:00:00:00:01]"})
-	if _, err := e.ipam.GetIP(testNetwork, "10.0.0.1"); err != nil {
+	if _, err := e.ipam.ReclaimIP(testNetwork, "10.0.0.1", "default/vm-test [02:00:00:00:00:01]"); err != nil {
 		t.Fatalf("allocating the own reservation: %s", err)
 	}
 
@@ -1833,7 +1833,7 @@ func TestVMNetCfgDeletionRefreshesPoolMetrics(t *testing.T) {
 	e := newTestEnv(t)
 	e.addSubnet("10.0.0.1", "10.0.0.2")
 	e.seedPool(map[string]string{"10.0.0.1": "default/vm-test [02:00:00:00:00:01]"})
-	if _, err := e.ipam.GetIP(testNetwork, "10.0.0.1"); err != nil {
+	if _, err := e.ipam.ReclaimIP(testNetwork, "10.0.0.1", "default/vm-test [02:00:00:00:00:01]"); err != nil {
 		t.Fatalf("allocating the recorded address: %s", err)
 	}
 	if err := e.dhcp.AddLease(testMAC, testNetwork, "10.0.0.1", testNamespace+"/"+testVMName); err != nil {

@@ -144,11 +144,20 @@ type ippoolBehaviorRestState struct {
 	putPath  string
 	lastBody *kihv1.IPPool
 	// vmnetcfgs backs the cluster-wide list of the claim protection sweep
+	// and its per-object re-verification reads
 	vmnetcfgs []*kihv1.VirtualMachineNetworkConfig
 	// failVMNetCfgList switches the list into its failure mode so a
 	// registration cannot obtain its claim snapshot
 	failVMNetCfgList bool
 	listCount        int
+	// failVMNetCfgGet switches the per-object claim re-verification into
+	// its failure mode so an unverifiable claim must fail the registration
+	failVMNetCfgGet  bool
+	vmnetcfgGetCount int
+	// vmnetcfgListHook runs after the list response was served: the
+	// concurrency regressions use it to complete a concurrent cleanup
+	// between the frozen list snapshot and the re-verification reads
+	vmnetcfgListHook func()
 }
 
 func ippoolBehaviorNewRestState(pool *kihv1.IPPool) *ippoolBehaviorRestState {
@@ -203,29 +212,74 @@ func (s *ippoolBehaviorRestState) ippoolBehaviorHandler() http.Handler {
 		}
 	})
 	mux.HandleFunc(vmPrefix, func(w http.ResponseWriter, r *http.Request) {
-		s.mu.Lock()
-		defer s.mu.Unlock()
-
 		if r.Method != http.MethodGet {
 			ippoolBehaviorWriteKubeError(w, http.StatusMethodNotAllowed)
-			return
-		}
-
-		s.listCount++
-		if s.failVMNetCfgList {
-			ippoolBehaviorWriteKubeError(w, http.StatusNotFound)
 			return
 		}
 
 		list := &kihv1.VirtualMachineNetworkConfigList{
 			TypeMeta: metav1.TypeMeta{APIVersion: kihv1.SchemeGroupVersion.String(), Kind: "VirtualMachineNetworkConfigList"},
 		}
+
+		hook := func() {}
+
+		s.mu.Lock()
+		s.listCount++
+		if s.failVMNetCfgList {
+			s.mu.Unlock()
+			ippoolBehaviorWriteKubeError(w, http.StatusNotFound)
+			return
+		}
 		for _, obj := range s.vmnetcfgs {
 			list.Items = append(list.Items, *obj.DeepCopy())
 		}
+		hook = s.vmnetcfgListHook
+		s.mu.Unlock()
 
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(list)
+
+		if hook != nil {
+			// the frozen snapshot was served: complete the interleaved
+			// concurrent cleanup before the re-verification reads arrive.
+			// the hook runs without the state lock and takes care of its
+			// own locking
+			hook()
+		}
+	})
+	// the per-object re-verification read of the claim sweep: the
+	// namespaced GET of one claiming object
+	// (/apis/.../v1/namespaces/{ns}/virtualmachinenetworkconfigs/{name})
+	mux.HandleFunc("/apis/kubevirtiphelper.k8s.binbash.org/v1/namespaces/", func(w http.ResponseWriter, r *http.Request) {
+		segments := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+		if len(segments) != 7 || segments[3] != "namespaces" || segments[5] != "virtualmachinenetworkconfigs" {
+			ippoolBehaviorWriteKubeError(w, http.StatusNotFound)
+			return
+		}
+
+		if r.Method != http.MethodGet {
+			ippoolBehaviorWriteKubeError(w, http.StatusMethodNotAllowed)
+			return
+		}
+
+		s.mu.Lock()
+		defer s.mu.Unlock()
+
+		s.vmnetcfgGetCount++
+		if s.failVMNetCfgGet {
+			ippoolBehaviorWriteKubeError(w, http.StatusInternalServerError)
+			return
+		}
+
+		for _, obj := range s.vmnetcfgs {
+			if obj.Namespace == segments[4] && obj.Name == segments[6] {
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(obj.DeepCopy())
+				return
+			}
+		}
+
+		ippoolBehaviorWriteKubeError(w, http.StatusNotFound)
 	})
 	return mux
 }
@@ -233,10 +287,18 @@ func (s *ippoolBehaviorRestState) ippoolBehaviorHandler() http.Handler {
 func ippoolBehaviorWriteKubeError(w http.ResponseWriter, code int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
+
+	reason := metav1.StatusReasonInternalError
+	if code == http.StatusNotFound {
+		reason = metav1.StatusReasonNotFound
+	} else if code == http.StatusMethodNotAllowed {
+		reason = metav1.StatusReasonMethodNotAllowed
+	}
+
 	_ = json.NewEncoder(w).Encode(&metav1.Status{
 		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"},
 		Status:   metav1.StatusFailure,
-		Reason:   metav1.StatusReasonNotFound,
+		Reason:   reason,
 		Message:  http.StatusText(code),
 		Code:     int32(code),
 	})
