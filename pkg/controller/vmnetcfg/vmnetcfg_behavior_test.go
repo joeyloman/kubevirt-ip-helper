@@ -519,9 +519,29 @@ func (f *fakeAPIServer) handleVMNetCfg(w http.ResponseWriter, r *http.Request, n
 			return
 		}
 		f.mu.Lock()
-		f.vmnetcfgs[key] = obj.DeepCopy()
+		stored, found := f.vmnetcfgs[key]
+		if !found {
+			f.mu.Unlock()
+			writeStatus(w, http.StatusNotFound, metav1.StatusReasonNotFound, "the server could not find the requested resource")
+			return
+		}
+		// a status write based on a stale resourceVersion is a conflict,
+		// like the real apiserver rejects it: a reconciliation whose
+		// snapshot was concurrently updated cannot land anymore. a body
+		// without a resourceVersion stays acceptable so the plain fixtures
+		// which hand the controller its object directly keep working
+		if submitted := obj.ObjectMeta.ResourceVersion; submitted != "" && submitted != stored.ObjectMeta.ResourceVersion {
+			f.mu.Unlock()
+			writeStatus(w, http.StatusConflict, metav1.StatusReasonConflict, "please apply your changes to the latest version and try again")
+			return
+		}
+		// a status subresource write only replaces the status of the
+		// stored object: it must not silently restore a concurrently
+		// removed spec or metadata
+		bumpResourceVersion(stored)
+		stored.Status = *obj.Status.DeepCopy()
 		f.mu.Unlock()
-		f.writeVMNetCfg(w, &obj)
+		f.writeVMNetCfg(w, stored)
 	default:
 		writeStatus(w, http.StatusNotFound, metav1.StatusReasonNotFound, "the server could not find the requested resource")
 	}

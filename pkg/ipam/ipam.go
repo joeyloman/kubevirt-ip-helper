@@ -344,6 +344,60 @@ func (a *IPAllocator) ReleaseIP(name string, givenIP string) (err error) {
 	return fmt.Errorf("given ip %s not found in network %s: %w", givenIP, name, ErrIPAlreadyFree)
 }
 
+// ReleaseIPOwnedBy releases the exact address only while its reservation
+// still carries the given owner reference: a compensating release after a
+// raced cleanup must never free an allocation which a successor took over
+// in the meantime (a fresh anonymous allocation or another owner's named
+// reclaim), so the owner check and the release run under one lock
+// acquisition. the caller treats the foreign-owner and already-free
+// outcomes as converged: there is nothing left of this owner to release.
+func (a *IPAllocator) ReleaseIPOwnedBy(name string, givenIP string, owner string) (err error) {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	if _, exists := a.ipam[name]; !exists {
+		return fmt.Errorf("%s: %w", name, ErrSubnetNotFound)
+	}
+
+	if givenIP == "" {
+		return fmt.Errorf("given ip is empty")
+	}
+
+	if owner == "" {
+		return fmt.Errorf("empty owner for the release of ip %s in network %s", givenIP, name)
+	}
+
+	gIP, err := netip.ParseAddr(givenIP)
+	if err != nil {
+		return err
+	}
+	gIPCheck := a.ipam[name].cidr.Contains(gIP)
+	if !gIPCheck {
+		return fmt.Errorf("given ip %s is not cidr %s: %w", givenIP, a.ipam[name].cidr, ErrIPNotInCidr)
+	}
+
+	ip := gIP.Unmap().String()
+
+	allocated, withinRange := a.ipam[name].ips[ip]
+	if !withinRange {
+		return fmt.Errorf("given ip %s not found in network %s: %w", ip, name, ErrIPAlreadyFree)
+	}
+	if !allocated {
+		return fmt.Errorf("given ip %s: %w", ip, ErrIPAlreadyFree)
+	}
+
+	if current := a.ipam[name].owners[ip]; current != owner {
+		return fmt.Errorf("given ip %s is allocated by %s: %w", ip, current, ErrIPForeignOwner)
+	}
+
+	a.ipam[name].ips[ip] = false
+	// a released address forgets its owner: a later reclaim starts over
+	// instead of matching a stale identity
+	delete(a.ipam[name].owners, ip)
+
+	return
+}
+
 func (a *IPAllocator) Used(name string) (i int) {
 	a.mutex.Lock()
 	defer a.mutex.Unlock()

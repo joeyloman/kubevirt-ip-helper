@@ -79,6 +79,26 @@ func (c *Controller) rollbackAppliedAllocations(vmnetcfg *kihv1.VirtualMachineNe
 	}
 }
 
+// releaseStaleNicClaim releases the ipam claim of a nic whose lease
+// vanished during this reconciliation, but only while the reservation
+// still carries this owner's reference: a successor which took the freed
+// address over in the meantime (a fresh anonymous allocation or another
+// owner's named reclaim) is never released by the stale cleanup. the
+// converged outcomes (a foreign owner, an already-free address, a subnet
+// which is gone) are tolerated: the release is an in-memory operation
+// without a transient failure mode, so it cannot leave the claim behind
+// retriable, and a process restart converges as well because the removed
+// nic records the address nowhere anymore.
+func (c *Controller) releaseStaleNicClaim(networkName string, ip string, ownerRef string) {
+	if err := c.ipam.ReleaseIPOwnedBy(networkName, ip, ownerRef); err != nil &&
+		!errors.Is(err, ipam.ErrIPForeignOwner) &&
+		!util.IsAlreadyReleased(err) {
+		log.Errorf("(vmnetcfg.releaseStaleNicClaim) [%s] cannot release the stale claim of ip %s in network %s: %s",
+			ownerRef, ip, networkName, err)
+		c.metrics.UpdateLogStatus("error")
+	}
+}
+
 func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnetcfg *kihv1.VirtualMachineNetworkConfig) (err error) {
 	var networkChange bool = false
 	var skipNic bool = false
@@ -329,28 +349,57 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 				// pin the lease's address in the allocator under the
 				// verified owner reference: a binding whose lease survived
 				// but whose ipam claim was lost keeps the address
-				// unavailable to fresh allocations. the lease was already
-				// checked to reference this vmnetcfg, so the verified adopt
-				// is idempotent for the own claim and promotes an anonymous
+				// unavailable to fresh allocations. the adoption is guarded
+				// by the live lease - the lease identity is re-validated
+				// under the dhcp lock around the allocator mutation,
+				// because the vm and the vmnetcfg controllers run
+				// independently and a concurrent cleanup can remove the
+				// lease and release the address between the snapshot and
+				// the adopt: an unguarded adopt would recreate the released
+				// reservation for the removed nic. the guarded adopt is
+				// idempotent for the own claim and promotes an anonymous
 				// allocation of a failed earlier sync; a foreign named
 				// allocation fails the sync visibly like the conflicting
 				// ownership record does.
-				if err := c.ipam.AdoptIP(v.NetworkName, lease.ClientIP.String(), util.AllocationRef(vmnetcfg.Namespace, vmnetcfg.Spec.VMName, v.MACAddress)); err != nil {
+				ownerRef := util.AllocationRef(vmnetcfg.Namespace, vmnetcfg.Spec.VMName, v.MACAddress)
+				vmRef := fmt.Sprintf("%s/%s", vmnetcfg.Namespace, vmnetcfg.Spec.VMName)
+				adoptErr := c.dhcp.WithOwnedLease(v.MACAddress, vmRef, func(clientIP string) error {
+					return c.ipam.AdoptIP(v.NetworkName, clientIP, ownerRef)
+				})
+				if adoptErr != nil {
+					if errors.Is(adoptErr, dhcp.ErrLeaseNotFound) || errors.Is(adoptErr, dhcp.ErrLeaseForeignOwner) {
+						// the lease vanished or was reassigned between the
+						// snapshot and the adoption: the nic is being
+						// removed by a concurrent cleanup. the guarded
+						// adopt recreated nothing, and a claim an earlier
+						// reconciliation of this binding left behind is
+						// released while it still carries this owner's
+						// reference, so the removed nic cannot keep the
+						// address blocked and a successor is never touched
+						log.Warnf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] the lease of hwaddr %s vanished before its address could be adopted, releasing the stale claim of the removed nic",
+							vmnetcfg.Namespace, vmnetcfg.Name, v.MACAddress)
+						c.metrics.UpdateLogStatus("warning")
+
+						c.releaseStaleNicClaim(v.NetworkName, lease.ClientIP.String(), ownerRef)
+
+						continue
+					}
+
 					// without the subnet in the allocator no fresh
 					// allocation is possible either, so there is no
 					// unprotected window: leave the pin to the converging
 					// registration retry instead of failing a binding which
 					// keeps serving by its lease
-					if errors.Is(err, ipam.ErrSubnetNotFound) {
+					if errors.Is(adoptErr, ipam.ErrSubnetNotFound) {
 						log.Warnf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] cannot pin the leased address %s: %s",
-							vmnetcfg.Namespace, vmnetcfg.Name, lease.ClientIP.String(), err)
+							vmnetcfg.Namespace, vmnetcfg.Name, lease.ClientIP.String(), adoptErr)
 					} else {
 						log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] ipam re-claim error: %s, skipping interface",
-							vmnetcfg.Namespace, vmnetcfg.Name, err)
+							vmnetcfg.Namespace, vmnetcfg.Name, adoptErr)
 						c.metrics.UpdateLogStatus("error")
 
 						if restoreErr == nil {
-							restoreErr = err
+							restoreErr = adoptErr
 						}
 					}
 				}
@@ -368,22 +417,24 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 				// is transient and the resynced retry converges through the
 				// pool-miss handling.
 
-				// the vm and the vmnetcfg controllers run independently:
-				// this reconciliation can hold a stale snapshot whose nic
-				// is concurrently removed. the repair must not resurrect
-				// ownership state which a raced cleanup just removed, so
-				// the lease is re-validated immediately before the write
+				// this reconciliation can still hold a stale snapshot whose
+				// nic is concurrently removed: the lease can vanish between
+				// the guarded adoption and this write. the repair must not
+				// resurrect ownership state which the raced cleanup removes,
+				// so the lease is re-validated immediately before the write
 				// and the record is verified again afterwards: a vanished
-				// lease skips the repair, and a lease which vanishes
-				// between the write and the verification is undone by the
-				// owner-validated compensating delete (a meanwhile
-				// recorded foreign owner is never clobbered - the own
-				// reference only removes the own record).
-				vmRef := fmt.Sprintf("%s/%s", vmnetcfg.Namespace, vmnetcfg.Spec.VMName)
+				// lease skips the repair and releases the stale claim, and a
+				// lease which vanishes between the write and the
+				// verification is undone by the owner-validated compensating
+				// delete and release (a meanwhile recorded foreign owner or
+				// a successor's allocation is never clobbered - the own
+				// reference only removes the own state).
 				if !c.dhcp.CheckLease(v.MACAddress) || c.dhcp.GetLease(v.MACAddress).Reference != vmRef {
-					log.Warnf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] the lease of hwaddr %s vanished during the ownership repair, skipping it",
+					log.Warnf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] the lease of hwaddr %s vanished during the ownership repair, skipping it and releasing the stale claim of the removed nic",
 						vmnetcfg.Namespace, vmnetcfg.Name, v.MACAddress)
 					c.metrics.UpdateLogStatus("warning")
+
+					c.releaseStaleNicClaim(v.NetworkName, lease.ClientIP.String(), ownerRef)
 
 					continue
 				}
@@ -433,6 +484,15 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 
 						repairErr = err
 					}
+
+					// the claim this reconciliation adopted for the removed
+					// nic is not justified by its lease anymore: release it
+					// while it still carries this owner's reference. the
+					// concurrent cleanup normally released it already (the
+					// owner-validated release treats that as converged) but
+					// a cleanup which skipped its own release must not
+					// leave the claim behind ownerless
+					c.releaseStaleNicClaim(v.NetworkName, lease.ClientIP.String(), ownerRef)
 				}
 
 				if repairErr != nil && restoreErr == nil {

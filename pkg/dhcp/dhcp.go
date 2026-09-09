@@ -312,6 +312,55 @@ func (a *DHCPAllocator) DeleteLeaseOwnedBy(hwAddr string, ref string) (err error
 	return
 }
 
+// WithOwnedLease runs fn with the client ip of the lease only while the
+// lease still exists and references the given owner reference: the
+// validation and the callback run under one lock acquisition, so a
+// concurrent cleanup cannot remove the lease between the check and the
+// claim mutation fn performs (the adoption of the leased address into the
+// ipam allocator). the snapshot-based lease checks of a reconciliation
+// cannot provide this guarantee on their own - there is always a window
+// between an unsynchronized check and the allocator mutation.
+//
+// fn must stay fast and in-memory: it runs while the dhcp allocator lock
+// is held, so it must not make network or kubernetes api calls, and it
+// must only acquire locks which are always taken after the dhcp lock. the
+// ipam allocator lock qualifies: nothing in this codebase takes the dhcp
+// lock while holding the ipam lock.
+func (a *DHCPAllocator) WithOwnedLease(hwAddr string, ref string, fn func(clientIP string) error) (err error) {
+	hw, err := net.ParseMAC(hwAddr)
+	if err != nil {
+		return fmt.Errorf("hwaddr %s is not valid", hwAddr)
+	}
+
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	key := hw.String()
+
+	lease, exists := a.leases[key]
+	if !exists {
+		return fmt.Errorf("%w: hwaddr %s", ErrLeaseNotFound, key)
+	}
+
+	if lease.Reference != ref {
+		return fmt.Errorf("%w: hwaddr %s is registered for %s", ErrLeaseForeignOwner, key, lease.Reference)
+	}
+
+	if lease.ClientIP == nil {
+		return fmt.Errorf("lease of hwaddr %s carries no client ip", key)
+	}
+
+	clientIP := lease.ClientIP.String()
+
+	if err := fn(clientIP); err != nil {
+		return fmt.Errorf("the guarded lease update of hwaddr %s failed: %w", key, err)
+	}
+
+	log.Debugf("(dhcp.WithOwnedLease) guarded lease update for hardware address: %s (%s)", key, ref)
+
+	return
+}
+
 func (a *DHCPAllocator) Usage() {
 	a.mutex.Lock()
 	defer a.mutex.Unlock()

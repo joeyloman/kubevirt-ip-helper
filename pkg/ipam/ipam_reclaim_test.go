@@ -150,3 +150,67 @@ func TestReleaseIPForgetsTheOwner(t *testing.T) {
 		t.Errorf("reclaim after the release = %v, want nil", err)
 	}
 }
+
+// The compensating release of a raced cleanup is owner-validated: it only
+// frees the address while the reservation still carries this owner's
+// reference, so an allocation a successor took over in the meantime (a
+// fresh anonymous allocation or another owner's named reclaim) survives
+// the stale cleanup, and every already-released outcome is converged.
+func TestReleaseIPOwnedByOnlyReleasesTheOwnClaim(t *testing.T) {
+	a := reclaimTestAllocator(t)
+
+	if _, err := a.ReclaimIP("net", "192.168.99.1", "ns/vm [02:00:00:00:00:01]"); err != nil {
+		t.Fatalf("ReclaimIP: %v", err)
+	}
+
+	// a foreign identity must not release the claim
+	if err := a.ReleaseIPOwnedBy("net", "192.168.99.1", "ns/other [02:00:00:00:00:02]"); !errors.Is(err, ErrIPForeignOwner) {
+		t.Errorf("foreign release = %v, want ErrIPForeignOwner", err)
+	}
+	if got := a.Used("net"); got != 1 {
+		t.Errorf("used = %d, want 1 after the rejected foreign release", got)
+	}
+
+	// the own release frees the address and forgets the owner
+	if err := a.ReleaseIPOwnedBy("net", "192.168.99.1", "ns/vm [02:00:00:00:00:01]"); err != nil {
+		t.Fatalf("own release: %v", err)
+	}
+	if got := a.Used("net"); got != 0 {
+		t.Errorf("used = %d, want 0 after the own release", got)
+	}
+	if _, err := a.ReclaimIP("net", "192.168.99.1", "ns/successor [02:00:00:00:00:09]"); err != nil {
+		t.Errorf("successor reclaim after the release = %v, want nil", err)
+	}
+
+	// a successor's anonymous allocation survives the stale owner's cleanup
+	if err := a.ReleaseIPOwnedBy("net", "192.168.99.1", "ns/vm [02:00:00:00:00:01]"); !errors.Is(err, ErrIPForeignOwner) {
+		t.Errorf("release of an anonymous successor allocation = %v, want ErrIPForeignOwner", err)
+	}
+	if got := a.Used("net"); got != 1 {
+		t.Errorf("used = %d, want 1 (the successor keeps the address)", got)
+	}
+}
+
+func TestReleaseIPOwnedByConvergedOutcomes(t *testing.T) {
+	a := reclaimTestAllocator(t)
+
+	// an already-free address is converged
+	if err := a.ReleaseIPOwnedBy("net", "192.168.99.2", "ns/vm [02:00:00:00:00:01]"); !errors.Is(err, ErrIPAlreadyFree) {
+		t.Errorf("release of a free address = %v, want ErrIPAlreadyFree", err)
+	}
+
+	// an address outside the registered subnet was never allocated
+	if err := a.ReleaseIPOwnedBy("net", "10.0.0.1", "ns/vm [02:00:00:00:00:01]"); !errors.Is(err, ErrIPNotInCidr) {
+		t.Errorf("release outside the subnet = %v, want ErrIPNotInCidr", err)
+	}
+
+	// a subnet without allocation state has nothing to release
+	if err := a.ReleaseIPOwnedBy("gone", "192.168.99.1", "ns/vm [02:00:00:00:00:01]"); !errors.Is(err, ErrSubnetNotFound) {
+		t.Errorf("release without a subnet = %v, want ErrSubnetNotFound", err)
+	}
+
+	// an empty owner identity is a caller error, not a converged release
+	if err := a.ReleaseIPOwnedBy("net", "192.168.99.1", ""); err == nil {
+		t.Error("release with an empty owner must fail")
+	}
+}

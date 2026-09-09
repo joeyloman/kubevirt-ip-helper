@@ -553,6 +553,74 @@ func TestDeleteLeaseOwnedBy(t *testing.T) {
 	}
 }
 
+// The guarded lease update runs its callback only while the lease still
+// exists and references the given owner: a concurrent cleanup cannot slip
+// between the validation and the callback's allocator mutation.
+func TestWithOwnedLease(t *testing.T) {
+	a := New()
+	if err := a.AddLease("aa:bb:cc:dd:ee:01", "pool1", "192.168.0.50", "ns1/vm1"); err != nil {
+		t.Fatalf("AddLease: %v", err)
+	}
+
+	var seenIP string
+	if err := a.WithOwnedLease("aa-bb-cc-dd-ee-01", "ns1/vm1", func(clientIP string) error {
+		seenIP = clientIP
+		return nil
+	}); err != nil {
+		t.Fatalf("WithOwnedLease: %v", err)
+	}
+	if seenIP != "192.168.0.50" {
+		t.Errorf("callback ip = %q, want the lease's client ip", seenIP)
+	}
+
+	// a foreign owner reference never reaches the callback
+	called := false
+	if err := a.WithOwnedLease("aa:bb:cc:dd:ee:01", "ns1/other-vm", func(clientIP string) error {
+		called = true
+		return nil
+	}); !errors.Is(err, ErrLeaseForeignOwner) {
+		t.Errorf("foreign-owner guard = %v, want ErrLeaseForeignOwner", err)
+	}
+	if called {
+		t.Error("the callback must not run for a foreign owner")
+	}
+
+	// a vanished lease never reaches the callback
+	if err := a.DeleteLeaseOwnedBy("aa:bb:cc:dd:ee:01", "ns1/vm1"); err != nil {
+		t.Fatalf("DeleteLeaseOwnedBy: %v", err)
+	}
+	if err := a.WithOwnedLease("aa:bb:cc:dd:ee:01", "ns1/vm1", func(clientIP string) error {
+		called = true
+		return nil
+	}); !errors.Is(err, ErrLeaseNotFound) {
+		t.Errorf("missing-lease guard = %v, want ErrLeaseNotFound", err)
+	}
+	if called {
+		t.Error("the callback must not run without the lease")
+	}
+
+	// an invalid macaddress is rejected before the lock
+	if err := a.WithOwnedLease("not-a-mac", "ns1/vm1", func(clientIP string) error { return nil }); err == nil {
+		t.Error("an invalid macaddress must fail the guarded update")
+	}
+}
+
+// The callback's error escapes classifiable: the caller inspects it for
+// the allocator outcomes (a foreign owner, a missing subnet).
+func TestWithOwnedLeasePropagatesTheCallbackError(t *testing.T) {
+	a := New()
+	if err := a.AddLease("aa:bb:cc:dd:ee:01", "pool1", "192.168.0.50", "ns1/vm1"); err != nil {
+		t.Fatalf("AddLease: %v", err)
+	}
+
+	sentinel := errors.New("boom")
+	if err := a.WithOwnedLease("aa:bb:cc:dd:ee:01", "ns1/vm1", func(clientIP string) error {
+		return sentinel
+	}); !errors.Is(err, sentinel) {
+		t.Errorf("callback error = %v, want the wrapped sentinel", err)
+	}
+}
+
 func captureLogrus(t *testing.T, fn func()) string {
 	t.Helper()
 	var buf bytes.Buffer
