@@ -778,7 +778,11 @@ func TestAddPoolResolvesNTPHostnamesOutsideTheAllocatorLock(t *testing.T) {
 
 	// the resolver dials from concurrent goroutines (one per dns server),
 	// so the observations of the allocator lock must be collected under
-	// their own mutex: only the allocator lock itself is under test
+	// their own mutex: only the allocator lock itself is under test. the
+	// assertions read a snapshot taken under the same mutex - a dial which
+	// has not run yet appends into a set nobody is reading, which is fine:
+	// the assertion is that every observed resolution ran outside the
+	// allocator lock, not that the resolution was complete.
 	var observationsMutex sync.Mutex
 	var lockFreeDuringResolve []bool
 	a.resolver = &net.Resolver{
@@ -809,10 +813,16 @@ func TestAddPoolResolvesNTPHostnamesOutsideTheAllocatorLock(t *testing.T) {
 		t.Fatalf("AddPool: %v", err)
 	}
 
-	if len(lockFreeDuringResolve) == 0 {
+	// every access to the observations is mutex-guarded: the assertions
+	// read a snapshot taken under the same lock the dials append under
+	observationsMutex.Lock()
+	observed := append([]bool(nil), lockFreeDuringResolve...)
+	observationsMutex.Unlock()
+
+	if len(observed) == 0 {
 		t.Fatal("the ntp hostname was not resolved, want the resolver to run during AddPool")
 	}
-	for _, free := range lockFreeDuringResolve {
+	for _, free := range observed {
 		if !free {
 			t.Error("the ntp hostname was resolved while the allocator lock was held: packet processing would stall behind the resolver")
 		}
