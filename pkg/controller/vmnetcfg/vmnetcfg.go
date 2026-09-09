@@ -332,7 +332,12 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 				// claim were retained while the record was never rebuilt).
 				// a matching owner entry is confirmed read-only, a missing
 				// entry is rebuilt, and a conflicting entry fails the sync
-				// visibly instead of serving with a leftover claim.
+				// visibly (like the bind path does) instead of serving
+				// silently with a leftover claim. a pool which is gone
+				// surfaces as a cache miss before this path (its deletion
+				// removes the registration), so an IPPool GET failure here
+				// is transient and the resynced retry converges through the
+				// pool-miss handling.
 				if err := c.updateIPPoolStatus(
 					ADD,
 					vmnetcfg.Namespace,

@@ -7,10 +7,12 @@ package vmnetcfg
 // forever (lease-present, used=1, pool owner="").
 
 import (
+	"errors"
 	"net/http"
 	"testing"
 
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/util"
 )
 
 // TestVMNetCfgLeaseIdempotencyRepairsPoolStatus: after a transient status
@@ -65,5 +67,45 @@ func TestVMNetCfgLeaseIdempotencyRepairsPoolStatus(t *testing.T) {
 	}
 	if !e.dhcp.CheckLease(testMAC) {
 		t.Error("the lease must remain")
+	}
+}
+
+// With the entry recorded for another owner the repair cannot converge: the
+// sync must fail visibly (not serve silently under a leftover foreign claim)
+// while keeping the lease and reservation intact for the retried reconcile.
+func TestVMNetCfgLeaseIdempotencyForeignOwnerFailsVisibly(t *testing.T) {
+	e := newTestEnv(t)
+	e.addSubnet("10.0.0.1", "10.0.0.2")
+	e.seedPool(map[string]string{"10.0.0.1": "other-ns/other-vm [02:00:00:00:00:99]"})
+	if _, err := e.ipam.GetIP(testNetwork, "10.0.0.1"); err != nil {
+		t.Fatalf("occupying the claimed address: %s", err)
+	}
+	if err := e.dhcp.AddLease(testMAC, testNetwork, "10.0.0.1", legacyVMRef); err != nil {
+		t.Fatalf("seeding our lease: %s", err)
+	}
+
+	vmnetcfg := newVMNetCfg("10.0.0.1", testMAC)
+	vmnetcfg.Status.NetworkConfig = []kihv1.NetworkConfigStatus{
+		{MACAddress: testMAC, NetworkName: testNetwork, Status: "OK", Message: "IP address successfully allocated"},
+	}
+	e.seedVMNetCfg(vmnetcfg)
+
+	err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, vmnetcfg)
+	if err == nil {
+		t.Fatal("want the foreign-owned record to fail the sync")
+	}
+	if !errors.Is(err, util.ErrForeignOwner) {
+		t.Errorf("error = %v, want the ErrForeignOwner classification", err)
+	}
+	// the failed repair must not unwind the served lease or reservation
+	if !e.dhcp.CheckLease(testMAC) {
+		t.Error("the own lease must remain")
+	}
+	if used := e.ipam.Used(testNetwork); used != 1 {
+		t.Errorf("ipam used = %d, want 1", used)
+	}
+	// the foreign record stays untouched
+	if got := e.getStoredPool().Status.IPv4.Allocated["10.0.0.1"]; got != "other-ns/other-vm [02:00:00:00:00:99]" {
+		t.Errorf("foreign record = %q, want preserved", got)
 	}
 }
