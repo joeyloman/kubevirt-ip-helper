@@ -131,8 +131,9 @@ func ippoolBehaviorAssertDHCPPoolOptions(t *testing.T, d *kihdhcp.DHCPAllocator,
 }
 
 // ippoolBehaviorRestState backs a minimal fake API server for the typed IPPool client: it
-// serves GET (stored object), PUT .../status (echo of the submitted body) and
-// can be switched into failing modes.
+// serves GET (stored object), PUT .../status (echo of the submitted body), the
+// cluster-wide VirtualMachineNetworkConfig LIST the claim protection takes its
+// authoritative snapshot from, and can be switched into failing modes.
 type ippoolBehaviorRestState struct {
 	mu       sync.Mutex
 	pool     *kihv1.IPPool
@@ -142,6 +143,12 @@ type ippoolBehaviorRestState struct {
 	putCount int
 	putPath  string
 	lastBody *kihv1.IPPool
+	// vmnetcfgs backs the cluster-wide list of the claim protection sweep
+	vmnetcfgs []*kihv1.VirtualMachineNetworkConfig
+	// failVMNetCfgList switches the list into its failure mode so a
+	// registration cannot obtain its claim snapshot
+	failVMNetCfgList bool
+	listCount        int
 }
 
 func ippoolBehaviorNewRestState(pool *kihv1.IPPool) *ippoolBehaviorRestState {
@@ -150,6 +157,7 @@ func ippoolBehaviorNewRestState(pool *kihv1.IPPool) *ippoolBehaviorRestState {
 
 func (s *ippoolBehaviorRestState) ippoolBehaviorHandler() http.Handler {
 	const prefix = "/apis/kubevirtiphelper.k8s.binbash.org/v1/ippools"
+	const vmPrefix = "/apis/kubevirtiphelper.k8s.binbash.org/v1/virtualmachinenetworkconfigs"
 	mux := http.NewServeMux()
 	mux.HandleFunc(prefix+"/", func(w http.ResponseWriter, r *http.Request) {
 		restPath := strings.TrimPrefix(r.URL.Path, prefix)
@@ -193,6 +201,31 @@ func (s *ippoolBehaviorRestState) ippoolBehaviorHandler() http.Handler {
 		default:
 			ippoolBehaviorWriteKubeError(w, http.StatusMethodNotAllowed)
 		}
+	})
+	mux.HandleFunc(vmPrefix, func(w http.ResponseWriter, r *http.Request) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+
+		if r.Method != http.MethodGet {
+			ippoolBehaviorWriteKubeError(w, http.StatusMethodNotAllowed)
+			return
+		}
+
+		s.listCount++
+		if s.failVMNetCfgList {
+			ippoolBehaviorWriteKubeError(w, http.StatusNotFound)
+			return
+		}
+
+		list := &kihv1.VirtualMachineNetworkConfigList{
+			TypeMeta: metav1.TypeMeta{APIVersion: kihv1.SchemeGroupVersion.String(), Kind: "VirtualMachineNetworkConfigList"},
+		}
+		for _, obj := range s.vmnetcfgs {
+			list.Items = append(list.Items, *obj.DeepCopy())
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(list)
 	})
 	return mux
 }

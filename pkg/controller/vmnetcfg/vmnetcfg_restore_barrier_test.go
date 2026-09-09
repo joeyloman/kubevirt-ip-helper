@@ -171,3 +171,69 @@ func TestBarrierHoldsBeforeTheRestoration(t *testing.T) {
 		t.Error("the recorded binding must serve again")
 	}
 }
+
+// A recovering pool protects a claim which only the vmnetcfg spec records
+// (its pool status entry was lost by a historical partial write): the
+// ippool-side recovery tests pin that claim through the real registration
+// steps (subnet, exclude pass, claim protection, status rebuild, metrics,
+// cache publication). This test consumes exactly the state that
+// registration publishes - the pinned canonical claim, the rebuilt ledger
+// entry and the cached pool - and reconciles bindings against it with the
+// application already past its startup gate, so the global APP_INIT
+// deferral cannot mask a missing pin: the fresh vm reconciles first, the
+// original binding restores afterwards.
+func TestSpecOnlyClaimRecoveryHoldsUnderAppRunning(t *testing.T) {
+	e := newTestEnv(t)
+	e.addSubnet("10.0.0.2", "10.0.0.3")
+
+	oldRef := util.AllocationRef(testNamespace, "vm-old", testMAC)
+
+	// the state the recovering registration publishes for the spec-only
+	// claim of vm-old
+	e.seedPool(map[string]string{"10.0.0.2": oldRef})
+	if _, err := e.ipam.ReclaimIP(testNetwork, "10.0.0.2", oldRef); err != nil {
+		t.Fatalf("seeding the registration pin: %s", err)
+	}
+
+	// steady state: the application is running, no startup deferral
+	*e.appStatus = APP_RUNNING
+
+	// a different vm requesting an automatic address reconciles first and
+	// must not receive the existing address
+	fresh := &kihv1.VirtualMachineNetworkConfig{
+		ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: "vm-fresh"},
+		Spec:       kihv1.VirtualMachineNetworkConfigSpec{VMName: "vm-fresh"},
+	}
+	fresh.Spec.NetworkConfig = []kihv1.NetworkConfig{
+		{NetworkName: testNetwork, MACAddress: testMAC2},
+	}
+	e.seedVMNetCfg(fresh)
+	if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, fresh); err != nil {
+		t.Fatalf("the fresh vm must receive a free address: %s", err)
+	}
+	if got := e.dhcp.GetLease(testMAC2).ClientIP.String(); got != "10.0.0.3" {
+		t.Errorf("fresh vm address = %q, want 10.0.0.3 (the spec-only claim must be skipped)", got)
+	}
+
+	// the original binding subsequently restores its own address and dhcp
+	// lease, and confirms its rebuilt ownership record
+	old := newVMNetCfg("10.0.0.2", testMAC)
+	old.ObjectMeta.Name = "vm-old"
+	old.Spec.VMName = "vm-old"
+	old.Status.NetworkConfig = []kihv1.NetworkConfigStatus{
+		{MACAddress: testMAC, NetworkName: testNetwork, Status: "OK", Message: "IP address successfully allocated"},
+	}
+	e.seedVMNetCfg(old)
+	if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, old); err != nil {
+		t.Fatalf("the original binding must restore its recorded address: %s", err)
+	}
+	if got := e.dhcp.GetLease(testMAC).ClientIP.String(); got != "10.0.0.2" {
+		t.Errorf("the original binding's lease ip = %q, want its recorded 10.0.0.2", got)
+	}
+	if got := e.getStoredPool().Status.IPv4.Allocated["10.0.0.2"]; got != oldRef {
+		t.Errorf("pool record = %q, want the confirmed owner %q", got, oldRef)
+	}
+	if used := e.ipam.Used(testNetwork); used != 2 {
+		t.Errorf("ipam used = %d, want 2 (both protected claims)", used)
+	}
+}

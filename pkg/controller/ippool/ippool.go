@@ -349,13 +349,42 @@ func (c *Controller) createOrUpdateDHCPPool(pool *kihv1.IPPool) (err error) {
 	return
 }
 
-// protectPersistedClaims pins the ownership records the pool status
-// survived with into the fresh ipam allocator: a recovering pool which
-// registers again after the startup gate dropped its retries must never
-// publish an allocator state which offers the bound addresses of live
-// bindings to fresh allocations. every claim reference the status carries
-// is re-used verbatim, so the restoring vmnetcfg binding reclaims its own
-// recorded address idempotently while a foreign allocation is rejected.
+// protectPersistedClaims pins every durable claim of the pool into the
+// fresh ipam allocator before the registration publishes it: a recovering
+// pool which registers again after the startup gate dropped its retries
+// must never expose an allocator state which offers the bound addresses
+// of live bindings to fresh allocations. the durable claims come from two
+// sources:
+//
+//   - the ownership ledger the pool status survived with. its records are
+//     the authoritative owner decisions of the previous process era, so
+//     they are pinned first and a spec claim which disagrees with them is
+//     a genuine conflict which must not overwrite the recorded owner.
+//     parseable references are normalized to the canonical spelling of
+//     util.AllocationRef before they are pinned and republished: main-era
+//     records such as "ns/vm [02-AA-BB-CC-DD-01]" describe the same owner
+//     as the restoring binding's "ns/vm [02:aa:bb:cc:dd:01]", and only the
+//     canonical spelling keeps the ipam owner identity, the republished
+//     ledger entry and the binding's identity in agreement. unparseable
+//     references keep their conservative protection: the address is pinned
+//     without an owner identity (never reclaimable, so never double-bound)
+//     and the original record is republished verbatim.
+//
+//   - the recorded assignments of the vmnetcfg objects (an authoritative
+//     cluster-wide snapshot). the ledger alone is not a complete inventory:
+//     main could persist a vmnetcfg assignment after the pool status write
+//     failed, so an existing vm can claim an address with no ledger entry
+//     at all. every persisted nonempty ip of every nic of every namespace
+//     referencing this network is pinned under its canonical owner
+//     reference, so the protection does not depend on which binding
+//     reconciles first or on the ledger having survived.
+//
+// the snapshot is taken through the api before the pool is published: the
+// publication point of the registration is the cache add, and fresh
+// allocations require the cached pool, so every claim is pinned strictly
+// before any fresh allocation can see the allocator. a snapshot which
+// cannot be obtained fails the registration instead of publishing an
+// allocator which may hand bound addresses to new vms.
 func (c *Controller) protectPersistedClaims(pool *kihv1.IPPool) (map[string]string, error) {
 	cPool, err := c.kihClientset.KubevirtiphelperV1().IPPools().Get(
 		context.TODO(), pool.Name, metav1.GetOptions{},
@@ -372,7 +401,8 @@ func (c *Controller) protectPersistedClaims(pool *kihv1.IPPool) (map[string]stri
 			continue
 		}
 
-		if _, _, _, ok := util.ParseAllocationRef(ref); !ok {
+		namespace, vmName, hwAddr, ok := util.ParseAllocationRef(ref)
+		if !ok {
 			// an unparseable claim cannot be attributed to an owner: while
 			// it stays inside the pool range the address is protected
 			// unconditionally (a wasted address never double-binds one),
@@ -393,20 +423,30 @@ func (c *Controller) protectPersistedClaims(pool *kihv1.IPPool) (map[string]stri
 			continue
 		}
 
+		// the canonical spelling of the parsed owner: the ipam owner token
+		// and the republished ledger entry must both agree with the
+		// reference the restoring binding constructs, otherwise the same
+		// logical owner of a legacy record is rejected as a foreign owner
+		ownerRef := util.AllocationRef(namespace, vmName, hwAddr)
+		if ownerRef != ref {
+			log.Warnf("(ippool.protectPersistedClaims) IPPool %s carries the allocation reference %q for ip %s in a legacy spelling, normalizing it to %q",
+				pool.Name, ref, ip, ownerRef)
+		}
+
 		// a claim outside the pool range can never be handed out by the
 		// allocator, so publishing it keeps the durable record without an
 		// exposure window; the range may grow back (which triggers an
 		// application reinitialization) and the next registration pins it
 		if !ipWithinPoolRange(pool, ip) {
 			log.Warnf("(ippool.protectPersistedClaims) IPPool %s carries the allocation record %q for ip %s outside its pool range, skipping the pin",
-				pool.Name, ref, ip)
+				pool.Name, ownerRef, ip)
 
-			claims[ip] = ref
+			claims[ip] = ownerRef
 
 			continue
 		}
 
-		if _, err := c.ipam.ReclaimIP(pool.Spec.NetworkName, ip, ref); err != nil {
+		if _, err := c.ipam.ReclaimIP(pool.Spec.NetworkName, ip, ownerRef); err != nil {
 			// a claim which fights the exclude pass or an already-reclaimed
 			// address must surface: publishing the allocator in this state
 			// would offer or drop a bound address
@@ -414,7 +454,93 @@ func (c *Controller) protectPersistedClaims(pool *kihv1.IPPool) (map[string]stri
 				ip, pool.Name, pool.Spec.NetworkName, err.Error())
 		}
 
-		claims[ip] = ref
+		claims[ip] = ownerRef
+	}
+
+	// the ledger is not a complete inventory of the durable claims: pin the
+	// assignments the vmnetcfg objects record for this network as well. the
+	// list is the authoritative cluster-wide snapshot, so the sweep covers
+	// every namespace and every nic, and a claim whose ledger entry was
+	// lost (a historical partial write) is protected like any other
+	vmnetcfgList, err := c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs("").List(
+		context.TODO(), metav1.ListOptions{},
+	)
+	if err != nil {
+		// an incomplete snapshot must not publish the pool: an unseen claim
+		// would be handed to a fresh allocation. the registration fails and
+		// its retry re-runs the whole protection
+		return nil, fmt.Errorf("error while listing the VirtualMachineNetworkConfigs for the claims of IPPool %s: %w", pool.Name, err)
+	}
+
+	for i := range vmnetcfgList.Items {
+		vmnetcfg := &vmnetcfgList.Items[i]
+
+		for _, v := range vmnetcfg.Spec.NetworkConfig {
+			if v.IPAddress == "" || v.NetworkName != pool.Spec.NetworkName {
+				continue
+			}
+
+			// the ledger already decided this address: a spec claim which
+			// disagrees with a recorded owner is a genuine conflict which
+			// stays with the recorded owner (the binding restore surfaces
+			// it visibly), and an agreeing claim is already pinned
+			if _, done := claims[v.IPAddress]; done {
+				continue
+			}
+
+			// an invalid macaddress cannot form an owner identity, so the
+			// binding could never reclaim the address either: protect it
+			// unconditionally without an owner (never double-bound, and a
+			// corrected object recovers through the next restart) instead
+			// of leaving it to a fresh allocation while the guest may
+			// still run with it
+			if _, macErr := net.ParseMAC(v.MACAddress); macErr != nil {
+				if !ipWithinPoolRange(pool, v.IPAddress) {
+					// outside the pool range the allocator can never hand
+					// the address out anyway
+					continue
+				}
+
+				log.Warnf("(ippool.protectPersistedClaims) VirtualMachineNetworkConfig %s/%s records ip %s for the invalid macaddress %q of network %s, protecting the address without an owner identity",
+					vmnetcfg.Namespace, vmnetcfg.Name, v.IPAddress, v.MACAddress, v.NetworkName)
+
+				if _, err := c.ipam.GetIP(pool.Spec.NetworkName, v.IPAddress); err != nil {
+					log.Warnf("(ippool.protectPersistedClaims) cannot protect the recorded ip %s of VirtualMachineNetworkConfig %s/%s: %s",
+						v.IPAddress, vmnetcfg.Namespace, vmnetcfg.Name, err.Error())
+				}
+
+				continue
+			}
+
+			if !ipWithinPoolRange(pool, v.IPAddress) {
+				// outside the pool range the allocator can never hand the
+				// address out, and the binding restore of such a claim
+				// fails visibly on its own
+				log.Warnf("(ippool.protectPersistedClaims) VirtualMachineNetworkConfig %s/%s records the ip %s outside the pool range of network %s, skipping the pin",
+					vmnetcfg.Namespace, vmnetcfg.Name, v.IPAddress, v.NetworkName)
+
+				continue
+			}
+
+			ownerRef := util.AllocationRef(vmnetcfg.Namespace, vmnetcfg.Spec.VMName, v.MACAddress)
+
+			if _, err := c.ipam.ReclaimIP(pool.Spec.NetworkName, v.IPAddress, ownerRef); err != nil {
+				// a claim which fights the exclude pass, the ledger pin or
+				// another spec claim must not overwrite that ownership and
+				// must not block the protection of the remaining claims:
+				// the conflicting binding surfaces the conflict visibly
+				// when it restores
+				log.Warnf("(ippool.protectPersistedClaims) cannot pin the recorded ip %s of VirtualMachineNetworkConfig %s/%s under the owner %q: %s",
+					v.IPAddress, vmnetcfg.Namespace, vmnetcfg.Name, ownerRef, err.Error())
+
+				continue
+			}
+
+			// the pinned spec claim becomes a ledger entry, so the
+			// restoring binding finds its own record again and the next
+			// registration no longer depends on the spec sweep for it
+			claims[v.IPAddress] = ownerRef
+		}
 	}
 
 	return claims, nil
