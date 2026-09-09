@@ -282,6 +282,13 @@ type fakeAPIServer struct {
 	conflictCount     int
 	poolStatusPutCode int
 	vmnetcfgPutCode   int
+	// optional single-shot interleaving hooks for the concurrency
+	// regression tests: they run after the pool request was processed,
+	// simulating a concurrent vm controller cleanup acting between the
+	// reconciliation steps. the hooks are read under the mutex and are
+	// responsible for their own locking and once semantics.
+	poolGetHook func()
+	poolPutHook func()
 }
 
 func newFakeAPIServer() *fakeAPIServer {
@@ -298,6 +305,22 @@ func (f *fakeAPIServer) seedPool(pool *kihv1.IPPool) {
 		pool.ObjectMeta.ResourceVersion = "1"
 	}
 	f.ippools[pool.Name] = pool.DeepCopy()
+}
+
+// runPoolInterleaveHooks fires the optional interleaving hooks after the
+// ippool handler served its request.
+func (f *fakeAPIServer) runPoolInterleaveHooks(method string, path string) {
+	f.mu.Lock()
+	getHook, putHook := f.poolGetHook, f.poolPutHook
+	f.mu.Unlock()
+
+	if getHook != nil && method == http.MethodGet {
+		getHook()
+	}
+
+	if putHook != nil && method == http.MethodPut && strings.HasSuffix(path, "/status") {
+		putHook()
+	}
 }
 
 func (f *fakeAPIServer) seedVMNetCfg(obj *kihv1.VirtualMachineNetworkConfig) {
@@ -339,6 +362,7 @@ func (f *fakeAPIServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			sub = p[2]
 		}
 		f.handleIPPool(w, r, name, sub)
+		f.runPoolInterleaveHooks(r.Method, r.URL.Path)
 	case "namespaces":
 		if len(p) < 4 || p[2] != "virtualmachinenetworkconfigs" {
 			writeStatus(w, http.StatusNotFound, metav1.StatusReasonNotFound, "the server could not find the requested resource")

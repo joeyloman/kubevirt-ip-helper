@@ -367,6 +367,28 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 				// removes the registration), so an IPPool GET failure here
 				// is transient and the resynced retry converges through the
 				// pool-miss handling.
+
+				// the vm and the vmnetcfg controllers run independently:
+				// this reconciliation can hold a stale snapshot whose nic
+				// is concurrently removed. the repair must not resurrect
+				// ownership state which a raced cleanup just removed, so
+				// the lease is re-validated immediately before the write
+				// and the record is verified again afterwards: a vanished
+				// lease skips the repair, and a lease which vanishes
+				// between the write and the verification is undone by the
+				// owner-validated compensating delete (a meanwhile
+				// recorded foreign owner is never clobbered - the own
+				// reference only removes the own record).
+				vmRef := fmt.Sprintf("%s/%s", vmnetcfg.Namespace, vmnetcfg.Spec.VMName)
+				if !c.dhcp.CheckLease(v.MACAddress) || c.dhcp.GetLease(v.MACAddress).Reference != vmRef {
+					log.Warnf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] the lease of hwaddr %s vanished during the ownership repair, skipping it",
+						vmnetcfg.Namespace, vmnetcfg.Name, v.MACAddress)
+					c.metrics.UpdateLogStatus("warning")
+
+					continue
+				}
+
+				var repairErr error
 				if err := c.updateIPPoolStatus(
 					ADD,
 					vmnetcfg.Namespace,
@@ -380,9 +402,41 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 						vmnetcfg.Namespace, vmnetcfg.Name, err)
 					c.metrics.UpdateLogStatus("error")
 
-					if restoreErr == nil {
-						restoreErr = err
+					repairErr = err
+				}
+
+				if repairErr == nil &&
+					(!c.dhcp.CheckLease(v.MACAddress) || c.dhcp.GetLease(v.MACAddress).Reference != vmRef) {
+					// the cleanup of the vm controller removed the lease
+					// between the repair decision and the durable write:
+					// undo the resurrected ownership record before it
+					// blocks the address for a later binding
+					log.Warnf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] the lease of hwaddr %s was removed by a concurrent cleanup during the ownership repair, undoing the record",
+						vmnetcfg.Namespace, vmnetcfg.Name, v.MACAddress)
+					c.metrics.UpdateLogStatus("warning")
+
+					if err := c.updateIPPoolStatus(
+						DELETE,
+						vmnetcfg.Namespace,
+						vmnetcfg.Spec.VMName,
+						v.IPAddress,
+						v.NetworkName,
+						v.MACAddress,
+						pool.(kihv1.IPPool).Name,
+					); err != nil && !errors.Is(err, util.ErrForeignOwner) {
+						// a foreign owner which recorded the address in
+						// the meantime is protected by the owner
+						// validation; any other failure is retriable
+						log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] cannot undo the ownership record after the raced cleanup: %s",
+							vmnetcfg.Namespace, vmnetcfg.Name, err)
+						c.metrics.UpdateLogStatus("error")
+
+						repairErr = err
 					}
+				}
+
+				if repairErr != nil && restoreErr == nil {
+					restoreErr = repairErr
 				}
 
 				continue
