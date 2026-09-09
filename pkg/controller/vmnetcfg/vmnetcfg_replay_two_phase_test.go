@@ -219,6 +219,13 @@ func TestPendingNicNeverOvertakesAFailedRestore(t *testing.T) {
 	}
 }
 
+// The deferred object settles the startup gate through its own sync: the
+// tested controller must actually see the pending object in its indexer
+// (an empty indexer would exercise the missing-object settlement instead
+// of the deferred-nic settlement). its sync is processed and counted
+// during APP_INIT while the pending nic allocates nothing, and after the
+// phase change the requeued deferred work runs through the queue and
+// obtains the address which the recorded assignments left free.
 func TestDeferredObjectSettlesTheStartupGate(t *testing.T) {
 	e := replayTwoPhaseEnv(t)
 	pending := &kihv1.VirtualMachineNetworkConfig{
@@ -228,22 +235,69 @@ func TestDeferredObjectSettlesTheStartupGate(t *testing.T) {
 	pending.Spec.NetworkConfig = []kihv1.NetworkConfig{
 		{MACAddress: testMAC2, NetworkName: testNetwork},
 	}
-	if err := e.controller.indexer.Add(pending); err != nil {
-		t.Fatalf("seeding indexer: %s", err)
+	recorded := newVMNetCfg("10.0.0.1", testMAC)
+	recorded.ObjectMeta.Name = "vm-b"
+	recorded.Spec.VMName = "vm-b"
+	recorded.Spec.NetworkConfig = []kihv1.NetworkConfig{
+		{IPAddress: "10.0.0.1", MACAddress: testMAC, NetworkName: testNetwork},
 	}
 
-	// a gate-wired controller so the settled count of the deferred sync
-	// is observable
+	// a gate-wired controller whose indexer actually holds both objects,
+	// as the informer would deliver them
+	indexer := newTestIndexer()
+	if err := indexer.Add(pending); err != nil {
+		t.Fatalf("seeding the pending object: %s", err)
+	}
+	if err := indexer.Add(recorded); err != nil {
+		t.Fatalf("seeding the recorded object: %s", err)
+	}
 	count := 0
-	controller := NewController(newTestQueue(), newTestIndexer(), nil, e.cache, e.ipam, e.dhcp, e.metrics, e.client, e.appStatus, &count)
+	controller := NewController(newTestQueue(), indexer, nil, e.cache, e.ipam, e.dhcp, e.metrics, e.client, e.appStatus, &count)
 
+	// the deferred object is processed and counted during APP_INIT
 	if err := controller.sync(Event{key: testNamespace + "/vm-a", action: ADD}); err != nil {
 		t.Fatalf("the deferred sync must succeed: %s", err)
 	}
-
-	// the sync of the deferred object counted as handled: the startup
-	// gate is not blocked by the deferred allocation
 	if count != 1 {
-		t.Errorf("gate count = %d, want 1 after the deferred sync settled", count)
+		t.Errorf("gate count = %d, want 1 after the deferred object settled", count)
+	}
+
+	// its pending nic did not allocate during the restoration replay
+	if e.dhcp.CheckLease(testMAC2) {
+		t.Error("the pending nic must not hold a lease during the replay")
+	}
+	if used := e.ipam.Used(testNetwork); used != 0 {
+		t.Errorf("ipam used = %d, want 0 during the replay (nothing allocated)", used)
+	}
+
+	// the recorded assignment of the other object restores while the gate
+	// is still open
+	if err := controller.sync(Event{key: testNamespace + "/vm-b", action: ADD}); err != nil {
+		t.Fatalf("the recorded assignment must restore: %s", err)
+	}
+	if count != 2 {
+		t.Errorf("gate count = %d, want 2 after the recorded object settled", count)
+	}
+	if got := e.dhcp.GetLease(testMAC).ClientIP.String(); got != "10.0.0.1" {
+		t.Errorf("vm-b lease ip = %q, want its recorded 10.0.0.1", got)
+	}
+
+	// after the phase change the deferred work runs through the queue and
+	// obtains the free address
+	*e.appStatus = APP_RUNNING
+	controller.requeueDeferredInitAllocations()
+	if !controller.processNextItem() {
+		t.Fatal("the requeued event must be processable")
+	}
+	if got := e.dhcp.GetLease(testMAC2).ClientIP.String(); got != "10.0.0.2" {
+		t.Errorf("vm-a lease ip = %q, want the free 10.0.0.2 after the replay", got)
+	}
+	if used := e.ipam.Used(testNetwork); used != 2 {
+		t.Errorf("ipam used = %d, want 2 after the deferred allocation", used)
+	}
+
+	// the requeue drained the deferred set: a second requeue is a no-op
+	if keys := controller.releaseDeferredInitAllocations(); len(keys) != 0 {
+		t.Errorf("deferred keys after the requeue = %v, want empty", keys)
 	}
 }
