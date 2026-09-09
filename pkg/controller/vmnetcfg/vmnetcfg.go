@@ -326,6 +326,31 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 					}
 				}
 
+				// the reservation is already applied: repair the durable
+				// pool ownership record, which an earlier status write
+				// failure may have left missing (the lease and the ipam
+				// claim were retained while the record was never rebuilt).
+				// a matching owner entry is confirmed read-only, a missing
+				// entry is rebuilt, and a conflicting entry fails the sync
+				// visibly instead of serving with a leftover claim.
+				if err := c.updateIPPoolStatus(
+					ADD,
+					vmnetcfg.Namespace,
+					vmnetcfg.Spec.VMName,
+					v.IPAddress,
+					v.NetworkName,
+					v.MACAddress,
+					pool.(kihv1.IPPool).Name,
+				); err != nil {
+					log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] %s",
+						vmnetcfg.Namespace, vmnetcfg.Name, err)
+					c.metrics.UpdateLogStatus("error")
+
+					if restoreErr == nil {
+						restoreErr = err
+					}
+				}
+
 				continue
 			}
 		}
