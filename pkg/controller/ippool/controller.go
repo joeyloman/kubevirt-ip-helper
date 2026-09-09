@@ -169,8 +169,16 @@ func (c *Controller) sync(event Event) (err error) {
 
 		pool, poolErr := c.cache.Get("pool", event.poolNetworkName)
 		if poolErr != nil {
-			log.Errorf("(ippool.sync) %s", poolErr)
-			c.metrics.UpdateLogStatus("error")
+			// no live registration exists under this networkname: the pool
+			// was never registered in this process era (its ADD was
+			// rejected, or its attempts failed and a partial registration
+			// was torn back down), so the deletion has no live state to
+			// clean up. this is the converged outcome of a never-registered
+			// pool, not a failure, so it is reported like the name-mismatch
+			// case below instead of counting as an error.
+			log.Warnf("(ippool.sync) IPPool %s [networkname %s] was never registered; skipping cleanup of the live state",
+				event.poolName, event.poolNetworkName)
+			c.metrics.UpdateLogStatus("warning")
 
 			return
 		}

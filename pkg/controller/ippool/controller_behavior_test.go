@@ -786,6 +786,36 @@ func TestSyncDeleteRegisteredPoolFreesItsState(t *testing.T) {
 	}
 }
 
+// deleting an IPPool object whose networkname resolves to no cache entry
+// at all (its registration was rejected, or failed and was torn back down)
+// is the converged outcome of a never-registered pool, not a failure: the
+// delete is a no-op which reports a warning like the name-mismatch case,
+// and the pool still counts for the startup gate so a startup-time
+// deletion cannot block the controller startup
+func TestSyncDeleteUncachedNetworkNameReportsWarning(t *testing.T) {
+	var appStatus int
+	gateCount := new(int)
+
+	indexer := newTestIndexer()
+
+	// no pool is registered under net-gone in this process era
+	controller, _ := newTestController(t, newTestQueue(), indexer, nil, &appStatus, gateCount)
+
+	if err := controller.sync(testPoolEvent("pool-a", DELETE, "net-gone")); err != nil {
+		t.Fatalf("sync(DELETE) for an uncached networkname returned error %v, want nil", err)
+	}
+
+	if v, ok := ippoolBehaviorMetricValue(t, controller.metrics, "kubevirtiphelper_app_logs", map[string]string{"loglevel": "error"}); ok {
+		t.Errorf("app log status gauge: got error entry %v, want none for a converged no-op delete", v)
+	}
+	if v, ok := ippoolBehaviorMetricValue(t, controller.metrics, "kubevirtiphelper_app_logs", map[string]string{"loglevel": "warning"}); !ok || v != 1 {
+		t.Errorf("app log status gauge: got value %v found %v, want exactly 1 warning entry", v, ok)
+	}
+	if *gateCount != 1 {
+		t.Errorf("startup gate count = %d, want 1: a startup-time deletion must count for the gate even without a cache entry", *gateCount)
+	}
+}
+
 // a pool whose networkname changed keeps its cache entry under the old key:
 // its update event must still reach the restart handling through it
 func TestSyncUpdateReachesRestartAfterNetworkNameChange(t *testing.T) {
