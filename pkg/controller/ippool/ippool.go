@@ -12,6 +12,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/network"
 
 	log "github.com/sirupsen/logrus"
@@ -95,6 +96,16 @@ func (c *Controller) registerIPPool(pool *kihv1.IPPool) (cleanup bool, err error
 		pool.Spec.IPv4Config.Pool.Start,
 		pool.Spec.IPv4Config.Pool.End,
 	); err != nil {
+		// a range configuration which can never become valid is a definitive
+		// rejection: classify it unregistrable so the startup gate counts the
+		// pool instead of waiting forever. the 'already exists' conflict stays
+		// a retryable plain error: a half-cleaned registration can still heal
+		// through the teardown of the failed attempt.
+		if errors.Is(err, ipam.ErrSubnetInvalid) {
+			return cleanup, fmt.Errorf("error while allocating a new subnet in IPAM for network [%s]: %s: %w",
+				pool.Spec.NetworkName, err.Error(), ErrPoolUnregistrable)
+		}
+
 		return cleanup, fmt.Errorf("error while allocating a new subnet in IPAM for network [%s]: %s", pool.Spec.NetworkName, err.Error())
 	}
 

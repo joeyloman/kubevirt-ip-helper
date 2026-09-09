@@ -2,6 +2,7 @@ package ipam
 
 import (
 	"bytes"
+	"errors"
 	"net/netip"
 	"strings"
 	"sync"
@@ -133,10 +134,20 @@ func TestIPAMNewSubnetValidationErrors(t *testing.T) {
 		{"bad-cidr", "not-a-cidr", "10.0.0.1", "10.0.0.2"},
 		{"bad-start", "10.0.0.0/24", "not-an-ip", "10.0.0.2"},
 		{"bad-end", "10.0.0.0/24", "10.0.0.1", "not-an-ip"},
+		{"start-outside", "10.0.0.0/24", "10.0.1.1", "10.0.1.2"},
+		{"end-outside", "10.0.0.0/24", "10.0.0.1", "10.0.1.2"},
+		{"reversed-range", "10.0.0.0/24", "10.0.0.50", "10.0.0.1"},
+		{"broadcast-end", "10.0.0.0/29", "10.0.0.1", "10.0.0.7"},
 	}
 	for _, tc := range cases {
-		if err := a.NewSubnet(tc.name, tc.subnet, tc.start, tc.end); err == nil {
+		err := a.NewSubnet(tc.name, tc.subnet, tc.start, tc.end)
+		if err == nil {
 			t.Errorf("NewSubnet(%s) expected error, got nil", tc.name)
+
+			continue
+		}
+		if !errors.Is(err, ErrSubnetInvalid) {
+			t.Errorf("NewSubnet(%s) = %v, want the ErrSubnetInvalid classification", tc.name, err)
 		}
 	}
 }
@@ -158,6 +169,8 @@ func TestIPAMRejectsDuplicateSubnetName(t *testing.T) {
 		t.Fatal("second NewSubnet must be rejected as duplicate")
 	} else if !strings.Contains(err.Error(), "already exists") {
 		t.Errorf("duplicate error = %q, want already-exists message", err)
+	} else if errors.Is(err, ErrSubnetInvalid) {
+		t.Errorf("duplicate conflict = %v, must stay a retryable plain error (not ErrSubnetInvalid)", err)
 	}
 
 	if occupied != "192.168.1.1" {

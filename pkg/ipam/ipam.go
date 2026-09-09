@@ -23,6 +23,12 @@ var (
 	// subnet of the named network: ipam never allocated such an address,
 	// so nothing is left to release and cleanup can converge.
 	ErrIPNotInCidr = errors.New("ip is not inside the subnet")
+
+	// ErrSubnetInvalid reports a subnet registration whose range can never
+	// become valid (unparseable or out-of-range start/end, reversed range or
+	// a broadcast end): the caller can classify the rejection as definitive
+	// instead of retrying it forever or letting the startup gate wait.
+	ErrSubnetInvalid = errors.New("invalid subnet configuration")
 )
 
 type IPSubnet struct {
@@ -62,32 +68,32 @@ func (a *IPAllocator) NewSubnet(name string, subnet string, start string, end st
 
 	ipnet, err := netip.ParsePrefix(subnet)
 	if err != nil {
-		return err
+		return fmt.Errorf("invalid subnet %s: %v: %w", subnet, err, ErrSubnetInvalid)
 	}
 	s.cidr = ipnet
 
 	startIP, err := netip.ParseAddr(start)
 	if err != nil {
-		return err
+		return fmt.Errorf("invalid start address %s: %v: %w", start, err, ErrSubnetInvalid)
 	}
 	startIPCheck := ipnet.Contains(startIP)
 	if !startIPCheck {
-		return fmt.Errorf("start address %s is not within subnet %s range", start, subnet)
+		return fmt.Errorf("start address %s is not within subnet %s range: %w", start, subnet, ErrSubnetInvalid)
 	}
 
 	endIP, err := netip.ParseAddr(end)
 	if err != nil {
-		return err
+		return fmt.Errorf("invalid end address %s: %v: %w", end, err, ErrSubnetInvalid)
 	}
 	endIPCheck := ipnet.Contains(endIP)
 	if !endIPCheck {
-		return fmt.Errorf("end address %s is not within subnet %s range", end, subnet)
+		return fmt.Errorf("end address %s is not within subnet %s range: %w", end, subnet, ErrSubnetInvalid)
 	}
 
 	startAddr, _ := netip.AddrFromSlice(s.start)
 	endAddr, _ := netip.AddrFromSlice(s.end)
 	if startAddr.Compare(endAddr) > 0 {
-		return fmt.Errorf("end address %s is smaller then the start address %s", end, start)
+		return fmt.Errorf("end address %s is smaller then the start address %s: %w", end, start, ErrSubnetInvalid)
 	}
 
 	subnetStart := net.IP(ipnet.Addr().AsSlice())
@@ -99,7 +105,7 @@ func (a *IPAllocator) NewSubnet(name string, subnet string, start string, end st
 	s.broadcast = subnetBroadcast
 
 	if s.end.Equal(s.broadcast) {
-		return fmt.Errorf("end address %s equals the broadcast address %s", s.end.String(), s.broadcast.String())
+		return fmt.Errorf("end address %s equals the broadcast address %s: %w", s.end.String(), s.broadcast.String(), ErrSubnetInvalid)
 	}
 
 	// pre-allocate all ips between the start and end address
