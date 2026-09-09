@@ -21,7 +21,7 @@ import (
 func TestVMNetCfgOldAddressCleanupStatusFailureReMarks(t *testing.T) {
 	e := newTestEnv(t)
 	e.addSubnet("10.0.0.1", "10.0.0.2")
-	e.seedPool(map[string]string{"10.0.0.1": legacyVMRef + " [" + testMAC + "]"})
+	e.seedPool(map[string]string{"10.0.0.1": canonicalLegacy})
 	if _, err := e.ipam.GetIP(testNetwork, "10.0.0.1"); err != nil {
 		t.Fatalf("occupying the old address: %s", err)
 	}
@@ -52,7 +52,7 @@ func TestVMNetCfgOldAddressCleanupStatusFailureReMarks(t *testing.T) {
 	if _, err := e.ipam.GetIP(testNetwork, "10.0.0.1"); err == nil {
 		t.Fatal("the re-marked old address must not be reissuable")
 	}
-	if got := e.getStoredPool().Status.IPv4.Allocated["10.0.0.1"]; got != legacyVMRef+" ["+testMAC+"]" {
+	if got := e.getStoredPool().Status.IPv4.Allocated["10.0.0.1"]; got != canonicalLegacy {
 		t.Errorf("old status entry = %q, want preserved after the failed delete", got)
 	}
 
@@ -74,7 +74,7 @@ func TestVMNetCfgOldAddressCleanupStatusFailureReMarks(t *testing.T) {
 		t.Error("the old address must not be reissuable after the converged retry")
 	}
 	pool := e.getStoredPool()
-	if got := pool.Status.IPv4.Allocated["10.0.0.2"]; got != legacyVMRef+" ["+testMAC+"]" {
+	if got := pool.Status.IPv4.Allocated["10.0.0.2"]; got != canonicalLegacy {
 		t.Errorf("new status entry = %q, want recorded", got)
 	}
 	if _, exists := pool.Status.IPv4.Allocated["10.0.0.1"]; !exists {

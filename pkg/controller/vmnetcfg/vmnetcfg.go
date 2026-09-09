@@ -624,13 +624,20 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 			c.metrics.UpdateLogStatus("warning")
 		} else {
 			// the pool status record could not be removed although the
-			// address was already released: the transition stays half-done
-			// and the address must not stay free for a fresh allocation, so
-			// the reservation is re-marked before the retry. the single
-			// controller worker serializes allocations, so the mark is
-			// still claimable; it stays held until a process restart
-			// rebuilds the status from the specs (fail closed).
-			if released {
+			// address was already released: during a live ip change the
+			// transition stays half-done and the address must not stay free
+			// for a fresh allocation, so the reservation is re-marked before
+			// the retry. the only other in-process allocator is the ippool
+			// worker's Exclude pass during a pool registration, which must
+			// not name this exact address; if it ever does, the re-mark
+			// reports 'already allocated' loudly below (and is invalidated
+			// if the vmnetcfg controller ever runs with more than one
+			// worker). during deletion the release stays immediate like
+			// before - immediate release on VM delete is the documented
+			// behavior - and the finalizer retry re-runs the whole cleanup
+			// (lease already converged, release succeeds, status delete
+			// retried).
+			if released && !deleting {
 				if _, markErr := c.ipam.GetIP(netCfg.NetworkName, netCfg.IPAddress); markErr != nil {
 					log.Errorf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] cannot re-mark the released address %s: %s",
 						vmnetcfg.Namespace, vmnetcfg.Name, netCfg.IPAddress, markErr)
