@@ -520,8 +520,15 @@ func (a *DHCPAllocator) sendNak(conn net.PacketConn, m *dhcpv4.DHCPv4, serverIP 
 
 	dst := &net.UDPAddr{IP: net.IPv4bcast, Port: dhcpv4.ClientPort}
 	if !m.GatewayIPAddr.Equal(net.IPv4zero) {
-		// the request was relayed: the relay agent forwards the nak
-		// towards the client's hardware address
+		// rfc 2131 section 4.3.2: a relayed client may not hold a valid
+		// network address or subnet mask and may not answer arp requests:
+		// the server MUST set the broadcast bit in the nak so the relay
+		// agent broadcasts it to the client (the request's own flags are
+		// copied by the reply builder, but the bit is set regardless)
+		reply.SetBroadcast()
+
+		// the relay agent forwards the nak towards the client's hardware
+		// address
 		dst = &net.UDPAddr{IP: m.GatewayIPAddr, Port: dhcpv4.ServerPort}
 	}
 
