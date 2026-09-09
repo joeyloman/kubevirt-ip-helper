@@ -33,6 +33,20 @@ const (
 // uncounted until the attempt settles.
 var ErrPoolUnregistrable = errors.New("the pool cannot be registered in its current form")
 
+// subnetRegistrationError classifies a NewSubnet failure for the startup
+// gate: a range configuration which can never become valid is a definitive
+// rejection (unregistrable, so the gate counts the pool as handled instead
+// of waiting forever), while every other error - including the retryable
+// 'already exists' state conflict of a half-cleaned registration - keeps
+// its plain error so the retried attempt can still settle it.
+func subnetRegistrationError(networkName string, err error) error {
+	if errors.Is(err, ipam.ErrSubnetInvalid) {
+		return fmt.Errorf("error while allocating a new subnet in IPAM for network [%s]: %s: %w", networkName, err.Error(), ErrPoolUnregistrable)
+	}
+
+	return fmt.Errorf("error while allocating a new subnet in IPAM for network [%s]: %s", networkName, err.Error())
+}
+
 func (c *Controller) registerIPPool(pool *kihv1.IPPool) (cleanup bool, err error) {
 
 	// the startup gate counts this pool as handled once its registration
@@ -96,17 +110,7 @@ func (c *Controller) registerIPPool(pool *kihv1.IPPool) (cleanup bool, err error
 		pool.Spec.IPv4Config.Pool.Start,
 		pool.Spec.IPv4Config.Pool.End,
 	); err != nil {
-		// a range configuration which can never become valid is a definitive
-		// rejection: classify it unregistrable so the startup gate counts the
-		// pool instead of waiting forever. the 'already exists' conflict stays
-		// a retryable plain error: a half-cleaned registration can still heal
-		// through the teardown of the failed attempt.
-		if errors.Is(err, ipam.ErrSubnetInvalid) {
-			return cleanup, fmt.Errorf("error while allocating a new subnet in IPAM for network [%s]: %s: %w",
-				pool.Spec.NetworkName, err.Error(), ErrPoolUnregistrable)
-		}
-
-		return cleanup, fmt.Errorf("error while allocating a new subnet in IPAM for network [%s]: %s", pool.Spec.NetworkName, err.Error())
+		return cleanup, subnetRegistrationError(pool.Spec.NetworkName, err)
 	}
 
 	// mark the exclude ips as used

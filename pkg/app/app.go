@@ -179,6 +179,14 @@ func (h *handler) Run(mainCtx context.Context) {
 	})
 }
 
+// initGateOpen reports whether the startup gate has counted enough objects
+// to proceed: the comparison tolerates an overshoot (an object created after
+// the startup snapshot counts too), so the gate opens when no object is
+// still waiting instead of requiring an exact match.
+func initGateOpen(current int, target int) bool {
+	return current >= target
+}
+
 func (h *handler) RunServices(ctx context.Context) {
 	var logStartupStateCheck int
 
@@ -236,7 +244,7 @@ func (h *handler) RunServices(ctx context.Context) {
 	// this prevents race conditions
 	logStartupStateCheck = 0
 	for {
-		if h.ippoolCountCurrent < h.ippoolCountTarget {
+		if !initGateOpen(h.ippoolCountCurrent, h.ippoolCountTarget) {
 			time.Sleep(time.Second * 5)
 
 			if logStartupStateCheck == 12 {
@@ -294,7 +302,7 @@ func (h *handler) RunServices(ctx context.Context) {
 	// this prevents race conditions
 	logStartupStateCheck = 0
 	for {
-		if h.vmnetcfgCountCurrent < h.vmnetcfgCountTarget {
+		if !initGateOpen(h.vmnetcfgCountCurrent, h.vmnetcfgCountTarget) {
 			time.Sleep(time.Second * 10)
 
 			if logStartupStateCheck == 30 {

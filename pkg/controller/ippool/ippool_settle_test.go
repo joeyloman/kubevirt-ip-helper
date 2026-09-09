@@ -6,7 +6,11 @@ package ippool
 
 import (
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
+
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
 )
 
 // A pool deleted during startup - before its registration ever settled -
@@ -63,5 +67,47 @@ func TestHandleErrDropSettlesStartupCount(t *testing.T) {
 
 	if countCurrent != 1 {
 		t.Errorf("ippool count = %d after the dropped key, want 1", countCurrent)
+	}
+}
+
+// The NewSubnet call-site classification is the only thing preventing a
+// typo'd range from wedging the startup gate forever: a deterministic
+// range rejection must come out unregistrable, while the retryable
+// already-exists conflict and plain transient errors stay unchanged.
+func TestSubnetRegistrationErrorClassification(t *testing.T) {
+	cases := []struct {
+		name              string
+		err               error
+		wantUnregistrable bool
+		wantText          string
+	}{
+		{
+			name:              "invalid-range",
+			err:               fmt.Errorf("start address 10.0.1.1 is not within subnet 10.0.0.0/24 range: %w", ipam.ErrSubnetInvalid),
+			wantUnregistrable: true,
+			wantText:          "cannot be registered",
+		},
+		{
+			name:     "duplicate-conflict",
+			err:      errors.New("network net-x already exists"),
+			wantText: "already exists",
+		},
+		{
+			name:     "plain-transient",
+			err:      errors.New("boom"),
+			wantText: "boom",
+		},
+	}
+	for _, tc := range cases {
+		got := subnetRegistrationError("net-x", tc.err)
+		if isUnregistrable := errors.Is(got, ErrPoolUnregistrable); isUnregistrable != tc.wantUnregistrable {
+			t.Errorf("%s: errors.Is(ErrPoolUnregistrable) = %v, want %v (%v)", tc.name, isUnregistrable, tc.wantUnregistrable, got)
+		}
+		if !strings.Contains(got.Error(), tc.wantText) {
+			t.Errorf("%s: error = %q, want text %q", tc.name, got.Error(), tc.wantText)
+		}
+		if !strings.Contains(got.Error(), "net-x") {
+			t.Errorf("%s: error = %q, want the network name", tc.name, got.Error())
+		}
 	}
 }

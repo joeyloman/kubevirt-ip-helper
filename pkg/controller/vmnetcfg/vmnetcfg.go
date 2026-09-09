@@ -283,9 +283,31 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 				oldNetcfg.IPAddress = lease.ClientIP.String()
 
 				if cleanupErr := c.cleanupNetworkInterface(vmnetcfg, &oldNetcfg, false); cleanupErr != nil {
-					c.rollbackAppliedAllocations(vmnetcfg, appliedAllocations)
+					// the transition could not complete: defer the failure
+					// and keep processing the remaining interfaces, so a
+					// failed cleanup of one interface never blocks the
+					// restoration of the others
+					log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] failed to clean up the old address of hwaddr %s: %s",
+						vmnetcfg.Namespace, vmnetcfg.Name, v.MACAddress, cleanupErr)
+					c.metrics.UpdateLogStatus("error")
 
-					return cleanupErr
+					newVmNetCfgs = append(newVmNetCfgs, v)
+
+					for _, nic := range vmnetcfg.Status.NetworkConfig {
+						if v.MACAddress == nic.MACAddress && v.NetworkName == nic.NetworkName {
+							netcfgStatus.Status = nic.Status
+							netcfgStatus.Message = nic.Message
+							newNetCfgStatusList = append(newNetCfgStatusList, netcfgStatus)
+
+							break
+						}
+					}
+
+					if restoreErr == nil {
+						restoreErr = cleanupErr
+					}
+
+					continue
 				}
 			} else {
 				log.Debugf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] hwaddr %s already exists in the leases, skipping interface",
@@ -332,17 +354,24 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 			ref,
 		); err != nil {
 			// dhcp must not serve the address when its owner reference
-			// cannot be registered: revert this interface's claim with
-			// every previously applied allocation of this sync
+			// cannot be registered: queue this interface's claim for the
+			// post-sync unwind (a restored durable claim stays reserved)
+			// and defer the failure so the remaining interfaces are still
+			// processed
 			log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] error registering the dhcp lease: %s",
 				vmnetcfg.Namespace, vmnetcfg.Name, err)
 			c.metrics.UpdateLogStatus("error")
 
 			rememberApplied(pool.(kihv1.IPPool).Name, v.MACAddress, v.NetworkName, ip, false)
-			c.rollbackAppliedAllocations(vmnetcfg, appliedAllocations)
 
-			return fmt.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] cannot register the dhcp lease for hwaddr %s: %s",
-				vmnetcfg.Namespace, vmnetcfg.Name, v.MACAddress, err.Error())
+			newVmNetCfgs = append(newVmNetCfgs, v)
+
+			if restoreErr == nil {
+				restoreErr = fmt.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] cannot register the dhcp lease for hwaddr %s: %s",
+					vmnetcfg.Namespace, vmnetcfg.Name, v.MACAddress, err.Error())
+			}
+
+			continue
 		}
 
 		n := kihv1.NetworkConfig{}
@@ -365,17 +394,24 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 			pool.(kihv1.IPPool).Name,
 		); err != nil {
 			// the lease would be served while the durable allocation state
-			// is missing: revert this interface's allocation with every
-			// previously applied allocation of this sync
+			// is missing: queue this interface's claim for the post-sync
+			// unwind (a restored durable claim of a transient status write
+			// failure stays reserved and protected) and defer the failure
+			// so the remaining interfaces are still processed
 			log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] %s",
 				vmnetcfg.Namespace, vmnetcfg.Name, err)
 			c.metrics.UpdateLogStatus("error")
 
 			rememberApplied(pool.(kihv1.IPPool).Name, v.MACAddress, v.NetworkName, ip, errors.Is(err, util.ErrForeignOwner))
-			c.rollbackAppliedAllocations(vmnetcfg, appliedAllocations)
 
-			return fmt.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] cannot update the IPPool %s status for ip %s: %w",
-				vmnetcfg.Namespace, vmnetcfg.Name, pool.(kihv1.IPPool).Name, ip, err)
+			newVmNetCfgs = append(newVmNetCfgs, v)
+
+			if restoreErr == nil {
+				restoreErr = fmt.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] cannot update the IPPool %s status for ip %s: %w",
+					vmnetcfg.Namespace, vmnetcfg.Name, pool.(kihv1.IPPool).Name, ip, err)
+			}
+
+			continue
 		}
 
 		if err := c.updateIPPoolMetrics(pool.(kihv1.IPPool).Name); err != nil {
