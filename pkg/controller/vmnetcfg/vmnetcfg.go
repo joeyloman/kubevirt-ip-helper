@@ -133,21 +133,44 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 		})
 	}
 
+	// missingPoolErr records the first pool lookup failure of this sync while
+	// the remaining interfaces are still processed: a network without a
+	// registered pool cannot restore or allocate that interface, but its
+	// failure must never block the restoration of the other interfaces
+	// (their assignments are protected through this same sync). the error
+	// is reported after every interface was handled; the startup gate counts
+	// the object through its settled classification and the resynced retry
+	// restores this interface once its pool registers.
+	var missingPoolErr error
+
 	for _, v := range vmnetcfg.Spec.NetworkConfig {
-		pool, poolErr := c.cache.Get("pool", v.NetworkName)
-		if poolErr != nil {
-			// earlier interfaces of this sync are applied while the object
-			// is not committed yet: unwind them so no live allocation is
-			// left for a never-persisted state
-			c.rollbackAppliedAllocations(vmnetcfg, appliedAllocations)
-
-			return poolErr
-		}
-
 		// create a fresh nic status
 		netcfgStatus := kihv1.NetworkConfigStatus{}
 		netcfgStatus.MACAddress = v.MACAddress
 		netcfgStatus.NetworkName = v.NetworkName
+
+		pool, poolErr := c.cache.Get("pool", v.NetworkName)
+		if poolErr != nil {
+			// keep the durable spec and the previous status entry untouched,
+			// skip this interface and continue with the next one
+			if missingPoolErr == nil {
+				missingPoolErr = poolErr
+			}
+
+			newVmNetCfgs = append(newVmNetCfgs, v)
+
+			for _, nic := range vmnetcfg.Status.NetworkConfig {
+				if v.MACAddress == nic.MACAddress && v.NetworkName == nic.NetworkName {
+					netcfgStatus.Status = nic.Status
+					netcfgStatus.Message = nic.Message
+					newNetCfgStatusList = append(newNetCfgStatusList, netcfgStatus)
+
+					break
+				}
+			}
+
+			continue
+		}
 
 		// skip the network interface updates when it has a status ERROR
 		skipNic = false
@@ -332,6 +355,17 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 		rememberApplied(pool.(kihv1.IPPool).Name, v.MACAddress, v.NetworkName, ip, false)
 
 		networkChange = true
+	}
+
+	if missingPoolErr != nil {
+		// the interfaces of this sync which were applied while the object
+		// is not committed yet must be unwound, so no live allocation is
+		// left for a never-persisted state; restored durable assignments
+		// are never queued and stay applied, protecting the running guests
+		c.rollbackAppliedAllocations(vmnetcfg, appliedAllocations)
+
+		return fmt.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] %w",
+			vmnetcfg.Namespace, vmnetcfg.Name, missingPoolErr)
 	}
 
 	newVmnetCfgStatus := kihv1.VirtualMachineNetworkConfigStatus{}
