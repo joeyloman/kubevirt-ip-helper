@@ -776,10 +776,19 @@ func TestGetLeaseByIPAndNetworkIsNetworkScoped(t *testing.T) {
 func TestAddPoolResolvesNTPHostnamesOutsideTheAllocatorLock(t *testing.T) {
 	a := New()
 
+	// the resolver dials from concurrent goroutines (one per dns server),
+	// so the observations of the allocator lock must be collected under
+	// their own mutex: only the allocator lock itself is under test
+	var observationsMutex sync.Mutex
 	var lockFreeDuringResolve []bool
 	a.resolver = &net.Resolver{
 		PreferGo: true,
 		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			// the probe runs serialized with itself: two concurrent dial
+			// goroutines probing the allocator lock at the same time would
+			// contend on it and report a held lock which nobody holds
+			observationsMutex.Lock()
+
 			// the resolver runs on the AddPool goroutine: if the allocator
 			// lock is already held there, the resolution happens under it
 			free := a.mutex.TryLock()
@@ -787,6 +796,8 @@ func TestAddPoolResolvesNTPHostnamesOutsideTheAllocatorLock(t *testing.T) {
 				a.mutex.Unlock()
 			}
 			lockFreeDuringResolve = append(lockFreeDuringResolve, free)
+
+			observationsMutex.Unlock()
 
 			// fail fast: an unresolvable hostname is logged and skipped, so
 			// the pool registers without ntp servers like before
