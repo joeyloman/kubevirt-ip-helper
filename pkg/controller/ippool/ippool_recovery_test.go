@@ -748,12 +748,15 @@ func TestRegisterIPPoolRejectsExcludeOverlappingLiveClaim(t *testing.T) {
 	pool := recoveryNewPool("pool1", "net-a")
 	pool.Spec.IPv4Config.Pool.Exclude = []string{"10.0.0.2"}
 
-	_, err := c.registerIPPool(pool)
+	cleanup, err := c.registerIPPool(pool)
 	if err == nil {
 		t.Fatal("the overlapping exclude must fail the registration")
 	}
 	if !errors.Is(err, ErrPoolUnregistrable) {
 		t.Errorf("error = %v, want ErrPoolUnregistrable so the startup gate counts the pool", err)
+	}
+	if cleanup {
+		t.Error("cleanup flag = true, want false: the rejection must not run any teardown of state it never created")
 	}
 
 	// the rejection happened before any mutation: nothing of the pool is
@@ -761,7 +764,10 @@ func TestRegisterIPPoolRejectsExcludeOverlappingLiveClaim(t *testing.T) {
 	if c.dhcp.CheckPool("net-a") {
 		t.Error("no dhcp pool may exist after the pre-mutation rejection")
 	}
-	if _, err := c.ipam.GetIP("net-a", ""); err == nil {
-		t.Error("no subnet may be registered after the pre-mutation rejection")
+	// Used discriminates a missing subnet (0) from a registered subnet
+	// whose single address the exclude pass claimed (1): the probe is
+	// read-only, unlike an allocation attempt
+	if used := c.ipam.Used("net-a"); used != 0 {
+		t.Errorf("ipam used = %d, want 0 (the rejection must precede the subnet registration)", used)
 	}
 }

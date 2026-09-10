@@ -301,6 +301,23 @@ func (f *fakeAPI) handleVMNetCfg(w http.ResponseWriter, r *http.Request, ns stri
 }
 
 func (f *fakeAPI) handlePool(w http.ResponseWriter, r *http.Request, segs []string, body []byte) {
+	// a cluster-scoped list (/apis/<group>/<version>/ippools) is served
+	// for the callback api-verify of the cleanup paths: it decides whether
+	// a cache-missed pool is truly gone (its ledger died with it) or
+	// merely missed the cache. without the route the fake panics on
+	// segs[4] and the clientset retries for ~10s
+	if len(segs) == 4 && r.Method == http.MethodGet {
+		f.mu.Lock()
+		list := &kihv1.IPPoolList{}
+		for _, pool := range f.pools {
+			list.Items = append(list.Items, *pool.DeepCopy())
+		}
+		f.mu.Unlock()
+		vmBehaviorWriteJSON(w, http.StatusOK, list)
+
+		return
+	}
+
 	name := segs[4]
 	sub := ""
 	if len(segs) >= 6 {
@@ -952,19 +969,34 @@ func TestCleanupNetworkInterfaceFailsWhenPoolUnknown(t *testing.T) {
 		Spec:       kihv1.VirtualMachineNetworkConfigSpec{VMName: "vm1"},
 	}
 
-	// the pool is not cached: the status entry cannot be un-recorded, so
-	// the cleanup must report failure (orphaning the record silently would
-	// lose the address forever), not a converged success
+	// the pool exists in the api but missed the cache: the status entry
+	// cannot be un-recorded, so the cleanup must report failure (proceeding
+	// silently would orphan the record forever), not a converged success
+	f.mu.Lock()
+	f.pools["pool-a"] = &kihv1.IPPool{
+		ObjectMeta: metav1.ObjectMeta{Name: "pool-a", ResourceVersion: "1"},
+		Spec:       kihv1.IPPoolSpec{NetworkName: networkName},
+		Status: kihv1.IPPoolStatus{
+			IPv4: kihv1.IPv4Status{Allocated: map[string]string{ip: "ns1/vm1 [" + mac + "]"}},
+		},
+	}
+	f.mu.Unlock()
+
 	err := c.cleanupNetworkInterface(vmnetcfg, &kihv1.NetworkConfig{MACAddress: mac, NetworkName: networkName, IPAddress: ip})
 	if err == nil || !strings.Contains(err.Error(), "does not exists in cache") {
 		t.Fatalf("expected pool cache miss error, got %v", err)
 	}
 	if n := len(f.requestsFor(http.MethodPut, "/status")); n != 0 {
-		t.Errorf("expected no pool status update when pool is unknown, got %d", n)
+		t.Errorf("expected no pool status update when the pool misses the cache, got %d", n)
+	}
+	// the un-record failed before any local release: the address stays
+	// fully intact for the retried cleanup
+	if !c.dhcp.CheckLease(mac) {
+		t.Error("expected the lease still registered after the failed un-record")
 	}
 
-	// once the pool is registered the retried cleanup converges: the
-	// releases above are idempotent and the record is removed
+	// once the pool is cached the retried cleanup converges: the releases
+	// are idempotent and the record is removed
 	storePool(t, c, f, "pool-a", networkName, map[string]string{
 		ip: "ns1/vm1 [" + mac + "]",
 	})
@@ -1441,6 +1473,9 @@ func TestCleanupNetworkInterfacePropagatesPoolStatusError(t *testing.T) {
 
 	addSubnetWithOwnedIP(t, c.ipam, networkName, ip, "ns1/vm1 ["+mac+"]")
 	storePool(t, c, f, "pool-a", networkName, map[string]string{ip: "ns1/vm1 [" + mac + "]"})
+	if err := c.dhcp.AddLease(mac, networkName, ip, "ns1/vm1"); err != nil {
+		t.Fatalf("seeding lease: %v", err)
+	}
 	f.ippoolStatusUpdateStatus = http.StatusInternalServerError
 	f.ippoolStatusUpdateErr = "boom"
 
@@ -1456,15 +1491,54 @@ func TestCleanupNetworkInterfacePropagatesPoolStatusError(t *testing.T) {
 		t.Errorf("error = %q, want it to carry the underlying failure", err)
 	}
 
-	// the un-record failed, so the claim must be fully intact: the address
-	// was never locally freed while its ownership record is still written,
-	// and the retried cleanup converges from a consistent state instead of
-	// leaving a ghost ledger entry behind
+	// the un-record failed, so the lease and the claim must be fully
+	// intact: the address was never locally freed while its ownership
+	// record is still written, and the retried cleanup converges from a
+	// consistent state instead of leaving a ghost ledger entry behind
+	if !c.dhcp.CheckLease(mac) {
+		t.Error("expected the lease to stay registered after the failed un-record")
+	}
 	if used := c.ipam.Used(networkName); used != 1 {
 		t.Errorf("expected the ipam allocation kept after the failed un-record, used=%d", used)
 	}
 	if n := len(f.requestsFor(http.MethodPut, "/ippools/pool-a/status")); n != 1 {
 		t.Errorf("expected 1 pool status attempt, got %d", n)
+	}
+}
+
+// TestCleanupNetworkInterfaceUnrecordsBeforeReleasing: on the success path
+// the durable un-record happens before the local releases (mirroring the
+// vmnetcfg live path), and the lease and claim are gone once the cleanup
+// converged.
+func TestCleanupNetworkInterfaceUnrecordsBeforeReleasing(t *testing.T) {
+	c, f := vmBehaviorNewTestController(t)
+
+	mac := "aa:bb:cc:00:00:02"
+	networkName := "default/net-a"
+	ip := "10.0.0.11"
+
+	addSubnetWithOwnedIP(t, c.ipam, networkName, ip, "ns1/vm1 ["+mac+"]")
+	storePool(t, c, f, "pool-a", networkName, map[string]string{ip: "ns1/vm1 [" + mac + "]"})
+	if err := c.dhcp.AddLease(mac, networkName, ip, "ns1/vm1"); err != nil {
+		t.Fatalf("seeding lease: %v", err)
+	}
+
+	vmnetcfg := &kihv1.VirtualMachineNetworkConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: "vm1", Namespace: "ns1"},
+		Spec:       kihv1.VirtualMachineNetworkConfigSpec{VMName: "vm1"},
+	}
+	if err := c.cleanupNetworkInterface(vmnetcfg, &kihv1.NetworkConfig{MACAddress: mac, NetworkName: networkName, IPAddress: ip}); err != nil {
+		t.Fatalf("cleanupNetworkInterface: %v", err)
+	}
+
+	if c.dhcp.CheckLease(mac) {
+		t.Error("the lease must be released after a converged cleanup")
+	}
+	if used := c.ipam.Used(networkName); used != 0 {
+		t.Errorf("ipam used = %d, want 0 after a converged cleanup", used)
+	}
+	if n := len(f.requestsFor(http.MethodPut, "/ippools/pool-a/status")); n != 1 {
+		t.Errorf("expected 1 pool status update, got %d", n)
 	}
 }
 

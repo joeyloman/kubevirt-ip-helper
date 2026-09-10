@@ -462,6 +462,20 @@ func (a *DHCPAllocator) logUnknownHWAddr(m *dhcpv4.DHCPv4) {
 	}
 }
 
+// IsRunning reports whether the DHCP service of the pool identified by
+// networkName currently serves on its interface. the ippool controller
+// uses it to detect a listener which died after its registration (its
+// socket error is deregistered by the serve wrapper) and re-serve the
+// pool on the next event or resync.
+func (a *DHCPAllocator) IsRunning(networkName string) bool {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	_, running := a.servers[networkName]
+
+	return running
+}
+
 // RemoveLeasesForNetwork drops every lease of the named network from the
 // lease registry: deleting a pool must not leave its leases behind, which
 // would blackhole the renewals of still-running vms with no pool to serve
@@ -780,9 +794,10 @@ func (a *DHCPAllocator) Run(networkName string, nic string) (err error) {
 	// the serve loop never returns while servicing; it returns only on a
 	// socket error or a Stop-initiated close. the wrapper deregisters the
 	// entry on an unexpected exit, so CheckPool/IsRunning stop reporting
-	// the pool as live and the controller's re-registration can re-serve
-	// it, instead of the pool silently never answering dhcp again while
-	// every lookup still believes it runs
+	// the pool as live, and the ippool controller's listener repair
+	// re-serves the pool on the next event or resync - instead of the pool
+	// silently never answering dhcp again while every lookup still
+	// believes it runs
 	go func() {
 		serveErr := server.Serve()
 

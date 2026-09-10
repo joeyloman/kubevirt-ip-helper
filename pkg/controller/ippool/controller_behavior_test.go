@@ -314,13 +314,23 @@ func TestSyncUpdateIgnoredWhileInitializing(t *testing.T) {
 	if err := cacheAllocator.Add(oldPool); err != nil {
 		t.Fatalf("seeding cache: %v", err)
 	}
+	listenerRepairs := 0
+	controller.runListener = func(networkName string, nic string) error {
+		listenerRepairs++
+		return nil
+	}
 
 	if err := controller.sync(testPoolEvent("pool-j", UPDATE, "net-j")); err != nil {
 		t.Errorf("sync(UPDATE) returned error %v, want nil", err)
 	}
 
 	// while initializing, pool updates are deliberately ignored: the cache
-	// still holds the originally registered pool
+	// still holds the originally registered pool, and the listener repair
+	// must not open sockets during the startup replay (the registration
+	// phase owns the listener lifecycle)
+	if listenerRepairs != 0 {
+		t.Errorf("listener repair attempts = %d, want 0 while the application initializes", listenerRepairs)
+	}
 	got, err := cacheAllocator.Get("pool", "net-j")
 	if err != nil {
 		t.Fatalf("pool missing from cache: %v", err)
@@ -342,6 +352,11 @@ func TestSyncUpdateSkipsIdenticalPoolWhenRunning(t *testing.T) {
 	if err := cacheAllocator.Add(pool); err != nil {
 		t.Fatalf("seeding cache: %v", err)
 	}
+	listenerRepairs := 0
+	controller.runListener = func(networkName string, nic string) error {
+		listenerRepairs++
+		return nil
+	}
 
 	if err := controller.sync(testPoolEvent("pool-k", UPDATE, "net-k")); err != nil {
 		t.Errorf("sync(UPDATE) returned error %v, want nil", err)
@@ -359,6 +374,37 @@ func TestSyncUpdateSkipsIdenticalPoolWhenRunning(t *testing.T) {
 	if controller.dhcp.CheckPool("net-k") {
 		t.Errorf("dhcp pool registered for an identical update")
 	}
+
+	// the pool has no running listener in this fixture, so the same event
+	// re-serves it through the repair seam: a died listener must not stay
+	// dead until an operator edits the pool or the pod restarts
+	if listenerRepairs != 1 {
+		t.Errorf("listener repair attempts = %d, want 1 (the identified no-change event re-serves the listener)", listenerRepairs)
+	}
+}
+
+// TestSyncUpdateListenerRepairFailsLoudly: a repair which cannot re-open
+// the socket surfaces the failure so the queue retries it instead of
+// silently leaving the pool unserved.
+func TestSyncUpdateListenerRepairFailsLoudly(t *testing.T) {
+	var appStatus atomic.Int32
+	appStatus.Store(APP_RUNNING)
+	pool := testPool("pool-m2", "net-m2", 60)
+
+	indexer := newTestIndexer()
+	indexer.Add(pool)
+
+	controller, cacheAllocator := newTestController(t, newTestQueue(), indexer, nil, &appStatus, new(atomic.Int32))
+	if err := cacheAllocator.Add(pool); err != nil {
+		t.Fatalf("seeding cache: %v", err)
+	}
+	controller.runListener = func(networkName string, nic string) error {
+		return errors.New("cannot bind to interface test-fake-iface: no such device")
+	}
+
+	if err := controller.sync(testPoolEvent("pool-m2", UPDATE, "net-m2")); err == nil {
+		t.Error("sync(UPDATE) returned nil, want the listener repair failure surfaced for the rate-limited retry")
+	}
 }
 
 func TestSyncUpdateReloadsPoolWhenRunning(t *testing.T) {
@@ -374,6 +420,7 @@ func TestSyncUpdateReloadsPoolWhenRunning(t *testing.T) {
 	if err := cacheAllocator.Add(oldPool); err != nil {
 		t.Fatalf("seeding cache: %v", err)
 	}
+	controller.runListener = func(networkName string, nic string) error { return nil }
 
 	if err := controller.sync(testPoolEvent("pool-l", UPDATE, "net-l")); err != nil {
 		t.Errorf("sync(UPDATE) returned error %v, want nil", err)

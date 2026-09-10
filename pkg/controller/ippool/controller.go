@@ -44,6 +44,13 @@ type Controller struct {
 	// initialization phase already handled, so a pool which definitively
 	// cannot register is still counted by the startup gate
 	initAttempted map[string]bool
+
+	// runListener opens the dhcp listener of a pool. it is an indirection
+	// over dhcp.Run so the listener repair is testable without a host
+	// interface (the same seam shape as network.AddIpToNic/RemoveIpFromNic):
+	// production controllers default to dhcp.Run, tests substitute a
+	// nil-returning stub
+	runListener func(networkName string, nic string) error
 }
 
 func NewController(
@@ -171,6 +178,32 @@ func (c *Controller) sync(event Event) (err error) {
 		if err != nil {
 			log.Errorf("(ippool.sync) failed to handle IPPool update for %s: %s", event.poolName, err.Error())
 			c.metrics.UpdateLogStatus("error")
+		}
+
+		// a pool whose dhcp listener died after its registration (its
+		// socket error was surfaced and deregistered by the serve wrapper)
+		// is re-served by the next event or resync: the registration state
+		// (server ip on the nic, dhcp pool, ipam subnet) is still live, so
+		// only the listener needs to be re-opened. the repair runs only
+		// while the application serves: during the startup replay
+		// (APP_INIT) and the reinitialization teardown (APP_RESTART) the
+		// listener lifecycle belongs to the era transitions, whose fresh
+		// registration re-opens the sockets
+		if err == nil && c.appStatus.Load() == APP_RUNNING && !c.dhcp.IsRunning(obj.(*kihv1.IPPool).Spec.NetworkName) {
+			runListener := c.runListener
+			if runListener == nil {
+				runListener = c.dhcp.Run
+			}
+
+			if runErr := runListener(obj.(*kihv1.IPPool).Spec.NetworkName, obj.(*kihv1.IPPool).Spec.BindInterface); runErr != nil {
+				log.Errorf("(ippool.sync) failed to restore the DHCP listener of pool %s: %s", event.poolName, runErr.Error())
+				c.metrics.UpdateLogStatus("error")
+
+				err = runErr
+			} else {
+				log.Warnf("(ippool.sync) restored the DHCP listener of pool %s after its unexpected termination", event.poolName)
+				c.metrics.UpdateLogStatus("warning")
+			}
 		}
 	case DELETE:
 		// a pool which is deleted can never settle a registration for the
