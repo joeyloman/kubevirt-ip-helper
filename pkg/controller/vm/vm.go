@@ -271,6 +271,7 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 	// its ownership record is still written, otherwise a crash between the
 	// release and the status write leaves an orphan ledger entry which the
 	// next registration re-pins to the ghost owner
+	var unrecordedPoolName string
 	if netCfg.IPAddress != "" {
 		pool, poolErr := c.cache.Get("pool", netCfg.NetworkName)
 		if poolErr != nil {
@@ -315,17 +316,24 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 			); statusErr != nil {
 				// the status entry of another owner is not this vm's to
 				// remove; replaying the cleanup must not abort the durable
-				// update over it
-				if errors.Is(statusErr, util.ErrForeignOwner) {
-					log.Warnf("(vm.cleanupNetworkInterface) [%s/%s] the allocation of ip %s in the %s status belongs to another owner, leaving the entry",
-						vmnetcfg.Namespace, vmnetcfg.Name, netCfg.IPAddress, pool.(kihv1.IPPool).Name)
-					c.metrics.UpdateLogStatus("warning")
-
-					return
+				// update over it. the entry stays, but the live state of this
+				// nic is still released below: the lease deletion and the ipam
+				// release are independently owner-validated, so they are
+				// converged no-ops when the live state genuinely belongs to
+				// another owner, while a ledger entry which merely diverges
+				// from the live state (a legacy spelling or a hand-edited
+				// record) must not pin the lease and the reservation of a
+				// removed nic forever
+				if !errors.Is(statusErr, util.ErrForeignOwner) {
+					return fmt.Errorf("(vm.cleanupNetworkInterface) [%s/%s] %s",
+						vmnetcfg.Namespace, vmnetcfg.Name, statusErr.Error())
 				}
 
-				return fmt.Errorf("(vm.cleanupNetworkInterface) [%s/%s] %s",
-					vmnetcfg.Namespace, vmnetcfg.Name, statusErr.Error())
+				log.Warnf("(vm.cleanupNetworkInterface) [%s/%s] the allocation of ip %s in the %s status belongs to another owner, leaving the entry",
+					vmnetcfg.Namespace, vmnetcfg.Name, netCfg.IPAddress, pool.(kihv1.IPPool).Name)
+				c.metrics.UpdateLogStatus("warning")
+			} else {
+				unrecordedPoolName = pool.(kihv1.IPPool).Name
 			}
 		}
 	}
@@ -384,6 +392,29 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 				// treated as done so a retried cleanup can converge
 				return fmt.Errorf("(vm.cleanupNetworkInterface) [%s/%s] error releasing ip from ipam: %s",
 					vmnetcfg.Namespace, vmnetcfg.Name, err.Error())
+			}
+		} else if unrecordedPoolName != "" {
+			// the release above changed the pool accounting after the
+			// un-record already persisted the pre-release counts: the
+			// persisted status must match the live allocator even when no
+			// follow-up write of the vmnetcfg controller ever lands, so
+			// the counts are republished through the same computation
+			// ippoolstatus.UpdateStatus performs (a converged no-op
+			// DELETE whose entry is already gone). the republish is
+			// best-effort: a foreign re-entry or a failed write is
+			// reported, not retried - the cleanup itself has converged
+			if republishErr := c.updateIPPoolStatus(
+				DELETE,
+				vmnetcfg.Namespace,
+				vmnetcfg.Spec.VMName,
+				netCfg.IPAddress,
+				netCfg.NetworkName,
+				netCfg.MACAddress,
+				unrecordedPoolName,
+			); republishErr != nil {
+				log.Warnf("(vm.cleanupNetworkInterface) [%s/%s] cannot republish the pool status counts of network %s: %s",
+					vmnetcfg.Namespace, vmnetcfg.Name, netCfg.NetworkName, republishErr.Error())
+				c.metrics.UpdateLogStatus("warning")
 			}
 		}
 	}

@@ -946,9 +946,11 @@ func TestCleanupNetworkInterfaceReleasesAllState(t *testing.T) {
 		t.Errorf("expected ip released, used=%d", used)
 	}
 
+	// a converged cleanup writes the pool status twice: the durable
+	// un-record and the post-release count republish
 	statusUpdates := f.requestsFor(http.MethodPut, "/ippools/pool-a/status")
-	if len(statusUpdates) != 1 {
-		t.Fatalf("expected 1 pool status update, got %d", len(statusUpdates))
+	if len(statusUpdates) != 2 {
+		t.Fatalf("expected 2 pool status updates (un-record and count republish), got %d", len(statusUpdates))
 	}
 	pool := f.storedPool("pool-a")
 	if pool == nil {
@@ -962,6 +964,12 @@ func TestCleanupNetworkInterfaceReleasesAllState(t *testing.T) {
 	}
 	if pool.Status.LastUpdate.IsZero() {
 		t.Error("expected LastUpdate to be set")
+	}
+	// the republish persists the post-release accounting: the address is
+	// free again, so the stored counts must match the live allocator
+	if pool.Status.IPv4.Used != 0 || pool.Status.IPv4.Available != 3 {
+		t.Errorf("expected used=0 available=3 after the republish, got used=%d available=%d",
+			pool.Status.IPv4.Used, pool.Status.IPv4.Available)
 	}
 }
 
@@ -1020,8 +1028,8 @@ func TestCleanupNetworkInterfaceFailsWhenPoolUnknown(t *testing.T) {
 	if c.dhcp.CheckLease(mac) {
 		t.Error("expected dhcp lease to be deleted")
 	}
-	if n := len(f.requestsFor(http.MethodPut, "/ippools/pool-a/status")); n != 1 {
-		t.Errorf("expected 1 pool status update after the retry, got %d", n)
+	if n := len(f.requestsFor(http.MethodPut, "/ippools/pool-a/status")); n != 2 {
+		t.Errorf("expected 2 pool status updates after the retry (un-record and count republish), got %d", n)
 	}
 	if pool := f.storedPool("pool-a"); pool != nil {
 		if _, stillThere := pool.Status.IPv4.Allocated[ip]; stillThere {
@@ -1076,6 +1084,12 @@ func TestCleanupNetworkInterfaceSkipsSuccessorAllocationOnRetry(t *testing.T) {
 	}
 	f.mu.Unlock()
 
+	// the first cleanup un-recorded the entry and republished the counts
+	putsAfterFirstCleanup := len(f.requestsFor(http.MethodPut, "/ippools/pool-a/status"))
+	if putsAfterFirstCleanup != 2 {
+		t.Fatalf("expected the first cleanup to un-record and republish, got %d puts", putsAfterFirstCleanup)
+	}
+
 	// the replay must converge instead of freeing the successor's claim
 	if err := c.cleanupNetworkInterface(vmnetcfg, &netCfg); err != nil {
 		t.Fatalf("retried cleanup: %v", err)
@@ -1092,8 +1106,8 @@ func TestCleanupNetworkInterfaceSkipsSuccessorAllocationOnRetry(t *testing.T) {
 	if got := pool.Status.IPv4.Allocated[ip]; got != "ns1/vm2 ["+successorMac+"]" {
 		t.Errorf("expected the successor's status entry preserved, got %q", got)
 	}
-	if n := len(f.requestsFor(http.MethodPut, "/ippools/pool-a/status")); n != 1 {
-		t.Errorf("expected the replay to write no pool status, got %d puts", n)
+	if n := len(f.requestsFor(http.MethodPut, "/ippools/pool-a/status")); n != putsAfterFirstCleanup {
+		t.Errorf("expected the replay to write no pool status, got %d new puts", n-putsAfterFirstCleanup)
 	}
 }
 
@@ -1136,6 +1150,55 @@ func TestCleanupNetworkInterfaceLeavesReassignedMac(t *testing.T) {
 	pool := f.storedPool("pool-a")
 	if got := pool.Status.IPv4.Allocated[ip]; got != "ns1/vm2 ["+mac+"]" {
 		t.Errorf("expected the successor's status entry preserved, got %q", got)
+	}
+}
+
+// a pool status entry which does not match this nic's owner reference
+// (a legacy spelling written by an older revision or a hand-edited record)
+// must not pin the interface state: the foreign ledger entry stays
+// untouched, but the owner-validated lease deletion and ipam release still
+// run, so the cleanup converges instead of leaking the lease and the
+// reservation of a removed nic
+func TestCleanupNetworkInterfaceReleasesOwnStateUnderForeignLedgerEntry(t *testing.T) {
+	c, f := vmBehaviorNewTestController(t)
+
+	mac := "aa:bb:cc:00:00:01"
+	networkName := "default/net-a"
+	ip := "10.0.0.11"
+	foreignRef := "ns1/vm2 [aa:bb:cc:00:00:99]"
+
+	// the live state belongs to this vm: named reservation and lease
+	addSubnetWithOwnedIP(t, c.ipam, networkName, ip, "ns1/vm1 ["+mac+"]")
+	if err := c.dhcp.AddLease(mac, networkName, ip, "ns1/vm1"); err != nil {
+		t.Fatalf("own lease: %v", err)
+	}
+	// the ledger records the address under a foreign reference
+	storePool(t, c, f, "pool-a", networkName, map[string]string{ip: foreignRef})
+
+	vmnetcfg := &kihv1.VirtualMachineNetworkConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: "vm1", Namespace: "ns1"},
+		Spec:       kihv1.VirtualMachineNetworkConfigSpec{VMName: "vm1"},
+	}
+
+	if err := c.cleanupNetworkInterface(vmnetcfg, &kihv1.NetworkConfig{MACAddress: mac, NetworkName: networkName, IPAddress: ip}); err != nil {
+		t.Fatalf("cleanup under a foreign ledger entry: %v", err)
+	}
+
+	// the live state of the removed nic is released
+	if c.dhcp.CheckLease(mac) {
+		t.Error("the own lease must be released although the ledger entry is foreign")
+	}
+	if used := c.ipam.Used(networkName); used != 0 {
+		t.Errorf("ipam used = %d, want 0: the own reservation must be released", used)
+	}
+
+	// the foreign ledger entry is kept and nothing was written through it
+	pool := f.storedPool("pool-a")
+	if got := pool.Status.IPv4.Allocated[ip]; got != foreignRef {
+		t.Errorf("pool record = %q, want the foreign entry kept", got)
+	}
+	if n := len(f.requestsFor(http.MethodPut, "/ippools/pool-a/status")); n != 0 {
+		t.Errorf("expected no pool status write for a foreign entry, got %d", n)
 	}
 }
 
@@ -1523,7 +1586,8 @@ func TestCleanupNetworkInterfacePropagatesPoolStatusError(t *testing.T) {
 // TestCleanupNetworkInterfaceUnrecordsBeforeReleasing: on the success path
 // the durable un-record happens before the local releases (mirroring the
 // vmnetcfg live path), and the lease and claim are gone once the cleanup
-// converged.
+// converged. the un-record persists the pre-release accounting, the
+// post-release republish persists the counts of the live allocator.
 func TestCleanupNetworkInterfaceUnrecordsBeforeReleasing(t *testing.T) {
 	c, f := vmBehaviorNewTestController(t)
 
@@ -1551,8 +1615,23 @@ func TestCleanupNetworkInterfaceUnrecordsBeforeReleasing(t *testing.T) {
 	if used := c.ipam.Used(networkName); used != 0 {
 		t.Errorf("ipam used = %d, want 0 after a converged cleanup", used)
 	}
-	if n := len(f.requestsFor(http.MethodPut, "/ippools/pool-a/status")); n != 1 {
-		t.Errorf("expected 1 pool status update, got %d", n)
+	puts := f.requestsFor(http.MethodPut, "/ippools/pool-a/status")
+	if len(puts) != 2 {
+		t.Fatalf("expected the un-record and the post-release republish, got %d puts", len(puts))
+	}
+	var unrecorded, republished kihv1.IPPool
+	if err := json.Unmarshal(puts[0].body, &unrecorded); err != nil {
+		t.Fatalf("decoding the un-record body: %v", err)
+	}
+	if err := json.Unmarshal(puts[1].body, &republished); err != nil {
+		t.Fatalf("decoding the republish body: %v", err)
+	}
+	if unrecorded.Status.IPv4.Used != 1 {
+		t.Errorf("the un-record must persist the pre-release accounting, got used=%d", unrecorded.Status.IPv4.Used)
+	}
+	if republished.Status.IPv4.Used != 0 || republished.Status.IPv4.Available != 3 {
+		t.Errorf("the republish must persist the post-release accounting, got used=%d available=%d",
+			republished.Status.IPv4.Used, republished.Status.IPv4.Available)
 	}
 }
 

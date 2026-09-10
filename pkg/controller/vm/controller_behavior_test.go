@@ -461,6 +461,64 @@ func TestRunShutsDownTheQueue(t *testing.T) {
 	}
 }
 
+// Run must not return while a worker is still syncing: the EventListener
+// join waits for Run, so an early return would let the restart flow observe
+// a stopped era while a reconciler still holds local allocator state
+func TestRunJoinsTheWorkerBeforeReturning(t *testing.T) {
+	release := make(chan struct{})
+	started := make(chan struct{})
+	var log requestLog
+	server := newFakeServer(t, &log, func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-started:
+		default:
+			close(started)
+		}
+		// the in-flight sync stays blocked until the test releases it
+		<-release
+		writeJSON(w, http.StatusOK, vmnetcfgBodyJSON)
+	})
+	// the blocked handler must always drain, also on the failure path:
+	// the server cleanup of the test waits for outstanding requests
+	var releaseOnce sync.Once
+	releaseSync := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseSync()
+
+	queue := newTestQueue()
+	indexer := newTestIndexer()
+	if err := indexer.Add(testVirtualMachine(true)); err != nil {
+		t.Fatalf("seeding indexer: %v", err)
+	}
+	controller := newTestController(t, queue, indexer, &stubInformer{synced: true}, newTestClientset(t, server))
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		controller.Run(1, stop)
+		close(done)
+	}()
+
+	queue.Add(testEvent(UPDATE))
+	<-started
+
+	close(stop)
+
+	// the worker is blocked mid-sync: Run must stay up while it runs
+	select {
+	case <-done:
+		t.Fatal("Run returned while the worker was still syncing")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	releaseSync()
+
+	select {
+	case <-done:
+	case <-time.After(shutdownWait):
+		t.Fatal("Run did not return after the in-flight sync finished")
+	}
+}
+
 func TestRunWorkerExitsWhenQueueShutsDown(t *testing.T) {
 	queue := newTestQueue()
 	controller := newTestController(t, queue, newTestIndexer(), nil, nil)
@@ -633,6 +691,27 @@ func TestGetKubeConfigUnknownContextFails(t *testing.T) {
 
 	if _, err := handler.getKubeConfig(); err == nil {
 		t.Fatal("expected an error for an unknown kubeconfig context")
+	}
+}
+
+// the informer client must not carry the one-shot client timeout: it
+// would tear the watch connection down every time it expires and an
+// initial list slower than the timeout would never complete
+func TestWatchRestConfigStripsTheClientTimeout(t *testing.T) {
+	config := &rest.Config{Host: "https://example.com", Timeout: 30 * time.Second}
+
+	watchConfig := watchRestConfig(config)
+
+	if watchConfig.Timeout != 0 {
+		t.Errorf("watch config timeout = %v, want it stripped", watchConfig.Timeout)
+	}
+	if watchConfig.Host != config.Host {
+		t.Errorf("watch config host = %q, want %q preserved", watchConfig.Host, config.Host)
+	}
+	// the source config stays untouched: the one-shot clients keep their
+	// bound
+	if config.Timeout != 30*time.Second {
+		t.Errorf("source config timeout = %v, want it untouched", config.Timeout)
 	}
 }
 

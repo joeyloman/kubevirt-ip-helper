@@ -97,12 +97,26 @@ func (e *EventHandler) Init() (err error) {
 		return
 	}
 
-	e.kcli, err = kubecli.GetKubevirtClientFromRESTConfig(e.kubeRestConfig)
+	e.kcli, err = kubecli.GetKubevirtClientFromRESTConfig(watchRestConfig(e.kubeRestConfig))
 	if err != nil {
 		return
 	}
 
 	return
+}
+
+// watchRestConfig strips the one-shot client timeout for the informer
+// client: the timeout applies to the watch connections too, so the
+// reflector's long-poll would be torn down by the http client every time
+// it expires (a constant re-watch churn), and an initial list which takes
+// longer than the timeout would never complete, leaving the controller
+// blocked in the cache sync wait. the one-shot bound stays on the config
+// handed to the kihClientset.
+func watchRestConfig(config *rest.Config) *rest.Config {
+	watchConfig := rest.CopyConfig(config)
+	watchConfig.Timeout = 0
+
+	return watchConfig
 }
 
 func (e *EventHandler) getKubeConfig() (config *rest.Config, err error) {
@@ -169,8 +183,9 @@ func (e *EventHandler) EventListener() (err error) {
 	stop := make(chan struct{})
 
 	// join the controller on shutdown: EventListener only returns after
-	// Controller.Run has fully stopped (its worker has drained the queue), so
-	// the application restart flow can wait for the old generation to be gone
+	// Controller.Run has fully stopped (its worker finished the in-flight
+	// sync and exited), so the application restart flow can wait for the
+	// old generation to be gone
 	done := make(chan struct{})
 	go func() {
 		controller.Run(1, stop)

@@ -2,6 +2,7 @@ package vm
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -157,11 +158,25 @@ func (c *Controller) Run(workers int, stopCh chan struct{}) {
 		return
 	}
 
+	// the workers are joined before Run returns: an in-flight sync may
+	// still hold local allocator state, so a caller waiting for this era
+	// to end (the EventListener join) must not observe Run returning
+	// while a worker is still reconciling
+	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
-		go wait.Until(c.runWorker, time.Second, stopCh)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			wait.Until(c.runWorker, time.Second, stopCh)
+		}()
 	}
 
 	<-stopCh
+	// shut the queue down before joining the workers: one blocked in
+	// queue.Get is only released by the shutdown, so waiting first would
+	// deadlock (the deferred shutdown stays as the early-return safety)
+	c.queue.ShutDown()
+	wg.Wait()
 	log.Infof("(vm.runWorker) stopping the VirtualMachine controller")
 }
 
