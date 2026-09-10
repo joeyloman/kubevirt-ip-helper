@@ -100,8 +100,8 @@ func (c *Controller) registerIPPool(pool *kihv1.IPPool) (cleanup bool, err error
 		return cleanup, fmt.Errorf("error while registering DHCP pool for network [%s]: %s", pool.Spec.NetworkName, err.Error())
 	}
 
-	// start a dhcp service thread
-	if err := c.dhcp.Run(pool.Spec.BindInterface, pool.Spec.IPv4Config.ServerIP); err != nil {
+	// start a dhcp service thread for the pool identity (networkname)
+	if err := c.dhcp.Run(pool.Spec.NetworkName, pool.Spec.BindInterface, pool.Spec.IPv4Config.ServerIP); err != nil {
 		return cleanup, fmt.Errorf("error while starting DHCP service thread for network [%s]: %s", pool.Spec.NetworkName, err.Error())
 	}
 
@@ -202,6 +202,15 @@ func (c *Controller) handleIPPoolObjectChange(oldPool kihv1.IPPool, newPool *kih
 			newPool.Spec.NetworkName, newPool.Spec.IPv4Config.Subnet, parseErr.Error())
 	}
 
+	// every projection which can never produce a live registration must
+	// be rejected before the teardown, not just the unparseable subnet:
+	// a range outside the subnet, a reversed range or the broadcast as end
+	// would drain the live services and then fail the registration forever
+	if validateErr := ipam.ValidateSubnetSpec(newPool.Spec.IPv4Config.Subnet, newPool.Spec.IPv4Config.Pool.Start, newPool.Spec.IPv4Config.Pool.End); validateErr != nil {
+		return fmt.Errorf("(ippool.handleIPPoolObjectChange) rejecting update for networkname [%s]: %s, keeping the currently registered configuration",
+			newPool.Spec.NetworkName, validateErr.Error())
+	}
+
 	if oldPool.Spec.NetworkName != newPool.Spec.NetworkName && c.dhcp.CheckPool(newPool.Spec.NetworkName) {
 		return fmt.Errorf("(ippool.handleIPPoolObjectChange) rejecting update for [%s]: the networkname [%s] is already registered by another IPPool, keeping the currently registered configuration",
 			oldPool.Spec.NetworkName, newPool.Spec.NetworkName)
@@ -212,8 +221,16 @@ func (c *Controller) handleIPPoolObjectChange(oldPool kihv1.IPPool, newPool *kih
 			break
 		}
 
+		// a dying generation must not spin forever: once the application
+		// cancels the era context this worker exits and the queued update is
+		// re-delivered by the next era's informer resync
+		select {
+		case <-c.ctx.Done():
+			return fmt.Errorf("(ippool.handleIPPoolObjectChange) deferring update of pool %s during application reinitialization", newPool.Name)
+		case <-time.After(time.Second * 5):
+		}
+
 		log.Warnf("(ippool.handleIPPoolObjectChange) application is still in restarting state, waiting until it's reinitialized..")
-		time.Sleep(time.Second * 5)
 	}
 
 	// the following pool changes need a restart
@@ -223,6 +240,7 @@ func (c *Controller) handleIPPoolObjectChange(oldPool kihv1.IPPool, newPool *kih
 		oldPool.Spec.IPv4Config.Pool.End != newPool.Spec.IPv4Config.Pool.End ||
 		!reflect.DeepEqual(oldPool.Spec.IPv4Config.Pool.Exclude, newPool.Spec.IPv4Config.Pool.Exclude) ||
 		oldPool.Spec.IPv4Config.Router != newPool.Spec.IPv4Config.Router ||
+		oldPool.Spec.BindInterface != newPool.Spec.BindInterface ||
 		oldPool.Spec.NetworkName != newPool.Spec.NetworkName {
 		updateAction = IPPOOL_RESTART
 	}
@@ -289,7 +307,7 @@ func (c *Controller) handleIPPoolObjectChange(oldPool kihv1.IPPool, newPool *kih
 }
 
 func (c *Controller) stopDHCPListener(pool *kihv1.IPPool) {
-	if err := c.dhcp.Stop(pool.Spec.BindInterface); err != nil {
+	if err := c.dhcp.Stop(pool.Spec.NetworkName); err != nil {
 		log.Errorf("(ippool.stopDHCPListener) error while shutting down DHCP listener running on nic [%s] for network [%s]: %s",
 			pool.Spec.BindInterface, pool.Spec.NetworkName, err.Error())
 		c.metrics.UpdateLogStatus("error")

@@ -110,11 +110,13 @@ func TestVMNetCfgPoolStatusFailureKeepsRestoredDurableAllocation(t *testing.T) {
 }
 
 // within one sync the rollback must distinguish the allocation kinds: the
-// fresh allocation of an earlier nic is unwound while the restored durable
-// assignment of another nic stays applied
-func TestVMNetCfgFailedSyncUnwindsOnlyFreshAllocations(t *testing.T) {
+// fresh allocation of an earlier nic stays quarantined (its lease may
+// already have been served to the guest; the retried sync adopts it into
+// the durable object), while the restored durable assignment of another
+// nic stays applied as well
+func TestVMNetCfgFailedSyncQuarantinesFreshAllocations(t *testing.T) {
 	e := newTestEnv(t)
-	// steady state: a running application's sync failure unwinds only
+	// steady state: a running application's sync failure quarantines only
 	// the fresh allocations of this sync
 	e.appStatus.Store(APP_RUNNING)
 	secondNetwork := "net-b"
@@ -159,18 +161,20 @@ func TestVMNetCfgFailedSyncUnwindsOnlyFreshAllocations(t *testing.T) {
 		t.Errorf("durable ipam used = %d, want 1", used)
 	}
 
-	// the fresh allocation of the second nic is unwound
-	if e.dhcp.CheckLease(testMAC2) {
-		t.Error("the fresh lease of the second nic must be released by the unwind")
+	// the fresh allocation of the second nic stays quarantined: its lease
+	// may already have been served, so it is kept (lease, claim and record)
+	// until the retried sync adopts it
+	if freshLease := e.dhcp.GetLease(testMAC2); freshLease.ClientIP == nil || freshLease.ClientIP.String() != "10.0.0.1" {
+		t.Errorf("fresh lease = %v, want the quarantined lease kept", freshLease.ClientIP)
 	}
-	if used := e.ipam.Used(secondNetwork); used != 0 {
-		t.Errorf("fresh ipam used = %d, want 0 after the unwind", used)
+	if used := e.ipam.Used(secondNetwork); used != 1 {
+		t.Errorf("fresh ipam used = %d, want the quarantined claim kept", used)
 	}
 
 	e.api.mu.Lock()
 	poolBStored := e.api.ippools[secondPoolName].DeepCopy()
 	e.api.mu.Unlock()
-	if got := poolBStored.Status.IPv4.Allocated["10.0.0.1"]; got != "" {
-		t.Errorf("fresh status entry = %q, want removed by the unwind", got)
+	if got := poolBStored.Status.IPv4.Allocated["10.0.0.1"]; got == "" {
+		t.Error("the quarantined status record of the second nic must be kept")
 	}
 }

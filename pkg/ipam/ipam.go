@@ -30,6 +30,11 @@ var (
 	// so nothing is left to release and cleanup can converge.
 	ErrIPNotInCidr = errors.New("ip is not inside the subnet")
 
+	// ErrIPInvalid reports a release attempt for an address which does not
+	// parse at all: no allocation can ever carry this identity, so cleanup
+	// callers treat the release as converged instead of retrying forever.
+	ErrIPInvalid = errors.New("invalid ip address")
+
 	// ErrSubnetInvalid reports a subnet registration whose range can never
 	// become valid (unparseable or out-of-range start/end, reversed range or
 	// a broadcast end): the caller can classify the rejection as definitive
@@ -78,6 +83,58 @@ func NewIPAllocator() *IPAllocator {
 	}
 }
 
+// ValidateSubnetSpec reports whether a subnet/range projection can ever
+// produce a live registration: the same classification NewSubnet applies,
+// exposed so callers can reject an unusable pool configuration before they
+// tear down the currently registered state. the errors are classified with
+// ErrSubnetInvalid.
+func ValidateSubnetSpec(subnet string, start string, end string) error {
+	ipnet, err := netip.ParsePrefix(subnet)
+	if err != nil {
+		return fmt.Errorf("invalid subnet %s: %v: %w", subnet, err, ErrSubnetInvalid)
+	}
+
+	// this controller only serves ipv4: an ipv6 prefix would blow up the
+	// broadcast computation below (net.CIDRMask(bits, 32) is nil there),
+	// so it is rejected like any other unregistrable projection
+	if ipnet.Bits() > 32 {
+		return fmt.Errorf("subnet %s is not an ipv4 subnet: %w", subnet, ErrSubnetInvalid)
+	}
+
+	startIP, err := netip.ParseAddr(start)
+	if err != nil {
+		return fmt.Errorf("invalid start address %s: %v: %w", start, err, ErrSubnetInvalid)
+	}
+	if !ipnet.Contains(startIP) {
+		return fmt.Errorf("start address %s is not within subnet %s range: %w", start, subnet, ErrSubnetInvalid)
+	}
+
+	endIP, err := netip.ParseAddr(end)
+	if err != nil {
+		return fmt.Errorf("invalid end address %s: %v: %w", end, err, ErrSubnetInvalid)
+	}
+	if !ipnet.Contains(endIP) {
+		return fmt.Errorf("end address %s is not within subnet %s range: %w", end, subnet, ErrSubnetInvalid)
+	}
+
+	if startIP.Compare(endIP) > 0 {
+		return fmt.Errorf("end address %s is smaller then the start address %s: %w", end, start, ErrSubnetInvalid)
+	}
+
+	subnetStart := net.IP(ipnet.Addr().AsSlice())
+	subnetMask := net.CIDRMask(ipnet.Bits(), 32)
+	subnetBroadcast := net.IP(make([]byte, 4))
+	for i := range subnetStart {
+		subnetBroadcast[i] = subnetStart[i] | ^subnetMask[i]
+	}
+	broadcastAddr, _ := netip.AddrFromSlice(subnetBroadcast)
+
+	if endIP.Unmap() == broadcastAddr.Unmap() {
+		return fmt.Errorf("end address %s equals the broadcast address %s: %w", end, subnetBroadcast.String(), ErrSubnetInvalid)
+	}
+
+	return nil
+}
 func (a *IPAllocator) NewSubnet(name string, subnet string, start string, end string) (err error) {
 	a.mutex.Lock()
 	defer a.mutex.Unlock()
@@ -88,6 +145,11 @@ func (a *IPAllocator) NewSubnet(name string, subnet string, start string, end st
 		return fmt.Errorf("network %s already exists", name)
 	}
 
+	// the same classification as ValidateSubnetSpec; the checks below
+	// stay in place as the construction path's own defense
+	if err := ValidateSubnetSpec(subnet, start, end); err != nil {
+		return err
+	}
 	s := IPSubnet{}
 	s.start = net.ParseIP(start)
 	s.end = net.ParseIP(end)
@@ -491,7 +553,7 @@ func (a *IPAllocator) ReleaseIPOwnedBy(name string, givenIP string, owner string
 
 	gIP, err := netip.ParseAddr(givenIP)
 	if err != nil {
-		return err
+		return fmt.Errorf("given ip %s: %w", givenIP, ErrIPInvalid)
 	}
 	gIPCheck := a.ipam[name].cidr.Contains(gIP)
 	if !gIPCheck {

@@ -2,6 +2,7 @@ package cache
 
 import (
 	"fmt"
+	"sync"
 
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
 
@@ -9,6 +10,10 @@ import (
 )
 
 type CacheAllocator struct {
+	// mutex guards ipPoolCache: all three controller workers share a single
+	// CacheAllocator instance, so every map access must be synchronized
+	// (a concurrent map read/write is an unrecoverable runtime fatal)
+	mutex       sync.RWMutex
 	ipPoolCache map[string]kihv1.IPPool
 }
 
@@ -25,6 +30,9 @@ func New() *CacheAllocator {
 }
 
 func (c *CacheAllocator) Add(t interface{}) (err error) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
 	switch t.(type) {
 	case *kihv1.IPPool:
 		log.Debugf("(cache.Add) adding pool for %s", t.(*kihv1.IPPool).Spec.NetworkName)
@@ -44,6 +52,9 @@ func (c *CacheAllocator) Add(t interface{}) (err error) {
 }
 
 func (c *CacheAllocator) Check(t interface{}) bool {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+
 	switch t.(type) {
 	case *kihv1.IPPool:
 		_, exists := c.ipPoolCache[t.(*kihv1.IPPool).Spec.NetworkName]
@@ -54,6 +65,9 @@ func (c *CacheAllocator) Check(t interface{}) bool {
 }
 
 func (c *CacheAllocator) Get(t string, name string) (i interface{}, err error) {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+
 	switch t {
 	case "pool":
 		log.Debugf("(cache.Get) returning pool for %s", name)
@@ -74,6 +88,9 @@ func (c *CacheAllocator) Get(t string, name string) (i interface{}, err error) {
 }
 
 func (c *CacheAllocator) Delete(t string, name string) (err error) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
 	switch t {
 	case "pool":
 		log.Debugf("(cache.Delete) deleting pool for %s", name)
@@ -89,6 +106,9 @@ func (c *CacheAllocator) Delete(t string, name string) (err error) {
 }
 
 func (c *CacheAllocator) Usage(t string) {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+
 	switch t {
 	case "pool":
 		for subnet, pool := range c.ipPoolCache {

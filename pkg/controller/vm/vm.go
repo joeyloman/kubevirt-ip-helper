@@ -258,6 +258,11 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 			// no lease left for this interface: the cleanup already
 			// converged, nothing to replay
 
+		case errors.Is(err, dhcp.ErrLeaseInvalidHwAddr):
+			// an unparseable mac can never own a lease: the dhcp side of
+			// this cleanup has converged, the ipam release of an
+			// unparseable ip is classified the same way below
+
 		case errors.Is(err, dhcp.ErrLeaseForeignOwner):
 			// the mac was reassigned to another vm which owns the whole
 			// interface state by now
@@ -310,9 +315,9 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 				log.Warnf("(vm.cleanupNetworkInterface) [%s/%s] ip %s is allocated by another owner, skipping the release of it",
 					vmnetcfg.Namespace, vmnetcfg.Name, netCfg.IPAddress)
 				c.metrics.UpdateLogStatus("warning")
-			} else if !util.IsAlreadyReleased(err) {
-				// already-free addresses are treated as done so a retried
-				// cleanup can converge
+			} else if !util.IsAlreadyReleased(err) && !util.IsUnusableIdentity(err) {
+				// already-free addresses and unparseable addresses are
+				// treated as done so a retried cleanup can converge
 				return fmt.Errorf("(vm.cleanupNetworkInterface) [%s/%s] error releasing ip from ipam: %s",
 					vmnetcfg.Namespace, vmnetcfg.Name, err.Error())
 			}
@@ -321,14 +326,15 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 
 	pool, poolErr := c.cache.Get("pool", netCfg.NetworkName)
 	if poolErr != nil {
-		// without the pool object the status entry cannot be removed; the
-		// cleanup of the reached state still continues so the durable
-		// update for the remaining interfaces can proceed
-		log.Errorf("(vm.cleanupNetworkInterface) [%s/%s] %s",
-			vmnetcfg.Namespace, vmnetcfg.Name, poolErr)
-		c.metrics.UpdateLogStatus("error")
-
-		return
+		// without the pool object the status entry cannot be removed: this
+		// is a failed cleanup, not a converged one. proceeding silently
+		// would orphan the ledger entry forever (it is re-pinned at every
+		// subsequent registration and no longer reachable by any owner).
+		// fail the sync instead: the lease and claim releases above are
+		// owner-checked and idempotent, so the retried cleanup converges
+		// once the pool is cached again
+		return fmt.Errorf("(vm.cleanupNetworkInterface) [%s/%s] %s",
+			vmnetcfg.Namespace, vmnetcfg.Name, poolErr.Error())
 	}
 
 	if statusErr := c.updateIPPoolStatus(
@@ -386,7 +392,7 @@ func (c *Controller) updateIPPoolStatus(event string, vmnetcfgNamespace string, 
 						return nil
 					}
 
-					return fmt.Errorf("ip %s already found in IPPool status", ip)
+					return fmt.Errorf("ip %s already found in IPPool status: %w", ip, util.ErrForeignOwner)
 				}
 				updatedAllocated[k] = v
 			}

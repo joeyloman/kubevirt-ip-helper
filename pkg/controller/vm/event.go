@@ -143,31 +143,80 @@ func (e *EventHandler) EventListener() (err error) {
 			}
 		},
 		DeleteFunc: func(obj interface{}) {
-			virtualMachine, isVM := util.UnwrapTombstone(obj).(*kubevirtv1.VirtualMachine)
-			if !isVM {
-				return
-			}
-
-			key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(virtualMachine)
-			if err == nil {
-				queue.Add(Event{
-					key:         key,
-					action:      DELETE,
-					vmName:      virtualMachine.GetName(),
-					vmNamespace: virtualMachine.GetNamespace(),
-				})
-			}
+			e.enqueueVirtualMachineDelete(queue, obj)
 		},
 	}, cache.Indexers{})
 
 	controller := NewController(queue, indexer, informer, e.cache, e.ipam, e.dhcp, e.metrics, e.kihClientset)
 	stop := make(chan struct{})
-	defer close(stop)
-	go controller.Run(1, stop)
+
+	// join the controller on shutdown: EventListener only returns after
+	// Controller.Run has fully stopped (its worker has drained the queue), so
+	// the application restart flow can wait for the old generation to be gone
+	done := make(chan struct{})
+	go func() {
+		controller.Run(1, stop)
+		close(done)
+	}()
 
 	select {
 	case <-e.ctx.Done():
 		log.Infof("(vm.EventListener) stopping the VirtualMachine event listener")
+		close(stop)
+		<-done
 		return
 	}
+}
+
+// enqueueVirtualMachineDelete derives the cleanup event for a deleted
+// virtual machine: a tombstone whose payload is no longer a VirtualMachine
+// (a stale final state from a relist) still identifies the deleted object
+// through its key, and dropping the event would strand the vmnetcfg object
+// and its allocations forever. objects which are neither a virtual machine
+// nor a tombstone do not come from this informer and stay dropped.
+func (e *EventHandler) enqueueVirtualMachineDelete(queue workqueue.RateLimitingInterface, obj interface{}) {
+	virtualMachine, isVM := util.UnwrapTombstone(obj).(*kubevirtv1.VirtualMachine)
+
+	if !isVM {
+		if _, isTombstone := obj.(cache.DeletedFinalStateUnknown); !isTombstone {
+			return
+		}
+	}
+
+	var key string
+	var vmNamespace string
+	var vmName string
+
+	if isVM {
+		var err error
+		key, err = cache.DeletionHandlingMetaNamespaceKeyFunc(virtualMachine)
+		if err != nil {
+			return
+		}
+		vmNamespace = virtualMachine.GetNamespace()
+		vmName = virtualMachine.GetName()
+	} else {
+		var err error
+		key, err = cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
+		if err != nil {
+			return
+		}
+
+		ns, name, splitErr := cache.SplitMetaNamespaceKey(key)
+		if splitErr != nil {
+			return
+		}
+
+		log.Warnf("(vm.EventListener) virtualmachine delete payload is no longer a VirtualMachine, deriving the cleanup from key %s", key)
+
+		vmNamespace = ns
+		vmName = name
+	}
+
+	queue.Add(Event{
+		key:         key,
+		action:      DELETE,
+		vmName:      vmName,
+		vmNamespace: vmNamespace,
+	})
 }

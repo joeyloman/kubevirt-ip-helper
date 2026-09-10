@@ -2,6 +2,7 @@ package ippool
 
 import (
 	"context"
+	"fmt"
 	"sync/atomic"
 	"time"
 
@@ -151,6 +152,16 @@ func (c *Controller) sync(event Event) (err error) {
 			// registration is torn back down, so the retried attempt is
 			// not rejected by the leftover sub-resources of its own
 			// previous attempt.
+			// a dying era must not re-register: registerPoolWithTeardown
+			// would re-add the server ip to the nic and re-open the dhcp
+			// listener after (or during) the application teardown, and the
+			// new era's registration would then collide with the stale
+			// address deterministically forever
+			if c.appStatus.Load() == APP_RESTART {
+				log.Warnf("(ippool.sync) deferring re-registration of pool %s while the application is reinitializing", event.poolName)
+				return fmt.Errorf("deferring re-registration of pool %s while the application is reinitializing", event.poolName)
+			}
+
 			err = c.registerPoolWithTeardown(obj.(*kihv1.IPPool), "failed to register unregistered pool")
 
 			return err

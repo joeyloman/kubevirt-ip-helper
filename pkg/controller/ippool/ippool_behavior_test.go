@@ -643,6 +643,67 @@ func TestHandleIPPoolObjectChangeRejectsUnparseableSubnetUpdate(t *testing.T) {
 	}
 }
 
+// the pre-teardown validation must classify every projection which can
+// never register, not only the unparseable subnet: an out-of-range start,
+// a reversed range or the broadcast as end would drain the live dhcp pool
+// and the registration afterwards, leaving the network unserved while the
+// leader crash-loops or logs forever
+func TestHandleIPPoolObjectChangeRejectsUnregistrableRangeUpdate(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(pool *kihv1.IPPool)
+	}{
+		{"start outside the subnet", func(pool *kihv1.IPPool) { pool.Spec.IPv4Config.Pool.Start = "192.168.9.9" }},
+		{"reversed range", func(pool *kihv1.IPPool) {
+			pool.Spec.IPv4Config.Pool.Start = "10.10.10.50"
+			pool.Spec.IPv4Config.Pool.End = "10.10.10.10"
+		}},
+		{"broadcast as end", func(pool *kihv1.IPPool) { pool.Spec.IPv4Config.Pool.End = "10.10.10.255" }},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _, d, ca, _ := ippoolBehaviorNewTestController(t, nil)
+
+			oldPool := ippoolBehaviorNewTestPool("pool1", "net-a")
+			if err := ca.Add(oldPool); err != nil {
+				t.Fatalf("failed to cache the registered pool: %s", err.Error())
+			}
+
+			if err := d.AddPool(
+				"net-a",
+				"10.10.10.1",
+				"255.255.255.0",
+				"10.10.10.254",
+				[]string{"10.10.10.2", "10.10.10.3"},
+				"example.local",
+				[]string{"example.local"},
+				[]string{"10.10.10.4"},
+				3600,
+				"eth-test",
+			); err != nil {
+				t.Fatalf("failed to seed the active dhcp pool: %s", err.Error())
+			}
+
+			newPool := ippoolBehaviorNewTestPool("pool1", "net-a")
+			tc.mutate(newPool)
+
+			if err := c.handleIPPoolObjectChange(*oldPool, newPool); err == nil {
+				t.Fatal("handleIPPoolObjectChange accepted an unregistrable range update")
+			}
+			if c.appStatus.Load() != APP_RUNNING {
+				t.Errorf("the rejected update started an application restart: app status got %d, want %d", c.appStatus.Load(), APP_RUNNING)
+			}
+			if !d.CheckPool("net-a") {
+				t.Error("the rejected update removed the active dhcp pool")
+			}
+			if !ca.Check(oldPool) {
+				t.Error("the rejected update touched the cache")
+			}
+		})
+	}
+}
+
 func TestCreateOrUpdateDHCPPoolProjectsOptions(t *testing.T) {
 	c, _, d, _, _ := ippoolBehaviorNewTestController(t, nil)
 

@@ -790,6 +790,13 @@ func TestUpdateVirtualMachineNetworkConfigObjectPropagatesUpdateError(t *testing
 	f.vmnetcfgUpdateStatus = http.StatusInternalServerError
 	f.vmnetcfgUpdateErr = "boom"
 
+	// the pool must be cached: the interface cleanup of the replaced nic
+	// now fails (and aborts before the object update) on a pool cache miss,
+	// so this test needs the cleanup to reach the durable update
+	storePool(t, c, f, "pool-a", "default/net-a", map[string]string{
+		"10.0.0.42": "ns1/vm1 [aa:bb:cc:00:00:01]",
+	})
+
 	f.mu.Lock()
 	f.vmnetcfgs["ns1/vm1"] = &kihv1.VirtualMachineNetworkConfig{
 		ObjectMeta: metav1.ObjectMeta{Name: "vm1", Namespace: "ns1"},
@@ -928,7 +935,7 @@ func TestCleanupNetworkInterfaceReleasesAllState(t *testing.T) {
 	}
 }
 
-func TestCleanupNetworkInterfaceSkipsPoolStatusWhenPoolUnknown(t *testing.T) {
+func TestCleanupNetworkInterfaceFailsWhenPoolUnknown(t *testing.T) {
 	c, f := vmBehaviorNewTestController(t)
 
 	mac := "aa:bb:cc:00:00:01"
@@ -942,15 +949,36 @@ func TestCleanupNetworkInterfaceSkipsPoolStatusWhenPoolUnknown(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "vm1", Namespace: "ns1"},
 		Spec:       kihv1.VirtualMachineNetworkConfigSpec{VMName: "vm1"},
 	}
-	if err := c.cleanupNetworkInterface(vmnetcfg, &kihv1.NetworkConfig{MACAddress: mac, NetworkName: networkName, IPAddress: ip}); err != nil {
-		t.Fatalf("cleanupNetworkInterface: %v", err)
-	}
 
-	if c.dhcp.CheckLease(mac) {
-		t.Error("expected dhcp lease to be deleted")
+	// the pool is not cached: the status entry cannot be un-recorded, so
+	// the cleanup must report failure (orphaning the record silently would
+	// lose the address forever), not a converged success
+	err := c.cleanupNetworkInterface(vmnetcfg, &kihv1.NetworkConfig{MACAddress: mac, NetworkName: networkName, IPAddress: ip})
+	if err == nil || !strings.Contains(err.Error(), "does not exists in cache") {
+		t.Fatalf("expected pool cache miss error, got %v", err)
 	}
 	if n := len(f.requestsFor(http.MethodPut, "/status")); n != 0 {
 		t.Errorf("expected no pool status update when pool is unknown, got %d", n)
+	}
+
+	// once the pool is registered the retried cleanup converges: the
+	// releases above are idempotent and the record is removed
+	storePool(t, c, f, "pool-a", networkName, map[string]string{
+		ip: "ns1/vm1 [" + mac + "]",
+	})
+	if err := c.cleanupNetworkInterface(vmnetcfg, &kihv1.NetworkConfig{MACAddress: mac, NetworkName: networkName, IPAddress: ip}); err != nil {
+		t.Fatalf("retried cleanupNetworkInterface: %v", err)
+	}
+	if c.dhcp.CheckLease(mac) {
+		t.Error("expected dhcp lease to be deleted")
+	}
+	if n := len(f.requestsFor(http.MethodPut, "/ippools/pool-a/status")); n != 1 {
+		t.Errorf("expected 1 pool status update after the retry, got %d", n)
+	}
+	if pool := f.storedPool("pool-a"); pool != nil {
+		if _, stillThere := pool.Status.IPv4.Allocated[ip]; stillThere {
+			t.Errorf("expected %s removed from allocations after the retry, got %v", ip, pool.Status.IPv4.Allocated)
+		}
 	}
 }
 

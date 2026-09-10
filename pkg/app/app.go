@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -55,19 +56,30 @@ type handler struct {
 	ippoolEventHandler   *ippool.EventHandler
 	vmnetcfgEventHandler *vmnetcfg.EventHandler
 	vmEventHandler       *vm.EventHandler
-	appStatus            atomic.Int32
+	// appStatus and the startup counters are allocated per service era in
+	// RunServices: the previous generation keeps its own atomics through the
+	// pointers passed into its handlers, so zombie workers of an old era can
+	// never write into the gate or status of the new era
+	appStatus            *atomic.Int32
+	listenerWg           *sync.WaitGroup
 	ippoolCountTarget    int
-	ippoolCountCurrent   atomic.Int32
+	ippoolCountCurrent   *atomic.Int32
 	vmnetcfgCountTarget  int
-	vmnetcfgCountCurrent atomic.Int32
+	vmnetcfgCountCurrent *atomic.Int32
 	lock                 *resourcelock.LeaseLock
 	leaderId             string
 }
 
 func Register() *handler {
-	return &handler{}
-}
+	h := &handler{}
 
+	// the shared era state must be usable on a freshly registered handler
+	h.appStatus = new(atomic.Int32)
+	h.appStatus.Store(APP_INIT)
+	h.listenerWg = &sync.WaitGroup{}
+
+	return h
+}
 func (h *handler) getKubeConfig() (config *rest.Config, err error) {
 	if !util.FileExists(h.kubeConfigFile) {
 		return rest.InClusterConfig()
@@ -100,7 +112,9 @@ func (h *handler) Init() {
 	// make sure the leader label is removed in case the pod crashed
 	h.RemoveLeaderPodLabel()
 
+	h.appStatus = new(atomic.Int32)
 	h.appStatus.Store(APP_INIT)
+	h.listenerWg = &sync.WaitGroup{}
 
 	config, err := h.getKubeConfig()
 	if err != nil {
@@ -150,6 +164,12 @@ func (h *handler) Run(mainCtx context.Context) {
 					time.Sleep(time.Second)
 					if h.appStatus.Load() == APP_RESTART {
 						cancel()
+
+						// join the previous controller era before touching shared host
+						// state or starting the new era: the old informers, controller
+						// workers and gate writers must be gone, so they cannot
+						// re-register NIC IPs or DHCP listeners behind the new era's back
+						h.listenerWg.Wait()
 						h.RemoveLeaderPodLabel()
 						h.metrics.Stop()
 						h.stopDHCPListeners()
@@ -157,7 +177,8 @@ func (h *handler) Run(mainCtx context.Context) {
 
 						time.Sleep(time.Second * 10)
 
-						h.appStatus.Store(APP_INIT)
+						// the new per-era appStatus (APP_INIT) and startup counters are
+						// allocated by RunServices itself
 						ctx, cancel = context.WithCancel(context.Background())
 						h.RunServices(ctx)
 						h.appStatus.Store(APP_RUNNING)
@@ -195,6 +216,14 @@ func (h *handler) RunServices(ctx context.Context) {
 	// register the new context
 	h.ctx = ctx
 
+	// allocate the shared state of this service era: handlers of a previous
+	// era keep the pointers they were constructed with, so zombie writes can
+	// no longer reach the startup gate or the status seen by the main loop
+	h.appStatus = new(atomic.Int32)
+	h.appStatus.Store(APP_INIT)
+	h.ippoolCountCurrent = new(atomic.Int32)
+	h.vmnetcfgCountCurrent = new(atomic.Int32)
+
 	// initialize the ipam service
 	h.ipam = ipam.New()
 
@@ -212,9 +241,9 @@ func (h *handler) RunServices(ctx context.Context) {
 	h.cache = cache.New()
 
 	// gather the ippool count so we know how many pools we should initialize during startup before initializing the next controller
-	IPPoolList, err := h.getIPPools()
+	IPPoolList, err := retryList(h.ctx, h.metrics, "the IPPoolList", func() ([]v1.IPPool, error) { return h.getIPPools() })
 	if err != nil {
-		log.Errorf("(app.RunServices) %s", err.Error())
+		log.Errorf("(app.RunServices) giving up on %s: %s", "the IPPoolList", err.Error())
 		h.metrics.UpdateLogStatus("error")
 
 		return
@@ -233,13 +262,17 @@ func (h *handler) RunServices(ctx context.Context) {
 		h.kubeContext,
 		nil,
 		nil,
-		&h.appStatus,
-		&h.ippoolCountCurrent,
+		h.appStatus,
+		h.ippoolCountCurrent,
 	)
 	if err := h.ippoolEventHandler.Init(); err != nil {
 		handleErr(err)
 	}
-	go h.ippoolEventHandler.EventListener()
+	h.listenerWg.Add(1)
+	go func() {
+		defer h.listenerWg.Done()
+		h.ippoolEventHandler.EventListener()
+	}()
 
 	// wait for the ippool handler to gather all the pools before proceeding the vmnetcfg controller
 	// this prevents race conditions
@@ -270,9 +303,9 @@ func (h *handler) RunServices(ctx context.Context) {
 	}
 
 	// gather the vmnetcfg count so we know how many network configs we should initialize during startup before initializing the next controller
-	vmnetcfgList, err := h.getVmNetCfgs()
+	vmnetcfgList, err := retryList(h.ctx, h.metrics, "the VirtualMachineNetworkConfig list", func() ([]v1.VirtualMachineNetworkConfig, error) { return h.getVmNetCfgs() })
 	if err != nil {
-		log.Errorf("(app.RunServices) %s", err.Error())
+		log.Errorf("(app.RunServices) giving up on %s: %s", "the VirtualMachineNetworkConfig list", err.Error())
 		h.metrics.UpdateLogStatus("error")
 
 		return
@@ -291,13 +324,17 @@ func (h *handler) RunServices(ctx context.Context) {
 		h.kubeContext,
 		nil,
 		nil,
-		&h.appStatus,
-		&h.vmnetcfgCountCurrent,
+		h.appStatus,
+		h.vmnetcfgCountCurrent,
 	)
 	if err := h.vmnetcfgEventHandler.Init(); err != nil {
 		handleErr(err)
 	}
-	go h.vmnetcfgEventHandler.EventListener()
+	h.listenerWg.Add(1)
+	go func() {
+		defer h.listenerWg.Done()
+		h.vmnetcfgEventHandler.EventListener()
+	}()
 
 	// wait for the vmnetcfg handler to gather all the network configs before proceeding the vm controller
 	// this prevents race conditions
@@ -347,13 +384,48 @@ func (h *handler) RunServices(ctx context.Context) {
 	if err := h.vmEventHandler.Init(); err != nil {
 		handleErr(err)
 	}
-	go h.vmEventHandler.EventListener()
+	h.listenerWg.Add(1)
+	go func() {
+		defer h.listenerWg.Done()
+		h.vmEventHandler.EventListener()
+	}()
 
 	// the vm controller is the last service and has no dependencies
 	// so no need to wait until it's initialized completely
 	// the 1 sec sleep is just to log the next line after the vm controller thread is started
 	time.Sleep(time.Second * 1)
 	log.Infof("(app.RunServices) all services are successfully initialized and started")
+}
+
+// retryList repeatedly gathers a startup snapshot until it succeeds or the
+// era context is cancelled: a transient api error must never leave the
+// leader running without controllers (the silent early return made the
+// whole ip management dead while the pod looked healthy). the first
+// attempts run on a short interval to heal quickly, the later ones back off
+// to a minute so a sustained outage does not spam the api.
+func retryList[T any](ctx context.Context, m *metrics.MetricsAllocator, what string, gather func() (T, error)) (result T, err error) {
+	for attempt := 1; ; attempt++ {
+		result, err = gather()
+		if err == nil {
+			return result, nil
+		}
+
+		m.UpdateLogStatus("error")
+
+		delay := time.Second * 5
+		if attempt >= 5 {
+			delay = time.Minute
+		}
+
+		if attempt == 10 {
+			log.Errorf("(app.RunServices) %s still cannot be gathered after %d attempts; the cluster api may be unreachable: the controllers cannot serve without the startup snapshot, keeping the retry alive", what, attempt)
+		}
+
+		select {
+		case <-ctx.Done():
+		case <-time.After(delay):
+		}
+	}
 }
 
 func (h *handler) getIPPools() (IPPools []v1.IPPool, err error) {
@@ -433,7 +505,7 @@ func (h *handler) stopDHCPListeners() {
 	}
 
 	for _, pool := range IPPoolList {
-		if err := h.dhcp.Stop(pool.Spec.BindInterface); err != nil {
+		if err := h.dhcp.Stop(pool.Spec.NetworkName); err != nil {
 			// this is defined as a debug log because some listeners could have been already stopped and this will cause an error
 			log.Debugf("(app.stopDHCPListeners) error while shutting down DHCP listener running on nic [%s] for network [%s]: %s",
 				pool.Spec.BindInterface, pool.Spec.NetworkName, err.Error())

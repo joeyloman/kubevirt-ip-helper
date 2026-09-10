@@ -1,7 +1,9 @@
 package cache
 
 import (
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
@@ -238,4 +240,34 @@ func TestCacheUsageLogsPoolDetails(t *testing.T) {
 		}
 	}
 	t.Errorf("Usage log entries did not mention the cached pool: %+v", hook.entries)
+}
+
+// the three controller workers share a single CacheAllocator: an
+// unsynchronized map access is an unrecoverable runtime fatal, so the
+// race detector must see clean concurrent traffic through the public api
+func TestCacheConcurrentAccessIsRaceClean(t *testing.T) {
+	c := New()
+
+	var wg sync.WaitGroup
+
+	for worker := range 8 {
+		wg.Add(1)
+
+		go func(worker int) {
+			defer wg.Done()
+
+			pool := newTestPool("network-" + strconv.Itoa(worker%4))
+			pool.Name = "pool-" + strconv.Itoa(worker%4)
+
+			for range 250 {
+				_ = c.Add(pool)
+				c.Check(pool)
+				_, _ = c.Get("pool", pool.Spec.NetworkName)
+				c.Usage("pool")
+				_ = c.Delete("pool", pool.Spec.NetworkName)
+			}
+		}(worker)
+	}
+
+	wg.Wait()
 }

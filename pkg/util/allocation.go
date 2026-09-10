@@ -6,6 +6,7 @@ import (
 	"net"
 	"strings"
 
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/dhcp"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
 )
 
@@ -68,4 +69,13 @@ func IsAlreadyReleased(err error) bool {
 	return errors.Is(err, ipam.ErrSubnetNotFound) ||
 		errors.Is(err, ipam.ErrIPAlreadyFree) ||
 		errors.Is(err, ipam.ErrIPNotInCidr)
+}
+
+// IsUnusableIdentity reports cleanup outcomes for identities which can
+// never hold state: an unparseable hardware address or ip cannot own a
+// lease or an allocation, so the cleanup has already converged for such an
+// entry and must not be retried forever.
+func IsUnusableIdentity(err error) bool {
+	return errors.Is(err, dhcp.ErrLeaseInvalidHwAddr) ||
+		errors.Is(err, ipam.ErrIPInvalid)
 }

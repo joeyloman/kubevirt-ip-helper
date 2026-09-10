@@ -152,12 +152,21 @@ func (e *EventHandler) EventListener() (err error) {
 
 	controller := NewController(queue, indexer, informer, e.cache, e.ipam, e.dhcp, e.metrics, e.kihClientset, e.appStatus, e.vmnetcfgCountCurrent)
 	stop := make(chan struct{})
-	defer close(stop)
-	go controller.Run(1, stop)
+
+	// join the controller on shutdown: EventListener only returns after
+	// Controller.Run has fully stopped (its worker has drained the queue), so
+	// the application restart flow can wait for the old generation to be gone
+	done := make(chan struct{})
+	go func() {
+		controller.Run(1, stop)
+		close(done)
+	}()
 
 	select {
 	case <-e.ctx.Done():
 		log.Infof("(vmnetcfg.EventListener) stopping the VirtualMachineNetworkConfig event listener")
+		close(stop)
+		<-done
 		return
 	}
 }

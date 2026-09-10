@@ -23,6 +23,12 @@ var (
 	// ErrLeaseForeignOwner reports a lease operation which would affect a
 	// lease registered for a different owner reference.
 	ErrLeaseForeignOwner = errors.New("lease belongs to another owner")
+
+	// ErrLeaseInvalidHwAddr reports a lease operation for a hardware address
+	// which does not parse at all: no lease can ever carry this identity, so
+	// cleanup callers treat the deletion as converged instead of retrying
+	// forever.
+	ErrLeaseInvalidHwAddr = errors.New("invalid hardware address")
 )
 
 type DHCPPool struct {
@@ -44,8 +50,11 @@ type DHCPLease struct {
 }
 
 type DHCPAllocator struct {
-	pools   map[string]DHCPPool
-	leases  map[string]DHCPLease
+	pools  map[string]DHCPPool
+	leases map[string]DHCPLease
+	// servers holds the running dhcp servers keyed by pool identity
+	// (spec.NetworkName), not by nic: several pools may legitimately share
+	// one interface and each server must stay individually stoppable
 	servers map[string]*server4.Server
 	mutex   sync.Mutex
 
@@ -288,7 +297,7 @@ func (a *DHCPAllocator) DeleteLease(hwAddr string) (err error) {
 func (a *DHCPAllocator) DeleteLeaseOwnedBy(hwAddr string, ref string) (err error) {
 	hw, err := net.ParseMAC(hwAddr)
 	if err != nil {
-		return fmt.Errorf("hwaddr %s is not valid", hwAddr)
+		return fmt.Errorf("%w: hwaddr %q", ErrLeaseInvalidHwAddr, hwAddr)
 	}
 
 	a.mutex.Lock()
@@ -586,8 +595,14 @@ func (a *DHCPAllocator) sendNak(conn net.PacketConn, m *dhcpv4.DHCPv4, serverIP 
 	}
 }
 
-func (a *DHCPAllocator) Run(nic string, serverip string) (err error) {
-	log.Infof("(dhcp.Run) starting DHCP service on nic %s", nic)
+// Run starts the DHCP service for the pool identified by networkName,
+// serving on nic. the server is registered under the pool identity before
+// serving starts, so a concurrent Stop always finds the entry. a second Run
+// for the same network is rejected instead of overwriting the registry
+// entry and orphaning the live server (socket and serve goroutine) which
+// Stop could then never reach.
+func (a *DHCPAllocator) Run(networkName string, nic string, serverip string) (err error) {
+	log.Infof("(dhcp.Run) starting DHCP service for network %s on nic %s", networkName, nic)
 
 	// we need to listen on 0.0.0.0 otherwise client discovers will not be answered
 	laddr := net.UDPAddr{
@@ -595,30 +610,41 @@ func (a *DHCPAllocator) Run(nic string, serverip string) (err error) {
 		Port: 67,
 	}
 
+	a.mutex.Lock()
+	if _, exists := a.servers[networkName]; exists {
+		a.mutex.Unlock()
+
+		return fmt.Errorf("dhcp service already running for network %s", networkName)
+	}
+
 	server, err := server4.NewServer(nic, &laddr, a.dhcpHandler)
 	if err != nil {
+		a.mutex.Unlock()
+
 		return
 	}
 
-	go server.Serve()
-
-	a.mutex.Lock()
-	a.servers[nic] = server
+	a.servers[networkName] = server
 	a.mutex.Unlock()
+
+	go server.Serve()
 
 	return
 }
 
-func (a *DHCPAllocator) Stop(nic string) (err error) {
-	log.Infof("(dhcp.Stop) stopping DHCP service on nic %s", nic)
+// Stop stops and removes the DHCP service of the pool identified by
+// networkName. stopping a network which is not running is a converged
+// no-op, so cleanup paths can call it unconditionally.
+func (a *DHCPAllocator) Stop(networkName string) (err error) {
+	log.Infof("(dhcp.Stop) stopping DHCP service for network %s", networkName)
 
 	a.mutex.Lock()
-	server, exists := a.servers[nic]
-	delete(a.servers, nic)
+	server, exists := a.servers[networkName]
+	delete(a.servers, networkName)
 	a.mutex.Unlock()
 
 	if !exists || server == nil {
-		log.Debugf("(dhcp.Stop) no running dhcp service on nic %s, nothing to stop", nic)
+		log.Debugf("(dhcp.Stop) no running dhcp service for network %s, nothing to stop", networkName)
 
 		return
 	}

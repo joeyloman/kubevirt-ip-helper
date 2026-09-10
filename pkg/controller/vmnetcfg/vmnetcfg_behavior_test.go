@@ -1519,9 +1519,12 @@ func TestVMNetCfgIPAMErrorSetsErrorStatus(t *testing.T) {
 	}
 }
 
-// A failing object update must roll back the allocation side effects: DHCP
-// may not keep serving an address the durable vmnetcfg object never recorded.
-func TestVMNetCfgUpdateFailureRollsBackAllocations(t *testing.T) {
+// A failing object commit must not tear down the fresh allocation: the
+// dhcp server may already have acked the address to its guest, so
+// releasing it would invite a reissue (duplicate ip). the lease, claim and
+// status record stay quarantined and converge through the retried sync
+// which adopts them into the durable spec.
+func TestVMNetCfgUpdateFailureQuarantinesServedAllocation(t *testing.T) {
 	e := newTestEnv(t)
 	// steady state: the failed-commit rollback of a fresh allocation
 	e.appStatus.Store(APP_RUNNING)
@@ -1542,16 +1545,31 @@ func TestVMNetCfgUpdateFailureRollsBackAllocations(t *testing.T) {
 	if n := e.countRequests(http.MethodPut, vmnetcfgStatusPath); n != 0 {
 		t.Errorf("status update requests = %d, want 0", n)
 	}
-	// the allocation side effects are reverted with the durable update gone
-	if e.dhcp.CheckLease(testMAC) {
-		t.Error("lease must be rolled back when the object update fails")
+
+	// the served allocation stays quarantined: lease, claim and record
+	if lease := e.dhcp.GetLease(testMAC); lease.ClientIP == nil || lease.ClientIP.String() != "10.0.0.1" {
+		t.Fatalf("lease = %v, want the quarantined lease kept", lease.ClientIP)
 	}
-	if got := e.ipam.Used(testNetwork); got != 0 {
-		t.Errorf("ipam used = %d, want 0 after the rollback", got)
+	if used := e.ipam.Used(testNetwork); used != 1 {
+		t.Errorf("ipam used = %d, want the quarantined claim kept", used)
 	}
 	pool := e.getStoredPool()
-	if len(pool.Status.IPv4.Allocated) != 0 {
-		t.Errorf("ippool status allocations = %v, want empty after the rollback", pool.Status.IPv4.Allocated)
+	if got := pool.Status.IPv4.Allocated["10.0.0.1"]; got == "" {
+		t.Errorf("status record = %q, want the quarantined record kept", pool.Status.IPv4.Allocated)
+	}
+
+	// the retried sync converges: the quarantined lease of the pending nic
+	// is adopted into the durable object
+	e.api.vmnetcfgPutCode = 0
+	if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, e.getStoredVMNetCfg()); err != nil {
+		t.Fatalf("retried sync: %v", err)
+	}
+	stored := e.getStoredVMNetCfg()
+	if len(stored.Spec.NetworkConfig) != 1 || stored.Spec.NetworkConfig[0].IPAddress != "10.0.0.1" {
+		t.Errorf("stored spec = %+v, want the quarantined address adopted", stored.Spec.NetworkConfig)
+	}
+	if !e.dhcp.CheckLease(testMAC) {
+		t.Error("lease must survive the converging sync")
 	}
 }
 
@@ -1588,14 +1606,15 @@ func TestVMNetCfgCleanupAbortsOnForeignLeaseWhileLive(t *testing.T) {
 	}
 }
 
-// a failing pool status update of a later nic must unwind the applied
-// allocations of the earlier nics too: leaving them registered while the
-// durable object never received the addresses leaks the ipam claims when
-// the object is deleted without spec ips to clean up from
-func TestVMNetCfgLaterNICPoolStatusFailureUnwindsEarlierNICs(t *testing.T) {
+// a failing pool status update of a later nic unwinds its contested claim
+// while the applied fresh allocation of an earlier nic stays quarantined:
+// its lease may already have been served to the guest, so releasing it
+// would reissue an address the guest still uses; the retried sync
+// converges it through the regular cleanup
+func TestVMNetCfgLaterNICPoolStatusFailureQuarantinesEarlierNIC(t *testing.T) {
 	e := newTestEnv(t)
-	// steady state: a running application's sync failure unwinds the
-	// nics allocated within the same sync
+	// steady state: a running application's sync failure quarantines the
+	// fresh allocations of the same sync
 	e.appStatus.Store(APP_RUNNING)
 
 	secondNetwork := "net-b"
@@ -1636,16 +1655,22 @@ func TestVMNetCfgLaterNICPoolStatusFailureUnwindsEarlierNICs(t *testing.T) {
 		t.Errorf("error = %q, want the pool status rejection", err)
 	}
 
-	// nothing of the sync stayed applied when the second nic failed: the
-	// first nic was already registered when the failure hit
-	if e.dhcp.CheckLease(testMAC) || e.dhcp.CheckLease(testMAC2) {
-		t.Error("leases of earlier and failing interfaces must be released")
+	// the fresh allocation of the first nic stays quarantined: the lease
+	// may already have been acked to the guest
+	if lease := e.dhcp.GetLease(testMAC); lease.ClientIP == nil || lease.ClientIP.String() != "10.0.0.1" {
+		t.Errorf("first nic's lease = %v, want the quarantined lease kept", lease.ClientIP)
 	}
-	if used := e.ipam.Used(testNetwork); used != 0 {
-		t.Errorf("first nic's ipam allocation = %d used, want 0 after the unwind", used)
+	if used := e.ipam.Used(testNetwork); used != 1 {
+		t.Errorf("first nic's ipam allocation = %d used, want the quarantined claim kept", used)
+	}
+
+	// the contested claim of the failing nic is unwound: its address
+	// belongs to another owner and must never be served with this lease
+	if e.dhcp.CheckLease(testMAC2) {
+		t.Error("the contested lease of the failing nic must be released")
 	}
 	if used := e.ipam.Used(secondNetwork); used != 0 {
-		t.Errorf("failing nic's ipam allocation = %d used, want 0 after the unwind", used)
+		t.Errorf("contested ipam allocation = %d used, want 0 after the unwind", used)
 	}
 
 	e.api.mu.Lock()
@@ -1653,8 +1678,8 @@ func TestVMNetCfgLaterNICPoolStatusFailureUnwindsEarlierNICs(t *testing.T) {
 	poolBStored := e.api.ippools[secondPoolName].DeepCopy()
 	e.api.mu.Unlock()
 
-	if got := poolA.Status.IPv4.Allocated["10.0.0.1"]; got != "" {
-		t.Errorf("first nic's status entry = %q, want removed by the unwind", got)
+	if got := poolA.Status.IPv4.Allocated["10.0.0.1"]; got == "" {
+		t.Error("the quarantined status record of the first nic must be kept")
 	}
 	if got := poolBStored.Status.IPv4.Allocated["10.0.0.2"]; got != "another/vm [02:00:00:00:00:02]" {
 		t.Errorf("foreign entry of the second pool = %q, want preserved", got)
@@ -1669,12 +1694,13 @@ func TestVMNetCfgLaterNICPoolStatusFailureUnwindsEarlierNICs(t *testing.T) {
 	}
 }
 
-// a pool lookup failing after an earlier nic was applied must unwind the
-// earlier allocation as well
-func TestVMNetCfgLaterNICPoolLookupFailureUnwindsEarlierNICs(t *testing.T) {
+// a pool lookup failing after an earlier nic was applied keeps the earlier
+// served allocation quarantined instead of releasing an address its guest
+// may already use
+func TestVMNetCfgLaterNICPoolLookupFailureQuarantinesEarlierNIC(t *testing.T) {
 	e := newTestEnv(t)
-	// steady state: a running application's sync failure unwinds the
-	// nics allocated within the same sync
+	// steady state: a running application's sync failure quarantines the
+	// fresh allocations of the same sync
 	e.appStatus.Store(APP_RUNNING)
 	e.addSubnet("10.0.0.1", "10.0.0.1")
 	e.seedPool(nil)
@@ -1694,18 +1720,19 @@ func TestVMNetCfgLaterNICPoolLookupFailureUnwindsEarlierNICs(t *testing.T) {
 		t.Errorf("error = %q, want the cache miss message", err)
 	}
 
-	if e.dhcp.CheckLease(testMAC) {
-		t.Error("the earlier nic's lease must be released by the unwind")
+	// the earlier nic's served allocation stays quarantined
+	if lease := e.dhcp.GetLease(testMAC); lease.ClientIP == nil || lease.ClientIP.String() != "10.0.0.1" {
+		t.Errorf("the earlier nic's lease = %v, want the quarantined lease kept", lease.ClientIP)
 	}
-	if used := e.ipam.Used(testNetwork); used != 0 {
-		t.Errorf("the earlier nic's ipam allocation = %d used, want 0 after the unwind", used)
+	if used := e.ipam.Used(testNetwork); used != 1 {
+		t.Errorf("the earlier nic's ipam allocation = %d used, want the quarantined claim kept", used)
 	}
 
 	e.api.mu.Lock()
 	poolA := e.api.ippools[testPoolName].DeepCopy()
 	e.api.mu.Unlock()
-	if got := poolA.Status.IPv4.Allocated["10.0.0.1"]; got != "" {
-		t.Errorf("the earlier nic's status entry = %q, want removed by the unwind", got)
+	if got := poolA.Status.IPv4.Allocated["10.0.0.1"]; got == "" {
+		t.Error("the quarantined status record of the earlier nic must be kept")
 	}
 
 	if n := e.countRequests(http.MethodPut, vmnetcfgMainPath); n != 0 {
@@ -1870,10 +1897,10 @@ func TestVMNetCfgDeletionRefreshesPoolMetrics(t *testing.T) {
 	}
 }
 
-// the rollback of a failed durable update must publish accounting which
-// reflects ipam after the releases: a status write that runs before the
-// releases persisted used/available of the still-held address
-func TestVMNetCfgRollbackPublishesSettledAccounting(t *testing.T) {
+// the quarantined rollback publishes nothing: the accounting written while
+// applying the allocation already matches the kept lease, the kept claim
+// and the kept status record (no phantom release in ledger or gauges)
+func TestVMNetCfgQuarantinedRollbackKeepsAccountingConsistent(t *testing.T) {
 	e := newTestEnv(t)
 	// steady state: the failed-commit rollback of a fresh allocation
 	e.appStatus.Store(APP_RUNNING)
@@ -1892,30 +1919,29 @@ func TestVMNetCfgRollbackPublishesSettledAccounting(t *testing.T) {
 		t.Errorf("error = %q, want the update prefix", err)
 	}
 
-	// the unwind released the allocation side effects...
-	if e.dhcp.CheckLease(testMAC) {
-		t.Error("lease must be rolled back when the object update fails")
+	// the allocation stays applied and its persisted accounting reflects it
+	if !e.dhcp.CheckLease(testMAC) {
+		t.Fatal("the lease must stay quarantined after the failed update")
 	}
-	if used := e.ipam.Used(testNetwork); used != 0 {
-		t.Errorf("ipam used = %d, want 0 after the rollback", used)
+	if used := e.ipam.Used(testNetwork); used != 1 {
+		t.Fatalf("ipam used = %d, want the quarantined claim kept", used)
 	}
 
-	// ...and the persisted accounting must reflect the settled state
 	pool := e.getStoredPool()
-	if len(pool.Status.IPv4.Allocated) != 0 {
-		t.Errorf("allocations = %v, want empty after the rollback", pool.Status.IPv4.Allocated)
+	if got := pool.Status.IPv4.Allocated["10.0.0.1"]; got == "" {
+		t.Fatalf("allocations = %v, want the quarantined record kept", pool.Status.IPv4.Allocated)
 	}
-	if pool.Status.IPv4.Used != 0 {
-		t.Errorf("persisted used = %d, want 0 (counters must be computed after the releases)", pool.Status.IPv4.Used)
+	if pool.Status.IPv4.Used != 1 {
+		t.Errorf("persisted used = %d, want 1 (the ledger must match the kept claim)", pool.Status.IPv4.Used)
 	}
-	if pool.Status.IPv4.Available != 2 {
-		t.Errorf("persisted available = %d, want 2", pool.Status.IPv4.Available)
+	if pool.Status.IPv4.Available != 1 {
+		t.Errorf("persisted available = %d, want 1", pool.Status.IPv4.Available)
 	}
 
-	if v, ok := e.metricValue(metricIPPoolUsed, map[string]string{"ippool": testPoolName, "subnet": testSubnet, "network": testNetwork}); !ok || v != 0 {
-		t.Errorf("used gauge after rollback = %v (present %v), want 0", v, ok)
+	if v, ok := e.metricValue(metricIPPoolUsed, map[string]string{"ippool": testPoolName, "subnet": testSubnet, "network": testNetwork}); !ok || v != 1 {
+		t.Errorf("used gauge after quarantine = %v (present %v), want 1", v, ok)
 	}
-	if v, ok := e.metricValue(metricIPPoolAvail, map[string]string{"ippool": testPoolName, "subnet": testSubnet, "network": testNetwork}); !ok || v != 2 {
-		t.Errorf("available gauge after rollback = %v (present %v), want 2", v, ok)
+	if v, ok := e.metricValue(metricIPPoolAvail, map[string]string{"ippool": testPoolName, "subnet": testSubnet, "network": testNetwork}); !ok || v != 1 {
+		t.Errorf("available gauge after quarantine = %v (present %v), want 1", v, ok)
 	}
 }
