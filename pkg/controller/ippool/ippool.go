@@ -48,6 +48,68 @@ func subnetRegistrationError(networkName string, err error) error {
 	return fmt.Errorf("error while allocating a new subnet in IPAM for network [%s]: %s", networkName, err.Error())
 }
 
+// validateExcludeEntries reports whether every exclude entry of the pool
+// projection can ever be claimed by a registration: an entry which does
+// not parse, is not an ipv4 address of the subnet, equals the broadcast
+// address or lies outside the start..end pool range could never be
+// reclaimed by the exclude pass, so it is rejected here - before any
+// host, dhcp or allocator mutation - instead of failing the registration
+// after the listener is already live and every resync rebuilding and
+// tearing the half-applied registration down again.
+func validateExcludeEntries(pool *kihv1.IPPool) error {
+	ipnet, err := netip.ParsePrefix(pool.Spec.IPv4Config.Subnet)
+	if err != nil {
+		return fmt.Errorf("invalid subnet %s: %s", pool.Spec.IPv4Config.Subnet, err.Error())
+	}
+	if !ipnet.Addr().Is4() {
+		return fmt.Errorf("subnet %s is not an ipv4 subnet", pool.Spec.IPv4Config.Subnet)
+	}
+
+	startAddr, err := netip.ParseAddr(pool.Spec.IPv4Config.Pool.Start)
+	if err != nil {
+		return fmt.Errorf("invalid start address %s: %s", pool.Spec.IPv4Config.Pool.Start, err.Error())
+	}
+	endAddr, err := netip.ParseAddr(pool.Spec.IPv4Config.Pool.End)
+	if err != nil {
+		return fmt.Errorf("invalid end address %s: %s", pool.Spec.IPv4Config.Pool.End, err.Error())
+	}
+	startAddr, endAddr = startAddr.Unmap(), endAddr.Unmap()
+
+	// the broadcast of the subnet: the allocator never hands it out, so an
+	// exclude entry may not claim it either
+	subnetStart := ipnet.Addr().As4()
+	subnetMask := net.CIDRMask(ipnet.Bits(), 32)
+	var broadcast [4]byte
+	for i := range subnetStart {
+		broadcast[i] = subnetStart[i] | ^subnetMask[i]
+	}
+	broadcastAddr, _ := netip.AddrFromSlice(broadcast[:])
+
+	for _, ex := range pool.Spec.IPv4Config.Pool.Exclude {
+		exAddr, err := netip.ParseAddr(ex)
+		if err != nil {
+			return fmt.Errorf("invalid exclude address %s: %s", ex, err.Error())
+		}
+		exAddr = exAddr.Unmap()
+
+		if !exAddr.Is4() {
+			return fmt.Errorf("exclude address %s is not an ipv4 address", ex)
+		}
+		if !ipnet.Contains(exAddr) {
+			return fmt.Errorf("exclude address %s is not within subnet %s", ex, pool.Spec.IPv4Config.Subnet)
+		}
+		if exAddr.Compare(broadcastAddr) == 0 {
+			return fmt.Errorf("exclude address %s equals the broadcast address %s", ex, broadcastAddr.String())
+		}
+		if exAddr.Compare(startAddr) < 0 || exAddr.Compare(endAddr) > 0 {
+			return fmt.Errorf("exclude address %s is not within the pool range %s-%s",
+				ex, pool.Spec.IPv4Config.Pool.Start, pool.Spec.IPv4Config.Pool.End)
+		}
+	}
+
+	return nil
+}
+
 func (c *Controller) registerIPPool(pool *kihv1.IPPool) (cleanup bool, err error) {
 
 	// the startup gate counts this pool as handled once its registration
@@ -82,6 +144,16 @@ func (c *Controller) registerIPPool(pool *kihv1.IPPool) (cleanup bool, err error
 		return cleanup, fmt.Errorf("error while validating subnet [%s] and range [%s-%s] for network [%s]: %s: %w",
 			pool.Spec.IPv4Config.Subnet, pool.Spec.IPv4Config.Pool.Start, pool.Spec.IPv4Config.Pool.End,
 			pool.Spec.NetworkName, validateErr.Error(), ErrPoolUnregistrable)
+	}
+
+	// every exclude entry must be claimable before any state is mutated:
+	// an unclaimable entry (outside the pool range, the subnet or the
+	// broadcast) could only fail the exclude pass after the listener is
+	// already live, so every retried attempt and resync would rebuild and
+	// tear the half-applied registration down again
+	if excludeErr := validateExcludeEntries(pool); excludeErr != nil {
+		return cleanup, fmt.Errorf("error while validating the exclude entries of pool [%s] for network [%s]: %s: %w",
+			pool.Name, pool.Spec.NetworkName, excludeErr.Error(), ErrPoolUnregistrable)
 	}
 
 	// an exclude entry which the persisted ledger records for a live
@@ -141,8 +213,14 @@ func (c *Controller) registerIPPool(pool *kihv1.IPPool) (cleanup bool, err error
 		return cleanup, fmt.Errorf("error while registering DHCP pool for network [%s]: %s", pool.Spec.NetworkName, err.Error())
 	}
 
-	// start a dhcp service thread for the pool identity (networkname)
-	if err := c.dhcp.Run(pool.Spec.NetworkName, pool.Spec.BindInterface); err != nil {
+	// start a dhcp service thread for the pool identity (networkname),
+	// through the runListener seam so a registration is testable without
+	// a host interface (production controllers default to dhcp.Run)
+	runListener := c.runListener
+	if runListener == nil {
+		runListener = c.dhcp.Run
+	}
+	if err := runListener(pool.Spec.NetworkName, pool.Spec.BindInterface); err != nil {
 		return cleanup, fmt.Errorf("error while starting DHCP service thread for network [%s]: %s", pool.Spec.NetworkName, err.Error())
 	}
 
@@ -189,6 +267,17 @@ func (c *Controller) registerIPPool(pool *kihv1.IPPool) (cleanup bool, err error
 	if err = c.cache.Add(rPool); err != nil {
 		return cleanup, fmt.Errorf("error while caching the IPPool for network [%s]: %s", pool.Spec.NetworkName, err.Error())
 	}
+
+	// record the live registration of this era: the pool NAME owns the
+	// networkname key it registered under, so a later update which does
+	// not carry that networkname anymore (a rename swallowed while the
+	// application was initializing, re-delivered by a resync with
+	// old==new) can still find and tear the old registration down instead
+	// of registering the pool a second time
+	if c.registeredPools == nil {
+		c.registeredPools = make(map[string]string)
+	}
+	c.registeredPools[pool.Name] = pool.Spec.NetworkName
 
 	log.Infof("(ippool.registerIPPool) [%s] new IPPool registered", pool.Name)
 
@@ -252,9 +341,45 @@ func (c *Controller) handleIPPoolObjectChange(oldPool kihv1.IPPool, newPool *kih
 			newPool.Spec.NetworkName, validateErr.Error())
 	}
 
+	// the exclude entries are part of the same pre-teardown validation:
+	// an unclaimable entry would drain the live services here and then
+	// fail the re-registration of the next era forever (the exclude pass
+	// can never reclaim it), so the update is rejected while the
+	// registered configuration keeps serving
+	if excludeErr := validateExcludeEntries(newPool); excludeErr != nil {
+		return fmt.Errorf("(ippool.handleIPPoolObjectChange) rejecting update for networkname [%s]: %s, keeping the currently registered configuration",
+			newPool.Spec.NetworkName, excludeErr.Error())
+	}
+
 	if oldPool.Spec.NetworkName != newPool.Spec.NetworkName && c.dhcp.CheckPool(newPool.Spec.NetworkName) {
 		return fmt.Errorf("(ippool.handleIPPoolObjectChange) rejecting update for [%s]: the networkname [%s] is already registered by another IPPool, keeping the currently registered configuration",
 			oldPool.Spec.NetworkName, newPool.Spec.NetworkName)
+	}
+
+	// an exclude entry which the persisted ledger records for a live
+	// binding is the same never-converging conflict the registration
+	// rejects up front: without this guard the restart teardown would
+	// drain the live services and the re-registration of the next era
+	// would then be rejected forever, so the update is refused while the
+	// registered configuration keeps serving. the check runs only when
+	// the exclude entries actually changed: the registered entries
+	// coexist with the ledger by construction. the ledger lookup needs
+	// the api; a controller without a clientset (unit-constructed) skips
+	// the check and the re-registration keeps the configuration honest.
+	if !reflect.DeepEqual(oldPool.Spec.IPv4Config.Pool.Exclude, newPool.Spec.IPv4Config.Pool.Exclude) && c.kihClientset != nil {
+		cPool, getErr := c.kihClientset.KubevirtiphelperV1().IPPools().Get(c.ctx, newPool.Name, metav1.GetOptions{})
+		if getErr != nil && !apierrors.IsNotFound(getErr) {
+			return fmt.Errorf("(ippool.handleIPPoolObjectChange) error while checking the exclude entries of pool [%s] against its persisted claims for network [%s]: %s",
+				newPool.Name, newPool.Spec.NetworkName, getErr.Error())
+		}
+		if getErr == nil {
+			for _, ex := range newPool.Spec.IPv4Config.Pool.Exclude {
+				if ref, claimed := cPool.Status.IPv4.Allocated[ex]; claimed && ref != ipam.ExcludedOwner {
+					return fmt.Errorf("(ippool.handleIPPoolObjectChange) rejecting update for [%s]: the exclude address [%s] is recorded in the IPPool status as allocated to [%s]; remove the exclude entry or release the claim first, keeping the currently registered configuration",
+						newPool.Name, ex, ref)
+				}
+			}
+		}
 	}
 
 	for {
@@ -368,6 +493,9 @@ func (c *Controller) cleanupIPPoolObjects(pool *kihv1.IPPool) (err error) {
 	c.dhcp.RemoveLeasesForNetwork(pool.Spec.NetworkName)
 	c.metrics.DeleteIPPool(pool.Name, pool.Spec.IPv4Config.Subnet, pool.Spec.NetworkName)
 	c.cache.Delete("pool", pool.Spec.NetworkName)
+	// the pool name holds no live registration anymore (delete on the nil
+	// map of a never-registered pool is a no-op)
+	delete(c.registeredPools, pool.Name)
 
 	ipnet, err := netip.ParsePrefix(pool.Spec.IPv4Config.Subnet)
 	if err != nil {

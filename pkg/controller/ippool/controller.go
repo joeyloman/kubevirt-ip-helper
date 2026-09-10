@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -47,11 +48,21 @@ type Controller struct {
 	initAttempted map[string]bool
 
 	// runListener opens the dhcp listener of a pool. it is an indirection
-	// over dhcp.Run so the listener repair is testable without a host
-	// interface (the same seam shape as network.AddIpToNic/RemoveIpFromNic):
-	// production controllers default to dhcp.Run, tests substitute a
-	// nil-returning stub
+	// over dhcp.Run so the listener start of a registration and the
+	// listener repair are testable without a host interface (the same
+	// seam shape as network.AddIpToNic/RemoveIpFromNic): production
+	// controllers default to dhcp.Run, tests substitute a nil-returning
+	// stub
 	runListener func(networkName string, nic string) error
+
+	// registeredPools records the networkname each pool NAME holds its
+	// live registration of this era under. the cache is keyed by the
+	// networkname alone, so this record is the only way an update event
+	// which no longer carries the registered networkname (a rename
+	// swallowed while the application was initializing, re-delivered by a
+	// resync with old==new) can find the live registration it must tear
+	// down instead of registering the pool a second time
+	registeredPools map[string]string
 }
 
 func NewController(
@@ -168,6 +179,36 @@ func (c *Controller) sync(event Event) (err error) {
 			if c.appStatus.Load() == APP_RESTART {
 				log.Warnf("(ippool.sync) deferring re-registration of pool %s while the application is reinitializing", event.poolName)
 				return fmt.Errorf("deferring re-registration of pool %s while the application is reinitializing", event.poolName)
+			}
+
+			// the pool can nevertheless own a live registration under a
+			// networkname which this event does not carry: its rename
+			// arrived while the application was initializing (updates are
+			// ignored then), so the registration kept serving under the
+			// old networkname while the object - and every resync update
+			// with it - already carries the new one. re-registering would
+			// create a SECOND live registration of the same pool (two dhcp
+			// listeners on the same segment, and a stale registration
+			// under the old networkname whose state no later event can
+			// clean anymore), so the rename is routed through the regular
+			// change handling, which tears the old registration down
+			// through the restart flow instead
+			if registeredNet, live := c.registeredPools[event.poolName]; live && registeredNet != event.poolNetworkName {
+				if oldPool, oldErr := c.cache.Get("pool", registeredNet); oldErr == nil && oldPool.(kihv1.IPPool).Name == event.poolName {
+					err = c.handleIPPoolObjectChange(oldPool.(kihv1.IPPool), obj.(*kihv1.IPPool))
+					if err != nil {
+						log.Errorf("(ippool.sync) failed to handle the deferred networkname change of pool %s: %s", event.poolName, err.Error())
+						c.metrics.UpdateLogStatus("error")
+					}
+
+					return err
+				}
+
+				// the recorded registration is not live anymore (its cache
+				// entry was released with it): fall through to the
+				// re-registration attempt
+				log.Warnf("(ippool.sync) the recorded registration of pool %s under networkname %s is not live anymore, re-registering it",
+					event.poolName, registeredNet)
 			}
 
 			err = c.registerPoolWithTeardown(obj.(*kihv1.IPPool), "failed to register unregistered pool")
@@ -311,11 +352,26 @@ func (c *Controller) Run(workers int, stopCh chan struct{}) {
 		return
 	}
 
+	// the workers are joined before Run returns: an in-flight sync may
+	// still be registering or tearing down pool state (nic addresses,
+	// dhcp listeners), so a caller waiting for this era to end (the
+	// EventListener join) must not observe Run returning while a worker
+	// is still reconciling
+	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
-		go wait.Until(c.runWorker, time.Second, stopCh)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			wait.Until(c.runWorker, time.Second, stopCh)
+		}()
 	}
 
 	<-stopCh
+	// shut the queue down before joining the workers: one blocked in
+	// queue.Get is only released by the shutdown, so waiting first would
+	// deadlock (the deferred shutdown stays as the early-return safety)
+	c.queue.ShutDown()
+	wg.Wait()
 	log.Infof("(ippool.Run) stopping the IPPool controller")
 }
 

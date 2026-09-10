@@ -1050,3 +1050,181 @@ func TestHandleIPPoolObjectChangeRejectsIPv6KeepsLiveState(t *testing.T) {
 		t.Error("the cached pool must survive a rejected projection update")
 	}
 }
+
+// TestRegisterIPPoolValidatesExcludeEntriesBeforeNetlink pins the review
+// finding: an exclude entry which the exclude pass could never reclaim
+// (outside the pool range, the subnet or the broadcast) used to fail the
+// registration only after the nic address, the dhcp pool and its listener
+// were already live, so every resync tore the half-built registration
+// down and rebuilt it forever. the entry must be rejected as an
+// unregistrable projection before any mutation.
+func TestRegisterIPPoolValidatesExcludeEntriesBeforeNetlink(t *testing.T) {
+	cases := []struct {
+		name    string
+		exclude []string
+	}{
+		{"outside the pool range", []string{"10.10.10.200"}},
+		{"outside the subnet", []string{"192.168.8.8"}},
+		{"the broadcast address", []string{"10.10.10.255"}},
+		{"unparseable", []string{"not-an-ip"}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _, d, ca, _ := ippoolBehaviorNewTestController(t, nil)
+
+			pool := ippoolBehaviorNewTestPool("pool1", "net-a")
+			pool.Spec.IPv4Config.Pool.Exclude = tc.exclude
+
+			cleanup, err := c.registerIPPool(pool)
+			if err == nil {
+				t.Fatal("the unclaimable exclude entry must fail the registration")
+			}
+			if !errors.Is(err, ErrPoolUnregistrable) {
+				t.Errorf("error = %v, want the ErrPoolUnregistrable classification so the startup gate counts the pool", err)
+			}
+			if cleanup {
+				t.Error("cleanup flag = true, want false: the rejection must not tear down state it never created")
+			}
+
+			// the rejection happened before any mutation
+			if d.CheckPool("net-a") {
+				t.Error("no dhcp pool may exist after the pre-mutation rejection")
+			}
+			if ca.Check(pool) {
+				t.Error("no cache entry may exist after the pre-mutation rejection")
+			}
+			if used := c.ipam.Used("net-a"); used != 0 {
+				t.Errorf("ipam used = %d, want 0 (the rejection must precede the subnet registration)", used)
+			}
+		})
+	}
+}
+
+// the update path must reject an unclaimable exclude entry before the
+// restart teardown: the restart would drain the live services of the
+// whole application and the re-registration of the next era would then
+// fail at the same exclude entry forever, leaving the network unserved
+// until the object is repaired by hand
+func TestHandleIPPoolObjectChangeRejectsUnclaimableExcludeUpdate(t *testing.T) {
+	cases := []struct {
+		name    string
+		exclude []string
+	}{
+		{"outside the pool range", []string{"10.10.10.20", "10.10.10.200"}},
+		{"outside the subnet", []string{"10.10.10.20", "192.168.8.8"}},
+		{"the broadcast address", []string{"10.10.10.20", "10.10.10.255"}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _, d, ca, _ := ippoolBehaviorNewTestController(t, nil)
+
+			oldPool := ippoolBehaviorNewTestPool("pool1", "net-a")
+			if err := ca.Add(oldPool); err != nil {
+				t.Fatalf("failed to cache the registered pool: %s", err.Error())
+			}
+
+			if err := d.AddPool(
+				"net-a",
+				"10.10.10.1",
+				"255.255.255.0",
+				"10.10.10.254",
+				[]string{"10.10.10.2", "10.10.10.3"},
+				"example.local",
+				[]string{"example.local"},
+				[]string{"10.10.10.4"},
+				3600,
+				"eth-test",
+			); err != nil {
+				t.Fatalf("failed to seed the active dhcp pool: %s", err.Error())
+			}
+
+			newPool := ippoolBehaviorNewTestPool("pool1", "net-a")
+			newPool.Spec.IPv4Config.Pool.Exclude = tc.exclude
+
+			if err := c.handleIPPoolObjectChange(*oldPool, newPool); err == nil {
+				t.Fatal("handleIPPoolObjectChange accepted an unclaimable exclude entry")
+			}
+			if c.appStatus.Load() != APP_RUNNING {
+				t.Errorf("the rejected update started an application restart: app status got %d, want %d", c.appStatus.Load(), APP_RUNNING)
+			}
+			if !d.CheckPool("net-a") {
+				t.Error("the rejected update removed the active dhcp pool")
+			}
+			if !ca.Check(oldPool) {
+				t.Error("the rejected update touched the cache")
+			}
+		})
+	}
+}
+
+// an exclude entry which the persisted ledger records for a live binding
+// can never converge: the re-registration of the next era rejects it up
+// front, so the update must be refused before the restart teardown as
+// well - otherwise a working network is drained by an edit which can
+// never succeed. the ledger is only consulted when the exclude entries
+// actually changed.
+func TestHandleIPPoolObjectChangeRejectsExcludeOverlappingLiveClaim(t *testing.T) {
+	stored := ippoolBehaviorNewTestPool("pool1", "net-a")
+	stored.Status.IPv4.Allocated = map[string]string{
+		"10.10.10.20": kihipam.ExcludedOwner,
+		"10.10.10.30": "default/vm-test [02:00:00:00:00:01]",
+	}
+	rs := ippoolBehaviorNewRestState(stored)
+	srv := httptest.NewServer(rs.ippoolBehaviorHandler())
+	t.Cleanup(srv.Close)
+
+	c, _, d, ca, _ := ippoolBehaviorNewTestController(t, srv)
+
+	oldPool := ippoolBehaviorNewTestPool("pool1", "net-a")
+	if err := ca.Add(oldPool); err != nil {
+		t.Fatalf("failed to cache the registered pool: %s", err.Error())
+	}
+
+	if err := d.AddPool(
+		"net-a",
+		"10.10.10.1",
+		"255.255.255.0",
+		"10.10.10.254",
+		[]string{"10.10.10.2", "10.10.10.3"},
+		"example.local",
+		[]string{"example.local"},
+		[]string{"10.10.10.4"},
+		3600,
+		"eth-test",
+	); err != nil {
+		t.Fatalf("failed to seed the active dhcp pool: %s", err.Error())
+	}
+
+	// the unchanged exclude list reconciles as no-change without
+	// consulting the ledger
+	unchanged := ippoolBehaviorNewTestPool("pool1", "net-a")
+	if err := c.handleIPPoolObjectChange(*oldPool, unchanged); err != nil {
+		t.Fatalf("the unchanged exclude list must reconcile as no-change: %v", err)
+	}
+	if got := rs.getCount; got != 0 {
+		t.Errorf("ledger reads = %d for unchanged exclude entries, want 0", got)
+	}
+
+	// adding the claimed address to the exclude list is rejected before
+	// the teardown
+	newPool := ippoolBehaviorNewTestPool("pool1", "net-a")
+	newPool.Spec.IPv4Config.Pool.Exclude = []string{"10.10.10.20", "10.10.10.30"}
+
+	if err := c.handleIPPoolObjectChange(*oldPool, newPool); err == nil {
+		t.Fatal("handleIPPoolObjectChange accepted an exclude entry overlapping a live ledger claim")
+	}
+	if c.appStatus.Load() != APP_RUNNING {
+		t.Errorf("the rejected update started an application restart: app status got %d, want %d", c.appStatus.Load(), APP_RUNNING)
+	}
+	if !d.CheckPool("net-a") {
+		t.Error("the rejected update removed the active dhcp pool")
+	}
+	if !ca.Check(oldPool) {
+		t.Error("the rejected update touched the cache")
+	}
+	if got := rs.getCount; got == 0 {
+		t.Error("the ledger conflict check never consulted the pool status")
+	}
+}

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1141,5 +1142,185 @@ func TestSyncUpdateListenerRepairAlreadyRunningConverges(t *testing.T) {
 
 	if err := controller.sync(testPoolEvent("pool-n2", UPDATE, "net-n2")); err != nil {
 		t.Errorf("sync(UPDATE) returned error %v, want nil for the converged already-running repair", err)
+	}
+}
+
+// TestSyncUpdateResyncReroutesSwallowedNetworkNameChange pins the review
+// finding: a networkname change which arrives while the application is
+// initializing is ignored, but the registration keeps serving under the
+// old networkname. the resync update which follows (old==new networkname)
+// used to misread the pool as never-registered and re-register it a
+// second time under the new name, leaving two live registrations of the
+// same pool - the stale one under the old networkname could never be
+// cleaned by a later event again. the resync must route the rename
+// through the regular change handling instead, which tears the old
+// registration down through the restart flow.
+func TestSyncUpdateResyncReroutesSwallowedNetworkNameChange(t *testing.T) {
+	stubNicMutation(t)
+
+	// the pool status the registration consults survives at the api
+	stored := testPool("pool-n", "net-old", 60)
+	rs := ippoolBehaviorNewRestState(stored)
+	srv := httptest.NewServer(rs.ippoolBehaviorHandler())
+	t.Cleanup(srv.Close)
+
+	var appStatus atomic.Int32
+	appStatus.Store(APP_INIT)
+	var countCurrent atomic.Int32
+
+	oldSpec := testPool("pool-n", "net-old", 60)
+	newSpec := testPool("pool-n", "net-new", 60)
+
+	indexer := newTestIndexer()
+	if err := indexer.Add(oldSpec); err != nil {
+		t.Fatalf("seeding indexer: %v", err)
+	}
+
+	controller, cacheAllocator := newTestController(t, newTestQueue(), indexer, nil, &appStatus, &countCurrent)
+	cs, err := kihclientset.NewForConfig(&rest.Config{Host: srv.URL})
+	if err != nil {
+		t.Fatalf("creating clientset: %v", err)
+	}
+	controller.kihClientset = cs
+	// the listener seam keeps the registration off the host network
+	controller.runListener = func(networkName string, nic string) error {
+		return nil
+	}
+
+	// the startup registration settles under the old networkname
+	if err := controller.sync(testPoolEvent("pool-n", ADD, "net-old")); err != nil {
+		t.Fatalf("the startup registration failed: %v", err)
+	}
+	if !cacheAllocator.Check(oldSpec) {
+		t.Fatal("the startup registration did not publish the pool under the old networkname")
+	}
+	if net, live := controller.registeredPools["pool-n"]; !live || net != "net-old" {
+		t.Fatalf("the settled registration was not recorded: registeredPools[pool-n] = %q, live=%v", net, live)
+	}
+
+	// the rename arrives while the application is initializing: the update
+	// is ignored, the registration keeps serving under the old networkname.
+	// the rename is persisted, so the api serves the new spec from now on
+	// (exactly like a cluster where the object was updated).
+	if err := indexer.Update(newSpec); err != nil {
+		t.Fatalf("applying the rename to the index: %v", err)
+	}
+	rs.pool = newSpec.DeepCopy()
+	renameEvent := testPoolEvent("pool-n", UPDATE, "net-new")
+	renameEvent.oldPoolNetworkName = "net-old"
+	if err := controller.sync(renameEvent); err != nil {
+		t.Fatalf("the initializing application must ignore the rename update: %v", err)
+	}
+	if appStatus.Load() != APP_INIT {
+		t.Fatalf("app status = %d, want %d: the swallowed rename must not restart the initializing application", appStatus.Load(), APP_INIT)
+	}
+
+	// a resync update (old==new networkname) must not double-register
+	// while the application is initializing either: it is routed through
+	// the change handling, which ignores it until the application runs
+	resyncEvent := testPoolEvent("pool-n", UPDATE, "net-new")
+	if err := controller.sync(resyncEvent); err != nil {
+		t.Fatalf("the resync during initialization returned an error: %v", err)
+	}
+	if controller.dhcp.CheckPool("net-new") || cacheAllocator.Check(newSpec) {
+		t.Fatal("the resync during initialization double-registered the pool")
+	}
+
+	// once the application runs, the resync routes the swallowed rename
+	// through the restart flow instead of registering a second time
+	appStatus.Store(APP_RUNNING)
+	if err := controller.sync(resyncEvent); err != nil {
+		t.Fatalf("the resync of the swallowed rename returned an error: %v", err)
+	}
+	if appStatus.Load() != APP_RESTART {
+		t.Errorf("app status = %d, want %d: the swallowed rename must take the restart flow", appStatus.Load(), APP_RESTART)
+	}
+
+	// no second registration exists: the new networkname has no live
+	// sub-resources, the old registration is the one the era restart
+	// tears down
+	if controller.dhcp.CheckPool("net-new") {
+		t.Error("the resync registered a second dhcp pool under the new networkname")
+	}
+	if cacheAllocator.Check(newSpec) {
+		t.Error("the resync published a second cache entry under the new networkname")
+	}
+	if controller.ipam.Used("net-new") != 0 {
+		t.Error("the resync registered a second ipam subnet under the new networkname")
+	}
+	if !controller.dhcp.CheckPool("net-old") {
+		t.Error("the old registration must stay live until the era restart tears it down")
+	}
+	if net, live := controller.registeredPools["pool-n"]; !live || net != "net-old" {
+		t.Errorf("the restart flow must keep the recorded registration untouched: registeredPools[pool-n] = %q, live=%v", net, live)
+	}
+	if countCurrent.Load() != 1 {
+		t.Errorf("ippool count = %d, want 1 (a single settled registration)", countCurrent.Load())
+	}
+}
+
+// Run must not return while a worker is still syncing: the EventListener
+// join waits for Run, so an early return would let the restart flow
+// observe a stopped era while a reconciler still registers or tears down
+// pool state (nic addresses, dhcp listeners)
+func TestRunJoinsTheInFlightSyncBeforeReturning(t *testing.T) {
+	release := make(chan struct{})
+	started := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-started:
+		default:
+			close(started)
+		}
+		// the in-flight sync stays blocked until the test releases it
+		<-release
+		ippoolBehaviorWriteKubeError(w, http.StatusInternalServerError)
+	}))
+	t.Cleanup(server.Close)
+	// the blocked handler must always drain, also on the failure path:
+	// the server cleanup of the test waits for outstanding requests
+	var releaseOnce sync.Once
+	releaseSync := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseSync()
+
+	queue := newTestQueue()
+	indexer := newTestIndexer()
+	if err := indexer.Add(testPool("pool-j", "net-j", 60)); err != nil {
+		t.Fatalf("seeding indexer: %v", err)
+	}
+
+	var appStatus atomic.Int32
+	controller, _ := newTestController(t, queue, indexer, &stubInformer{synced: true}, &appStatus, new(atomic.Int32))
+	cs, err := kihclientset.NewForConfig(&rest.Config{Host: server.URL})
+	if err != nil {
+		t.Fatalf("creating clientset: %v", err)
+	}
+	controller.kihClientset = cs
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		controller.Run(1, stop)
+		close(done)
+	}()
+
+	queue.Add(testPoolEvent("pool-j", ADD, "net-j"))
+	<-started
+
+	close(stop)
+
+	// the worker is blocked mid-sync: Run must stay up while it runs
+	select {
+	case <-done:
+		t.Fatal("Run returned while the worker was still syncing")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	releaseSync()
+
+	select {
+	case <-done:
+	case <-time.After(shutdownWait):
+		t.Fatal("Run did not return after the in-flight sync finished")
 	}
 }
