@@ -2,6 +2,7 @@ package ippool
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync/atomic"
 	"time"
@@ -188,7 +189,11 @@ func (c *Controller) sync(event Event) (err error) {
 		// while the application serves: during the startup replay
 		// (APP_INIT) and the reinitialization teardown (APP_RESTART) the
 		// listener lifecycle belongs to the era transitions, whose fresh
-		// registration re-opens the sockets
+		// registration re-opens the sockets. the controller runs one sync
+		// worker, but the queue keys items by event rather than by pool, so
+		// an in-flight ADD and a resync UPDATE of the same network stay
+		// distinct items: the duplicate-run rejection is therefore
+		// classified as the converged outcome instead of a failure
 		if err == nil && c.appStatus.Load() == APP_RUNNING && !c.dhcp.IsRunning(obj.(*kihv1.IPPool).Spec.NetworkName) {
 			runListener := c.runListener
 			if runListener == nil {
@@ -196,10 +201,18 @@ func (c *Controller) sync(event Event) (err error) {
 			}
 
 			if runErr := runListener(obj.(*kihv1.IPPool).Spec.NetworkName, obj.(*kihv1.IPPool).Spec.BindInterface); runErr != nil {
-				log.Errorf("(ippool.sync) failed to restore the DHCP listener of pool %s: %s", event.poolName, runErr.Error())
-				c.metrics.UpdateLogStatus("error")
+				if errors.Is(runErr, dhcp.ErrServerAlreadyRunning) {
+					// a concurrent registration (or a repair which just
+					// won the race) serves the pool already: converged,
+					// nothing to retry
+					log.Warnf("(ippool.sync) the DHCP listener of pool %s is already running, nothing to repair", event.poolName)
+					c.metrics.UpdateLogStatus("warning")
+				} else {
+					log.Errorf("(ippool.sync) failed to restore the DHCP listener of pool %s: %s", event.poolName, runErr.Error())
+					c.metrics.UpdateLogStatus("error")
 
-				err = runErr
+					err = runErr
+				}
 			} else {
 				log.Warnf("(ippool.sync) restored the DHCP listener of pool %s after its unexpected termination", event.poolName)
 				c.metrics.UpdateLogStatus("warning")

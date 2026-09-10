@@ -3,6 +3,7 @@ package ippool
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1114,5 +1115,31 @@ func TestSyncUpdateForeignCacheEntryDoesNotCascadeRestart(t *testing.T) {
 	}
 	if !cacheAllocator.Check(foreignPool) {
 		t.Error("the live pool was dropped from the cache by the unrelated update")
+	}
+}
+
+// TestSyncUpdateListenerRepairAlreadyRunningConverges: a repair which loses
+// the race against a concurrent registration (the queue keys items by
+// event, not by pool, so an in-flight ADD and a resync UPDATE of the same
+// network stay distinct items) must not surface a failure - the pool is
+// serving, which is exactly what the repair wanted.
+func TestSyncUpdateListenerRepairAlreadyRunningConverges(t *testing.T) {
+	var appStatus atomic.Int32
+	appStatus.Store(APP_RUNNING)
+	pool := testPool("pool-n2", "net-n2", 60)
+
+	indexer := newTestIndexer()
+	indexer.Add(pool)
+
+	controller, cacheAllocator := newTestController(t, newTestQueue(), indexer, nil, &appStatus, new(atomic.Int32))
+	if err := cacheAllocator.Add(pool); err != nil {
+		t.Fatalf("seeding cache: %v", err)
+	}
+	controller.runListener = func(networkName string, nic string) error {
+		return fmt.Errorf("%w: network %s", dhcp.ErrServerAlreadyRunning, networkName)
+	}
+
+	if err := controller.sync(testPoolEvent("pool-n2", UPDATE, "net-n2")); err != nil {
+		t.Errorf("sync(UPDATE) returned error %v, want nil for the converged already-running repair", err)
 	}
 }

@@ -182,6 +182,8 @@ type fakeAPI struct {
 	vmnetcfgDeleteErr        string
 	ippoolGetStatus          int
 	ippoolGetErr             string
+	ippoolListStatus         int // when set, the cluster-scoped list fails
+	ippoolListErr            string
 	ippoolStatusConflicts    int // consecutive 409s before a successful status update
 	ippoolStatusUpdateStatus int
 	ippoolStatusUpdateErr    string
@@ -307,6 +309,15 @@ func (f *fakeAPI) handlePool(w http.ResponseWriter, r *http.Request, segs []stri
 	// merely missed the cache. without the route the fake panics on
 	// segs[4] and the clientset retries for ~10s
 	if len(segs) == 4 && r.Method == http.MethodGet {
+		f.mu.Lock()
+		listStatus := f.ippoolListStatus
+		listErr := f.ippoolListErr
+		f.mu.Unlock()
+		if listStatus != 0 {
+			writeAPIError(w, listStatus, listErr)
+			return
+		}
+
 		f.mu.Lock()
 		list := &kihv1.IPPoolList{}
 		for _, pool := range f.pools {
@@ -994,6 +1005,9 @@ func TestCleanupNetworkInterfaceFailsWhenPoolUnknown(t *testing.T) {
 	if !c.dhcp.CheckLease(mac) {
 		t.Error("expected the lease still registered after the failed un-record")
 	}
+	if used := c.ipam.Used(networkName); used != 1 {
+		t.Errorf("expected the ipam claim kept after the failed un-record, used=%d", used)
+	}
 
 	// once the pool is cached the retried cleanup converges: the releases
 	// are idempotent and the record is removed
@@ -1677,5 +1691,74 @@ func TestCleanupNetworkInterfaceDoesNotReleaseTheSuccessorAfterDelayedResume(t *
 	// the successor's exact address is not handed to a third vm
 	if _, err := c.ipam.GetIP(networkName, ip); err == nil {
 		t.Error("the preserved reservation must not be allocatable")
+	}
+}
+
+// TestCleanupNetworkInterfaceConvergesWhenPoolDeleted: the pool is gone
+// from the api and missed the cache, so its status ledger died with it -
+// the cleanup converges (releasing lease and claim) instead of failing
+// forever over a record which can no longer exist.
+func TestCleanupNetworkInterfaceConvergesWhenPoolDeleted(t *testing.T) {
+	c, f := vmBehaviorNewTestController(t)
+
+	mac := "aa:bb:cc:00:00:03"
+	networkName := "default/net-deleted"
+	ip := "10.0.0.11"
+
+	addSimpleLease(t, c.dhcp, mac, ip, "ns1/vm1")
+	addSubnetWithOwnedIP(t, c.ipam, networkName, ip, "ns1/vm1 ["+mac+"]")
+
+	vmnetcfg := &kihv1.VirtualMachineNetworkConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: "vm1", Namespace: "ns1"},
+		Spec:       kihv1.VirtualMachineNetworkConfigSpec{VMName: "vm1"},
+	}
+
+	// neither the cache nor the api knows the pool: the api-verify (an
+	// empty list) classifies it as deleted - its ledger record went with
+	// it, so there is nothing left to un-record
+	if err := c.cleanupNetworkInterface(vmnetcfg, &kihv1.NetworkConfig{MACAddress: mac, NetworkName: networkName, IPAddress: ip}); err != nil {
+		t.Fatalf("cleanupNetworkInterface for a deleted pool: %v", err)
+	}
+
+	if c.dhcp.CheckLease(mac) {
+		t.Error("the lease of a deleted pool must be released")
+	}
+	if used := c.ipam.Used(networkName); used != 0 {
+		t.Errorf("ipam used = %d, want 0 after the converged cleanup", used)
+	}
+	if n := len(f.requestsFor(http.MethodPut, "/status")); n != 0 {
+		t.Errorf("expected no pool status update for a deleted pool, got %d", n)
+	}
+}
+
+// TestCleanupNetworkInterfaceFailsClosedWhenListFails: the api-verify
+// itself fails, so the pool may still exist with a live ledger entry -
+// the cleanup fails conservatively with the state fully intact instead of
+// releasing an address whose ownership record is still written.
+func TestCleanupNetworkInterfaceFailsClosedWhenListFails(t *testing.T) {
+	c, f := vmBehaviorNewTestController(t)
+
+	mac := "aa:bb:cc:00:00:04"
+	networkName := "default/net-a"
+	ip := "10.0.0.11"
+
+	addSimpleLease(t, c.dhcp, mac, ip, "ns1/vm1")
+	addSubnetWithOwnedIP(t, c.ipam, networkName, ip, "ns1/vm1 ["+mac+"]")
+	f.ippoolListStatus = http.StatusInternalServerError
+	f.ippoolListErr = "boom"
+
+	vmnetcfg := &kihv1.VirtualMachineNetworkConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: "vm1", Namespace: "ns1"},
+		Spec:       kihv1.VirtualMachineNetworkConfigSpec{VMName: "vm1"},
+	}
+	err := c.cleanupNetworkInterface(vmnetcfg, &kihv1.NetworkConfig{MACAddress: mac, NetworkName: networkName, IPAddress: ip})
+	if err == nil {
+		t.Fatal("expected the list failure to fail the cleanup conservatively")
+	}
+	if !c.dhcp.CheckLease(mac) {
+		t.Error("the lease must stay registered when the api-verify fails")
+	}
+	if used := c.ipam.Used(networkName); used != 1 {
+		t.Errorf("ipam used = %d, want 1 (no release on an unverifiable pool)", used)
 	}
 }

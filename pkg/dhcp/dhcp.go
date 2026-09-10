@@ -29,6 +29,12 @@ var (
 	// cleanup callers treat the deletion as converged instead of retrying
 	// forever.
 	ErrLeaseInvalidHwAddr = errors.New("invalid hardware address")
+
+	// ErrServerAlreadyRunning reports a Run for a network the allocator
+	// already serves: the caller classifies it as the converged outcome of
+	// a racing listener repair - the pool is serving, which is exactly what
+	// the repair wanted.
+	ErrServerAlreadyRunning = errors.New("dhcp service already running")
 )
 
 type DHCPPool struct {
@@ -765,7 +771,7 @@ func (a *DHCPAllocator) Run(networkName string, nic string) (err error) {
 	if _, exists := a.servers[networkName]; exists {
 		a.mutex.Unlock()
 
-		return fmt.Errorf("dhcp service already running for network %s", networkName)
+		return fmt.Errorf("%w: network %s", ErrServerAlreadyRunning, networkName)
 	}
 
 	// several pools on one interface share the 0.0.0.0:67 socket group;
