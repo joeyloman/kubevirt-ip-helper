@@ -3,6 +3,7 @@ package ippool
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/rest"
 	"net"
@@ -22,6 +23,7 @@ import (
 	kihclientset "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/clientset/versioned"
 	kihipam "github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/metrics"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/network"
 
 	prom "github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
@@ -965,5 +967,86 @@ func TestResetIPPoolMetricsGetErrorIsReturned(t *testing.T) {
 
 	if err := c.resetIPPoolMetrics(ippoolBehaviorNewTestPool("pool1", "net-a")); err == nil {
 		t.Fatalf("expected the GET failure to be returned")
+	}
+}
+
+// A v6 subnet parses as a prefix but can never be registered: the
+// projection validation must reject it before the bind-interface
+// mutation, the dhcp pool or the listener exist, so no compensating
+// cleanup (which would rebuild the same malformed address string it
+// should remove) is needed.
+func TestRegisterIPPoolRejectsIPv6BeforeAnyMutation(t *testing.T) {
+	c, ipam, dhcp, cache, _ := ippoolBehaviorNewTestController(t, nil)
+
+	var nicMutated bool
+	orig := network.AddIpToNic
+	network.AddIpToNic = func(nic string, ip4 string) error {
+		nicMutated = true
+
+		return nil
+	}
+	t.Cleanup(func() {
+		network.AddIpToNic = orig
+	})
+
+	pool := ippoolBehaviorNewTestPool("pool-v6", "net-v6")
+	pool.Spec.IPv4Config.Subnet = "2001:db8::/64"
+	pool.Spec.IPv4Config.Pool.Start = "2001:db8::1"
+	pool.Spec.IPv4Config.Pool.End = "2001:db8::2"
+
+	cleanup, err := c.registerIPPool(pool)
+	if err == nil {
+		t.Fatal("the v6 subnet registration returned nil, want rejection")
+	}
+	if cleanup {
+		t.Error("cleanup flag = true, want false: nothing was applied yet")
+	}
+	if !errors.Is(err, ErrPoolUnregistrable) {
+		t.Errorf("rejection = %v, want the ErrPoolUnregistrable classification", err)
+	}
+	if nicMutated {
+		t.Error("the bind interface must not be mutated for an unregistrable projection")
+	}
+	if dhcp.CheckPool(pool.Spec.NetworkName) {
+		t.Error("no dhcp pool may exist for an unregistrable projection")
+	}
+	if ipam.Used(pool.Spec.NetworkName) != 0 {
+		t.Error("no ipam subnet may exist for an unregistrable projection")
+	}
+	if cache.Check(pool) {
+		t.Error("no cache entry may exist for an unregistrable projection")
+	}
+}
+
+// The update path must reject an unregistrable projection before the
+// reload teardown: a v6 subnet would otherwise delete the live dhcp pool
+// and mask it to an all-ones v4 prefix or "<nil>" before any later check
+// could reject it.
+func TestHandleIPPoolObjectChangeRejectsIPv6KeepsLiveState(t *testing.T) {
+	c, _, dhcp, cache, _ := ippoolBehaviorNewTestController(t, nil)
+	c.appStatus.Store(APP_RUNNING)
+
+	oldPool := ippoolBehaviorNewTestPool("pool1", "net-a")
+	if err := c.createOrUpdateDHCPPool(oldPool); err != nil {
+		t.Fatalf("seeding the live dhcp pool: %s", err)
+	}
+	if err := cache.Add(oldPool); err != nil {
+		t.Fatalf("seeding the cache: %s", err)
+	}
+
+	newPool := oldPool.DeepCopy()
+	newPool.Spec.IPv4Config.Subnet = "2001:db8::/64"
+	newPool.Spec.IPv4Config.Pool.Start = "2001:db8::1"
+	newPool.Spec.IPv4Config.Pool.End = "2001:db8::2"
+
+	if err := c.handleIPPoolObjectChange(*oldPool, newPool); err == nil {
+		t.Fatal("the v6 update returned nil, want rejection")
+	}
+
+	if !dhcp.CheckPool(oldPool.Spec.NetworkName) {
+		t.Error("the live dhcp pool must survive a rejected projection update")
+	}
+	if !cache.Check(oldPool) {
+		t.Error("the cached pool must survive a rejected projection update")
 	}
 }

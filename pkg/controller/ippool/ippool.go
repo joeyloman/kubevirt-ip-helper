@@ -72,6 +72,17 @@ func (c *Controller) registerIPPool(pool *kihv1.IPPool) (cleanup bool, err error
 		return cleanup, fmt.Errorf("error while parsing subnet [%s] for network [%s]: %s: %w",
 			pool.Spec.IPv4Config.Subnet, pool.Spec.NetworkName, err.Error(), ErrPoolUnregistrable)
 	}
+	// the full projection must be registrable before any state is mutated:
+	// the nic add, the dhcp pool and its listener would otherwise run with
+	// a garbage projection (an ipv6 subnet masks to a wrong v4 prefix or
+	// to "<nil>") and only the later NewSubnet validation would reject it,
+	// leaving the compensating cleanup to rebuild the same malformed
+	// address string it should remove
+	if validateErr := ipam.ValidateSubnetSpec(pool.Spec.IPv4Config.Subnet, pool.Spec.IPv4Config.Pool.Start, pool.Spec.IPv4Config.Pool.End); validateErr != nil {
+		return cleanup, fmt.Errorf("error while validating subnet [%s] and range [%s-%s] for network [%s]: %s: %w",
+			pool.Spec.IPv4Config.Subnet, pool.Spec.IPv4Config.Pool.Start, pool.Spec.IPv4Config.Pool.End,
+			pool.Spec.NetworkName, validateErr.Error(), ErrPoolUnregistrable)
+	}
 	// the pool sub-resources (dhcp pool, ipam subnet, cache entry) are all
 	// keyed by the networkname, and the allocators start empty on every
 	// (re)start: a live dhcp pool under this networkname therefore belongs
@@ -336,9 +347,17 @@ func (c *Controller) cleanupIPPoolObjects(pool *kihv1.IPPool) (err error) {
 }
 
 func (c *Controller) createOrUpdateDHCPPool(pool *kihv1.IPPool) (err error) {
-	// validate the projection first: only a subnet which parses may replace
-	// the active dhcp pool, otherwise a rejected update would destroy the
-	// working configuration
+	// validate the projection first: only an ipv4 subnet with a registrable
+	// range may replace the active dhcp pool, otherwise a rejected update
+	// would destroy the working configuration (the dhcp pool delete below
+	// runs before the mask projection, so an ipv6 subnet would already be
+	// masked to an all-ones v4 prefix or "<nil>" and handed to AddPool by
+	// the time any later check could reject it)
+	if validateErr := ipam.ValidateSubnetSpec(pool.Spec.IPv4Config.Subnet, pool.Spec.IPv4Config.Pool.Start, pool.Spec.IPv4Config.Pool.End); validateErr != nil {
+		return fmt.Errorf("(ippool.createOrUpdateDHCPPool) invalid subnet [%s] and range [%s-%s] for network [%s]: %s",
+			pool.Spec.IPv4Config.Subnet, pool.Spec.IPv4Config.Pool.Start, pool.Spec.IPv4Config.Pool.End,
+			pool.Spec.NetworkName, validateErr.Error())
+	}
 	ipnet, err := netip.ParsePrefix(pool.Spec.IPv4Config.Subnet)
 	if err != nil {
 		return fmt.Errorf("(ippool.createOrUpdateDHCPPool) invalid subnet [%s] for network [%s]: %s",

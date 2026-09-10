@@ -58,6 +58,16 @@ func UpdateStatus(
 	hwAddr string,
 	poolName string,
 ) (err error) {
+	// an unknown event must never reach the persisted status - falling
+	// through would rebuild the allocation map from scratch and erase
+	// every live allocation entry - and it is rejected before any API
+	// call, so the ledger and the request counters stay untouched
+	switch event {
+	case EventAdd, EventDelete:
+	default:
+		return fmt.Errorf("unsupported ippool status event %s for ip %s in pool %s", event, ip, poolName)
+	}
+
 	for retry := 0; retry < maxRetries; retry++ {
 		currentPool, err := client.KubevirtiphelperV1().IPPools().Get(ctx, poolName, metav1.GetOptions{})
 		if err != nil {
