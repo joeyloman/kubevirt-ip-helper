@@ -102,9 +102,13 @@ func ValidateSubnetSpec(subnet string, start string, end string) error {
 	}
 
 	// this controller only serves ipv4: an ipv6 prefix would blow up the
-	// broadcast computation below (net.CIDRMask(bits, 32) is nil there),
-	// so it is rejected like any other unregistrable projection
-	if ipnet.Bits() > 32 {
+	// broadcast computation below (net.CIDRMask(bits, 32) is nil there and
+	// the 16-byte address would overrun the 4-byte broadcast buffer), so
+	// it is rejected like any other unregistrable projection. the family
+	// gate compares the address, not the prefix length: an ipv6 prefix
+	// like 2001:db8::/32 carries 32 bits and would slip past a bits-only
+	// check
+	if !ipnet.Addr().Is4() {
 		return fmt.Errorf("subnet %s is not an ipv4 subnet: %w", subnet, ErrSubnetInvalid)
 	}
 

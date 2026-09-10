@@ -138,6 +138,11 @@ func TestIPAMNewSubnetValidationErrors(t *testing.T) {
 		{"end-outside", "10.0.0.0/24", "10.0.0.1", "10.0.1.2"},
 		{"reversed-range", "10.0.0.0/24", "10.0.0.50", "10.0.0.1"},
 		{"broadcast-end", "10.0.0.0/29", "10.0.0.1", "10.0.0.7"},
+		// an ipv6 prefix with <= 32 bits is not caught by a bits-only
+		// family gate; it must still be classified as unregistrable before
+		// the 16-byte address reaches the broadcast computation
+		{"ipv6-prefix", "2001:db8::/32", "2001:db8::1", "2001:db8::2"},
+		{"ipv6-prefix-zero-bits", "2001:db8::/0", "2001:db8::1", "2001:db8::2"},
 	}
 	for _, tc := range cases {
 		err := a.NewSubnet(tc.name, tc.subnet, tc.start, tc.end)

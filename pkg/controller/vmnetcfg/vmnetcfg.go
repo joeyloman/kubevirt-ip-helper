@@ -288,8 +288,8 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 			// this should be automatically handled by the vm controller and not manually when the program is not running
 			if vmnetcfg.CreationTimestamp.After(pool.(kihv1.IPPool).Status.LastUpdateBeforeStart.Time) &&
 				pool.(kihv1.IPPool).Status.LastUpdate.After(vmnetcfg.CreationTimestamp.Time) {
-				log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] vmnetcfg was manually created after this program was (re)started, preventing possible ip hijack",
-					vmnetcfg.Namespace, vmnetcfg.Name)
+				log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] %s",
+					vmnetcfg.Namespace, vmnetcfg.Name, hijackErrorStatusMessage)
 				c.metrics.UpdateLogStatus("error")
 
 				netcfgStatus.Status = "ERROR"

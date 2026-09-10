@@ -1205,8 +1205,7 @@ func TestVMNetCfgStartupTimestampGate(t *testing.T) {
 		}
 
 		stored := e.getStoredVMNetCfg()
-		if got := stored.Status.NetworkConfig[0]; got.Status != "ERROR" ||
-			got.Message != "vmnetcfg was manually created after this program was (re)started, preventing possible ip hijack" {
+		if got := stored.Status.NetworkConfig[0]; got.Status != "ERROR" || got.Message != hijackErrorStatusMessage {
 			t.Errorf("status = %+v, want startup hijack ERROR", got)
 		}
 		if e.dhcp.CheckLease(testMAC) {
@@ -1294,6 +1293,18 @@ func TestVMNetCfgStartupTimestampGate(t *testing.T) {
 			t.Errorf("deferred keys = %v, want the vmnetcfg key", deferred)
 		}
 	})
+}
+
+// TestHijackErrorStatusMessageWireFormat pins the persisted spelling of the
+// terminal hijack marker: every code path (the status write, the retry
+// rejection and the log) references the const, so this one literal is the
+// only place the on-disk text is spelled out and a typo in the const fails
+// here instead of silently making the hijack guard retriable.
+func TestHijackErrorStatusMessageWireFormat(t *testing.T) {
+	const want = "vmnetcfg was manually created after this program was (re)started, preventing possible ip hijack"
+	if hijackErrorStatusMessage != want {
+		t.Errorf("hijackErrorStatusMessage = %q, want %q", hijackErrorStatusMessage, want)
+	}
 }
 
 func TestVMNetCfgStatusAndMetricsProjection(t *testing.T) {
