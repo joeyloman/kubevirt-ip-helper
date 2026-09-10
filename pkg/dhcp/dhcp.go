@@ -804,23 +804,37 @@ func (a *DHCPAllocator) Run(networkName string, nic string) (err error) {
 	// re-serves the pool on the next event or resync - instead of the pool
 	// silently never answering dhcp again while every lookup still
 	// believes it runs
-	go func() {
-		serveErr := server.Serve()
-
-		a.mutex.Lock()
-		_, stillRegistered := a.servers[networkName]
-		if stillRegistered {
-			delete(a.servers, networkName)
-			delete(a.serverNics, networkName)
-		}
-		a.mutex.Unlock()
-
-		if serveErr != nil && stillRegistered {
-			log.Errorf("(dhcp.Run) the DHCP service of network %s terminated unexpectedly: %v; the pool is deregistered and the next pool sync re-serves it", networkName, serveErr)
-		}
-	}()
+	go a.serveAndDeregister(networkName, server)
 
 	return
+}
+
+// serveAndDeregister runs the serve loop of one registered server and
+// deregisters the server when the loop exits: a socket error ends the
+// service of the network, so the entry must not keep reporting the pool
+// as live while nothing answers anymore (the ippool controller's listener
+// repair re-serves the pool on the next event or resync). the
+// deregistration matches the server instance, not just the network name:
+// a Stop followed by a re-Run (the restart flow, or a pool re-created
+// after its deletion) can register the replacement before this wrapper of
+// the stopped server wakes up, and a key-only check would delete the live
+// replacement's registration - leaving it serving but unreachable for
+// Stop and reported as not running by IsRunning.
+func (a *DHCPAllocator) serveAndDeregister(networkName string, server *server4.Server) {
+	serveErr := server.Serve()
+
+	a.mutex.Lock()
+	current, stillRegistered := a.servers[networkName]
+	ownRegistration := stillRegistered && current == server
+	if ownRegistration {
+		delete(a.servers, networkName)
+		delete(a.serverNics, networkName)
+	}
+	a.mutex.Unlock()
+
+	if serveErr != nil && ownRegistration {
+		log.Errorf("(dhcp.serveAndDeregister) the DHCP service of network %s terminated unexpectedly: %v; the pool is deregistered and the next pool sync re-serves it", networkName, serveErr)
+	}
 }
 
 // Stop stops and removes the DHCP service of the pool identified by
@@ -842,4 +856,29 @@ func (a *DHCPAllocator) Stop(networkName string) (err error) {
 	}
 
 	return server.Close()
+}
+
+// StopAll stops and removes every running dhcp service: the shutdown path
+// of the process must drain all listeners through the server registry
+// itself, because it must not depend on the kubernetes api (an ippool
+// listing is not available anymore once the managers are shutting down).
+// the entries are removed under the allocator lock and the sockets are
+// closed outside of it; a close error is surfaced as a debug log so one
+// failed teardown never keeps the sweep from draining the remaining
+// listeners.
+func (a *DHCPAllocator) StopAll() {
+	a.mutex.Lock()
+	servers := make(map[string]*server4.Server, len(a.servers))
+	for networkName, server := range a.servers {
+		servers[networkName] = server
+		delete(a.servers, networkName)
+		delete(a.serverNics, networkName)
+	}
+	a.mutex.Unlock()
+
+	for networkName, server := range servers {
+		if err := server.Close(); err != nil {
+			log.Debugf("(dhcp.StopAll) error while closing the dhcp service of network %s: %s", networkName, err.Error())
+		}
+	}
 }

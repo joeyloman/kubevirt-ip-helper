@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/insomniacslk/dhcp/dhcpv4"
+	"github.com/insomniacslk/dhcp/dhcpv4/server4"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -1014,4 +1015,100 @@ func TestDHCPHandlerNoMatchedPoolDiscoverDropped(t *testing.T) {
 	if conn.len() != 0 {
 		t.Errorf("expected no reply for a discover against a vanished pool, got %d", conn.len())
 	}
+}
+
+// newLoopbackServer builds a server bound to an ephemeral loopback port:
+// the production Run binds 0.0.0.0:67, which is not bindable in the test
+// environment, so the listener lifecycle tests register the servers
+// through the registry directly (the same state Run publishes).
+func newLoopbackServer(t *testing.T) *server4.Server {
+	t.Helper()
+
+	server, err := server4.NewServer("", &net.UDPAddr{Port: 0}, func(net.PacketConn, net.Addr, *dhcpv4.DHCPv4) {})
+	if err != nil {
+		t.Fatalf("creating a loopback server: %v", err)
+	}
+
+	return server
+}
+
+// TestServeAndDeregisterKeepsTheReplacementRegistered pins the identity
+// check of the serve-exit wrapper: a Stop followed by a re-Run (the
+// restart flow, or a pool re-created after its deletion) can register the
+// replacement server before the stopped server's wrapper wakes up, and a
+// key-only deregistration would delete the live replacement's registry
+// entry - leaving it serving but unreachable for Stop and reported as not
+// running by IsRunning.
+func TestServeAndDeregisterKeepsTheReplacementRegistered(t *testing.T) {
+	a := NewDHCPAllocator()
+
+	// the first listener is registered and stopped like the pool restart
+	// flow does: Stop removes the registry entry and closes the socket
+	first := newLoopbackServer(t)
+	a.servers["net-repair"] = first
+	a.serverNics["net-repair"] = "lo"
+	if err := a.Stop("net-repair"); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	// the listener repair re-registers the replacement before the stopped
+	// server's serve loop has returned
+	second := newLoopbackServer(t)
+	a.servers["net-repair"] = second
+	a.serverNics["net-repair"] = "lo"
+
+	// the stopped server's wrapper runs late: it must not take the
+	// replacement's registration down with it
+	a.serveAndDeregister("net-repair", first)
+
+	if !a.IsRunning("net-repair") {
+		t.Fatal("the replacement listener must stay registered after the stopped server's wrapper ran")
+	}
+	if current, running := a.servers["net-repair"]; !running || current != second {
+		t.Errorf("the registry must still hold the replacement server, running=%v, own=%v", running, current == second)
+	}
+
+	// the replacement's own wrapper deregisters exactly it
+	if err := second.Close(); err != nil {
+		t.Fatalf("closing the replacement: %v", err)
+	}
+	a.serveAndDeregister("net-repair", second)
+
+	if a.IsRunning("net-repair") {
+		t.Error("the replacement must be deregistered after its own serve loop exited")
+	}
+}
+
+// TestStopAllDrainsEveryRegisteredServer pins the shutdown sweep: the
+// process teardown must stop every listener through the registry itself,
+// because it must not depend on the kubernetes api. every registry entry
+// is removed and every socket is closed, and a second sweep is a
+// converged no-op.
+func TestStopAllDrainsEveryRegisteredServer(t *testing.T) {
+	a := NewDHCPAllocator()
+
+	servers := map[string]*server4.Server{}
+	for _, networkName := range []string{"net-a", "net-b"} {
+		server := newLoopbackServer(t)
+		a.servers[networkName] = server
+		a.serverNics[networkName] = "lo"
+		servers[networkName] = server
+	}
+
+	a.StopAll()
+
+	for networkName := range servers {
+		if a.IsRunning(networkName) {
+			t.Errorf("the listener of %s must be deregistered by the sweep", networkName)
+		}
+	}
+
+	for networkName, server := range servers {
+		if err := server.Serve(); err == nil {
+			t.Errorf("the socket of %s must be closed by the sweep", networkName)
+		}
+	}
+
+	// a second sweep has nothing left to drain and must stay a no-op
+	a.StopAll()
 }
