@@ -544,7 +544,7 @@ func (a *IPAllocator) ReleaseIP(name string, givenIP string) (err error) {
 
 	gIP, err := netip.ParseAddr(givenIP)
 	if err != nil {
-		return err
+		return fmt.Errorf("given ip %s: %w", givenIP, ErrIPInvalid)
 	}
 	gIPCheck := a.ipam[name].cidr.Contains(gIP)
 	if !gIPCheck {

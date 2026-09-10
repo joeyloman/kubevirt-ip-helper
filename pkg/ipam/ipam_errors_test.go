@@ -45,4 +45,12 @@ func TestIPAMReleaseOutcomesAreSentinelErrors(t *testing.T) {
 	if err := allocator.ReleaseIP("net", ""); err == nil || errors.Is(err, ErrIPAlreadyFree) || errors.Is(err, ErrSubnetNotFound) {
 		t.Errorf("empty-ip release = %v, want a plain failing error", err)
 	}
+
+	// an unparseable ip can never hold an allocation: the release carries
+	// the ErrIPInvalid sentinel like ReleaseIPOwnedBy, so the
+	// sentinel-classifying cleanup callers converge it instead of
+	// retrying it forever
+	if err := allocator.ReleaseIP("net", "not-an-ip"); !errors.Is(err, ErrIPInvalid) {
+		t.Errorf("unparseable-ip release = %v, want ErrIPInvalid", err)
+	}
 }
