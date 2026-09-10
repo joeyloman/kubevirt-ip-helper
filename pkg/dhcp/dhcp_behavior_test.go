@@ -355,15 +355,51 @@ func TestDHCPHandlerReleaseGetsNoReply(t *testing.T) {
 	}
 }
 
-func TestDHCPHandlerUnhandledMessageTypeNoReply(t *testing.T) {
+func TestDHCPHandlerInformAckWithoutLeaseTime(t *testing.T) {
 	a := newTestPooledAllocator(t)
 	conn := &recordingPacketConn{}
 
+	// rfc 2131 4.3.5: an inform is acked with the configuration options
+	// only - no yiaddr and no lease time
 	req := newBootRequest(t, mustHWAddr(t, "aa:bb:cc:dd:ee:01"), dhcpv4.MessageTypeInform)
 	a.dhcpHandler(conn, testPeer(), req)
 
+	if conn.len() != 1 {
+		t.Fatalf("expected 1 inform ack, got %d", conn.len())
+	}
+	resp, err := dhcpv4.FromBytes(conn.payloads[0])
+	if err != nil {
+		t.Fatalf("parsing reply: %v", err)
+	}
+	if mt := resp.MessageType(); mt != dhcpv4.MessageTypeAck {
+		t.Errorf("got message type %v, want Ack for an inform", mt)
+	}
+	if !resp.YourIPAddr.IsUnspecified() {
+		t.Errorf("YourIPAddr = %s, want 0.0.0.0 for an inform ack", resp.YourIPAddr)
+	}
+	if resp.GetOneOption(dhcpv4.OptionIPAddressLeaseTime) != nil {
+		t.Error("inform ack carries the lease time option, rfc 2131 4.3.5 forbids it")
+	}
+	if resp.GetOneOption(dhcpv4.OptionSubnetMask) == nil {
+		t.Error("inform ack must carry the configuration options (subnet mask)")
+	}
+}
+
+func TestDHCPHandlerDeclineNoReplyKeepsLease(t *testing.T) {
+	a := newTestPooledAllocator(t)
+	conn := &recordingPacketConn{}
+
+	// rfc 2131 4.3.3: a decline is a one-way notification; the server
+	// must not write a reply. the pre-allocated model keeps the lease so
+	// the binding's resync re-serves the same address by design
+	req := newBootRequest(t, mustHWAddr(t, "aa:bb:cc:dd:ee:01"), dhcpv4.MessageTypeDecline)
+	a.dhcpHandler(conn, testPeer(), req)
+
 	if conn.len() != 0 {
-		t.Errorf("expected no reply for unhandled message type, got %d", conn.len())
+		t.Errorf("expected 0 writes for DHCPDECLINE, got %d", conn.len())
+	}
+	if !a.CheckLease("aa:bb:cc:dd:ee:01") {
+		t.Error("the decline must not drop the pre-allocated lease")
 	}
 }
 
@@ -901,5 +937,81 @@ func TestAddPoolResolvesNTPHostnamesOutsideTheAllocatorLock(t *testing.T) {
 	pool := a.GetPool("net-a")
 	if len(pool.NTP) != 1 || !pool.NTP[0].Equal(net.ParseIP("192.168.0.10")) {
 		t.Errorf("pool ntp = %v, want only the literal 192.168.0.10", pool.NTP)
+	}
+}
+
+// TestRemoveLeasesForNetwork pins the pool-deletion lease sweep: deleting
+// a pool must not leave its leases behind, which would blackhole the
+// renewals of still-running vms against a pool which can never serve them
+// again. the sweep is network-scoped and leaves the leases of other
+// networks untouched.
+func TestRemoveLeasesForNetwork(t *testing.T) {
+	a := New()
+	if err := a.AddLease("aa:bb:cc:dd:ee:01", "pool-a", "192.168.0.50", "ns1/vm1"); err != nil {
+		t.Fatalf("AddLease pool-a: %v", err)
+	}
+	if err := a.AddLease("aa:bb:cc:dd:ee:02", "pool-a", "192.168.0.51", "ns1/vm2"); err != nil {
+		t.Fatalf("AddLease pool-a #2: %v", err)
+	}
+	if err := a.AddLease("aa:bb:cc:dd:ee:03", "pool-b", "10.0.0.5", "ns1/vm3"); err != nil {
+		t.Fatalf("AddLease pool-b: %v", err)
+	}
+
+	a.RemoveLeasesForNetwork("pool-a")
+
+	if a.CheckLease("aa:bb:cc:dd:ee:01") {
+		t.Error("pool-a lease 1 must be swept")
+	}
+	if a.CheckLease("aa:bb:cc:dd:ee:02") {
+		t.Error("pool-a lease 2 must be swept")
+	}
+	if !a.CheckLease("aa:bb:cc:dd:ee:03") {
+		t.Error("a lease of another network must survive the sweep")
+	}
+}
+
+// TestDHCPHandlerNoMatchedPoolNaksRequest: a request whose lease's pool is
+// gone (a deleted pool whose cleanup is still in flight, or the brief
+// reload window) must fail the client fast with a nak instead of dropping
+// the packet silently - a silent drop leaves the client retransmitting
+// against a server which can never serve the address again.
+func TestDHCPHandlerNoMatchedPoolNaksRequest(t *testing.T) {
+	a := newTestPooledAllocator(t)
+	if err := a.DeletePool("pool1"); err != nil {
+		t.Fatalf("deleting the pool: %v", err)
+	}
+	conn := &recordingPacketConn{}
+
+	req := newBootRequest(t, mustHWAddr(t, "aa:bb:cc:dd:ee:01"), dhcpv4.MessageTypeRequest)
+	req.UpdateOption(dhcpv4.OptRequestedIPAddress(net.ParseIP("192.168.0.50")))
+	a.dhcpHandler(conn, testPeer(), req)
+
+	if conn.len() != 1 {
+		t.Fatalf("expected a nak for the request of a vanished pool, got %d", conn.len())
+	}
+	resp, err := dhcpv4.FromBytes(conn.payloads[0])
+	if err != nil {
+		t.Fatalf("parsing reply: %v", err)
+	}
+	if mt := resp.MessageType(); mt != dhcpv4.MessageTypeNak {
+		t.Errorf("message type = %v, want Nak", mt)
+	}
+}
+
+// TestDHCPHandlerNoMatchedPoolDiscoverDropped: a discover against a
+// vanished pool has nothing to offer - the packet is dropped without a
+// reply (never nacked, a nak on a discover is not defined by rfc 2131).
+func TestDHCPHandlerNoMatchedPoolDiscoverDropped(t *testing.T) {
+	a := newTestPooledAllocator(t)
+	if err := a.DeletePool("pool1"); err != nil {
+		t.Fatalf("deleting the pool: %v", err)
+	}
+	conn := &recordingPacketConn{}
+
+	req := newBootRequest(t, mustHWAddr(t, "aa:bb:cc:dd:ee:01"), dhcpv4.MessageTypeDiscover)
+	a.dhcpHandler(conn, testPeer(), req)
+
+	if conn.len() != 0 {
+		t.Errorf("expected no reply for a discover against a vanished pool, got %d", conn.len())
 	}
 }

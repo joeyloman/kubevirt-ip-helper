@@ -36,8 +36,11 @@ func TestVMNetCfgInvalidMacDoesNotConsumeReservationAndRecovers(t *testing.T) {
 	}
 
 	// the macaddress is corrected: the retried sync must now serve the
-	// requested address instead of failing on its own stale claim
+	// requested address instead of failing on its own stale claim. the api
+	// object reflects the correction (the informer event and the durable
+	// object are the same state a real controller sees)
 	vmnetcfg.Spec.NetworkConfig[0].MACAddress = testMAC
+	e.seedVMNetCfg(vmnetcfg)
 	if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, vmnetcfg); err != nil {
 		t.Fatalf("the corrected interface must converge: %s", err)
 	}

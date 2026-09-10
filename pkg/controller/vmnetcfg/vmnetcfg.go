@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"reflect"
 
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/dhcp"
@@ -160,6 +161,13 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 	// enter this list: releasing them would free addresses which the
 	// guests still use while the durable object keeps claiming them
 	appliedAllocations := []allocatedNetworkConfig{}
+
+	// claimedNics records the claims this sync freshly bound or restored,
+	// so their ownership can be re-verified against the live object before
+	// the commit: a nic which the vm controller removed while this sync
+	// ran must not keep a freshly recreated lease/claim/ledger entry which
+	// no reconciliation ever cleans again (the stale-spec restore race)
+	claimedNics := []allocatedNetworkConfig{}
 
 	// addresses which the stored spec already records (mac, networkname
 	// and ip): applying them again only restores the previous assignment
@@ -727,9 +735,33 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 			c.metrics.UpdateLogStatus("error")
 		}
 
+		claimedNics = append(claimedNics, allocatedNetworkConfig{
+			macAddress:  v.MACAddress,
+			networkName: v.NetworkName,
+			ipAddress:   ip,
+			poolName:    pool.(kihv1.IPPool).Name,
+		})
+
 		rememberApplied(pool.(kihv1.IPPool).Name, v.MACAddress, v.NetworkName, ip, false)
 
 		networkChange = true
+	}
+
+	// verify the freshly claimed ownership records against the live object
+	// before anything is committed: the vm controller releases the state of
+	// a removed nic before its durable spec update lands, and a sync which
+	// read the stale spec would re-claim and re-record the nic into an
+	// object which no longer references it - an orphan lease, claim and
+	// ledger entry which no reconciliation ever cleans (the finalizer
+	// iterates only the present spec nics). a nic which vanished during
+	// this sync is unwound through the owner-validated release and dropped
+	// from the pending commit
+	if err := c.verifyClaimedNics(vmnetcfg, claimedNics, &newVmNetCfgs, &newNetCfgStatusList); err != nil {
+		log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] %s",
+			vmnetcfg.Namespace, vmnetcfg.Name, err)
+		c.metrics.UpdateLogStatus("error")
+
+		return err
 	}
 
 	if restoreErr != nil {
@@ -1048,10 +1080,140 @@ func (c *Controller) cleanupVirtualMachineNetworkConfig(vmnetcfg *kihv1.VirtualM
 	return
 }
 
+// verifyClaimedNics re-reads the vmnetcfg object after every interface of
+// this sync bound its claim and confirms each claimed nic is still recorded
+// in the live spec. the vm and the vmnetcfg controllers mutate the same
+// object from separate queues: the vm controller releases the state of a
+// removed nic before its durable spec update lands, and a sync which read
+// the object before that update would restore the nic's claim into a spec
+// which no longer references it - an orphan lease, claim and ledger entry
+// which no reconciliation ever cleans (the finalizer iterates only the
+// present spec nics). a nic which vanished during the sync is unwound
+// through the owner-validated release and dropped from the pending commit,
+// mirroring the registration sweep's re-verification of its own pins.
+func (c *Controller) verifyClaimedNics(vmnetcfg *kihv1.VirtualMachineNetworkConfig, claimed []allocatedNetworkConfig, pendingSpec *[]kihv1.NetworkConfig, pendingStatus *[]kihv1.NetworkConfigStatus) error {
+	if len(claimed) == 0 {
+		return nil
+	}
+
+	live, err := c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs(vmnetcfg.Namespace).Get(c.ctx, vmnetcfg.Name, metav1.GetOptions{})
+	if err != nil {
+		// the retried sync re-runs the whole verification; an object which
+		// is gone entirely is handled by its deletion event
+		return fmt.Errorf("(vmnetcfg.verifyClaimedNics) [%s/%s] cannot re-read the object to verify the claimed nics: %s",
+			vmnetcfg.Namespace, vmnetcfg.Name, err.Error())
+	}
+
+	for _, nc := range claimed {
+		if nicRecorded(live, nc) {
+			continue
+		}
+
+		log.Warnf("(vmnetcfg.verifyClaimedNics) [%s/%s] the nic %s of network %s with ip %s was removed while this sync restored it, unwinding its freshly created claim",
+			vmnetcfg.Namespace, vmnetcfg.Name, nc.macAddress, nc.networkName, nc.ipAddress)
+		c.metrics.UpdateLogStatus("warning")
+
+		c.unwindClaim(vmnetcfg, nc)
+		removeNicFromSpec(pendingSpec, nc.macAddress, nc.networkName)
+		removeNicFromStatus(pendingStatus, nc.macAddress, nc.networkName)
+	}
+
+	return nil
+}
+
+// nicRecorded reports whether the nic identified by mac/networkname is
+// still part of the spec of the given object. the address is deliberately
+// not compared: a fresh allocation or an ip change of this very sync is
+// only durable after its own commit, so the live object still carries the
+// pre-sync address (or none) at verification time. the vm controller
+// removes a nic as a whole (mac+network), which is exactly the race this
+// verification closes.
+func nicRecorded(vmnetcfg *kihv1.VirtualMachineNetworkConfig, nc allocatedNetworkConfig) bool {
+	for _, v := range vmnetcfg.Spec.NetworkConfig {
+		if v.MACAddress == nc.macAddress && v.NetworkName == nc.networkName {
+			return true
+		}
+	}
+
+	return false
+}
+
+// unwindClaim releases the owner-validated state of a nic whose recorded
+// claim this sync recreated but whose spec entry concurrently vanished.
+// every release is guarded by its owner reference: a successor which took
+// the address over in the meantime (a fresh allocation or another owner's
+// claim) is never freed with it, and the converged outcomes (already-free
+// addresses, foreign owners, absent leases) are tolerated.
+func (c *Controller) unwindClaim(vmnetcfg *kihv1.VirtualMachineNetworkConfig, nc allocatedNetworkConfig) {
+	ref := fmt.Sprintf("%s/%s", vmnetcfg.Namespace, vmnetcfg.Spec.VMName)
+
+	if err := c.dhcp.DeleteLeaseOwnedBy(nc.macAddress, ref); err != nil &&
+		!errors.Is(err, dhcp.ErrLeaseNotFound) && !errors.Is(err, dhcp.ErrLeaseForeignOwner) {
+		log.Errorf("(vmnetcfg.unwindClaim) [%s/%s] failed to delete the lease of hwaddr %s: %s",
+			vmnetcfg.Namespace, vmnetcfg.Name, nc.macAddress, err)
+		c.metrics.UpdateLogStatus("error")
+	}
+
+	ownerRef := util.AllocationRef(vmnetcfg.Namespace, vmnetcfg.Spec.VMName, nc.macAddress)
+	if err := c.ipam.ReleaseIPOwnedBy(nc.networkName, nc.ipAddress, ownerRef); err != nil &&
+		!errors.Is(err, ipam.ErrIPForeignOwner) && !util.IsAlreadyReleased(err) {
+		log.Errorf("(vmnetcfg.unwindClaim) [%s/%s] failed to release the claim of ip %s in network %s: %s",
+			vmnetcfg.Namespace, vmnetcfg.Name, nc.ipAddress, nc.networkName, err)
+		c.metrics.UpdateLogStatus("error")
+	}
+
+	if err := c.updateIPPoolStatus(DELETE, vmnetcfg.Namespace, vmnetcfg.Spec.VMName, nc.ipAddress, nc.networkName, nc.macAddress, nc.poolName); err != nil &&
+		!errors.Is(err, util.ErrForeignOwner) {
+		log.Errorf("(vmnetcfg.unwindClaim) [%s/%s] failed to remove the ip %s record from the IPPool %s status: %s",
+			vmnetcfg.Namespace, vmnetcfg.Name, nc.ipAddress, nc.poolName, err)
+		c.metrics.UpdateLogStatus("error")
+	}
+
+	if err := c.updateIPPoolMetrics(nc.poolName); err != nil {
+		log.Errorf("(vmnetcfg.unwindClaim) [%s/%s] %s",
+			vmnetcfg.Namespace, vmnetcfg.Name, err)
+		c.metrics.UpdateLogStatus("error")
+	}
+}
+
+// removeNicFromSpec and removeNicFromStatus drop the entries of a vanished
+// nic from the pending commit of a sync, so the stale spec read cannot
+// write the removed nic back into the live object.
+func removeNicFromSpec(spec *[]kihv1.NetworkConfig, macAddress string, networkName string) {
+	kept := (*spec)[:0]
+	for _, v := range *spec {
+		if !(v.MACAddress == macAddress && v.NetworkName == networkName) {
+			kept = append(kept, v)
+		}
+	}
+	*spec = kept
+}
+
+func removeNicFromStatus(status *[]kihv1.NetworkConfigStatus, macAddress string, networkName string) {
+	kept := (*status)[:0]
+	for _, v := range *status {
+		if !(v.MACAddress == macAddress && v.NetworkName == networkName) {
+			kept = append(kept, v)
+		}
+	}
+	*status = kept
+}
+
 func (c *Controller) updateIPPoolStatus(event string, vmnetcfgNamespace string, vmnetcfgVMName string, ip string, networkName string, hwAddr string, poolName string) (err error) {
 	return ippoolstatus.UpdateStatus(c.ctx, c.kihClientset, c.ipam, event, vmnetcfgNamespace, vmnetcfgVMName, ip, networkName, hwAddr, poolName)
 }
 func (c *Controller) updateVirtualMachineNetworkConfigStatus(vmnetcfg *kihv1.VirtualMachineNetworkConfig, vmnetcfgStatus *kihv1.VirtualMachineNetworkConfigStatus) (err error) {
+	// skip the write when the status is unchanged: the informer re-delivers
+	// every object once per minute (resync), and an unconditional status
+	// update per object per minute is apiserver/etcd churn that grows
+	// linearly with the fleet size
+	if reflect.DeepEqual(&vmnetcfg.Status, vmnetcfgStatus) {
+		log.Debugf("(vmnetcfg.updateVirtualMachineNetworkConfigStatus) [%s/%s] status unchanged, skipping write",
+			vmnetcfg.Namespace, vmnetcfg.Name)
+
+		return
+	}
+
 	// the object is mutated here: callers must hand in their own copy,
 	// never a shared informer object
 	vmnetcfg.Status = *vmnetcfgStatus

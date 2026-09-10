@@ -272,9 +272,19 @@ func (a *IPAllocator) GetIP(name string, givenIP string) (string, error) {
 		}
 	}
 
+	// the bitmap keys are stored in the canonical unmapped spelling, so an
+	// alternative spelling of the same address (a v4-in-v6 form such as
+	// ::ffff:10.0.0.5) is compared on its canonical form
+	givenIPCanonical := ""
+	if givenIP != "" {
+		if gIP, err := netip.ParseAddr(givenIP); err == nil {
+			givenIPCanonical = gIP.Unmap().String()
+		}
+	}
+
 	for ip, allocated := range a.ipam[name].ips {
 		if givenIP != "" {
-			if ip == givenIP {
+			if ip == givenIPCanonical {
 				if allocated {
 					return "", fmt.Errorf("given ip %s is already allocated", givenIP)
 				} else {

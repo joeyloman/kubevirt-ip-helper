@@ -745,8 +745,10 @@ func TestVMNetCfgStickyErrorDuringStartupReplay(t *testing.T) {
 	if n := e.countRequests(http.MethodPut, vmnetcfgMainPath); n != 0 {
 		t.Errorf("main update requests = %d, want 0", n)
 	}
-	if n := e.countRequests(http.MethodPut, vmnetcfgStatusPath); n != 1 {
-		t.Errorf("status update requests = %d, want 1", n)
+	// the rebuilt status equals the persisted one: the churn guard skips
+	// the write instead of bumping the resourceVersion once per resync
+	if n := e.countRequests(http.MethodPut, vmnetcfgStatusPath); n != 0 {
+		t.Errorf("status update requests = %d, want 0 (unchanged status must not be rewritten)", n)
 	}
 }
 
@@ -877,8 +879,10 @@ func TestVMNetCfgExistingLeaseIdempotency(t *testing.T) {
 	if n := e.countRequests(http.MethodGet, ippoolPath); n != 1 {
 		t.Errorf("ippool get requests = %d, want 1 (the idempotent path verifies the ownership record)", n)
 	}
-	if n := e.countRequests(http.MethodPut, vmnetcfgStatusPath); n != 1 {
-		t.Errorf("status update requests = %d, want 1", n)
+	// the rebuilt status equals the persisted one: the churn guard skips
+	// the write instead of bumping the resourceVersion once per resync
+	if n := e.countRequests(http.MethodPut, vmnetcfgStatusPath); n != 0 {
+		t.Errorf("status update requests = %d, want 0 (unchanged status must not be rewritten)", n)
 	}
 }
 

@@ -30,6 +30,7 @@ package ippool
 // published state is covered by the vmnetcfg-side recovery tests.
 
 import (
+	"errors"
 	"net/http/httptest"
 	"testing"
 	"time"
@@ -727,5 +728,40 @@ func TestRegistrationAttributesTheUnusableMacClaim(t *testing.T) {
 	}
 	if _, err := c.ipam.ReclaimIPClaimant("net-a", "10.0.0.3", correctedRef, "default/vm-broken"); err != nil {
 		t.Errorf("the corrected binding of the claiming vm retaking its pin: %s", err)
+	}
+}
+
+// TestRegisterIPPoolRejectsExcludeOverlappingLiveClaim pins the P2.6
+// finding: an exclude entry which the persisted ledger records for a live
+// binding is a configuration conflict which can never converge, so the
+// registration must reject it as unregistrable BEFORE any host, dhcp or
+// allocator mutation. without the up-front rejection, the exclude pass
+// claims the address as EXCLUDED first and the claim protection of the
+// same address fails the registration forever - each resync tearing the
+// half-built registration down and rebuilding it.
+func TestRegisterIPPoolRejectsExcludeOverlappingLiveClaim(t *testing.T) {
+	stored := recoveryNewPool("pool1", "net-a")
+	stored.Status.IPv4.Allocated = map[string]string{"10.0.0.2": "default/vm-test [02:00:00:00:00:01]"}
+
+	c, _, _ := recoveryNewController(t, stored)
+
+	pool := recoveryNewPool("pool1", "net-a")
+	pool.Spec.IPv4Config.Pool.Exclude = []string{"10.0.0.2"}
+
+	_, err := c.registerIPPool(pool)
+	if err == nil {
+		t.Fatal("the overlapping exclude must fail the registration")
+	}
+	if !errors.Is(err, ErrPoolUnregistrable) {
+		t.Errorf("error = %v, want ErrPoolUnregistrable so the startup gate counts the pool", err)
+	}
+
+	// the rejection happened before any mutation: nothing of the pool is
+	// registered anywhere
+	if c.dhcp.CheckPool("net-a") {
+		t.Error("no dhcp pool may exist after the pre-mutation rejection")
+	}
+	if _, err := c.ipam.GetIP("net-a", ""); err == nil {
+		t.Error("no subnet may be registered after the pre-mutation rejection")
 	}
 }

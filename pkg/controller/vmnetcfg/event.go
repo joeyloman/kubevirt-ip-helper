@@ -102,14 +102,28 @@ func (e *EventHandler) Init() (err error) {
 }
 
 func (e *EventHandler) getKubeConfig() (config *rest.Config, err error) {
+	// bound every controller api call: a hang against the api must not
+	// wedge the reconcilers behind an unresponsive transport
+	const configTimeout = 30 * time.Second
+
 	if !util.FileExists(e.kubeConfig) {
-		return rest.InClusterConfig()
+		if config, err = rest.InClusterConfig(); err != nil {
+			return
+		}
+		config.Timeout = configTimeout
+
+		return
 	}
 
-	return clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+	config, err = clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
 		&clientcmd.ClientConfigLoadingRules{ExplicitPath: e.kubeConfig},
 		&clientcmd.ConfigOverrides{ClusterInfo: clientcmdapi.Cluster{}, CurrentContext: e.kubeContext},
 	).ClientConfig()
+	if err == nil {
+		config.Timeout = configTimeout
+	}
+
+	return
 }
 
 func (e *EventHandler) EventListener() (err error) {

@@ -56,7 +56,17 @@ type DHCPAllocator struct {
 	// (spec.NetworkName), not by nic: several pools may legitimately share
 	// one interface and each server must stay individually stoppable
 	servers map[string]*server4.Server
-	mutex   sync.Mutex
+	// serverNics records the interface each running server is bound to, so
+	// a second Run on the same interface can surface the kernel-dependent
+	// delivery duplication instead of hiding it
+	serverNics map[string]string
+	// warnMutex guards the throttled warning state of the packet handler:
+	// a broadcast flood of unknown hardware addresses must not produce one
+	// log line (and one string formatting pass) per packet
+	warnMutex          sync.Mutex
+	lastUnknownHWAddr  time.Time
+	unknownHWAddrCount uint64
+	mutex              sync.Mutex
 
 	// resolver resolves ntp hostname entries during pool registrations;
 	// a nil resolver uses net.DefaultResolver. the field lets tests
@@ -68,11 +78,13 @@ func NewDHCPAllocator() *DHCPAllocator {
 	pools := make(map[string]DHCPPool)
 	leases := make(map[string]DHCPLease)
 	servers := make(map[string]*server4.Server)
+	serverNics := make(map[string]string)
 
 	return &DHCPAllocator{
-		pools:   pools,
-		leases:  leases,
-		servers: servers,
+		pools:      pools,
+		leases:     leases,
+		servers:    servers,
+		serverNics: serverNics,
 	}
 }
 
@@ -397,6 +409,75 @@ func New() *DHCPAllocator {
 	return NewDHCPAllocator()
 }
 
+// packetLeaseAndPool resolves the lease and its pool of one packet under a
+// single lock acquisition. the dhcp packet handler previously looked the
+// lease, the pool existence and the pool up with three separate lock
+// acquisitions per packet; a flood on the shared interface then serialized
+// its ten layers of contention across the whole registration and lease
+// adoption machinery. an hwaddr without a lease reports leaseFound=false
+// (a stored lease always carries a client ip), and a lease whose pool is
+// gone reports poolFound=false so the caller can fail its client fast.
+func (a *DHCPAllocator) packetLeaseAndPool(hwAddr string) (lease DHCPLease, pool DHCPPool, leaseFound bool, poolFound bool) {
+	hw, err := net.ParseMAC(hwAddr)
+	if err != nil {
+		return lease, pool, false, false
+	}
+
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	key := hw.String()
+	lease, leaseFound = a.leases[key]
+	if !leaseFound || lease.ClientIP == nil {
+		return lease, pool, false, false
+	}
+
+	pool, poolFound = a.pools[lease.PoolName]
+
+	return lease, pool, true, poolFound
+}
+
+// logUnknownHWAddr reports packets whose hardware address has no lease,
+// throttled to one aggregated line per window: an unrelated or abusive
+// broadcast flood on the served segment must not produce one log line per
+// packet. the count resets with every window so a persistent flood keeps a
+// periodic heartbeat visible.
+func (a *DHCPAllocator) logUnknownHWAddr(m *dhcpv4.DHCPv4) {
+	warnNow := false
+
+	a.warnMutex.Lock()
+	a.unknownHWAddrCount++
+	if a.lastUnknownHWAddr.IsZero() || time.Since(a.lastUnknownHWAddr) >= 5*time.Second {
+		warnNow = true
+		a.lastUnknownHWAddr = time.Now()
+	}
+	count := a.unknownHWAddrCount
+	if warnNow {
+		a.unknownHWAddrCount = 0
+	}
+	a.warnMutex.Unlock()
+
+	if warnNow {
+		log.Warnf("(dhcp.dhcpHandler) NO LEASE FOUND: hwaddr=%s (txid=%s, type=%s) - %d unknown-hwaddr packet(s) in the last 5s", m.ClientHWAddr.String(), m.TransactionID.String(), m.MessageType(), count)
+	}
+}
+
+// RemoveLeasesForNetwork drops every lease of the named network from the
+// lease registry: deleting a pool must not leave its leases behind, which
+// would blackhole the renewals of still-running vms with no pool to serve
+// them (and no NAK to restart them). it is called by the pool deletion
+// path only - a dhcp pool reload keeps the leases of the live vms.
+func (a *DHCPAllocator) RemoveLeasesForNetwork(networkName string) {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	for hw, lease := range a.leases {
+		if lease.PoolName == networkName {
+			delete(a.leases, hw)
+		}
+	}
+}
+
 func (a *DHCPAllocator) dhcpHandler(conn net.PacketConn, peer net.Addr, m *dhcpv4.DHCPv4) {
 	if m == nil {
 		log.Errorf("(dhcp.dhcpHandler) packet is nil!")
@@ -404,7 +485,12 @@ func (a *DHCPAllocator) dhcpHandler(conn net.PacketConn, peer net.Addr, m *dhcpv
 		return
 	}
 
-	log.Tracef("(dhcp.dhcpHandler) INCOMING PACKET=%s", m.Summary())
+	// the summary is an expensive string build: only format it when the
+	// trace level is actually enabled, or every single packet on the
+	// served segment pays for it even at the default info level
+	if log.IsLevelEnabled(log.TraceLevel) {
+		log.Tracef("(dhcp.dhcpHandler) INCOMING PACKET=%s", m.Summary())
+	}
 
 	if m.OpCode != dhcpv4.OpcodeBootRequest {
 		log.Errorf("(dhcp.dhcpHandler) not a BootRequest!")
@@ -412,21 +498,36 @@ func (a *DHCPAllocator) dhcpHandler(conn net.PacketConn, peer net.Addr, m *dhcpv
 		return
 	}
 
-	// lease lookups use the canonical colon form of the mac address
-	lease := a.GetLease(m.ClientHWAddr.String())
+	// lease and pool resolution under one lock acquisition (see
+	// packetLeaseAndPool): a flood on the shared interface must not stall
+	// the allocator behind three serialized lookups per packet
+	lease, pool, leaseFound, poolFound := a.packetLeaseAndPool(m.ClientHWAddr.String())
 
-	if lease.ClientIP == nil {
-		log.Warnf("(dhcp.dhcpHandler) NO LEASE FOUND: hwaddr=%s", m.ClientHWAddr.String())
+	if !leaseFound {
+		a.logUnknownHWAddr(m)
 
 		return
 	}
 
-	if !a.CheckPool(lease.PoolName) {
+	if !poolFound {
+		// the lease's pool is gone (deleted while the vm still runs, or the
+		// brief reload window): a request which asks for an address this
+		// server can no longer serve gets a nak so the client restarts the
+		// discovery instead of retransmitting indefinitely against a silent
+		// drop; other message types are dropped, there is nothing to offer
 		log.Warnf("(dhcp.dhcpHandler) NO MATCHED POOL FOUND FOR LEASE: hwaddr=%s", m.ClientHWAddr.String())
 
+		if m.MessageType() == dhcpv4.MessageTypeRequest {
+			serverIP := m.ServerIdentifier()
+			if len(serverIP) == 0 {
+				serverIP = net.IPv4zero
+			}
+
+			a.sendNak(conn, m, serverIP)
+		}
+
 		return
 	}
-	pool := a.GetPool(lease.PoolName)
 
 	log.Debugf("(dhcp.dhcpHandler) LEASE FOUND: hwaddr=%s, serverip=%s, clientip=%s, mask=%s, router=%s, dns=%+v, domainname=%s, domainsearch=%+v, ntp=%+v, leasetime=%d, reference=%s, nic=%s",
 		m.ClientHWAddr.String(),
@@ -445,6 +546,9 @@ func (a *DHCPAllocator) dhcpHandler(conn net.PacketConn, peer net.Addr, m *dhcpv
 
 	var replyType dhcpv4.MessageType
 	var sendReply bool
+	// informReply marks a DHCPINFORM ack: rfc 2131 4.3.5 says it carries
+	// the configuration options only - no yiaddr and no lease time
+	informReply := false
 
 	switch mt := m.MessageType(); mt {
 	case dhcpv4.MessageTypeDiscover:
@@ -481,6 +585,27 @@ func (a *DHCPAllocator) dhcpHandler(conn net.PacketConn, peer net.Addr, m *dhcpv
 
 		replyType = dhcpv4.MessageTypeAck
 		sendReply = true
+	case dhcpv4.MessageTypeInform:
+		// rfc 2131 4.3.5: a client which already has an address asks only
+		// for its configuration parameters; the ack carries the options
+		// without yiaddr and without a lease time
+		log.Infof("(dhcp.dhcpHandler) [txid=%s] DHCPINFORM from %s via %s", m.TransactionID.String(), m.ClientHWAddr.String(), pool.Nic)
+
+		replyType = dhcpv4.MessageTypeAck
+		sendReply = true
+		informReply = true
+	case dhcpv4.MessageTypeDecline:
+		// rfc 2131 4.3.3: the client reports an on-segment conflict for
+		// the offered address. the pre-allocated model keeps the lease:
+		// the address belongs to this binding by the controller's ledger,
+		// and abandoning it under the dhcp lock is not possible without
+		// the ipam allocator (whose lock is only ever taken after this
+		// one). the conflict stays visible here; the binding's resync
+		// re-serves the same address by design
+		log.Errorf("(dhcp.dhcpHandler) [txid=%s] DHCPDECLINE for %s from %s: client reports an address conflict for a pre-allocated lease, keeping the reservation (see the ipam/ippool status for the binding)",
+			m.TransactionID.String(), lease.ClientIP, m.ClientHWAddr.String())
+
+		return
 	case dhcpv4.MessageTypeRelease:
 		// rfc 2131 4.3.4: a release is a one-way notification without a reply
 		log.Infof("(dhcp.dhcpHandler) [txid=%s] DHCPRELEASE for %s from %s via %s", m.TransactionID.String(), lease.ClientIP, m.ClientHWAddr.String(), pool.Nic)
@@ -505,14 +630,17 @@ func (a *DHCPAllocator) dhcpHandler(conn net.PacketConn, peer net.Addr, m *dhcpv
 
 	// rfc 2131 figure 3: an offer always carries a zero ciaddr and the
 	// offered address in yiaddr; an ack copies the client address of its
-	// request, which is set during renewal and zero during address selection
+	// request, which is set during renewal and zero during address selection;
+	// an inform ack carries no yiaddr at all (rfc 2131 4.3.5)
 	reply.ServerIPAddr = pool.ServerIP
-	reply.YourIPAddr = lease.ClientIP
 	reply.TransactionID = m.TransactionID
 	reply.ClientHWAddr = m.ClientHWAddr
 	reply.Flags = m.Flags
 	reply.GatewayIPAddr = m.GatewayIPAddr
-	if replyType == dhcpv4.MessageTypeAck {
+	if !informReply {
+		reply.YourIPAddr = lease.ClientIP
+	}
+	if replyType == dhcpv4.MessageTypeAck && !informReply {
 		reply.ClientIPAddr = m.ClientIPAddr
 	}
 
@@ -545,14 +673,18 @@ func (a *DHCPAllocator) dhcpHandler(conn net.PacketConn, peer net.Addr, m *dhcpv
 		reply.UpdateOption(dhcpv4.OptNTPServers(pool.NTP...))
 	}
 
-	if pool.LeaseTime > 0 {
-		reply.UpdateOption(dhcpv4.OptIPAddressLeaseTime(time.Duration(pool.LeaseTime) * time.Second))
-	} else {
-		// default lease time: 1 year
-		reply.UpdateOption(dhcpv4.OptIPAddressLeaseTime(31536000 * time.Second))
+	if !informReply {
+		if pool.LeaseTime > 0 {
+			reply.UpdateOption(dhcpv4.OptIPAddressLeaseTime(time.Duration(pool.LeaseTime) * time.Second))
+		} else {
+			// default lease time: 1 year
+			reply.UpdateOption(dhcpv4.OptIPAddressLeaseTime(31536000 * time.Second))
+		}
 	}
 	if replyType == dhcpv4.MessageTypeOffer {
 		log.Infof("(dhcp.dhcpHandler) [txid=%s] DHCPOFFER on %s to %s via %s", m.TransactionID.String(), lease.ClientIP, m.ClientHWAddr.String(), pool.Nic)
+	} else if informReply {
+		log.Infof("(dhcp.dhcpHandler) [txid=%s] DHCPACK (inform) to %s via %s", m.TransactionID.String(), m.ClientHWAddr.String(), pool.Nic)
 	} else {
 		log.Infof("(dhcp.dhcpHandler) [txid=%s] DHCPACK on %s to %s via %s", m.TransactionID.String(), lease.ClientIP, m.ClientHWAddr.String(), pool.Nic)
 	}
@@ -622,6 +754,18 @@ func (a *DHCPAllocator) Run(networkName string, nic string) (err error) {
 		return fmt.Errorf("dhcp service already running for network %s", networkName)
 	}
 
+	// several pools on one interface share the 0.0.0.0:67 socket group;
+	// whether the kernel duplicates broadcast packets to every reuseport
+	// socket of the group is kernel-version dependent, so the setup is
+	// surfaced instead of silently relying on it
+	for registeredNetwork, registeredNic := range a.serverNics {
+		if registeredNic == nic {
+			log.Warnf("(dhcp.Run) network %s serves on the same interface %s as network %s: broadcast dhcp packets are delivered to every socket of the shared interface (reuseport group), the duplication semantics depend on the deployment kernel",
+				networkName, nic, registeredNetwork)
+			break
+		}
+	}
+
 	server, err := server4.NewServer(nic, &laddr, a.dhcpHandler)
 	if err != nil {
 		a.mutex.Unlock()
@@ -630,9 +774,30 @@ func (a *DHCPAllocator) Run(networkName string, nic string) (err error) {
 	}
 
 	a.servers[networkName] = server
+	a.serverNics[networkName] = nic
 	a.mutex.Unlock()
 
-	go server.Serve()
+	// the serve loop never returns while servicing; it returns only on a
+	// socket error or a Stop-initiated close. the wrapper deregisters the
+	// entry on an unexpected exit, so CheckPool/IsRunning stop reporting
+	// the pool as live and the controller's re-registration can re-serve
+	// it, instead of the pool silently never answering dhcp again while
+	// every lookup still believes it runs
+	go func() {
+		serveErr := server.Serve()
+
+		a.mutex.Lock()
+		_, stillRegistered := a.servers[networkName]
+		if stillRegistered {
+			delete(a.servers, networkName)
+			delete(a.serverNics, networkName)
+		}
+		a.mutex.Unlock()
+
+		if serveErr != nil && stillRegistered {
+			log.Errorf("(dhcp.Run) the DHCP service of network %s terminated unexpectedly: %v; the pool is deregistered and the next pool sync re-serves it", networkName, serveErr)
+		}
+	}()
 
 	return
 }
@@ -646,6 +811,7 @@ func (a *DHCPAllocator) Stop(networkName string) (err error) {
 	a.mutex.Lock()
 	server, exists := a.servers[networkName]
 	delete(a.servers, networkName)
+	delete(a.serverNics, networkName)
 	a.mutex.Unlock()
 
 	if !exists || server == nil {

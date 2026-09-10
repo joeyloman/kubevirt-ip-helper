@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"sync"
 
 	log "github.com/sirupsen/logrus"
 
@@ -31,6 +32,21 @@ type MetricsAllocator struct {
 	kubevirtiphelperIPPoolAvailable *prometheus.GaugeVec
 	kubevirtiphelperVmNetCfgStatus  *prometheus.GaugeVec
 	registry                        *prometheus.Registry
+	// healthChecks are registered by the application and evaluated by the
+	// /healthz and /ready endpoints: the liveness probe of the pod checks
+	// the leader-election freshness through them, so a stale leader is
+	// restarted by the kubelet instead of serving dhcp forever
+	healthMutex  sync.Mutex
+	healthChecks []healthCheck
+}
+
+type healthCheck struct {
+	name  string
+	check func() error
+	// readiness-only checks (the application's readiness registration)
+	// run for the /ready endpoint only, so a pod which is not yet serving
+	// stays not-ready without failing its liveness probe
+	readiness bool
 }
 
 func NewMetricsAllocator() *MetricsAllocator {
@@ -184,12 +200,84 @@ func (m *MetricsAllocator) Run() {
 	}
 	listenAddress := fmt.Sprintf(":%d", metricsPort)
 
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.HandlerFor(m.registry, promhttp.HandlerOpts{Registry: m.registry}))
+	mux.HandleFunc("/healthz", m.healthzHandler)
+	mux.HandleFunc("/ready", m.readyHandler)
+
 	m.httpServer = http.Server{
 		Addr:    listenAddress,
-		Handler: promhttp.HandlerFor(m.registry, promhttp.HandlerOpts{Registry: m.registry}),
+		Handler: mux,
 	}
 
 	log.Infof("(metrics.Run) %s", m.httpServer.ListenAndServe())
+}
+
+// SetHealthCheck registers a named check evaluated by the /healthz and
+// /ready endpoints: a check error turns the endpoint into a 503, so the
+// liveness probe of the pod restarts it. checks are registered by the
+// application before the server starts.
+func (m *MetricsAllocator) SetHealthCheck(name string, check func() error) {
+	m.healthMutex.Lock()
+	defer m.healthMutex.Unlock()
+
+	m.healthChecks = append(m.healthChecks, healthCheck{name: name, check: check})
+}
+
+// SetReadinessCheck registers a check evaluated by the /ready endpoint
+// only: a pod which has not started serving (or never acquired the
+// leadership) stays not-ready without failing its liveness probe.
+func (m *MetricsAllocator) SetReadinessCheck(name string, check func() error) {
+	m.healthMutex.Lock()
+	defer m.healthMutex.Unlock()
+
+	m.healthChecks = append(m.healthChecks, healthCheck{name: name, check: check, readiness: true})
+}
+
+// checksFor returns the checks of an endpoint: /healthz runs the liveness
+// checks, /ready runs liveness plus readiness.
+func (m *MetricsAllocator) checksFor(includeReadiness bool) []healthCheck {
+	m.healthMutex.Lock()
+	defer m.healthMutex.Unlock()
+
+	var checks []healthCheck
+	for _, hc := range m.healthChecks {
+		if includeReadiness || !hc.readiness {
+			checks = append(checks, hc)
+		}
+	}
+
+	return checks
+}
+
+// healthzHandler reports 200 only when every registered liveness check
+// passes.
+func (m *MetricsAllocator) healthzHandler(w http.ResponseWriter, r *http.Request) {
+	m.evalChecks(w, m.checksFor(false))
+}
+
+// readyHandler reports 200 only when every liveness and readiness check
+// passes.
+func (m *MetricsAllocator) readyHandler(w http.ResponseWriter, r *http.Request) {
+	m.evalChecks(w, m.checksFor(true))
+}
+
+func (m *MetricsAllocator) evalChecks(w http.ResponseWriter, checks []healthCheck) {
+	if len(checks) == 0 {
+		http.Error(w, "no health checks registered", http.StatusServiceUnavailable)
+
+		return
+	}
+
+	for _, hc := range checks {
+		if err := hc.check(); err != nil {
+			http.Error(w, fmt.Sprintf("%s: %s", hc.name, err.Error()), http.StatusServiceUnavailable)
+
+			return
+		}
+	}
+
+	w.WriteHeader(http.StatusOK)
 }
 
 func (m *MetricsAllocator) Stop() {

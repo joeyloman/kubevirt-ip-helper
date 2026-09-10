@@ -247,6 +247,89 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 
 	ref := fmt.Sprintf("%s/%s", vmnetcfg.Namespace, vmnetcfg.Spec.VMName)
 
+	// freeing an ip which is leased to another vm of the same network
+	// would leave the other lease serving an address ipam could reissue to
+	// a third client; ipam itself holds no owner references, so this
+	// stays a network-scoped snapshot check without an owner-validated
+	// release primitive: the same numeric addresses of separate networks
+	// are no claim on this network's allocation
+	if netCfg.IPAddress != "" {
+		if leaseHwAddr, lease, found := c.dhcp.GetLeaseByIPAndNetwork(netCfg.NetworkName, netCfg.IPAddress); found && lease.Reference != ref {
+			// the release already happened in an earlier attempt and a
+			// successor vm owns the ip now: this interface's cleanup
+			// converged
+			log.Warnf("(vm.cleanupNetworkInterface) [%s/%s] ip %s belongs to %s via hwaddr %s, skipping the release of it",
+				vmnetcfg.Namespace, vmnetcfg.Name, netCfg.IPAddress, lease.Reference, leaseHwAddr)
+			c.metrics.UpdateLogStatus("warning")
+
+			return
+		}
+	}
+
+	// the durable un-record happens before any local release (mirroring
+	// the vmnetcfg live path): the address is never locally freed while
+	// its ownership record is still written, otherwise a crash between the
+	// release and the status write leaves an orphan ledger entry which the
+	// next registration re-pins to the ghost owner
+	if netCfg.IPAddress != "" {
+		pool, poolErr := c.cache.Get("pool", netCfg.NetworkName)
+		if poolErr != nil {
+			// a deleted pool object takes its whole status ledger with it,
+			// so the un-record may only be skipped when the pool is truly
+			// gone: verify that through the api. a pool object which merely
+			// missed the cache still holds the ledger entry, and skipping
+			// the un-record would orphan it forever
+			apiPools, listErr := c.kihClientset.KubevirtiphelperV1().IPPools().List(c.ctx, metav1.ListOptions{})
+			if listErr == nil {
+				poolExists := false
+				for _, p := range apiPools.Items {
+					if p.Spec.NetworkName == netCfg.NetworkName {
+						poolExists = true
+
+						break
+					}
+				}
+
+				if !poolExists {
+					log.Warnf("(vm.cleanupNetworkInterface) [%s/%s] the pool of network %s does not exist anymore, its status record is gone with it",
+						vmnetcfg.Namespace, vmnetcfg.Name, netCfg.NetworkName)
+				} else {
+					return fmt.Errorf("(vm.cleanupNetworkInterface) [%s/%s] cannot un-record ip %s of network %s: %s",
+						vmnetcfg.Namespace, vmnetcfg.Name, netCfg.IPAddress, netCfg.NetworkName, poolErr.Error())
+				}
+			} else if listErr != nil {
+				// the api verification itself failed: fail conservatively,
+				// the record might still exist in a live pool object
+				return fmt.Errorf("(vm.cleanupNetworkInterface) [%s/%s] cannot verify the pool of network %s, cache miss: %s: %s",
+					vmnetcfg.Namespace, vmnetcfg.Name, netCfg.NetworkName, poolErr.Error(), listErr.Error())
+			}
+		} else {
+			if statusErr := c.updateIPPoolStatus(
+				DELETE,
+				vmnetcfg.Namespace,
+				vmnetcfg.Spec.VMName,
+				netCfg.IPAddress,
+				netCfg.NetworkName,
+				netCfg.MACAddress,
+				pool.(kihv1.IPPool).Name,
+			); statusErr != nil {
+				// the status entry of another owner is not this vm's to
+				// remove; replaying the cleanup must not abort the durable
+				// update over it
+				if errors.Is(statusErr, util.ErrForeignOwner) {
+					log.Warnf("(vm.cleanupNetworkInterface) [%s/%s] the allocation of ip %s in the %s status belongs to another owner, leaving the entry",
+						vmnetcfg.Namespace, vmnetcfg.Name, netCfg.IPAddress, pool.(kihv1.IPPool).Name)
+					c.metrics.UpdateLogStatus("warning")
+
+					return
+				}
+
+				return fmt.Errorf("(vm.cleanupNetworkInterface) [%s/%s] %s",
+					vmnetcfg.Namespace, vmnetcfg.Name, statusErr.Error())
+			}
+		}
+	}
+
 	// the owner check and the deletion run under one lock acquisition, so
 	// a delayed cleanup cannot delete a lease which a concurrent writer
 	// reassigned to another vm
@@ -274,24 +357,7 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 		}
 	}
 
-	// freeing an ip which is leased to another vm of the same network
-	// would leave the other lease serving an address ipam could reissue to
-	// a third client; ipam itself holds no owner references, so this
-	// stays a network-scoped snapshot check without an owner-validated
-	// release primitive: the same numeric addresses of separate networks
-	// are no claim on this network's allocation
 	if netCfg.IPAddress != "" {
-		if leaseHwAddr, lease, found := c.dhcp.GetLeaseByIPAndNetwork(netCfg.NetworkName, netCfg.IPAddress); found && lease.Reference != ref {
-			// the release already happened in an earlier attempt and a
-			// successor vm owns the ip now: this interface's cleanup
-			// converged
-			log.Warnf("(vm.cleanupNetworkInterface) [%s/%s] ip %s belongs to %s via hwaddr %s, skipping the release of it",
-				vmnetcfg.Namespace, vmnetcfg.Name, netCfg.IPAddress, lease.Reference, leaseHwAddr)
-			c.metrics.UpdateLogStatus("warning")
-
-			return
-		}
-
 		// the release is owner-validated: a binding's fresh allocation is
 		// a named reservation, so the release only frees the address while
 		// it still carries this nic's owner reference. a successor which
@@ -320,42 +386,6 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 					vmnetcfg.Namespace, vmnetcfg.Name, err.Error())
 			}
 		}
-	}
-
-	pool, poolErr := c.cache.Get("pool", netCfg.NetworkName)
-	if poolErr != nil {
-		// without the pool object the status entry cannot be removed: this
-		// is a failed cleanup, not a converged one. proceeding silently
-		// would orphan the ledger entry forever (it is re-pinned at every
-		// subsequent registration and no longer reachable by any owner).
-		// fail the sync instead: the lease and claim releases above are
-		// owner-checked and idempotent, so the retried cleanup converges
-		// once the pool is cached again
-		return fmt.Errorf("(vm.cleanupNetworkInterface) [%s/%s] %s",
-			vmnetcfg.Namespace, vmnetcfg.Name, poolErr.Error())
-	}
-
-	if statusErr := c.updateIPPoolStatus(
-		DELETE,
-		vmnetcfg.Namespace,
-		vmnetcfg.Spec.VMName,
-		netCfg.IPAddress,
-		netCfg.NetworkName,
-		netCfg.MACAddress,
-		pool.(kihv1.IPPool).Name,
-	); statusErr != nil {
-		// the status entry of another owner is not this vm's to remove;
-		// replaying the cleanup must not abort the durable update over it
-		if errors.Is(statusErr, util.ErrForeignOwner) {
-			log.Warnf("(vm.cleanupNetworkInterface) [%s/%s] the allocation of ip %s in the %s status belongs to another owner, leaving the entry",
-				vmnetcfg.Namespace, vmnetcfg.Name, netCfg.IPAddress, pool.(kihv1.IPPool).Name)
-			c.metrics.UpdateLogStatus("warning")
-
-			return
-		}
-
-		return fmt.Errorf("(vm.cleanupNetworkInterface) [%s/%s] %s",
-			vmnetcfg.Namespace, vmnetcfg.Name, statusErr.Error())
 	}
 
 	return

@@ -1428,8 +1428,10 @@ func TestCleanupNetworkInterfaceConvergesWithoutLeaseAndIP(t *testing.T) {
 }
 
 // when the pool exists but its status cannot be updated the cleanup aborts
-// so the sync retries: the release always happens first, so the retry
-// converges instead of repeating a destructive step
+// so the sync retries: the durable un-record runs before any local release
+// (mirroring the vmnetcfg live path), so this interface's address is never
+// locally freed while its ownership record is still written - a retried
+// cleanup converges from a fully intact state
 func TestCleanupNetworkInterfacePropagatesPoolStatusError(t *testing.T) {
 	c, f := vmBehaviorNewTestController(t)
 
@@ -1454,13 +1456,12 @@ func TestCleanupNetworkInterfacePropagatesPoolStatusError(t *testing.T) {
 		t.Errorf("error = %q, want it to carry the underlying failure", err)
 	}
 
-	// the release finished before the abort: a retry converges instead of
-	// repeating a destructive step
-	if c.dhcp.CheckLease(mac) {
-		t.Error("expected the lease to be released before the abort")
-	}
-	if used := c.ipam.Used(networkName); used != 0 {
-		t.Errorf("expected the ipam allocation released before the abort, used=%d", used)
+	// the un-record failed, so the claim must be fully intact: the address
+	// was never locally freed while its ownership record is still written,
+	// and the retried cleanup converges from a consistent state instead of
+	// leaving a ghost ledger entry behind
+	if used := c.ipam.Used(networkName); used != 1 {
+		t.Errorf("expected the ipam allocation kept after the failed un-record, used=%d", used)
 	}
 	if n := len(f.requestsFor(http.MethodPut, "/ippools/pool-a/status")); n != 1 {
 		t.Errorf("expected 1 pool status attempt, got %d", n)

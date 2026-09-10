@@ -83,6 +83,34 @@ func (c *Controller) registerIPPool(pool *kihv1.IPPool) (cleanup bool, err error
 			pool.Spec.IPv4Config.Subnet, pool.Spec.IPv4Config.Pool.Start, pool.Spec.IPv4Config.Pool.End,
 			pool.Spec.NetworkName, validateErr.Error(), ErrPoolUnregistrable)
 	}
+
+	// an exclude entry which the persisted ledger records for a live
+	// binding is a configuration conflict which can never converge: the
+	// exclude pass claims the address as EXCLUDED first, so the later
+	// claim protection of the same address fails with a foreign-owner
+	// error and every retry tears the half-built registration down again
+	// (re-adding and removing the nic address, dhcp pool and listener in
+	// a loop). the conflict is rejected before any mutation as a
+	// definitive, unregistrable configuration, so the startup gate counts
+	// the pool and the churn stops
+	// the persisted-claim lookup needs the api; a controller without a
+	// clientset (unit-constructed) skips the up-front check and the later
+	// claim protection keeps the registration honest
+	if c.kihClientset != nil {
+		cPool, getErr := c.kihClientset.KubevirtiphelperV1().IPPools().Get(c.ctx, pool.Name, metav1.GetOptions{})
+		if getErr != nil && !apierrors.IsNotFound(getErr) {
+			return cleanup, fmt.Errorf("error while checking the exclude entries of pool [%s] against its persisted claims for network [%s]: %s",
+				pool.Name, pool.Spec.NetworkName, getErr.Error())
+		}
+		if getErr == nil {
+			for _, ex := range pool.Spec.IPv4Config.Pool.Exclude {
+				if ref, claimed := cPool.Status.IPv4.Allocated[ex]; claimed && ref != ipam.ExcludedOwner {
+					return cleanup, fmt.Errorf("exclude address [%s] of network [%s] is recorded in the IPPool status as allocated to [%s]; remove the exclude entry or release the claim first: %w",
+						ex, pool.Spec.NetworkName, ref, ErrPoolUnregistrable)
+				}
+			}
+		}
+	}
 	// the pool sub-resources (dhcp pool, ipam subnet, cache entry) are all
 	// keyed by the networkname, and the allocators start empty on every
 	// (re)start: a live dhcp pool under this networkname therefore belongs
@@ -333,6 +361,11 @@ func (c *Controller) cleanupIPPoolObjects(pool *kihv1.IPPool) (err error) {
 	c.stopDHCPListener(pool)
 	c.ipam.DeleteSubnet(pool.Spec.NetworkName)
 	c.dhcp.DeletePool(pool.Spec.NetworkName)
+	// a deleted pool must not leave its leases behind: its server is gone,
+	// so the renewals of still-running vms would be blackholed against a
+	// pool which can never serve them again (unlike a reload, which keeps
+	// the leases of the live vms)
+	c.dhcp.RemoveLeasesForNetwork(pool.Spec.NetworkName)
 	c.metrics.DeleteIPPool(pool.Name, pool.Spec.IPv4Config.Subnet, pool.Spec.NetworkName)
 	c.cache.Delete("pool", pool.Spec.NetworkName)
 

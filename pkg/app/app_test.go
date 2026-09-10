@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +16,8 @@ import (
 	log "github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/dhcp"
 )
 
 // The tests in this file cover the app handler's configuration, listing,
@@ -280,7 +283,7 @@ func TestHandler_getIPPools(t *testing.T) {
 		defer srv.Close()
 
 		h := &handler{kubeConfigFile: writeTestKubeconfig(t, srv.URL)}
-		pools, err := h.getIPPools()
+		pools, err := h.getIPPools(context.Background())
 		if err != nil {
 			t.Fatalf("getIPPools() unexpected error: %s", err)
 		}
@@ -307,7 +310,7 @@ func TestHandler_getIPPools(t *testing.T) {
 		defer srv.Close()
 
 		h := &handler{kubeConfigFile: writeTestKubeconfig(t, srv.URL)}
-		_, err := h.getIPPools()
+		_, err := h.getIPPools(context.Background())
 		if err == nil {
 			t.Fatal("getIPPools() expected an error for an API failure")
 		}
@@ -319,7 +322,7 @@ func TestHandler_getIPPools(t *testing.T) {
 	t.Run("missing kubeconfig is wrapped", func(t *testing.T) {
 		clearInClusterEnv(t)
 		h := &handler{kubeConfigFile: filepath.Join(t.TempDir(), "does-not-exist")}
-		_, err := h.getIPPools()
+		_, err := h.getIPPools(context.Background())
 		if err == nil {
 			t.Fatal("getIPPools() expected an error without a kubeconfig")
 		}
@@ -346,7 +349,7 @@ func TestHandler_getVmNetCfgs(t *testing.T) {
 		defer srv.Close()
 
 		h := &handler{kubeConfigFile: writeTestKubeconfig(t, srv.URL)}
-		cfgs, err := h.getVmNetCfgs()
+		cfgs, err := h.getVmNetCfgs(context.Background())
 		if err != nil {
 			t.Fatalf("getVmNetCfgs() unexpected error: %s", err)
 		}
@@ -371,7 +374,7 @@ func TestHandler_getVmNetCfgs(t *testing.T) {
 		defer srv.Close()
 
 		h := &handler{kubeConfigFile: writeTestKubeconfig(t, srv.URL)}
-		_, err := h.getVmNetCfgs()
+		_, err := h.getVmNetCfgs(context.Background())
 		if err == nil {
 			t.Fatal("getVmNetCfgs() expected an error for an API failure")
 		}
@@ -486,6 +489,9 @@ func TestHandler_stopDHCPListeners(t *testing.T) {
 		h := &handler{
 			kubeConfigFile: writeTestKubeconfig(t, url),
 			namespace:      "testns",
+			// the nil-guarded path (no services ever ran) is covered
+			// separately; here the listener shutdown itself must proceed
+			dhcp: dhcp.New(),
 		}
 		h.stopDHCPListeners() // must not panic
 
