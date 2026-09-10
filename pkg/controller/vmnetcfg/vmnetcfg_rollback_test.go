@@ -178,3 +178,86 @@ func TestVMNetCfgFailedSyncQuarantinesFreshAllocations(t *testing.T) {
 		t.Error("the quarantined status record of the second nic must be kept")
 	}
 }
+
+// the contested unwind tolerates its converged foreign-owner outcomes: the
+// ledger record of a contested address belongs to another owner by
+// definition and a concurrently reassigned lease is not this binding's to
+// delete, so neither may raise the error level while the own claim is still
+// released
+func TestContestedRollbackClassifiesForeignOwnerOutcomesAsConverged(t *testing.T) {
+	e := newTestEnv(t)
+	e.addSubnet("10.0.0.1", "10.0.0.1")
+	e.seedPool(map[string]string{"10.0.0.1": "other-ns/other-vm [02:00:00:00:00:99]"})
+
+	vmnetcfg := newVMNetCfg("", testMAC)
+	ownRef := testNamespace + "/" + testVMName + " [" + testMAC + "]"
+
+	// the state a contested rollback reverts: a claim under this binding's
+	// owner reference, while the lease was reassigned to another owner and
+	// the ledger records the address for another owner as well
+	if _, err := e.ipam.ReclaimIP(testNetwork, "10.0.0.1", ownRef); err != nil {
+		t.Fatalf("seeding the own claim: %s", err)
+	}
+	if err := e.dhcp.AddLease(testMAC, testNetwork, "10.0.0.1", "other-ns/other-vm"); err != nil {
+		t.Fatalf("seeding the reassigned lease: %s", err)
+	}
+
+	e.controller.rollbackAppliedAllocations(vmnetcfg, []allocatedNetworkConfig{
+		{macAddress: testMAC, networkName: testNetwork, ipAddress: "10.0.0.1", poolName: testPoolName, contested: true},
+	})
+
+	if used := e.ipam.Used(testNetwork); used != 0 {
+		t.Errorf("ipam used = %d, want 0 (the contested claim is released)", used)
+	}
+	if lease := e.dhcp.GetLease(testMAC); lease.Reference != "other-ns/other-vm" {
+		t.Errorf("reassigned lease reference = %q, want the foreign owner preserved", lease.Reference)
+	}
+	if got := e.getStoredPool().Status.IPv4.Allocated["10.0.0.1"]; got != "other-ns/other-vm [02:00:00:00:00:99]" {
+		t.Errorf("foreign record = %q, want preserved", got)
+	}
+
+	// the converged outcomes must not raise the error level
+	if v, ok := e.metricValue(metricAppLogs, map[string]string{"loglevel": "error"}); ok && v != 0 {
+		t.Errorf("error log metric = %v, want none: the foreign-owner outcomes of the contested unwind are converged", v)
+	}
+}
+
+// an allocation whose dhcp lease could not be registered was never served:
+// its claim must be released directly through releaseOwnClaim (the branch
+// the failed lease registration takes), because no lease, no ledger record
+// and no spec entry references the address anymore and no later
+// reconciliation could detect a quarantined claim again. the branch itself
+// only runs when the lease registration fails after the pre-validation,
+// which a second lease writer or a diverging mac spelling would cause.
+func TestUndeliveredClaimIsReleasedNotQuarantined(t *testing.T) {
+	e := newTestEnv(t)
+	e.addSubnet("10.0.0.1", "10.0.0.2")
+
+	ownRef := testNamespace + "/" + testVMName + " [" + testMAC + "]"
+	if _, err := e.ipam.ReclaimIP(testNetwork, "10.0.0.1", ownRef); err != nil {
+		t.Fatalf("seeding the undelivered claim: %s", err)
+	}
+
+	e.controller.releaseOwnClaim(testNetwork, "10.0.0.1", ownRef)
+
+	if used := e.ipam.Used(testNetwork); used != 0 {
+		t.Errorf("ipam used = %d, want 0 (the undelivered claim is released, not quarantined)", used)
+	}
+
+	// the converged outcomes stay tolerated: an already-free address and a
+	// foreign owner are not failures of the release
+	e.controller.releaseOwnClaim(testNetwork, "10.0.0.1", ownRef)
+
+	foreignRef := testNamespace + "/other-vm [02:00:00:00:00:99]"
+	if _, err := e.ipam.ReclaimIP(testNetwork, "10.0.0.1", foreignRef); err != nil {
+		t.Fatalf("seeding the successor's claim: %s", err)
+	}
+	e.controller.releaseOwnClaim(testNetwork, "10.0.0.1", ownRef)
+
+	if used := e.ipam.Used(testNetwork); used != 1 {
+		t.Errorf("ipam used = %d, want 1 (the successor's claim is never released)", used)
+	}
+	if v, ok := e.metricValue(metricAppLogs, map[string]string{"loglevel": "error"}); ok && v != 0 {
+		t.Errorf("error log metric = %v, want none: the converged releases are not errors", v)
+	}
+}

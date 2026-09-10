@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/util"
 )
 
@@ -140,5 +141,54 @@ func TestSyncAddInvalidMacCountsAsHandledDuringInit(t *testing.T) {
 	}
 	if used := e.ipam.Used(testNetwork); used != 0 {
 		t.Errorf("ipam used = %d, want 0: an unusable macaddress must not consume a reservation", used)
+	}
+}
+
+// a transient failure on one interface must keep the object uncounted even
+// when an unrelated interface of the same object is permanently broken: the
+// settled classification follows the recorded per-interface failure, never a
+// re-scan of the spec, or the gate would open while the transient restore is
+// still pending and the deferred fresh allocations of other objects could
+// take its address
+func TestSyncAddMixedFailureClassifiesOnTheRecordedFailure(t *testing.T) {
+	e, controller, count := newGateTestEnv(t)
+
+	e.addSubnet("10.0.0.1", "10.0.0.2")
+	e.seedPool(nil)
+
+	// the first interface fails transiently (its pool status write), the
+	// second interface sits on a network without a registered pool
+	vmnetcfg := newVMNetCfg("", testMAC)
+	vmnetcfg.Spec.NetworkConfig = []kihv1.NetworkConfig{
+		{IPAddress: "10.0.0.1", MACAddress: testMAC, NetworkName: testNetwork},
+		{MACAddress: testMAC2, NetworkName: "net-missing"},
+	}
+	e.seedVMNetCfg(vmnetcfg)
+	if err := controller.indexer.Add(vmnetcfg); err != nil {
+		t.Fatalf("seeding indexer: %s", err)
+	}
+	key := testNamespace + "/" + testVMNetCfgName
+
+	// the transient failure is recorded first, so the permanently broken
+	// second interface must not settle the object
+	e.api.poolStatusPutCode = http.StatusInternalServerError
+	if err := controller.sync(Event{key: key, action: ADD}); err == nil {
+		t.Fatal("want the mixed-failure sync to fail")
+	}
+	if count.Load() != 0 {
+		t.Fatalf("gate count = %d, want 0: the recorded transient failure keeps the object uncounted although another interface is permanently broken", count.Load())
+	}
+	if !e.dhcp.CheckLease(testMAC) {
+		t.Fatal("the transiently failed interface keeps its lease protected for the retry")
+	}
+
+	// once the transient failure healed, the remaining permanent failure
+	// settles the object for the gate
+	e.api.poolStatusPutCode = 0
+	if err := controller.sync(Event{key: key, action: ADD}); err == nil {
+		t.Fatal("want the pool-less interface to keep failing the sync")
+	}
+	if count.Load() != 1 {
+		t.Fatalf("gate count = %d, want 1: the pool-less interface settles the gate", count.Load())
 	}
 }

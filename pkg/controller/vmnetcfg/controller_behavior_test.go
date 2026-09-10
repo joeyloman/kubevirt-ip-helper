@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -403,6 +404,93 @@ func TestRunShutsDownTheQueue(t *testing.T) {
 		t.Fatal("Run did not return after the stop channel was closed")
 	}
 
+	if !queue.ShuttingDown() {
+		t.Errorf("queue was not shut down after Run returned")
+	}
+}
+
+// Run joins its workers before returning: an event listener which waits for
+// Run must have seen the last in-flight reconciliation of the old
+// generation, so a worker which is mid-reconciliation finishes its item
+// first instead of mutating state behind the new era's back
+func TestRunJoinsTheInFlightSyncBeforeReturning(t *testing.T) {
+	e := newTestEnv(t)
+	e.appStatus.Store(APP_RUNNING)
+
+	// the pool status write parks until the test releases it, so the worker
+	// is deterministically inside its in-flight reconciliation. the release
+	// runs as a cleanup as well: a parked handler would otherwise block the
+	// httptest server shutdown forever when an earlier assertion fails
+	block := make(chan struct{})
+	var unblockOnce sync.Once
+	unblock := func() { unblockOnce.Do(func() { close(block) }) }
+	t.Cleanup(unblock)
+	e.api.blockPoolStatusPut = block
+
+	e.addSubnet("10.0.0.1", "10.0.0.1")
+	e.seedPool(nil)
+	vmnetcfg := newVMNetCfg("", testMAC)
+	e.seedVMNetCfg(vmnetcfg)
+
+	queue := newTestQueue()
+	indexer := newTestIndexer()
+	if err := indexer.Add(vmnetcfg); err != nil {
+		t.Fatalf("seeding indexer: %s", err)
+	}
+	var count atomic.Int32
+	controller := NewController(
+		context.Background(),
+		queue,
+		indexer,
+		&stubInformer{synced: true},
+		e.cache,
+		e.ipam,
+		e.dhcp,
+		e.metrics,
+		e.client,
+		e.appStatus,
+		&count,
+	)
+	queue.Add(Event{key: testNamespace + "/" + testVMNetCfgName, action: ADD})
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		controller.Run(1, stop)
+		close(done)
+	}()
+
+	// wait until the worker parks inside the blocked pool status write
+	deadline := time.Now().Add(shutdownWait)
+	for e.countRequests(http.MethodPut, ippoolStatusPath) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the worker never reached the blocked pool status write")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	close(stop)
+
+	// Run must not return while the in-flight sync is still parked
+	select {
+	case <-done:
+		t.Fatal("Run returned before its in-flight worker sync finished")
+	case <-time.After(time.Second):
+	}
+
+	// releasing the parked write lets the sync finish, and only then Run
+	// returns: the join really waited for the last reconciliation
+	unblock()
+
+	select {
+	case <-done:
+	case <-time.After(shutdownWait):
+		t.Fatal("Run did not return after the in-flight sync finished")
+	}
+
+	if got := e.getStoredVMNetCfg().Spec.NetworkConfig[0].IPAddress; got != "10.0.0.1" {
+		t.Errorf("spec ip = %q, want the in-flight sync committed before Run returned", got)
+	}
 	if !queue.ShuttingDown() {
 		t.Errorf("queue was not shut down after Run returned")
 	}

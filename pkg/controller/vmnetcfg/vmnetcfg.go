@@ -61,10 +61,18 @@ func (c *Controller) rollbackNetworkAllocation(vmnetcfg *kihv1.VirtualMachineNet
 
 	ref := fmt.Sprintf("%s/%s", vmnetcfg.Namespace, vmnetcfg.Spec.VMName)
 
-	if err := c.dhcp.DeleteLeaseOwnedBy(allocated.macAddress, ref); err != nil && !errors.Is(err, dhcp.ErrLeaseNotFound) {
-		log.Errorf("(vmnetcfg.rollbackNetworkAllocation) [%s/%s] failed to revert the dhcp lease for hwaddr %s: %s",
-			vmnetcfg.Namespace, vmnetcfg.Name, allocated.macAddress, err)
-		c.metrics.UpdateLogStatus("error")
+	if err := c.dhcp.DeleteLeaseOwnedBy(allocated.macAddress, ref); err != nil {
+		if errors.Is(err, dhcp.ErrLeaseNotFound) || errors.Is(err, dhcp.ErrLeaseForeignOwner) {
+			// no lease of this binding is left, or a concurrent writer
+			// reassigned it to another owner: the dhcp side of the rollback
+			// converged and must not raise the error level
+			log.Debugf("(vmnetcfg.rollbackNetworkAllocation) [%s/%s] the lease of hwaddr %s is gone or foreign, nothing left to revert",
+				vmnetcfg.Namespace, vmnetcfg.Name, allocated.macAddress)
+		} else {
+			log.Errorf("(vmnetcfg.rollbackNetworkAllocation) [%s/%s] failed to revert the dhcp lease for hwaddr %s: %s",
+				vmnetcfg.Namespace, vmnetcfg.Name, allocated.macAddress, err)
+			c.metrics.UpdateLogStatus("error")
+		}
 	}
 
 	// the release is owner-validated: an allocation this sync made carries
@@ -88,9 +96,17 @@ func (c *Controller) rollbackNetworkAllocation(vmnetcfg *kihv1.VirtualMachineNet
 		allocated.macAddress,
 		allocated.poolName,
 	); err != nil {
-		log.Errorf("(vmnetcfg.rollbackNetworkAllocation) [%s/%s] failed to revert the ippool status for ip %s: %s",
-			vmnetcfg.Namespace, vmnetcfg.Name, allocated.ipAddress, err)
-		c.metrics.UpdateLogStatus("error")
+		if errors.Is(err, util.ErrForeignOwner) {
+			// the ledger record of a contested address belongs to its
+			// foreign owner by definition, so the compensating delete
+			// converged and must not raise the error level
+			log.Debugf("(vmnetcfg.rollbackNetworkAllocation) [%s/%s] the ippool status record of ip %s belongs to another owner, leaving it",
+				vmnetcfg.Namespace, vmnetcfg.Name, allocated.ipAddress)
+		} else {
+			log.Errorf("(vmnetcfg.rollbackNetworkAllocation) [%s/%s] failed to revert the ippool status for ip %s: %s",
+				vmnetcfg.Namespace, vmnetcfg.Name, allocated.ipAddress, err)
+			c.metrics.UpdateLogStatus("error")
+		}
 	}
 
 	if err := c.updateIPPoolMetrics(allocated.poolName); err != nil {
@@ -114,21 +130,23 @@ func (c *Controller) rollbackAppliedAllocations(vmnetcfg *kihv1.VirtualMachineNe
 	}
 }
 
-// releaseStaleNicClaim releases the ipam claim of a nic whose lease
-// vanished during this reconciliation, but only while the reservation
-// still carries this owner's reference: a successor which took the freed
+// releaseOwnClaim releases an ipam claim which still carries this owner's
+// reference but which no live state justifies anymore: the claim of a nic
+// whose lease vanished during this reconciliation, or the claim of an
+// allocation whose dhcp lease could not be registered (nothing was served
+// and no ledger record was written). a successor which took the freed
 // address over in the meantime (a fresh anonymous allocation or another
-// owner's named reclaim) is never released by the stale cleanup. the
-// converged outcomes (a foreign owner, an already-free address, a subnet
-// which is gone) are tolerated: the release is an in-memory operation
-// without a transient failure mode, so it cannot leave the claim behind
-// retriable, and a process restart converges as well because the removed
-// nic records the address nowhere anymore.
-func (c *Controller) releaseStaleNicClaim(networkName string, ip string, ownerRef string) {
+// owner's named reclaim) is never released by it. the converged outcomes
+// (a foreign owner, an already-free address, a subnet which is gone) are
+// tolerated: the release is an in-memory operation without a transient
+// failure mode, so it cannot leave the claim behind retriable, and a
+// process restart converges as well because nothing references the
+// address anymore.
+func (c *Controller) releaseOwnClaim(networkName string, ip string, ownerRef string) {
 	if err := c.ipam.ReleaseIPOwnedBy(networkName, ip, ownerRef); err != nil &&
 		!errors.Is(err, ipam.ErrIPForeignOwner) &&
 		!util.IsAlreadyReleased(err) {
-		log.Errorf("(vmnetcfg.releaseStaleNicClaim) [%s] cannot release the stale claim of ip %s in network %s: %s",
+		log.Errorf("(vmnetcfg.releaseOwnClaim) [%s] cannot release the own claim of ip %s in network %s: %s",
 			ownerRef, ip, networkName, err)
 		c.metrics.UpdateLogStatus("error")
 	}
@@ -219,7 +237,11 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 			// keep the durable spec and the previous status entry untouched,
 			// skip this interface and continue with the next one
 			if restoreErr == nil {
-				restoreErr = poolErr
+				// the sentinel lets the startup gate classify this failure as
+				// permanent (initSyncSettled): a networkname without a live
+				// pool registration cannot restore its reservation until the
+				// offending IPPool is repaired
+				restoreErr = fmt.Errorf("%w: %s", errNicPoolMissing, poolErr)
 			}
 
 			newVmNetCfgs = append(newVmNetCfgs, v)
@@ -343,7 +365,10 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 			}
 
 			if restoreErr == nil {
-				restoreErr = fmt.Errorf("invalid macaddress %q for network %s", v.MACAddress, v.NetworkName)
+				// the sentinel lets the startup gate classify this failure as
+				// permanent (initSyncSettled): an unusable macaddress can
+				// never register a lease until the spec is corrected
+				restoreErr = fmt.Errorf("%w: invalid macaddress %q for network %s", errNicMacInvalid, v.MACAddress, v.NetworkName)
 			}
 
 			continue
@@ -389,7 +414,14 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 				c.metrics.UpdateLogStatus("warning")
 
 				oldNetcfg := kihv1.NetworkConfig{}
-				oldNetcfg.NetworkName = v.NetworkName
+				// the cleanup must un-record and release the allocation the
+				// lease actually holds: the lease carries the network its
+				// address was allocated from, which is not necessarily the
+				// network of the spec entry (a mac which moved to another
+				// network). targeting the spec's network would release an
+				// address which was never allocated there and leak the old
+				// network's claim and ledger entry instead
+				oldNetcfg.NetworkName = lease.PoolName
 				oldNetcfg.MACAddress = v.MACAddress
 				oldNetcfg.IPAddress = lease.ClientIP.String()
 
@@ -470,7 +502,7 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 							vmnetcfg.Namespace, vmnetcfg.Name, v.MACAddress)
 						c.metrics.UpdateLogStatus("warning")
 
-						c.releaseStaleNicClaim(v.NetworkName, lease.ClientIP.String(), ownerRef)
+						c.releaseOwnClaim(v.NetworkName, lease.ClientIP.String(), ownerRef)
 
 						continue
 					}
@@ -524,7 +556,7 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 						vmnetcfg.Namespace, vmnetcfg.Name, v.MACAddress)
 					c.metrics.UpdateLogStatus("warning")
 
-					c.releaseStaleNicClaim(v.NetworkName, lease.ClientIP.String(), ownerRef)
+					c.releaseOwnClaim(v.NetworkName, lease.ClientIP.String(), ownerRef)
 
 					continue
 				}
@@ -582,7 +614,7 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 					// owner-validated release treats that as converged) but
 					// a cleanup which skipped its own release must not
 					// leave the claim behind ownerless
-					c.releaseStaleNicClaim(v.NetworkName, lease.ClientIP.String(), ownerRef)
+					c.releaseOwnClaim(v.NetworkName, lease.ClientIP.String(), ownerRef)
 				}
 
 				if repairErr != nil && restoreErr == nil {
@@ -671,15 +703,28 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 			vmRef,
 		); err != nil {
 			// dhcp must not serve the address when its owner reference
-			// cannot be registered: queue this interface's claim for the
-			// post-sync unwind (a restored durable claim stays reserved)
-			// and defer the failure so the remaining interfaces are still
+			// cannot be registered: nothing was served, no ledger record
+			// was written and the pending spec entry is not durable yet,
+			// so the claim has no lease, no status record and no spec
+			// entry which any later reconciliation could detect again -
+			// quarantining it would block the address until a process
+			// restart. release it directly instead (a restored durable
+			// claim keeps its reservation: the spec entry protects it) and
+			// defer the failure so the remaining interfaces are still
 			// processed
 			log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] error registering the dhcp lease: %s",
 				vmnetcfg.Namespace, vmnetcfg.Name, err)
 			c.metrics.UpdateLogStatus("error")
 
-			rememberApplied(pool.(kihv1.IPPool).Name, v.MACAddress, v.NetworkName, ip, false)
+			if !durableAllocations[v.MACAddress+"/"+v.NetworkName+"/"+ip] {
+				c.releaseOwnClaim(v.NetworkName, ip, ownerRef)
+
+				if err := c.updateIPPoolMetrics(pool.(kihv1.IPPool).Name); err != nil {
+					log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] %s",
+						vmnetcfg.Namespace, vmnetcfg.Name, err)
+					c.metrics.UpdateLogStatus("error")
+				}
+			}
 
 			newVmNetCfgs = append(newVmNetCfgs, v)
 
@@ -760,6 +805,15 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 		log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] %s",
 			vmnetcfg.Namespace, vmnetcfg.Name, err)
 		c.metrics.UpdateLogStatus("error")
+
+		// the verification could not run and the pending commit is lost
+		// either way: unwind the contested claims of this sync now (an
+		// uncontested allocation stays quarantined like below). the retried
+		// sync takes the lease-based repair path for these nics, which
+		// never unwinds a contested claim, so skipping the rollback here
+		// would leave their leases serving addresses whose ledger record
+		// belongs to another owner
+		c.rollbackAppliedAllocations(vmnetcfg, appliedAllocations)
 
 		return err
 	}

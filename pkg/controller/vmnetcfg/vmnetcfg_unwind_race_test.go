@@ -11,7 +11,10 @@ package vmnetcfg
 // pending commit.
 
 import (
+	"net/http"
 	"testing"
+
+	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
 )
 
 // TestVerifyClaimedNicsUnwindsVanishedNic: the sync's snapshot still lists
@@ -108,5 +111,65 @@ func TestVerifyClaimedNicsKeepsDurableRestore(t *testing.T) {
 	stored := e.getStoredVMNetCfg()
 	if len(stored.Spec.NetworkConfig) != 1 || stored.Spec.NetworkConfig[0].IPAddress != "10.0.0.1" {
 		t.Errorf("spec = %v, want the durable restore kept", stored.Spec.NetworkConfig)
+	}
+}
+
+// TestVerifyFailureStillUnwindsContestedClaims: the pre-commit verification
+// of the claimed nics fails its re-read, so the pending commit is lost. The
+// contested claim of this sync (the pool status records its address for
+// another owner) must still be unwound - the retried sync takes the
+// lease-based repair path for the nic, which never unwinds a contested
+// claim, so skipping the rollback would leave the lease serving an address
+// whose ledger record belongs to another owner forever.
+func TestVerifyFailureStillUnwindsContestedClaims(t *testing.T) {
+	e := newTestEnv(t)
+	e.appStatus.Store(APP_RUNNING)
+	e.addSubnet("10.0.0.1", "10.0.0.2")
+
+	// the ledger records the reclaimed address for another owner while the
+	// allocator is free: the re-claim succeeds, the lease is served and the
+	// record write rejects the claim as contested
+	e.seedPool(map[string]string{"10.0.0.1": "other-ns/other-vm [02:00:00:00:00:99]"})
+
+	vmnetcfg := newVMNetCfg("", testMAC)
+	vmnetcfg.Spec.NetworkConfig = []kihv1.NetworkConfig{
+		{IPAddress: "10.0.0.1", MACAddress: testMAC, NetworkName: testNetwork},
+		{MACAddress: testMAC2, NetworkName: testNetwork},
+	}
+	e.seedVMNetCfg(vmnetcfg)
+
+	// the pre-commit verification cannot re-read the live object
+	e.api.vmnetcfgGetCode = http.StatusInternalServerError
+
+	if err := e.controller.updateVirtualMachineNetworkConfig(ADD, vmnetcfg); err == nil {
+		t.Fatal("want the failed verification to fail the sync")
+	}
+
+	// the contested claim of the first nic is unwound
+	if e.dhcp.CheckLease(testMAC) {
+		t.Error("the contested lease must be deleted by the rollback")
+	}
+	if used := e.ipam.Used(testNetwork); used != 1 {
+		t.Errorf("ipam used = %d, want 1 (only the quarantined claim of the second nic kept)", used)
+	}
+
+	// the uncontested allocation of the second nic stays quarantined
+	if !e.dhcp.CheckLease(testMAC2) {
+		t.Error("the served lease of the uncontested second nic must stay quarantined")
+	}
+
+	// the foreign ledger record was never clobbered, and the quarantined
+	// record of the second nic is kept for the retried sync
+	pool := e.getStoredPool()
+	if got := pool.Status.IPv4.Allocated["10.0.0.1"]; got != "other-ns/other-vm [02:00:00:00:00:99]" {
+		t.Errorf("allocated[10.0.0.1] = %q, want the foreign owner preserved", got)
+	}
+	if got := pool.Status.IPv4.Allocated["10.0.0.2"]; got != testNamespace+"/"+testVMName+" ["+testMAC2+"]" {
+		t.Errorf("allocated[10.0.0.2] = %q, want the quarantined record kept", got)
+	}
+
+	// the failure is pre-commit: the durable object was never written
+	if n := e.countRequests("PUT", vmnetcfgMainPath); n != 0 {
+		t.Errorf("vmnetcfg updates = %d, want 0", n)
 	}
 }

@@ -299,6 +299,13 @@ type fakeAPIServer struct {
 	conflictCount     int
 	poolStatusPutCode int
 	vmnetcfgPutCode   int
+	// vmnetcfgGetCode fails the vmnetcfg GET requests while set, so the
+	// pre-commit verification of the claimed nics can be made to fail
+	vmnetcfgGetCode int
+	// blockPoolStatusPut, when non-nil, parks every pool status PUT until
+	// the channel is closed: the Run-join test holds the worker inside its
+	// in-flight reconciliation deterministically
+	blockPoolStatusPut chan struct{}
 	// optional single-shot interleaving hooks for the concurrency
 	// regression tests: they run after the pool request was processed,
 	// simulating a concurrent vm controller cleanup acting between the
@@ -410,6 +417,12 @@ func (f *fakeAPIServer) handleIPPool(w http.ResponseWriter, r *http.Request, nam
 		f.writePool(w, pool)
 	case r.Method == http.MethodPut && sub == "status":
 		f.mu.Lock()
+		block := f.blockPoolStatusPut
+		f.mu.Unlock()
+		if block != nil {
+			<-block
+		}
+		f.mu.Lock()
 		conflict := f.conflictPath == r.URL.Path && f.conflictCount > 0
 		if conflict {
 			f.conflictCount--
@@ -491,7 +504,12 @@ func (f *fakeAPIServer) handleVMNetCfg(w http.ResponseWriter, r *http.Request, n
 	case r.Method == http.MethodGet && sub == "":
 		f.mu.Lock()
 		obj, ok := f.vmnetcfgs[key]
+		failCode := f.vmnetcfgGetCode
 		f.mu.Unlock()
+		if failCode != 0 {
+			writeStatus(w, failCode, metav1.StatusReasonInternalError, "boom")
+			return
+		}
 		if !ok {
 			writeStatus(w, http.StatusNotFound, metav1.StatusReasonNotFound, "the server could not find the requested resource")
 			return
@@ -938,6 +956,75 @@ func TestVMNetCfgRequestedIPTransition(t *testing.T) {
 	}
 	if n := e.countRequests(http.MethodPut, ippoolStatusPath); n != 2 {
 		t.Errorf("ippool status update requests = %d, want 2 (delete + add)", n)
+	}
+}
+
+// a mac whose spec entry moved to another network must release the old
+// network's allocation: the ip-change cleanup targets the network of the
+// lease (the network the address was actually allocated from), not the new
+// network of the spec entry, so the old claim and ledger entry cannot leak
+// while the finalizer iterates only the current spec
+func TestVMNetCfgNetworkMoveReleasesTheOldNetworkAllocation(t *testing.T) {
+	e := newTestEnv(t)
+	e.appStatus.Store(APP_RUNNING)
+
+	// the old network: the mac's live lease still serves its address there
+	if err := e.ipam.NewSubnet("net-old", "10.0.2.0/29", "10.0.2.1", "10.0.2.1"); err != nil {
+		t.Fatalf("adding the old subnet: %s", err)
+	}
+	ownRef := testNamespace + "/" + testVMName + " [" + testMAC + "]"
+	poolOld := &kihv1.IPPool{
+		ObjectMeta: metav1.ObjectMeta{Name: "ippool-old"},
+		Spec: kihv1.IPPoolSpec{
+			NetworkName: "net-old",
+			IPv4Config:  kihv1.IPv4Config{Subnet: "10.0.2.0/29", ServerIP: "10.0.2.1"},
+		},
+		Status: kihv1.IPPoolStatus{
+			IPv4: kihv1.IPv4Status{Allocated: map[string]string{"10.0.2.1": ownRef}},
+		},
+	}
+	e.seedPoolWith(poolOld)
+	if _, err := e.ipam.ReclaimIP("net-old", "10.0.2.1", ownRef); err != nil {
+		t.Fatalf("seeding the old claim: %s", err)
+	}
+	if err := e.dhcp.AddLease(testMAC, "net-old", "10.0.2.1", testNamespace+"/"+testVMName); err != nil {
+		t.Fatalf("seeding the old lease: %s", err)
+	}
+
+	// the new network: the spec moved the nic to it and asks for a fresh
+	// allocation
+	e.addSubnet("10.0.0.1", "10.0.0.1")
+	e.seedPool(nil)
+	vmnetcfg := newVMNetCfg("", testMAC)
+	e.seedVMNetCfg(vmnetcfg)
+
+	if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, vmnetcfg); err != nil {
+		t.Fatalf("the network move must converge: %s", err)
+	}
+
+	// the old network's claim and ledger entry are gone
+	if used := e.ipam.Used("net-old"); used != 0 {
+		t.Errorf("old network used = %d, want 0 (the old claim is released)", used)
+	}
+	oldPool := e.api.ippools["ippool-old"].DeepCopy()
+	if _, exists := oldPool.Status.IPv4.Allocated["10.0.2.1"]; exists {
+		t.Errorf("old pool status = %v, want the moved-away entry removed", oldPool.Status.IPv4.Allocated)
+	}
+
+	// the nic serves its fresh allocation of the new network
+	lease := e.dhcp.GetLease(testMAC)
+	if lease.ClientIP == nil || lease.ClientIP.String() != "10.0.0.1" || lease.PoolName != testNetwork {
+		t.Errorf("lease = %+v, want a fresh 10.0.0.1 lease of %s", lease, testNetwork)
+	}
+	if used := e.ipam.Used(testNetwork); used != 1 {
+		t.Errorf("new network used = %d, want 1", used)
+	}
+	if got := e.getStoredPool().Status.IPv4.Allocated["10.0.0.1"]; got != testNamespace+"/"+testVMName+" ["+testMAC+"]" {
+		t.Errorf("allocated[10.0.0.1] = %q, want the new owner record", got)
+	}
+	stored := e.getStoredVMNetCfg()
+	if got := stored.Spec.NetworkConfig[0]; got.IPAddress != "10.0.0.1" || got.NetworkName != testNetwork {
+		t.Errorf("spec entry = %+v, want the fresh allocation of the new network committed", got)
 	}
 }
 

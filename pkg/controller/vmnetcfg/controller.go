@@ -3,7 +3,6 @@ package vmnetcfg
 import (
 	"context"
 	"errors"
-	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -117,31 +116,35 @@ func (c *Controller) markInitAttempt(key string) {
 	c.vmnetcfgCountCurrent.Add(1)
 }
 
+// errNicPoolMissing marks a per-interface restore failure whose networkname
+// has no live pool registration: the interface cannot restore its
+// reservation until the offending IPPool is repaired, so a sync failing
+// with it can never succeed on a retry and settles the startup gate.
+var errNicPoolMissing = errors.New("networkname has no registered pool")
+
+// errNicMacInvalid marks a per-interface restore failure whose macaddress
+// cannot parse: the interface can never register a lease until the spec is
+// corrected, so a sync failing with it settles the startup gate as well.
+var errNicMacInvalid = errors.New("invalid macaddress")
+
 // initSyncSettled reports whether a failed sync can never succeed on a
-// retry during the initialization phase: a networkname without a live
-// pool registration cannot restore its reservation until the offending
-// IPPool is repaired, an invalid macaddress in the spec cannot register a
-// lease at all, and an ownership conflict (the pool status records the
+// retry during the initialization phase. the classification follows the
+// recorded per-interface failure itself (the sentinel-wrapped restore
+// errors of updateVirtualMachineNetworkConfig), never a re-scan of the
+// spec: a transient failure on one interface must keep the object
+// uncounted even when an unrelated interface of the same object is
+// permanently broken, or the gate would open while the transient restore
+// is still pending. an ownership conflict (the pool status records the
 // claimed address for another owner) needs one of the claiming objects to
-// be edited. the startup gate must not wait for such objects, while every
+// be edited, a networkname without a live pool registration cannot
+// restore its reservation until the offending IPPool is repaired, and an
+// invalid macaddress in the spec cannot register a lease at all. every
 // other failure is transient and the retried sync must stay able to
 // settle the object for the gate.
-func (c *Controller) initSyncSettled(vmnetcfg *kihv1.VirtualMachineNetworkConfig, err error) bool {
-	if errors.Is(err, util.ErrForeignOwner) {
-		return true
-	}
-
-	for _, v := range vmnetcfg.Spec.NetworkConfig {
-		if _, cacheErr := c.cache.Get("pool", v.NetworkName); cacheErr != nil {
-			return true
-		}
-
-		if _, macErr := net.ParseMAC(v.MACAddress); macErr != nil {
-			return true
-		}
-	}
-
-	return false
+func (c *Controller) initSyncSettled(err error) bool {
+	return errors.Is(err, util.ErrForeignOwner) ||
+		errors.Is(err, errNicPoolMissing) ||
+		errors.Is(err, errNicMacInvalid)
 }
 
 // deferInitAllocation records one vmnetcfg key whose startup sync
@@ -261,7 +264,7 @@ func (c *Controller) sync(event Event) (err error) {
 		// a transiently failed restore stays uncounted instead: the
 		// rate-limited retry must stay able to protect the existing
 		// reservation before the vm controller opens new allocations
-		if err == nil || (event.action == ADD && c.initSyncSettled(obj.(*kihv1.VirtualMachineNetworkConfig), err)) {
+		if err == nil || (event.action == ADD && c.initSyncSettled(err)) {
 			c.markInitAttempt(event.key)
 		}
 	case DELETE:
@@ -316,8 +319,18 @@ func (c *Controller) Run(workers int, stopCh chan struct{}) {
 		return
 	}
 
+	// the workers are joined before Run returns: the queue shutdown below
+	// makes a worker which waits on the empty queue return, and a worker
+	// which is mid-reconciliation finishes its in-flight item first, so an
+	// event listener waiting for Run has really seen the last
+	// reconciliation of the old generation when it proceeds
+	var workerWg sync.WaitGroup
 	for i := 0; i < workers; i++ {
-		go wait.Until(c.runWorker, time.Second, stopCh)
+		workerWg.Add(1)
+		go func() {
+			defer workerWg.Done()
+			wait.Until(c.runWorker, time.Second, stopCh)
+		}()
 	}
 
 	// requeue the pending nics deferred during the startup replay once
@@ -327,6 +340,12 @@ func (c *Controller) Run(workers int, stopCh chan struct{}) {
 
 	<-stopCh
 	log.Infof("(vmnetcfg.Run) stopping the VirtualMachineNetworkConfig controller")
+
+	// shut the queue down before joining the workers: the shutdown is
+	// what makes a worker blocked on the empty queue return, so it must
+	// happen first or the join below would wait forever on it
+	c.queue.ShutDown()
+	workerWg.Wait()
 }
 
 func (c *Controller) runWorker() {
