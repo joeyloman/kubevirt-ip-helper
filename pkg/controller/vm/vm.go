@@ -417,7 +417,7 @@ func (c *Controller) updateIPPoolStatus(event string, vmnetcfgNamespace string, 
 			return nil
 		} else {
 			// If it's a conflict error try again
-			if strings.Contains(err.Error(), "please apply your changes to the latest version and try again") {
+			if apierrors.IsConflict(err) || strings.Contains(err.Error(), "please apply your changes to the latest version and try again") {
 				if retry == maxRetries-1 {
 					return fmt.Errorf("cannot update status of IPPool %s after %d retries: %s", updatedPool.Name, maxRetries, err.Error())
 				}

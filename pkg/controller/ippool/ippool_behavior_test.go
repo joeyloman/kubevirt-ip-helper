@@ -2,18 +2,18 @@ package ippool
 
 import (
 	"encoding/json"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/rest"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unsafe"
-
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/rest"
 
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
 	kihcache "github.com/joeyloman/kubevirt-ip-helper/pkg/cache"
@@ -64,8 +64,9 @@ func ippoolBehaviorNewTestPool(name, network string) *kihv1.IPPool {
 func ippoolBehaviorNewTestController(t *testing.T, srv *httptest.Server) (*Controller, *kihipam.IPAllocator, *kihdhcp.DHCPAllocator, *kihcache.CacheAllocator, *metrics.MetricsAllocator) {
 	t.Helper()
 
-	appStatus := APP_RUNNING
-	ippoolCountCurrent := 0
+	var appStatus atomic.Int32
+	appStatus.Store(APP_RUNNING)
+	var ippoolCountCurrent atomic.Int32
 
 	var cs *kihclientset.Clientset
 	if srv != nil {
@@ -356,7 +357,7 @@ func ippoolBehaviorMetricHasLabel(pairs []*dto.LabelPair, name, want string) boo
 
 func TestHandleIPPoolObjectChangeAppInitIgnoresUpdate(t *testing.T) {
 	c, _, d, ca, _ := ippoolBehaviorNewTestController(t, nil)
-	*c.appStatus = APP_INIT
+	c.appStatus.Store(APP_INIT)
 
 	oldPool := ippoolBehaviorNewTestPool("pool1", "net-a")
 	oldPool.Status.LastUpdate = metav1.Now()
@@ -376,8 +377,8 @@ func TestHandleIPPoolObjectChangeAppInitIgnoresUpdate(t *testing.T) {
 		t.Fatalf("unexpected error: %s", err.Error())
 	}
 
-	if *c.appStatus != APP_INIT {
-		t.Errorf("app status changed during init: got %d, want %d", *c.appStatus, APP_INIT)
+	if c.appStatus.Load() != APP_INIT {
+		t.Errorf("app status changed during init: got %d, want %d", c.appStatus.Load(), APP_INIT)
 	}
 	if d.CheckPool("net-a") {
 		t.Errorf("a dhcp pool was created although updates are ignored during init")
@@ -389,8 +390,8 @@ func TestHandleIPPoolObjectChangeAppInitIgnoresUpdate(t *testing.T) {
 	if !reflect.DeepEqual(got.(kihv1.IPPool), cached) {
 		t.Errorf("cache was modified during init, want the unchanged cached pool")
 	}
-	if *c.ippoolCountCurrent != 0 {
-		t.Errorf("ippool count changed during init: got %d, want 0", *c.ippoolCountCurrent)
+	if c.ippoolCountCurrent.Load() != 0 {
+		t.Errorf("ippool count changed during init: got %d, want 0", c.ippoolCountCurrent.Load())
 	}
 }
 
@@ -416,8 +417,8 @@ func TestHandleIPPoolObjectChangeNoChangeKeepsState(t *testing.T) {
 		t.Fatalf("unexpected error: %s", err.Error())
 	}
 
-	if *c.appStatus != APP_RUNNING {
-		t.Errorf("app status changed on no-change update: got %d, want %d", *c.appStatus, APP_RUNNING)
+	if c.appStatus.Load() != APP_RUNNING {
+		t.Errorf("app status changed on no-change update: got %d, want %d", c.appStatus.Load(), APP_RUNNING)
 	}
 	got, err := ca.Get("pool", "net-a")
 	if err != nil {
@@ -456,8 +457,8 @@ func TestHandleIPPoolObjectChangeReloadUpdatesPoolAndCache(t *testing.T) {
 	// A restart-class change would have flipped appStatus to APP_RESTART and
 	// returned before touching the cache; staying APP_RUNNING with a refreshed
 	// cache proves the change was classified as reloadable.
-	if *c.appStatus != APP_RUNNING {
-		t.Errorf("reloadable change was classified as restart: app status got %d, want %d", *c.appStatus, APP_RUNNING)
+	if c.appStatus.Load() != APP_RUNNING {
+		t.Errorf("reloadable change was classified as restart: app status got %d, want %d", c.appStatus.Load(), APP_RUNNING)
 	}
 
 	ippoolBehaviorAssertDHCPPoolOptions(t, d, "net-a",
@@ -515,8 +516,8 @@ func TestHandleIPPoolObjectChangeReloadAddsNewCacheEntry(t *testing.T) {
 	if !d.CheckPool("net-a") {
 		t.Errorf("expected a dhcp pool to be created for the reloaded network")
 	}
-	if *c.appStatus != APP_RUNNING {
-		t.Errorf("reloadable change was classified as restart: app status got %d, want %d", *c.appStatus, APP_RUNNING)
+	if c.appStatus.Load() != APP_RUNNING {
+		t.Errorf("reloadable change was classified as restart: app status got %d, want %d", c.appStatus.Load(), APP_RUNNING)
 	}
 }
 
@@ -578,8 +579,8 @@ func TestHandleIPPoolObjectChangeRejectedInvalidSubnet(t *testing.T) {
 	if storedPool.Spec.IPv4Config.LeaseTime != 3600 {
 		t.Errorf("cache lease time = %d, want the previously cached 3600, not the rejected 4200", storedPool.Spec.IPv4Config.LeaseTime)
 	}
-	if *c.appStatus != APP_RUNNING {
-		t.Errorf("app status changed: got %d, want %d", *c.appStatus, APP_RUNNING)
+	if c.appStatus.Load() != APP_RUNNING {
+		t.Errorf("app status changed: got %d, want %d", c.appStatus.Load(), APP_RUNNING)
 	}
 }
 
@@ -618,8 +619,8 @@ func TestHandleIPPoolObjectChangeRejectsUnparseableSubnetUpdate(t *testing.T) {
 		t.Fatal("handleIPPoolObjectChange accepted an unparseable subnet update")
 	}
 
-	if *c.appStatus != APP_RUNNING {
-		t.Errorf("the rejected update started an application restart: app status got %d, want %d", *c.appStatus, APP_RUNNING)
+	if c.appStatus.Load() != APP_RUNNING {
+		t.Errorf("the rejected update started an application restart: app status got %d, want %d", c.appStatus.Load(), APP_RUNNING)
 	}
 	if plc := d.CheckPool("net-a"); !plc {
 		t.Error("the rejected update removed the active dhcp pool")
@@ -634,8 +635,8 @@ func TestHandleIPPoolObjectChangeRejectsUnparseableSubnetUpdate(t *testing.T) {
 	if err := c.handleIPPoolObjectChange(*oldPool, restored); err != nil {
 		t.Errorf("handleIPPoolObjectChange rejected the restored spec: %v", err)
 	}
-	if *c.appStatus != APP_RUNNING {
-		t.Errorf("the restored spec started an application restart: app status got %d, want %d", *c.appStatus, APP_RUNNING)
+	if c.appStatus.Load() != APP_RUNNING {
+		t.Errorf("the restored spec started an application restart: app status got %d, want %d", c.appStatus.Load(), APP_RUNNING)
 	}
 	if !d.CheckPool("net-a") {
 		t.Error("the restored spec removed the active dhcp pool")
@@ -707,11 +708,11 @@ func TestRegisterIPPoolValidatesSubnetBeforeNetlink(t *testing.T) {
 	if ca.Check(pool) {
 		t.Errorf("pool must not be cached when the subnet is invalid")
 	}
-	if *c.appStatus != APP_RUNNING {
-		t.Errorf("app status changed: got %d, want %d", *c.appStatus, APP_RUNNING)
+	if c.appStatus.Load() != APP_RUNNING {
+		t.Errorf("app status changed: got %d, want %d", c.appStatus.Load(), APP_RUNNING)
 	}
-	if *c.ippoolCountCurrent != 0 {
-		t.Errorf("ippool count changed: got %d, want 0", *c.ippoolCountCurrent)
+	if c.ippoolCountCurrent.Load() != 0 {
+		t.Errorf("ippool count changed: got %d, want 0", c.ippoolCountCurrent.Load())
 	}
 }
 

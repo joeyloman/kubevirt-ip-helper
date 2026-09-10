@@ -2,6 +2,7 @@ package vmnetcfg
 
 import (
 	"context"
+	"sync/atomic"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -45,8 +46,8 @@ type EventHandler struct {
 	kubeContext          string
 	kubeRestConfig       *rest.Config
 	kihClientset         *kihclientset.Clientset
-	appStatus            *int
-	vmnetcfgCountCurrent *int
+	appStatus            *atomic.Int32
+	vmnetcfgCountCurrent *atomic.Int32
 }
 
 type Event struct {
@@ -64,8 +65,8 @@ func NewEventHandler(
 	kubeContext string,
 	kubeRestConfig *rest.Config,
 	kihClientset *kihclientset.Clientset,
-	appStatus *int,
-	vmnetcfgCountCurrent *int,
+	appStatus *atomic.Int32,
+	vmnetcfgCountCurrent *atomic.Int32,
 ) *EventHandler {
 	return &EventHandler{
 		ctx:                  ctx,
@@ -134,7 +135,12 @@ func (e *EventHandler) EventListener() (err error) {
 			}
 		},
 		DeleteFunc: func(obj interface{}) {
-			key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
+			vmnetcfg, isVMNetCfg := util.UnwrapTombstone(obj).(*kihv1.VirtualMachineNetworkConfig)
+			if !isVMNetCfg {
+				return
+			}
+
+			key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(vmnetcfg)
 			if err == nil {
 				queue.Add(Event{
 					key:    key,

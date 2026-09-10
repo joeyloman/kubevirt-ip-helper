@@ -2,6 +2,7 @@ package ippool
 
 import (
 	"context"
+	"sync/atomic"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -46,8 +47,8 @@ type EventHandler struct {
 	kubeContext        string
 	kubeRestConfig     *rest.Config
 	kihClientset       *kihclientset.Clientset
-	appStatus          *int
-	ippoolCountCurrent *int
+	appStatus          *atomic.Int32
+	ippoolCountCurrent *atomic.Int32
 }
 
 type Event struct {
@@ -68,8 +69,8 @@ func NewEventHandler(
 	kubeContext string,
 	kubeRestConfig *rest.Config,
 	kihClientset *kihclientset.Clientset,
-	appStatus *int,
-	ippoolCountCurrent *int,
+	appStatus *atomic.Int32,
+	ippoolCountCurrent *atomic.Int32,
 ) *EventHandler {
 	return &EventHandler{
 		ctx:                ctx,

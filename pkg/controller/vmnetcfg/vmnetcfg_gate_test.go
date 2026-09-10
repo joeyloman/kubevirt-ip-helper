@@ -3,6 +3,7 @@ package vmnetcfg
 import (
 	"errors"
 	"net/http"
+	"sync/atomic"
 	"testing"
 
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/util"
@@ -16,13 +17,13 @@ import (
 // newGateTestEnv wires a controller with a real indexer to the behavior
 // test environment, so sync() can be exercised with the fake API server
 // and the startup gate counters of a private initialization phase.
-func newGateTestEnv(t *testing.T) (*testEnv, *Controller, *int) {
+func newGateTestEnv(t *testing.T) (*testEnv, *Controller, *atomic.Int32) {
 	t.Helper()
 
 	e := newTestEnv(t)
 
-	appStatus := APP_INIT
-	count := 0
+	var appStatus, count atomic.Int32
+	appStatus.Store(APP_INIT)
 	controller := NewController(
 		newTestQueue(),
 		newTestIndexer(),
@@ -64,8 +65,8 @@ func TestSyncAddTransientFailureStaysUncountedUntilTheRestoreSucceeds(t *testing
 	if err := controller.sync(event); err == nil {
 		t.Fatal("want the transient status failure to fail the sync")
 	}
-	if *count != 0 {
-		t.Errorf("gate count = %d, want 0: a transiently failed restore must stay uncounted", *count)
+	if count.Load() != 0 {
+		t.Errorf("gate count = %d, want 0: a transiently failed restore must stay uncounted", count.Load())
 	}
 
 	// the retried sync rebuilds the reservation and settles the gate
@@ -74,16 +75,16 @@ func TestSyncAddTransientFailureStaysUncountedUntilTheRestoreSucceeds(t *testing
 	if err := controller.sync(event); err != nil {
 		t.Fatalf("the retried sync failed: %s", err)
 	}
-	if *count != 1 {
-		t.Errorf("gate count = %d, want 1 after the settled restore", *count)
+	if count.Load() != 1 {
+		t.Errorf("gate count = %d, want 1 after the settled restore", count.Load())
 	}
 
 	// a further sync of the settled object must not double count
 	if err := controller.sync(event); err != nil {
 		t.Fatalf("the repeated sync failed: %s", err)
 	}
-	if *count != 1 {
-		t.Errorf("gate count = %d after the repeated sync, want 1", *count)
+	if count.Load() != 1 {
+		t.Errorf("gate count = %d after the repeated sync, want 1", count.Load())
 	}
 }
 
@@ -109,8 +110,8 @@ func TestSyncAddOwnershipConflictCountsAsHandledDuringInit(t *testing.T) {
 	if !errors.Is(err, util.ErrForeignOwner) {
 		t.Errorf("error = %v, want the util.ErrForeignOwner classification", err)
 	}
-	if *count != 1 {
-		t.Errorf("gate count = %d, want 1: a definitively rejected claim must count as handled", *count)
+	if count.Load() != 1 {
+		t.Errorf("gate count = %d, want 1: a definitively rejected claim must count as handled", count.Load())
 	}
 }
 
@@ -132,8 +133,8 @@ func TestSyncAddInvalidMacCountsAsHandledDuringInit(t *testing.T) {
 	if err == nil {
 		t.Fatal("want the invalid macaddress to fail the sync")
 	}
-	if *count != 1 {
-		t.Errorf("gate count = %d, want 1: a definitively broken object must count as handled", *count)
+	if count.Load() != 1 {
+		t.Errorf("gate count = %d, want 1: a definitively broken object must count as handled", count.Load())
 	}
 	if used := e.ipam.Used(testNetwork); used != 0 {
 		t.Errorf("ipam used = %d, want 0: an unusable macaddress must not consume a reservation", used)

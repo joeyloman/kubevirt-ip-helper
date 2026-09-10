@@ -132,8 +132,8 @@ func TestHandler_Register(t *testing.T) {
 	if h == nil {
 		t.Fatal("Register() returned nil")
 	}
-	if h.appStatus != APP_INIT {
-		t.Errorf("fresh handler appStatus = %d, want %d (APP_INIT)", h.appStatus, APP_INIT)
+	if h.appStatus.Load() != APP_INIT {
+		t.Errorf("fresh handler appStatus = %d, want %d (APP_INIT)", h.appStatus.Load(), APP_INIT)
 	}
 	if h.kubeConfigFile != "" {
 		t.Errorf("fresh handler kubeConfigFile = %q, want empty", h.kubeConfigFile)
@@ -832,8 +832,8 @@ func TestHandler_Init(t *testing.T) {
 		if h.kubeContext != "test" {
 			t.Errorf("kubeContext = %q, want %q", h.kubeContext, "test")
 		}
-		if h.appStatus != APP_INIT {
-			t.Errorf("appStatus = %d, want %d (APP_INIT)", h.appStatus, APP_INIT)
+		if h.appStatus.Load() != APP_INIT {
+			t.Errorf("appStatus = %d, want %d (APP_INIT)", h.appStatus.Load(), APP_INIT)
 		}
 		if h.leaderId == "" {
 			t.Error("leaderId is empty after Init")

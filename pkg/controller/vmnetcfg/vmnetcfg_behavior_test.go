@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unsafe"
@@ -84,7 +85,7 @@ type testEnv struct {
 	// appStatus exposes the application phase so tests can switch
 	// between the startup replay (APP_INIT, fresh allocations deferred)
 	// and the steady state (APP_RUNNING)
-	appStatus *int
+	appStatus *atomic.Int32
 }
 
 func newTestEnv(t *testing.T) *testEnv {
@@ -99,8 +100,8 @@ func newTestEnv(t *testing.T) *testEnv {
 		t.Fatalf("creating clientset: %s", err)
 	}
 
-	appStatus := APP_INIT
-	count := 0
+	var appStatus, count atomic.Int32
+	appStatus.Store(APP_INIT)
 	e := &testEnv{
 		t:       t,
 		srv:     srv,
@@ -592,7 +593,7 @@ func TestVMNetCfgFreshAllocation(t *testing.T) {
 		e := newTestEnv(t)
 		// steady state: a running application serves fresh allocations
 		// immediately; the startup replay defers them instead
-		*e.appStatus = APP_RUNNING
+		e.appStatus.Store(APP_RUNNING)
 		e.addSubnet("10.0.0.1", "10.0.0.1")
 		e.seedPool(nil)
 		vmnetcfg := newVMNetCfg("", testMAC)
@@ -1140,7 +1141,7 @@ func TestVMNetCfgStartupTimestampGate(t *testing.T) {
 		// steady state: the timestamp gate rejects only the objects
 		// created inside the restart window; in the running application
 		// the pending nic of a pre-restart object allocates normally
-		*e.appStatus = APP_RUNNING
+		e.appStatus.Store(APP_RUNNING)
 
 		if err := e.controller.updateVirtualMachineNetworkConfig(ADD, vmnetcfg); err != nil {
 			t.Fatalf("unexpected error: %s", err)
@@ -1523,7 +1524,7 @@ func TestVMNetCfgIPAMErrorSetsErrorStatus(t *testing.T) {
 func TestVMNetCfgUpdateFailureRollsBackAllocations(t *testing.T) {
 	e := newTestEnv(t)
 	// steady state: the failed-commit rollback of a fresh allocation
-	*e.appStatus = APP_RUNNING
+	e.appStatus.Store(APP_RUNNING)
 	e.addSubnet("10.0.0.1", "10.0.0.1")
 	e.seedPool(nil)
 	e.api.vmnetcfgPutCode = http.StatusInternalServerError
@@ -1595,7 +1596,7 @@ func TestVMNetCfgLaterNICPoolStatusFailureUnwindsEarlierNICs(t *testing.T) {
 	e := newTestEnv(t)
 	// steady state: a running application's sync failure unwinds the
 	// nics allocated within the same sync
-	*e.appStatus = APP_RUNNING
+	e.appStatus.Store(APP_RUNNING)
 
 	secondNetwork := "net-b"
 	const secondPoolName = "ippool-b"
@@ -1674,7 +1675,7 @@ func TestVMNetCfgLaterNICPoolLookupFailureUnwindsEarlierNICs(t *testing.T) {
 	e := newTestEnv(t)
 	// steady state: a running application's sync failure unwinds the
 	// nics allocated within the same sync
-	*e.appStatus = APP_RUNNING
+	e.appStatus.Store(APP_RUNNING)
 	e.addSubnet("10.0.0.1", "10.0.0.1")
 	e.seedPool(nil)
 
@@ -1875,7 +1876,7 @@ func TestVMNetCfgDeletionRefreshesPoolMetrics(t *testing.T) {
 func TestVMNetCfgRollbackPublishesSettledAccounting(t *testing.T) {
 	e := newTestEnv(t)
 	// steady state: the failed-commit rollback of a fresh allocation
-	*e.appStatus = APP_RUNNING
+	e.appStatus.Store(APP_RUNNING)
 	e.addSubnet("10.0.0.1", "10.0.0.2")
 	e.seedPool(nil)
 	e.api.vmnetcfgPutCode = http.StatusInternalServerError

@@ -184,7 +184,7 @@ func (c *Controller) handleIPPoolObjectChange(oldPool kihv1.IPPool, newPool *kih
 	var updateAction int = IPPOOL_NOCHANGE
 
 	// if the app still initializing don't handle IPPool updates
-	if *c.appStatus == APP_INIT {
+	if c.appStatus.Load() == APP_INIT {
 		log.Debugf("(ippool.handleIPPoolObjectChange) application is still in initializing state, ignoring updates until it's running..")
 		return
 	}
@@ -208,7 +208,7 @@ func (c *Controller) handleIPPoolObjectChange(oldPool kihv1.IPPool, newPool *kih
 	}
 
 	for {
-		if *c.appStatus != APP_RESTART {
+		if c.appStatus.Load() != APP_RESTART {
 			break
 		}
 
@@ -248,7 +248,7 @@ func (c *Controller) handleIPPoolObjectChange(oldPool kihv1.IPPool, newPool *kih
 		}
 
 		// notify the main thread that everything needs to be reinitialized
-		*c.appStatus = APP_RESTART
+		c.appStatus.Store(APP_RESTART)
 
 		return
 	}

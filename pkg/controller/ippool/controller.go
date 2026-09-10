@@ -2,6 +2,7 @@ package ippool
 
 import (
 	"context"
+	"sync/atomic"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -35,8 +36,8 @@ type Controller struct {
 	dhcp               *dhcp.DHCPAllocator
 	metrics            *metrics.MetricsAllocator
 	kihClientset       *kihclientset.Clientset
-	appStatus          *int
-	ippoolCountCurrent *int
+	appStatus          *atomic.Int32
+	ippoolCountCurrent *atomic.Int32
 
 	// initAttempted tracks the IPPool objects which the current
 	// initialization phase already handled, so a pool which definitively
@@ -54,8 +55,8 @@ func NewController(
 	dhcp *dhcp.DHCPAllocator,
 	metrics *metrics.MetricsAllocator,
 	kihClientset *kihclientset.Clientset,
-	appStatus *int,
-	ippoolCountCurrent *int,
+	appStatus *atomic.Int32,
+	ippoolCountCurrent *atomic.Int32,
 ) *Controller {
 	return &Controller{
 		informer:           informer,
@@ -79,7 +80,7 @@ func NewController(
 // registered yet, while rejected pools still count so a broken object
 // does not block the controller startup until it is removed first.
 func (c *Controller) markInitAttempt(name string) {
-	if *c.appStatus != APP_INIT {
+	if c.appStatus.Load() != APP_INIT {
 		return
 	}
 
@@ -93,7 +94,7 @@ func (c *Controller) markInitAttempt(name string) {
 
 	c.initAttempted[name] = true
 
-	*c.ippoolCountCurrent++
+	c.ippoolCountCurrent.Add(1)
 }
 
 func (c *Controller) processNextItem() bool {

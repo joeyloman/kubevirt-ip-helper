@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
@@ -17,15 +18,16 @@ import (
 // must count so the startup gate does not wait for a pool which can never
 // register.
 func TestSyncDeleteSettlesUnregisteredPoolStartup(t *testing.T) {
-	appStatus := APP_INIT
-	var countCurrent int
+	var appStatus atomic.Int32
+	appStatus.Store(APP_INIT)
+	var countCurrent atomic.Int32
 	controller, _ := newTestController(t, newTestQueue(), newTestIndexer(), nil, &appStatus, &countCurrent)
 
 	if err := controller.sync(Event{key: "ippool-x", action: DELETE, poolName: "ippool-x", poolNetworkName: "net-x"}); err != nil {
 		t.Fatalf("the delete sync failed: %s", err)
 	}
-	if countCurrent != 1 {
-		t.Errorf("ippool count = %d after the deleted pool, want 1", countCurrent)
+	if countCurrent.Load() != 1 {
+		t.Errorf("ippool count = %d after the deleted pool, want 1", countCurrent.Load())
 	}
 }
 
@@ -33,8 +35,9 @@ func TestSyncDeleteSettlesUnregisteredPoolStartup(t *testing.T) {
 // never settle through its own retries anymore, so the gate waiting for it
 // would block the whole controller startup forever.
 func TestHandleErrDropSettlesStartupCount(t *testing.T) {
-	appStatus := APP_INIT
-	var countCurrent int
+	var appStatus atomic.Int32
+	appStatus.Store(APP_INIT)
+	var countCurrent atomic.Int32
 	queue := newTestQueue()
 	controller, _ := newTestController(t, queue, newTestIndexer(), nil, &appStatus, &countCurrent)
 
@@ -51,8 +54,8 @@ func TestHandleErrDropSettlesStartupCount(t *testing.T) {
 		controller.handleErr(syncErr, item)
 		queue.Done(item)
 	}
-	if countCurrent != 0 {
-		t.Fatalf("ippool count = %d after five requeues, want 0", countCurrent)
+	if countCurrent.Load() != 0 {
+		t.Fatalf("ippool count = %d after five requeues, want 0", countCurrent.Load())
 	}
 
 	// the next failure exceeds the retry threshold: the key is dropped and
@@ -65,8 +68,8 @@ func TestHandleErrDropSettlesStartupCount(t *testing.T) {
 	controller.handleErr(syncErr, item)
 	queue.Done(item)
 
-	if countCurrent != 1 {
-		t.Errorf("ippool count = %d after the dropped key, want 1", countCurrent)
+	if countCurrent.Load() != 1 {
+		t.Errorf("ippool count = %d after the dropped key, want 1", countCurrent.Load())
 	}
 }
 

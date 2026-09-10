@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -59,7 +60,7 @@ func (s *stubInformer) Run(stopCh <-chan struct{})      {}
 func (s *stubInformer) HasSynced() bool                 { return s.synced }
 func (s *stubInformer) LastSyncResourceVersion() string { return "" }
 
-func newTestController(t *testing.T, queue workqueue.RateLimitingInterface, indexer cache.Indexer, informer cache.Controller, appStatus *int, ippoolCountCurrent *int) (*Controller, *kihcache.CacheAllocator) {
+func newTestController(t *testing.T, queue workqueue.RateLimitingInterface, indexer cache.Indexer, informer cache.Controller, appStatus *atomic.Int32, ippoolCountCurrent *atomic.Int32) (*Controller, *kihcache.CacheAllocator) {
 	t.Helper()
 
 	cacheAllocator := kihcache.NewCacheAllocator()
@@ -123,8 +124,8 @@ func testPoolEvent(key, action, networkName string) Event {
 
 func TestProcessNextItemReturnsFalseAfterShutdown(t *testing.T) {
 	queue := newTestQueue()
-	var appStatus int
-	controller, _ := newTestController(t, queue, newTestIndexer(), nil, &appStatus, new(int))
+	var appStatus atomic.Int32
+	controller, _ := newTestController(t, queue, newTestIndexer(), nil, &appStatus, new(atomic.Int32))
 
 	queue.ShutDown()
 
@@ -135,8 +136,8 @@ func TestProcessNextItemReturnsFalseAfterShutdown(t *testing.T) {
 
 func TestProcessNextItemSucceedsForMissingIndexObject(t *testing.T) {
 	queue := newTestQueue()
-	var appStatus int
-	controller, _ := newTestController(t, queue, newTestIndexer(), nil, &appStatus, new(int))
+	var appStatus atomic.Int32
+	controller, _ := newTestController(t, queue, newTestIndexer(), nil, &appStatus, new(atomic.Int32))
 
 	event := testPoolEvent("pool-a", ADD, "net-a")
 	queue.Add(event)
@@ -152,9 +153,9 @@ func TestProcessNextItemSucceedsForMissingIndexObject(t *testing.T) {
 
 func TestProcessNextItemRequeuesOnIndexerError(t *testing.T) {
 	queue := newTestQueue()
-	var appStatus int
+	var appStatus atomic.Int32
 	indexer := &failingIndexer{Indexer: newTestIndexer(), err: errors.New("store unavailable")}
-	controller, _ := newTestController(t, queue, indexer, nil, &appStatus, new(int))
+	controller, _ := newTestController(t, queue, indexer, nil, &appStatus, new(atomic.Int32))
 
 	event := testPoolEvent("pool-b", ADD, "net-b")
 	queue.Add(event)
@@ -170,8 +171,8 @@ func TestProcessNextItemRequeuesOnIndexerError(t *testing.T) {
 
 func TestHandleErrForgetsOnSuccess(t *testing.T) {
 	queue := newTestQueue()
-	var appStatus int
-	controller, _ := newTestController(t, queue, newTestIndexer(), nil, &appStatus, new(int))
+	var appStatus atomic.Int32
+	controller, _ := newTestController(t, queue, newTestIndexer(), nil, &appStatus, new(atomic.Int32))
 
 	key := "pool-c"
 	queue.Add(key)
@@ -193,8 +194,8 @@ func TestHandleErrForgetsOnSuccess(t *testing.T) {
 
 func TestHandleErrRateLimitsOnFailure(t *testing.T) {
 	queue := newTestQueue()
-	var appStatus int
-	controller, _ := newTestController(t, queue, newTestIndexer(), nil, &appStatus, new(int))
+	var appStatus atomic.Int32
+	controller, _ := newTestController(t, queue, newTestIndexer(), nil, &appStatus, new(atomic.Int32))
 
 	key := "pool-d"
 	queue.Add(key)
@@ -216,8 +217,8 @@ func TestHandleErrRateLimitsOnFailure(t *testing.T) {
 
 func TestHandleErrDropsAfterMaxRequeues(t *testing.T) {
 	queue := newTestQueue()
-	var appStatus int
-	controller, _ := newTestController(t, queue, newTestIndexer(), nil, &appStatus, new(int))
+	var appStatus atomic.Int32
+	controller, _ := newTestController(t, queue, newTestIndexer(), nil, &appStatus, new(atomic.Int32))
 
 	key := "pool-e"
 	syncErr := errors.New("persistent failure")
@@ -256,8 +257,8 @@ func TestHandleErrDropsAfterMaxRequeues(t *testing.T) {
 }
 
 func TestSyncReturnsNilForMissingIndexObject(t *testing.T) {
-	var appStatus int
-	controller, _ := newTestController(t, newTestQueue(), newTestIndexer(), nil, &appStatus, new(int))
+	var appStatus atomic.Int32
+	controller, _ := newTestController(t, newTestQueue(), newTestIndexer(), nil, &appStatus, new(atomic.Int32))
 
 	if err := controller.sync(testPoolEvent("pool-f", ADD, "net-f")); err != nil {
 		t.Errorf("sync() for a missing index object returned error %v, want nil", err)
@@ -265,9 +266,9 @@ func TestSyncReturnsNilForMissingIndexObject(t *testing.T) {
 }
 
 func TestSyncReturnsIndexerError(t *testing.T) {
-	var appStatus int
+	var appStatus atomic.Int32
 	indexer := &failingIndexer{Indexer: newTestIndexer(), err: errors.New("store unavailable")}
-	controller, _ := newTestController(t, newTestQueue(), indexer, nil, &appStatus, new(int))
+	controller, _ := newTestController(t, newTestQueue(), indexer, nil, &appStatus, new(atomic.Int32))
 
 	if err := controller.sync(testPoolEvent("pool-g", ADD, "net-g")); err == nil {
 		t.Fatalf("sync() returned nil, want the indexer error")
@@ -277,8 +278,8 @@ func TestSyncReturnsIndexerError(t *testing.T) {
 func TestSyncDeleteSucceedsWhenPoolNotCached(t *testing.T) {
 	// a DELETE snapshot for a pool that is gone from the index and unknown to
 	// the cache only logs the cache lookup failure and returns without error
-	var appStatus int
-	controller, _ := newTestController(t, newTestQueue(), newTestIndexer(), nil, &appStatus, new(int))
+	var appStatus atomic.Int32
+	controller, _ := newTestController(t, newTestQueue(), newTestIndexer(), nil, &appStatus, new(atomic.Int32))
 
 	if err := controller.sync(testPoolEvent("pool-h", DELETE, "net-h")); err != nil {
 		t.Errorf("sync(DELETE) returned error %v, want nil", err)
@@ -290,10 +291,10 @@ func TestSyncUpdateReturnsErrorWhenPoolNotCached(t *testing.T) {
 	// registration attempt; in this environment the attempt fails at the
 	// netlink step (no test-fake-iface), which still returns an error so
 	// the queue retries instead of silently forgetting the event
-	var appStatus int
+	var appStatus atomic.Int32
 	indexer := newTestIndexer()
 	indexer.Add(testPool("pool-i", "net-i", 60))
-	controller, _ := newTestController(t, newTestQueue(), indexer, nil, &appStatus, new(int))
+	controller, _ := newTestController(t, newTestQueue(), indexer, nil, &appStatus, new(atomic.Int32))
 
 	if err := controller.sync(testPoolEvent("pool-i", UPDATE, "net-i")); err == nil {
 		t.Error("sync(UPDATE) returned nil, want a rate-limited requeue error for the missing cache entry")
@@ -301,14 +302,15 @@ func TestSyncUpdateReturnsErrorWhenPoolNotCached(t *testing.T) {
 }
 
 func TestSyncUpdateIgnoredWhileInitializing(t *testing.T) {
-	appStatus := APP_INIT
+	var appStatus atomic.Int32
+	appStatus.Store(APP_INIT)
 	oldPool := testPool("pool-j", "net-j", 60)
 	newPool := testPool("pool-j", "net-j", 120)
 
 	indexer := newTestIndexer()
 	indexer.Add(newPool)
 
-	controller, cacheAllocator := newTestController(t, newTestQueue(), indexer, nil, &appStatus, new(int))
+	controller, cacheAllocator := newTestController(t, newTestQueue(), indexer, nil, &appStatus, new(atomic.Int32))
 	if err := cacheAllocator.Add(oldPool); err != nil {
 		t.Fatalf("seeding cache: %v", err)
 	}
@@ -329,13 +331,14 @@ func TestSyncUpdateIgnoredWhileInitializing(t *testing.T) {
 }
 
 func TestSyncUpdateSkipsIdenticalPoolWhenRunning(t *testing.T) {
-	appStatus := APP_RUNNING
+	var appStatus atomic.Int32
+	appStatus.Store(APP_RUNNING)
 	pool := testPool("pool-k", "net-k", 60)
 
 	indexer := newTestIndexer()
 	indexer.Add(pool)
 
-	controller, cacheAllocator := newTestController(t, newTestQueue(), indexer, nil, &appStatus, new(int))
+	controller, cacheAllocator := newTestController(t, newTestQueue(), indexer, nil, &appStatus, new(atomic.Int32))
 	if err := cacheAllocator.Add(pool); err != nil {
 		t.Fatalf("seeding cache: %v", err)
 	}
@@ -359,14 +362,15 @@ func TestSyncUpdateSkipsIdenticalPoolWhenRunning(t *testing.T) {
 }
 
 func TestSyncUpdateReloadsPoolWhenRunning(t *testing.T) {
-	appStatus := APP_RUNNING
+	var appStatus atomic.Int32
+	appStatus.Store(APP_RUNNING)
 	oldPool := testPool("pool-l", "net-l", 60)
 	newPool := testPool("pool-l", "net-l", 120)
 
 	indexer := newTestIndexer()
 	indexer.Add(newPool)
 
-	controller, cacheAllocator := newTestController(t, newTestQueue(), indexer, nil, &appStatus, new(int))
+	controller, cacheAllocator := newTestController(t, newTestQueue(), indexer, nil, &appStatus, new(atomic.Int32))
 	if err := cacheAllocator.Add(oldPool); err != nil {
 		t.Fatalf("seeding cache: %v", err)
 	}
@@ -391,8 +395,8 @@ func TestSyncUpdateReloadsPoolWhenRunning(t *testing.T) {
 
 func TestRunShutsDownTheQueue(t *testing.T) {
 	queue := newTestQueue()
-	var appStatus int
-	controller, _ := newTestController(t, queue, newTestIndexer(), &stubInformer{synced: true}, &appStatus, new(int))
+	var appStatus atomic.Int32
+	controller, _ := newTestController(t, queue, newTestIndexer(), &stubInformer{synced: true}, &appStatus, new(atomic.Int32))
 
 	stop := make(chan struct{})
 	done := make(chan struct{})
@@ -416,8 +420,8 @@ func TestRunShutsDownTheQueue(t *testing.T) {
 
 func TestRunWorkerExitsWhenQueueShutsDown(t *testing.T) {
 	queue := newTestQueue()
-	var appStatus int
-	controller, _ := newTestController(t, queue, newTestIndexer(), nil, &appStatus, new(int))
+	var appStatus atomic.Int32
+	controller, _ := newTestController(t, queue, newTestIndexer(), nil, &appStatus, new(atomic.Int32))
 
 	queue.ShutDown()
 
@@ -448,8 +452,8 @@ func TestEventListenerStopsWhenContextIsCancelled(t *testing.T) {
 		"",
 		nil,
 		newUnavailableClientset(t),
-		new(int),
-		new(int),
+		new(atomic.Int32),
+		new(atomic.Int32),
 	)
 
 	done := make(chan error, 1)
@@ -513,8 +517,8 @@ func newTestEventHandler(kubeConfig, kubeContext string) *EventHandler {
 		kubeContext,
 		nil,
 		nil,
-		new(int),
-		new(int),
+		new(atomic.Int32),
+		new(atomic.Int32),
 	)
 }
 
@@ -603,8 +607,8 @@ func TestSyncAddReturnsErrorWhenPoolFailsToRegister(t *testing.T) {
 		t.Fatalf("seeding indexer: %v", err)
 	}
 
-	var appStatus int
-	controller, _ := newTestController(t, newTestQueue(), indexer, nil, &appStatus, new(int))
+	var appStatus atomic.Int32
+	controller, _ := newTestController(t, newTestQueue(), indexer, nil, &appStatus, new(atomic.Int32))
 
 	if err := controller.sync(testPoolEvent("pool-m", ADD, "net-m")); err == nil {
 		t.Error("sync(ADD) returned nil, want a rate-limited requeue error from the registration failure")
@@ -623,7 +627,7 @@ func TestSyncAddReturnsErrorWhenPoolFailsToRegister(t *testing.T) {
 // is rejected before any pool state is created, so every failure path
 // of the registration stays scoped to its own keys
 func TestSyncAddDuplicateNetworkNameDoesNotTouchForeignState(t *testing.T) {
-	var appStatus int
+	var appStatus atomic.Int32
 	foreignPool := testPool("pool-a", "net-dup", 60)
 
 	indexer := newTestIndexer()
@@ -634,7 +638,7 @@ func TestSyncAddDuplicateNetworkNameDoesNotTouchForeignState(t *testing.T) {
 		t.Fatalf("seeding indexer: %v", err)
 	}
 
-	controller, cacheAllocator := newTestController(t, newTestQueue(), indexer, nil, &appStatus, new(int))
+	controller, cacheAllocator := newTestController(t, newTestQueue(), indexer, nil, &appStatus, new(atomic.Int32))
 
 	// a foreign pool registration already owns the net-dup keys and holds
 	// one live allocation
@@ -687,7 +691,7 @@ func TestSyncAddDuplicateNetworkNameDoesNotTouchForeignState(t *testing.T) {
 // rejected) must not resolve to the live pool in the cache, which shares
 // that networkname, and free the live pool's state
 func TestSyncDeleteForeignCacheEntryKeepsLivePoolState(t *testing.T) {
-	var appStatus int
+	var appStatus atomic.Int32
 	foreignPool := testPool("pool-a", "net-dup", 60)
 
 	indexer := newTestIndexer()
@@ -695,7 +699,7 @@ func TestSyncDeleteForeignCacheEntryKeepsLivePoolState(t *testing.T) {
 		t.Fatalf("seeding indexer: %v", err)
 	}
 
-	controller, cacheAllocator := newTestController(t, newTestQueue(), indexer, nil, &appStatus, new(int))
+	controller, cacheAllocator := newTestController(t, newTestQueue(), indexer, nil, &appStatus, new(atomic.Int32))
 
 	// a live registration owns the net-dup keys and holds one allocation
 	if err := controller.ipam.NewSubnet("net-dup", "192.168.1.0/24", "192.168.1.10", "192.168.1.100"); err != nil {
@@ -740,7 +744,7 @@ func TestSyncDeleteForeignCacheEntryKeepsLivePoolState(t *testing.T) {
 // must free exactly that registration: dhcp pool, ipam subnet, cache entry
 // and both pool gauges
 func TestSyncDeleteRegisteredPoolFreesItsState(t *testing.T) {
-	var appStatus int
+	var appStatus atomic.Int32
 	storedPool := testPool("pool-a", "net-dup", 60)
 
 	indexer := newTestIndexer()
@@ -748,7 +752,7 @@ func TestSyncDeleteRegisteredPoolFreesItsState(t *testing.T) {
 		t.Fatalf("seeding indexer: %v", err)
 	}
 
-	controller, cacheAllocator := newTestController(t, newTestQueue(), indexer, nil, &appStatus, new(int))
+	controller, cacheAllocator := newTestController(t, newTestQueue(), indexer, nil, &appStatus, new(atomic.Int32))
 
 	if err := controller.ipam.NewSubnet("net-dup", "192.168.1.0/24", "192.168.1.10", "192.168.1.100"); err != nil {
 		t.Fatalf("registering the ipam subnet: %v", err)
@@ -793,8 +797,8 @@ func TestSyncDeleteRegisteredPoolFreesItsState(t *testing.T) {
 // and the pool still counts for the startup gate so a startup-time
 // deletion cannot block the controller startup
 func TestSyncDeleteUncachedNetworkNameReportsWarning(t *testing.T) {
-	var appStatus int
-	gateCount := new(int)
+	var appStatus atomic.Int32
+	gateCount := new(atomic.Int32)
 
 	indexer := newTestIndexer()
 
@@ -811,15 +815,16 @@ func TestSyncDeleteUncachedNetworkNameReportsWarning(t *testing.T) {
 	if v, ok := ippoolBehaviorMetricValue(t, controller.metrics, "kubevirtiphelper_app_logs", map[string]string{"loglevel": "warning"}); !ok || v != 1 {
 		t.Errorf("app log status gauge: got value %v found %v, want exactly 1 warning entry", v, ok)
 	}
-	if *gateCount != 1 {
-		t.Errorf("startup gate count = %d, want 1: a startup-time deletion must count for the gate even without a cache entry", *gateCount)
+	if gateCount.Load() != 1 {
+		t.Errorf("startup gate count = %d, want 1: a startup-time deletion must count for the gate even without a cache entry", gateCount.Load())
 	}
 }
 
 // a pool whose networkname changed keeps its cache entry under the old key:
 // its update event must still reach the restart handling through it
 func TestSyncUpdateReachesRestartAfterNetworkNameChange(t *testing.T) {
-	appStatus := APP_RUNNING
+	var appStatus atomic.Int32
+	appStatus.Store(APP_RUNNING)
 	oldPool := testPool("pool-n", "net-old", 60)
 	newPool := testPool("pool-n", "net-new", 60)
 
@@ -828,7 +833,7 @@ func TestSyncUpdateReachesRestartAfterNetworkNameChange(t *testing.T) {
 		t.Fatalf("seeding indexer: %v", err)
 	}
 
-	controller, cacheAllocator := newTestController(t, newTestQueue(), indexer, nil, &appStatus, new(int))
+	controller, cacheAllocator := newTestController(t, newTestQueue(), indexer, nil, &appStatus, new(atomic.Int32))
 	if err := cacheAllocator.Add(oldPool); err != nil {
 		t.Fatalf("seeding cache: %v", err)
 	}
@@ -840,8 +845,8 @@ func TestSyncUpdateReachesRestartAfterNetworkNameChange(t *testing.T) {
 		t.Fatalf("unexpected error: %s", err)
 	}
 
-	if appStatus != APP_RESTART {
-		t.Errorf("app status = %d, want %d after a networkname change", appStatus, APP_RESTART)
+	if appStatus.Load() != APP_RESTART {
+		t.Errorf("app status = %d, want %d after a networkname change", appStatus.Load(), APP_RESTART)
 	}
 }
 
@@ -850,7 +855,8 @@ func TestSyncUpdateReachesRestartAfterNetworkNameChange(t *testing.T) {
 // re-registration: that update must be rejected before any teardown, so
 // the currently registered configuration keeps serving
 func TestSyncUpdateRejectsNetworkNameChangeToClaimedNetwork(t *testing.T) {
-	appStatus := APP_RUNNING
+	var appStatus atomic.Int32
+	appStatus.Store(APP_RUNNING)
 	oldPool := testPool("pool-n", "net-old", 60)
 	newPool := testPool("pool-n", "net-claimed", 60)
 
@@ -859,7 +865,7 @@ func TestSyncUpdateRejectsNetworkNameChangeToClaimedNetwork(t *testing.T) {
 		t.Fatalf("seeding indexer: %v", err)
 	}
 
-	controller, cacheAllocator := newTestController(t, newTestQueue(), indexer, nil, &appStatus, new(int))
+	controller, cacheAllocator := newTestController(t, newTestQueue(), indexer, nil, &appStatus, new(atomic.Int32))
 	if err := cacheAllocator.Add(oldPool); err != nil {
 		t.Fatalf("seeding cache: %v", err)
 	}
@@ -876,8 +882,8 @@ func TestSyncUpdateRejectsNetworkNameChangeToClaimedNetwork(t *testing.T) {
 		t.Fatal("sync(UPDATE) accepted a networkname change into an already claimed networkname")
 	}
 
-	if appStatus != APP_RUNNING {
-		t.Errorf("the rejected rename started an application restart: app status got %d, want %d", appStatus, APP_RUNNING)
+	if appStatus.Load() != APP_RUNNING {
+		t.Errorf("the rejected rename started an application restart: app status got %d, want %d", appStatus.Load(), APP_RUNNING)
 	}
 	if !cacheAllocator.Check(oldPool) {
 		t.Error("the rejected rename dropped the live registration from the cache")
@@ -890,8 +896,9 @@ func TestSyncUpdateRejectsNetworkNameChangeToClaimedNetwork(t *testing.T) {
 // the vmnetcfg/vm controllers from starting. the rate-limited retries of
 // the failing object must not double count.
 func TestSyncAddRejectedPoolCountsAsHandledDuringInit(t *testing.T) {
-	appStatus := APP_INIT
-	countCurrent := 0
+	var appStatus atomic.Int32
+	appStatus.Store(APP_INIT)
+	var countCurrent atomic.Int32
 	foreignPool := testPool("pool-a", "net-dup", 60)
 
 	indexer := newTestIndexer()
@@ -921,16 +928,16 @@ func TestSyncAddRejectedPoolCountsAsHandledDuringInit(t *testing.T) {
 	if err := controller.sync(testPoolEvent("pool-b", ADD, "net-dup")); err == nil {
 		t.Fatal("sync(ADD) for an already-claimed networkname returned nil, want a rejection error")
 	}
-	if countCurrent != 1 {
-		t.Errorf("ippool count = %d, want 1: the rejected registration must count as handled", countCurrent)
+	if countCurrent.Load() != 1 {
+		t.Errorf("ippool count = %d, want 1: the rejected registration must count as handled", countCurrent.Load())
 	}
 
 	// the rate-limited retries of the same event must not double count
 	if err := controller.sync(testPoolEvent("pool-b", ADD, "net-dup")); err == nil {
 		t.Fatal("the retried sync(ADD) returned nil, want a rejection error")
 	}
-	if countCurrent != 1 {
-		t.Errorf("ippool count = %d after the retried event, want 1", countCurrent)
+	if countCurrent.Load() != 1 {
+		t.Errorf("ippool count = %d after the retried event, want 1", countCurrent.Load())
 	}
 }
 
@@ -938,15 +945,16 @@ func TestSyncAddRejectedPoolCountsAsHandledDuringInit(t *testing.T) {
 // handled: the pool cannot produce a registration anymore and the startup
 // gate must not wait for it
 func TestSyncAddVanishedPoolCountsAsHandledDuringInit(t *testing.T) {
-	appStatus := APP_INIT
-	var countCurrent int
+	var appStatus atomic.Int32
+	appStatus.Store(APP_INIT)
+	var countCurrent atomic.Int32
 	controller, _ := newTestController(t, newTestQueue(), newTestIndexer(), nil, &appStatus, &countCurrent)
 
 	if err := controller.sync(testPoolEvent("pool-z", ADD, "net-z")); err != nil {
 		t.Fatalf("sync(ADD) for a vanished pool returned error %v, want nil", err)
 	}
-	if countCurrent != 1 {
-		t.Errorf("ippool count = %d, want 1: a vanished pool must not block the startup gate", countCurrent)
+	if countCurrent.Load() != 1 {
+		t.Errorf("ippool count = %d, want 1: a vanished pool must not block the startup gate", countCurrent.Load())
 	}
 }
 
@@ -954,14 +962,15 @@ func TestSyncAddVanishedPoolCountsAsHandledDuringInit(t *testing.T) {
 // attempts in the running or restarting phases must not touch the counter
 func TestMarkInitAttemptOnlyCountsDuringInit(t *testing.T) {
 	for _, phase := range []int{APP_RUNNING, APP_RESTART} {
-		appStatus := phase
-		var countCurrent int
+		var appStatus atomic.Int32
+		appStatus.Store(int32(phase))
+		var countCurrent atomic.Int32
 		controller, _ := newTestController(t, newTestQueue(), newTestIndexer(), nil, &appStatus, &countCurrent)
 
 		controller.markInitAttempt("pool-x")
 
-		if countCurrent != 0 {
-			t.Errorf("ippool count = %d in phase %d, want 0: the gate is only evaluated during initialization", countCurrent, phase)
+		if countCurrent.Load() != 0 {
+			t.Errorf("ippool count = %d in phase %d, want 0: the gate is only evaluated during initialization", countCurrent.Load(), phase)
 		}
 	}
 }
@@ -974,8 +983,9 @@ func TestMarkInitAttemptOnlyCountsDuringInit(t *testing.T) {
 // re-registration (here: the bindinterface is missing on the host) must
 // keep the gate waiting for its retry.
 func TestSyncUpdateAttemptsRegistrationForUnregisteredPool(t *testing.T) {
-	appStatus := APP_INIT
-	countCurrent := 0
+	var appStatus atomic.Int32
+	appStatus.Store(APP_INIT)
+	var countCurrent atomic.Int32
 	indexer := newTestIndexer()
 	if err := indexer.Add(testPool("pool-r", "net-fresh", 60)); err != nil {
 		t.Fatalf("seeding indexer: %v", err)
@@ -990,8 +1000,8 @@ func TestSyncUpdateAttemptsRegistrationForUnregisteredPool(t *testing.T) {
 			t.Errorf("the update resolved to the cache-miss invariant instead of attempting registration: %v", err)
 		}
 	}
-	if countCurrent != 0 {
-		t.Errorf("ippool count = %d, want 0: a transiently failed re-registration must stay uncounted", countCurrent)
+	if countCurrent.Load() != 0 {
+		t.Errorf("ippool count = %d, want 0: a transiently failed re-registration must stay uncounted", countCurrent.Load())
 	}
 
 	// the retried event must not double count
@@ -1000,8 +1010,8 @@ func TestSyncUpdateAttemptsRegistrationForUnregisteredPool(t *testing.T) {
 			t.Errorf("the retried update fell back to the cache-miss invariant: %v", err)
 		}
 	}
-	if countCurrent != 0 {
-		t.Errorf("ippool count = %d after the retried event, want 0 until the registration settles", countCurrent)
+	if countCurrent.Load() != 0 {
+		t.Errorf("ippool count = %d after the retried event, want 0 until the registration settles", countCurrent.Load())
 	}
 
 }
@@ -1012,7 +1022,8 @@ func TestSyncUpdateAttemptsRegistrationForUnregisteredPool(t *testing.T) {
 // attempts the registration of its own pool instead, which the duplicate
 // networkname check rejects without touching the live state.
 func TestSyncUpdateForeignCacheEntryDoesNotCascadeRestart(t *testing.T) {
-	appStatus := APP_RUNNING
+	var appStatus atomic.Int32
+	appStatus.Store(APP_RUNNING)
 	foreignPool := testPool("pool-a", "net-shared", 60)
 
 	indexer := newTestIndexer()
@@ -1023,7 +1034,7 @@ func TestSyncUpdateForeignCacheEntryDoesNotCascadeRestart(t *testing.T) {
 		t.Fatalf("seeding indexer: %v", err)
 	}
 
-	controller, cacheAllocator := newTestController(t, newTestQueue(), indexer, nil, &appStatus, new(int))
+	controller, cacheAllocator := newTestController(t, newTestQueue(), indexer, nil, &appStatus, new(atomic.Int32))
 
 	// a live registration owns the net-shared keys and holds one allocation
 	if err := controller.ipam.NewSubnet("net-shared", "192.168.1.0/24", "192.168.1.10", "192.168.1.100"); err != nil {
@@ -1045,8 +1056,8 @@ func TestSyncUpdateForeignCacheEntryDoesNotCascadeRestart(t *testing.T) {
 		t.Errorf("error = %v, want the duplicate networkname rejection", err)
 	}
 
-	if appStatus != APP_RUNNING {
-		t.Errorf("app status = %d after the rejected update, want %d: the foreign registration must not start an application restart", appStatus, APP_RUNNING)
+	if appStatus.Load() != APP_RUNNING {
+		t.Errorf("app status = %d after the rejected update, want %d: the foreign registration must not start an application restart", appStatus.Load(), APP_RUNNING)
 	}
 	if used := controller.ipam.Used("net-shared"); used < 1 {
 		t.Errorf("live allocation of net-shared wiped: used=%d, want >= 1", used)

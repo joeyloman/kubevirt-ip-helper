@@ -8,12 +8,12 @@ import (
 	"strings"
 	"time"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/dhcp"
 	ipam "github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/util"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	log "github.com/sirupsen/logrus"
 )
@@ -528,7 +528,7 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 		if v.IPAddress != "" {
 			ip, err = c.ipam.ReclaimIPClaimant(v.NetworkName, v.IPAddress, ownerRef, vmRef)
 		} else {
-			if *c.appStatus == APP_INIT {
+			if c.appStatus.Load() == APP_INIT {
 				// two-phase startup replay: a pending nic without a
 				// recorded address must not allocate during the
 				// initialization replay, because the recorded
@@ -992,7 +992,7 @@ func (c *Controller) updateIPPoolStatus(event string, vmnetcfgNamespace string, 
 			return nil
 		} else {
 			// If it's a conflict error try again
-			if strings.Contains(err.Error(), "please apply your changes to the latest version and try again") {
+			if apierrors.IsConflict(err) || strings.Contains(err.Error(), "please apply your changes to the latest version and try again") {
 				if retry == maxRetries-1 {
 					return fmt.Errorf("cannot update status of IPPool %s after %d retries: %s", updatedPool.Name, maxRetries, err.Error())
 				}

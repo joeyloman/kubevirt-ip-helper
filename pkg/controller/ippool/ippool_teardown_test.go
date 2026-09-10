@@ -2,6 +2,7 @@ package ippool
 
 import (
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/network"
@@ -37,8 +38,9 @@ func stubNicMutation(t *testing.T) {
 func TestSyncUpdateFailedRegistrationTearsDownPartialState(t *testing.T) {
 	stubNicMutation(t)
 
-	appStatus := APP_INIT
-	countCurrent := 0
+	var appStatus atomic.Int32
+	appStatus.Store(APP_INIT)
+	var countCurrent atomic.Int32
 	indexer := newTestIndexer()
 	if err := indexer.Add(testPool("pool-r2", "net-fresh2", 60)); err != nil {
 		t.Fatalf("seeding indexer: %v", err)
@@ -72,8 +74,8 @@ func TestSyncUpdateFailedRegistrationTearsDownPartialState(t *testing.T) {
 
 	// the transient failure keeps the pool uncounted for the startup gate:
 	// the retry settles it once the environment is repaired
-	if countCurrent != 0 {
-		t.Errorf("ippool count = %d, want 0: the transiently failing registration must stay uncounted", countCurrent)
+	if countCurrent.Load() != 0 {
+		t.Errorf("ippool count = %d, want 0: the transiently failing registration must stay uncounted", countCurrent.Load())
 	}
 }
 
@@ -82,8 +84,9 @@ func TestSyncUpdateFailedRegistrationTearsDownPartialState(t *testing.T) {
 func TestSyncAddFailedRegistrationTearsDownPartialState(t *testing.T) {
 	stubNicMutation(t)
 
-	appStatus := APP_INIT
-	countCurrent := 0
+	var appStatus atomic.Int32
+	appStatus.Store(APP_INIT)
+	var countCurrent atomic.Int32
 	indexer := newTestIndexer()
 	if err := indexer.Add(testPool("pool-a2", "net-a2", 60)); err != nil {
 		t.Fatalf("seeding indexer: %v", err)

@@ -66,7 +66,7 @@ func TestFreshAllocationAfterRecoverySkipsThePinnedClaim(t *testing.T) {
 	// a second vm arrives and asks for an automatic address: steady state
 	// (a running application serves fresh allocations immediately; the
 	// startup replay defers them, covered by the finding-4 tests)
-	*e.appStatus = APP_RUNNING
+	e.appStatus.Store(APP_RUNNING)
 	fresh := &kihv1.VirtualMachineNetworkConfig{
 		ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: "vm-fresh"},
 		Spec:       kihv1.VirtualMachineNetworkConfigSpec{VMName: "vm-fresh"},
@@ -149,7 +149,7 @@ func TestBarrierHoldsBeforeTheRestoration(t *testing.T) {
 	// the recorded binding's vmnetcfg object is not processed yet at this
 	// point, but the vmnetcfg controller of a running application - the
 	// startup replay defers instead and is covered by the finding-4 tests
-	*e.appStatus = APP_RUNNING
+	e.appStatus.Store(APP_RUNNING)
 
 	if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, fresh); err != nil {
 		t.Fatalf("the fresh vm must receive a free address: %s", err)
@@ -196,7 +196,7 @@ func TestSpecOnlyClaimRecoveryHoldsUnderAppRunning(t *testing.T) {
 	}
 
 	// steady state: the application is running, no startup deferral
-	*e.appStatus = APP_RUNNING
+	e.appStatus.Store(APP_RUNNING)
 
 	// a different vm requesting an automatic address reconciles first and
 	// must not receive the existing address

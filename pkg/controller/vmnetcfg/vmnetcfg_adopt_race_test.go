@@ -66,7 +66,7 @@ func adoptRaceEnv(t *testing.T) (*testEnv, *kihv1.VirtualMachineNetworkConfig) {
 	t.Helper()
 
 	e := newTestEnv(t)
-	*e.appStatus = APP_RUNNING
+	e.appStatus.Store(APP_RUNNING)
 	e.addSubnet("10.0.0.1", "10.0.0.1")
 	e.seedPool(map[string]string{"10.0.0.1": canonicalLegacy})
 	if _, err := e.ipam.ReclaimIP(testNetwork, "10.0.0.1", canonicalLegacy); err != nil {
@@ -226,7 +226,7 @@ func TestStaleCleanupDoesNotReleaseASuccessor(t *testing.T) {
 // the ownership record.
 func TestGuardedAdoptionStillPromotesAnAnonymousAllocation(t *testing.T) {
 	e := newTestEnv(t)
-	*e.appStatus = APP_RUNNING
+	e.appStatus.Store(APP_RUNNING)
 	e.addSubnet("10.0.0.1", "10.0.0.1")
 	e.seedPool(nil)
 

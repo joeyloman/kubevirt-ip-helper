@@ -173,8 +173,8 @@ func TestVMNetCfgStartupGateMissingPoolKeepsLaterInterfacesProtected(t *testing.
 	if err == nil {
 		t.Fatal("want the sync to fail while the pool is missing")
 	}
-	if *count != 1 {
-		t.Fatalf("gate count = %d, want 1 (settled classification for the missing pool)", *count)
+	if count.Load() != 1 {
+		t.Fatalf("gate count = %d, want 1 (settled classification for the missing pool)", count.Load())
 	}
 	if used := e.ipam.Used(healthyNet2); used != 1 {
 		t.Fatalf("healthy network used = %d right after the gate opened, want 1 (later interface protected)", used)

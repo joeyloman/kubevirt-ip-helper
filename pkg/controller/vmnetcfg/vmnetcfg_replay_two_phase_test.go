@@ -12,10 +12,10 @@ package vmnetcfg
 
 import (
 	"context"
-	"net/http"
-	"testing"
-
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"net/http"
+	"sync/atomic"
+	"testing"
 
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
 )
@@ -99,7 +99,7 @@ func TestStartupReplayAllocatesOnlyAfterEveryAssignmentRestored(t *testing.T) {
 	}
 
 	// phase 2: the replay finished and the deferred key requeues
-	*e.appStatus = APP_RUNNING
+	e.appStatus.Store(APP_RUNNING)
 	if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, pending); err != nil {
 		t.Fatalf("the requeued pending nic must allocate: %s", err)
 	}
@@ -133,7 +133,7 @@ func TestDeferredKeysRequeueThroughTheQueue(t *testing.T) {
 	}
 
 	// the initialization finished: the wake requeues the deferred key
-	*e.appStatus = APP_RUNNING
+	e.appStatus.Store(APP_RUNNING)
 	e.controller.requeueDeferredInitAllocations()
 
 	// the queued UPDATE event allocates
@@ -209,7 +209,7 @@ func TestPendingNicNeverOvertakesAFailedRestore(t *testing.T) {
 
 	// the deferred allocation runs after the restore and takes the free
 	// address only
-	*e.appStatus = APP_RUNNING
+	e.appStatus.Store(APP_RUNNING)
 	e.controller.requeueDeferredInitAllocations()
 	if err := e.controller.sync(Event{key: testNamespace + "/vm-a", action: UPDATE}); err != nil {
 		t.Fatalf("the requeued pending nic must allocate: %s", err)
@@ -251,15 +251,15 @@ func TestDeferredObjectSettlesTheStartupGate(t *testing.T) {
 	if err := indexer.Add(recorded); err != nil {
 		t.Fatalf("seeding the recorded object: %s", err)
 	}
-	count := 0
+	var count atomic.Int32
 	controller := NewController(newTestQueue(), indexer, nil, e.cache, e.ipam, e.dhcp, e.metrics, e.client, e.appStatus, &count)
 
 	// the deferred object is processed and counted during APP_INIT
 	if err := controller.sync(Event{key: testNamespace + "/vm-a", action: ADD}); err != nil {
 		t.Fatalf("the deferred sync must succeed: %s", err)
 	}
-	if count != 1 {
-		t.Errorf("gate count = %d, want 1 after the deferred object settled", count)
+	if count.Load() != 1 {
+		t.Errorf("gate count = %d, want 1 after the deferred object settled", count.Load())
 	}
 
 	// its pending nic did not allocate during the restoration replay
@@ -275,8 +275,8 @@ func TestDeferredObjectSettlesTheStartupGate(t *testing.T) {
 	if err := controller.sync(Event{key: testNamespace + "/vm-b", action: ADD}); err != nil {
 		t.Fatalf("the recorded assignment must restore: %s", err)
 	}
-	if count != 2 {
-		t.Errorf("gate count = %d, want 2 after the recorded object settled", count)
+	if count.Load() != 2 {
+		t.Errorf("gate count = %d, want 2 after the recorded object settled", count.Load())
 	}
 	if got := e.dhcp.GetLease(testMAC).ClientIP.String(); got != "10.0.0.1" {
 		t.Errorf("vm-b lease ip = %q, want its recorded 10.0.0.1", got)
@@ -284,7 +284,7 @@ func TestDeferredObjectSettlesTheStartupGate(t *testing.T) {
 
 	// after the phase change the deferred work runs through the queue and
 	// obtains the free address
-	*e.appStatus = APP_RUNNING
+	e.appStatus.Store(APP_RUNNING)
 	controller.requeueDeferredInitAllocations()
 	if !controller.processNextItem() {
 		t.Fatal("the requeued event must be processable")

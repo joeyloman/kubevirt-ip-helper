@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -37,8 +38,8 @@ type Controller struct {
 	dhcp                 *dhcp.DHCPAllocator
 	metrics              *metrics.MetricsAllocator
 	kihClientset         *kihclientset.Clientset
-	appStatus            *int
-	vmnetcfgCountCurrent *int
+	appStatus            *atomic.Int32
+	vmnetcfgCountCurrent *atomic.Int32
 
 	// initAttempted tracks the vmnetcfg objects which the current
 	// initialization phase already handled, so an object which cannot
@@ -63,8 +64,8 @@ func NewController(
 	dhcp *dhcp.DHCPAllocator,
 	metrics *metrics.MetricsAllocator,
 	kihClientset *kihclientset.Clientset,
-	appStatus *int,
-	vmnetcfgCountCurrent *int,
+	appStatus *atomic.Int32,
+	vmnetcfgCountCurrent *atomic.Int32,
 ) *Controller {
 	return &Controller{
 		informer:             informer,
@@ -88,7 +89,7 @@ func NewController(
 // controller opens new allocations; a definitively broken object still
 // counts so it does not block the controller startup until it is removed.
 func (c *Controller) markInitAttempt(key string) {
-	if *c.appStatus != APP_INIT {
+	if c.appStatus.Load() != APP_INIT {
 		return
 	}
 
@@ -102,7 +103,7 @@ func (c *Controller) markInitAttempt(key string) {
 
 	c.initAttempted[key] = true
 
-	*c.vmnetcfgCountCurrent++
+	c.vmnetcfgCountCurrent.Add(1)
 }
 
 // initSyncSettled reports whether a failed sync can never succeed on a
@@ -177,7 +178,7 @@ func (c *Controller) runDeferredInitAllocations(stopCh chan struct{}) {
 		case <-time.After(time.Second):
 		}
 
-		if *c.appStatus != APP_INIT {
+		if c.appStatus.Load() != APP_INIT {
 			break
 		}
 	}

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -54,11 +55,11 @@ type handler struct {
 	ippoolEventHandler   *ippool.EventHandler
 	vmnetcfgEventHandler *vmnetcfg.EventHandler
 	vmEventHandler       *vm.EventHandler
-	appStatus            int
+	appStatus            atomic.Int32
 	ippoolCountTarget    int
-	ippoolCountCurrent   int
+	ippoolCountCurrent   atomic.Int32
 	vmnetcfgCountTarget  int
-	vmnetcfgCountCurrent int
+	vmnetcfgCountCurrent atomic.Int32
 	lock                 *resourcelock.LeaseLock
 	leaderId             string
 }
@@ -99,7 +100,7 @@ func (h *handler) Init() {
 	// make sure the leader label is removed in case the pod crashed
 	h.RemoveLeaderPodLabel()
 
-	h.appStatus = APP_INIT
+	h.appStatus.Store(APP_INIT)
 
 	config, err := h.getKubeConfig()
 	if err != nil {
@@ -142,12 +143,12 @@ func (h *handler) Run(mainCtx context.Context) {
 				ctx, cancel = context.WithCancel(context.Background())
 
 				h.RunServices(ctx)
-				h.appStatus = APP_RUNNING
+				h.appStatus.Store(APP_RUNNING)
 
 				// keep the main thread alive
 				for {
 					time.Sleep(time.Second)
-					if h.appStatus == APP_RESTART {
+					if h.appStatus.Load() == APP_RESTART {
 						cancel()
 						h.RemoveLeaderPodLabel()
 						h.metrics.Stop()
@@ -156,10 +157,10 @@ func (h *handler) Run(mainCtx context.Context) {
 
 						time.Sleep(time.Second * 10)
 
-						h.appStatus = APP_INIT
+						h.appStatus.Store(APP_INIT)
 						ctx, cancel = context.WithCancel(context.Background())
 						h.RunServices(ctx)
-						h.appStatus = APP_RUNNING
+						h.appStatus.Store(APP_RUNNING)
 					}
 				}
 			},
@@ -219,7 +220,7 @@ func (h *handler) RunServices(ctx context.Context) {
 		return
 	}
 	h.ippoolCountTarget = len(IPPoolList)
-	h.ippoolCountCurrent = 0
+	h.ippoolCountCurrent.Store(0)
 
 	// initialize the ippoolEventListener handler
 	h.ippoolEventHandler = ippool.NewEventHandler(
@@ -244,17 +245,17 @@ func (h *handler) RunServices(ctx context.Context) {
 	// this prevents race conditions
 	logStartupStateCheck = 0
 	for {
-		if !initGateOpen(h.ippoolCountCurrent, h.ippoolCountTarget) {
+		if !initGateOpen(int(h.ippoolCountCurrent.Load()), h.ippoolCountTarget) {
 			time.Sleep(time.Second * 5)
 
 			if logStartupStateCheck == 12 {
-				log.Warnf("app.RunServices) still waiting for IPPool initialization [%d out of %d] after 1 min.", h.ippoolCountCurrent, h.ippoolCountTarget)
+				log.Warnf("app.RunServices) still waiting for IPPool initialization [%d out of %d] after 1 min.", h.ippoolCountCurrent.Load(), h.ippoolCountTarget)
 				logStartupStateCheck++
 				h.metrics.UpdateLogStatus("warning")
 			} else if logStartupStateCheck == 24 {
 				log.Errorf("app.RunServices) DHCP services are still NOT running [%d out of %d]! There might be something wrong with one of the IPPools!"+
 					" Check above logs for errors and fix them. Then restart the application!",
-					h.ippoolCountCurrent, h.ippoolCountTarget)
+					h.ippoolCountCurrent.Load(), h.ippoolCountTarget)
 				// log again in 65 secs
 				logStartupStateCheck = 13
 				h.metrics.UpdateLogStatus("error")
@@ -277,7 +278,7 @@ func (h *handler) RunServices(ctx context.Context) {
 		return
 	}
 	h.vmnetcfgCountTarget = len(vmnetcfgList)
-	h.vmnetcfgCountCurrent = 0
+	h.vmnetcfgCountCurrent.Store(0)
 
 	// initialize the vmnetcfgEventListener handler
 	h.vmnetcfgEventHandler = vmnetcfg.NewEventHandler(
@@ -302,21 +303,21 @@ func (h *handler) RunServices(ctx context.Context) {
 	// this prevents race conditions
 	logStartupStateCheck = 0
 	for {
-		if !initGateOpen(h.vmnetcfgCountCurrent, h.vmnetcfgCountTarget) {
+		if !initGateOpen(int(h.vmnetcfgCountCurrent.Load()), h.vmnetcfgCountTarget) {
 			time.Sleep(time.Second * 10)
 
 			if logStartupStateCheck == 30 {
-				log.Warnf("app.RunServices) still waiting for VirtualMachineNetworkConfiguration initialization [%d out of %d] after 5 mins.", h.vmnetcfgCountCurrent, h.vmnetcfgCountTarget)
+				log.Warnf("app.RunServices) still waiting for VirtualMachineNetworkConfiguration initialization [%d out of %d] after 5 mins.", h.vmnetcfgCountCurrent.Load(), h.vmnetcfgCountTarget)
 				logStartupStateCheck++
 				h.metrics.UpdateLogStatus("warning")
 			} else if logStartupStateCheck == 60 {
-				log.Warnf("app.RunServices) still waiting for VirtualMachineNetworkConfiguration initialization [%d out of %d] after 10 mins.", h.vmnetcfgCountCurrent, h.vmnetcfgCountTarget)
+				log.Warnf("app.RunServices) still waiting for VirtualMachineNetworkConfiguration initialization [%d out of %d] after 10 mins.", h.vmnetcfgCountCurrent.Load(), h.vmnetcfgCountTarget)
 				logStartupStateCheck++
 				h.metrics.UpdateLogStatus("warning")
 			} else if logStartupStateCheck == 90 {
 				log.Errorf("app.RunServices) VirtualMachineNetworkConfiguration initialization is still not complete [%d out of %d] after > 15 mins! There might be something wrong with the VmNetCfgs count!"+
 					" Check above logs for errors and fix them. Then restart the application!",
-					h.vmnetcfgCountCurrent, h.vmnetcfgCountTarget)
+					h.vmnetcfgCountCurrent.Load(), h.vmnetcfgCountTarget)
 				// log again in 60 secs
 				logStartupStateCheck = 84
 				h.metrics.UpdateLogStatus("error")

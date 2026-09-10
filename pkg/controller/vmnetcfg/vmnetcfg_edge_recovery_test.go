@@ -25,7 +25,7 @@ import (
 // under the canonical owner.
 func TestCorrectedMacRetakesItsAttributedPin(t *testing.T) {
 	e := newTestEnv(t)
-	*e.appStatus = APP_RUNNING
+	e.appStatus.Store(APP_RUNNING)
 	e.addSubnet("10.0.0.1", "10.0.0.1")
 	e.seedPool(nil)
 
@@ -73,7 +73,7 @@ func TestForeignAndUnattributedPinsAreNotAdopted(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			e := newTestEnv(t)
-			*e.appStatus = APP_RUNNING
+			e.appStatus.Store(APP_RUNNING)
 			e.addSubnet("10.0.0.1", "10.0.0.1")
 			e.seedPool(nil)
 
@@ -115,7 +115,7 @@ func TestForeignAndUnattributedPinsAreNotAdopted(t *testing.T) {
 // it while no other owner can displace or release it.
 func TestFreshAllocationIsANamedReservation(t *testing.T) {
 	e := newTestEnv(t)
-	*e.appStatus = APP_RUNNING
+	e.appStatus.Store(APP_RUNNING)
 	e.addSubnet("10.0.0.1", "10.0.0.1")
 	e.seedPool(nil)
 
@@ -158,7 +158,7 @@ func TestFreshAllocationIsANamedReservation(t *testing.T) {
 // and the cleanup converges.
 func TestIpChangeCleanupLeavesTheSuccessorClaim(t *testing.T) {
 	e := newTestEnv(t)
-	*e.appStatus = APP_RUNNING
+	e.appStatus.Store(APP_RUNNING)
 	e.addSubnet("10.0.0.1", "10.0.0.2")
 
 	// the own ledger record still exists while the claim was taken over
