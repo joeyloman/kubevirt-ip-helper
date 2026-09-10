@@ -155,6 +155,57 @@ func TestCacheGetReturnsValueCopy(t *testing.T) {
 	}
 }
 
+// List enumerates every cached pool as a deep copy: the shutdown paths of
+// the application iterate the locally registered pools without the api, so
+// a mutation through a List entry must never rewrite the cached object.
+func TestCacheListReturnsValueCopies(t *testing.T) {
+	c := New()
+	if pools := c.List("pool"); len(pools) != 0 {
+		t.Fatalf("List on an empty cache returned %d pools, want 0", len(pools))
+	}
+
+	if err := c.Add(newTestPool("default/net-a")); err != nil {
+		t.Fatalf("Add returned error: %v", err)
+	}
+	if err := c.Add(newTestPool("default/net-b")); err != nil {
+		t.Fatalf("Add returned error: %v", err)
+	}
+
+	pools := c.List("pool")
+	if len(pools) != 2 {
+		t.Fatalf("List returned %d pools, want 2", len(pools))
+	}
+
+	names := make(map[string]string)
+	for _, pool := range pools {
+		names[pool.Spec.NetworkName] = pool.Spec.IPv4Config.ServerIP
+	}
+	if _, ok := names["default/net-a"]; !ok {
+		t.Errorf("List is missing default/net-a: %v", names)
+	}
+	if _, ok := names["default/net-b"]; !ok {
+		t.Errorf("List is missing default/net-b: %v", names)
+	}
+
+	for i := range pools {
+		if pools[i].Spec.NetworkName == "default/net-a" {
+			pools[i].Spec.IPv4Config.ServerIP = "192.0.2.99"
+		}
+	}
+	got, err := c.Get("pool", "default/net-a")
+	if err != nil {
+		t.Fatalf("Get returned error: %v", err)
+	}
+	if serverIP := got.(kihv1.IPPool).Spec.IPv4Config.ServerIP; serverIP != "10.0.0.1" {
+		t.Errorf("cached ServerIP = %q after mutating a List copy, want 10.0.0.1", serverIP)
+	}
+
+	// unknown types return nothing instead of failing
+	if pools := c.List("vmnetcfg"); len(pools) != 0 {
+		t.Errorf("List of an unknown type returned %d pools, want 0", len(pools))
+	}
+}
+
 // nested state (slices/maps) must be isolated in both directions: mutating
 // the added source object, or the value returned by Get, must never rewrite
 // the cached pool.

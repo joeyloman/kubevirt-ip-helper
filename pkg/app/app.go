@@ -46,45 +46,47 @@ const (
 )
 
 type handler struct {
-	ctx                  context.Context
 	kubeConfigFile       string
 	kubeContext          string
 	namespace            string
-	ipam                 *ipam.IPAllocator
-	dhcp                 *dhcp.DHCPAllocator
-	cache                *cache.CacheAllocator
 	metrics              *metrics.MetricsAllocator
 	ippoolEventHandler   *ippool.EventHandler
 	vmnetcfgEventHandler *vmnetcfg.EventHandler
 	vmEventHandler       *vm.EventHandler
-	// appStatus and the startup counters are allocated per service era in
-	// RunServices: the previous generation keeps its own atomics through the
-	// pointers passed into its handlers, so zombie workers of an old era can
-	// never write into the gate or status of the new era
-	appStatus            *atomic.Int32
-	listenerWg           *sync.WaitGroup
-	ippoolCountTarget    int
-	ippoolCountCurrent   *atomic.Int32
-	vmnetcfgCountTarget  int
-	vmnetcfgCountCurrent *atomic.Int32
-	lock                 *resourcelock.LeaseLock
-	leaderId             string
+	// listenerWg joins the listener goroutines of the current service era
+	// on its shutdown paths: it is allocated once before the leader
+	// election starts and never reassigned, so Wait is always safe
+	listenerWg *sync.WaitGroup
+	lock       *resourcelock.LeaseLock
+	leaderId   string
 	// leaderWatchdog is the leader-election healthz adaptor of the
 	// process: the liveness probe and the force-exit fence both check the
 	// freshness of the leader lease through it. it is created in Run and
-	// registered on every service era's metrics server
+	// registered on the process-global metrics server
 	leaderWatchdog *leaderelection.HealthzAdaptor
+	// era holds the shared state of the current service era: RunServices
+	// builds it fully and publishes it atomically, so the shutdown paths on
+	// other goroutines (OnStoppedLeading, the force-exit fence, the startup
+	// drain) always read a consistent snapshot of the serving state
+	era atomic.Pointer[eraState]
+}
+
+// eraState bundles the shared state of one service era. the event handlers
+// of the era keep the pointers they were constructed with, so zombie
+// workers of a dying era can never write into the startup gate or the
+// status of the next era.
+type eraState struct {
+	ctx                  context.Context
+	appStatus            *atomic.Int32
+	ippoolCountCurrent   *atomic.Int32
+	vmnetcfgCountCurrent *atomic.Int32
+	ipam                 *ipam.IPAllocator
+	dhcp                 *dhcp.DHCPAllocator
+	cache                *cache.CacheAllocator
 }
 
 func Register() *handler {
-	h := &handler{}
-
-	// the shared era state must be usable on a freshly registered handler
-	h.appStatus = new(atomic.Int32)
-	h.appStatus.Store(APP_INIT)
-	h.listenerWg = &sync.WaitGroup{}
-
-	return h
+	return &handler{listenerWg: &sync.WaitGroup{}}
 }
 func (h *handler) getKubeConfig() (config *rest.Config, err error) {
 	// the clients built from this config are used by the leader election
@@ -137,10 +139,6 @@ func (h *handler) Init() {
 	// make sure the leader label is removed in case the pod crashed
 	h.RemoveLeaderPodLabel()
 
-	h.appStatus = new(atomic.Int32)
-	h.appStatus.Store(APP_INIT)
-	h.listenerWg = &sync.WaitGroup{}
-
 	config, err := h.getKubeConfig()
 	if err != nil {
 		handleErr(err)
@@ -174,6 +172,14 @@ func (h *handler) Run(mainCtx context.Context) {
 	// servers answering on the segment
 	h.leaderWatchdog = leaderelection.NewLeaderHealthzAdaptor(10 * time.Second)
 
+	// the metrics and health endpoints are process-global: a standby which
+	// never acquires the leadership must still answer the liveness probe of
+	// its pod (the server used to start per service era, so the kubelet
+	// killed every standby shortly after it started)
+	h.metrics = metrics.New()
+	h.registerHealthChecks()
+	go h.metrics.Run()
+
 	// force-exit fence: the liveness probe and the leader election exit are
 	// the primary fences, but a stale leader stops serving dhcp and removes
 	// its host state a bounded time after the lease went stale even if both
@@ -204,6 +210,26 @@ func (h *handler) Run(mainCtx context.Context) {
 	})
 }
 
+// registerHealthChecks wires the process-global health endpoints: the
+// leaderElection check passes for a non-leader (client-go reports
+// unhealthy only for a lease owner which cannot renew), so a standby stays
+// live, and the services check keeps a not-serving pod out of the ready
+// endpoint without failing its liveness probe.
+func (h *handler) registerHealthChecks() {
+	h.metrics.SetHealthCheck("leaderElection", func() error {
+		return h.leaderWatchdog.Check(nil)
+	})
+	h.metrics.SetHealthCheck("process", func() error { return nil })
+	h.metrics.SetReadinessCheck("services", func() error {
+		era := h.era.Load()
+		if era == nil || era.appStatus.Load() != APP_RUNNING {
+			return errors.New("application is not running its services")
+		}
+
+		return nil
+	})
+}
+
 // onStartedLeading runs the service era of the leadership. the era context
 // is derived from the leader-election context: when the lease is lost,
 // client-go cancels it before the OnStoppedLeading callback runs, so the
@@ -218,7 +244,7 @@ func (h *handler) onStartedLeading(ctx context.Context) {
 
 		return
 	}
-	h.appStatus.Store(APP_RUNNING)
+	h.era.Load().appStatus.Store(APP_RUNNING)
 
 	for {
 		select {
@@ -232,7 +258,8 @@ func (h *handler) onStartedLeading(ctx context.Context) {
 		case <-time.After(time.Second):
 		}
 
-		if h.appStatus.Load() == APP_RESTART {
+		era := h.era.Load()
+		if era != nil && era.appStatus.Load() == APP_RESTART {
 			eraCancel()
 
 			// join the previous controller era before touching shared host
@@ -241,9 +268,6 @@ func (h *handler) onStartedLeading(ctx context.Context) {
 			// re-register NIC IPs or DHCP listeners behind the new era's back
 			h.listenerWg.Wait()
 			h.RemoveLeaderPodLabel()
-			if h.metrics != nil {
-				h.metrics.Stop()
-			}
 			h.stopDHCPListeners()
 			h.NetworkCleanup()
 
@@ -258,7 +282,7 @@ func (h *handler) onStartedLeading(ctx context.Context) {
 
 				return
 			}
-			h.appStatus.Store(APP_RUNNING)
+			h.era.Load().appStatus.Store(APP_RUNNING)
 		}
 	}
 }
@@ -270,9 +294,6 @@ func (h *handler) onStartedLeading(ctx context.Context) {
 func (h *handler) drainStoppedEra(eraCancel context.CancelFunc) {
 	eraCancel()
 	h.listenerWg.Wait()
-	if h.metrics != nil {
-		h.metrics.Stop()
-	}
 	h.stopDHCPListeners()
 	h.RemoveLeaderPodLabel()
 	h.NetworkCleanup()
@@ -301,22 +322,25 @@ func (h *handler) onStoppedLeading() {
 }
 
 // leaderWatchdogLoop force-exits a stale leader: a leader which lost the
-// api cannot renew its lease, and the standby only acquires once the lease
-// expired - the stale leader must stop serving dhcp before that, or two
-// servers answer on the same segment with diverging allocators. the check
-// fails only while this client still owns the lease record but could not
-// renew it (a follower and a healthy leader never fail), and the exit is
-// delayed across consecutive failures so a transient api blip does not
-// kill a healthy leader.
+// api cannot renew its lease, and the standby acquires once the lease
+// expired. this fence is the backstop for a wedged election loop (the
+// primary fences are the election loop's own renew deadline and the
+// liveness probe): the check fails only while this client still owns the
+// lease record but could not renew it (a follower and a healthy leader
+// never fail), and the force-exit lands shortly after the lease-expiry
+// horizon, so the standby may already hold the lease - but the dhcp
+// listeners and the nic addresses are torn down from the local state (the
+// dhcp registry and the pool cache, no api calls), so the stale leader
+// stops answering dhcp within seconds of the first failed checks.
 func (h *handler) leaderWatchdogLoop(adaptor *leaderelection.HealthzAdaptor) {
 	var staleCount int
 
 	for {
-		time.Sleep(10 * time.Second)
+		time.Sleep(5 * time.Second)
 
 		if adaptor.Check(nil) != nil {
 			staleCount++
-			if staleCount >= 3 {
+			if staleCount >= 2 {
 				log.Errorf("(app.Run) the leadership lease of %s could not be renewed for too long, stopping the DHCP services and host state and exiting so the kubelet restarts this pod", h.leaderId)
 				h.stopDHCPListeners()
 				h.NetworkCleanup()
@@ -341,51 +365,27 @@ func initGateOpen(current int, target int) bool {
 }
 
 func (h *handler) RunServices(ctx context.Context) error {
-	// TODO: follow best practice by removing the ctx from the struct
-	// register the new context
-	h.ctx = ctx
-
-	// allocate the shared state of this service era: handlers of a previous
-	// era keep the pointers they were constructed with, so zombie writes can
-	// no longer reach the startup gate or the status seen by the main loop
-	h.appStatus = new(atomic.Int32)
-	h.appStatus.Store(APP_INIT)
-	h.ippoolCountCurrent = new(atomic.Int32)
-	h.vmnetcfgCountCurrent = new(atomic.Int32)
-
-	// initialize the ipam service
-	h.ipam = ipam.New()
-
-	// initialize the dhcp service
-	h.dhcp = dhcp.New()
-
-	// initialize the metrics service
-	h.metrics = metrics.New()
-
-	// the liveness probe of this pod checks the leader-election freshness
-	// and the process state through this server: register the checks on
-	// every era, the server is created per era
-	if h.leaderWatchdog != nil {
-		h.metrics.SetHealthCheck("leaderElection", func() error {
-			return h.leaderWatchdog.Check(nil)
-		})
+	// allocate the shared state of this service era and publish it through
+	// the atomic era pointer: the handlers constructed below keep the
+	// pointers they were constructed with, so zombie workers of a previous
+	// era can never write into the startup gate or the status of this era,
+	// while the shutdown paths on other goroutines always see the current
+	// era. the metrics and health endpoints are process-global (started in
+	// Run) and are never restarted per era
+	era := &eraState{
+		ctx:                  ctx,
+		appStatus:            new(atomic.Int32),
+		ippoolCountCurrent:   new(atomic.Int32),
+		vmnetcfgCountCurrent: new(atomic.Int32),
+		ipam:                 ipam.New(),
+		dhcp:                 dhcp.New(),
+		cache:                cache.New(),
 	}
-	h.metrics.SetHealthCheck("process", func() error { return nil })
-	h.metrics.SetReadinessCheck("services", func() error {
-		if h.appStatus.Load() != APP_RUNNING {
-			return errors.New("application is not running its services")
-		}
-
-		return nil
-	})
-
-	go h.metrics.Run()
+	era.appStatus.Store(APP_INIT)
+	h.era.Store(era)
 
 	// add the kubevirtiphelper/leader pod label
 	h.addLeaderPodLabel()
-
-	// initialize the pool cache
-	h.cache = cache.New()
 
 	// gather the ippool count so we know how many pools we should initialize during startup before initializing the next controller
 	IPPoolList, err := retryList(ctx, h.metrics, "the IPPoolList", func(attemptCtx context.Context) ([]v1.IPPool, error) {
@@ -403,22 +403,22 @@ func (h *handler) RunServices(ctx context.Context) error {
 
 		return fmt.Errorf("cannot gather the IPPoolList: %s", err.Error())
 	}
-	h.ippoolCountTarget = len(IPPoolList)
-	h.ippoolCountCurrent.Store(0)
+	ippoolCountTarget := len(IPPoolList)
+	era.ippoolCountCurrent.Store(0)
 
 	// initialize the ippoolEventListener handler
 	h.ippoolEventHandler = ippool.NewEventHandler(
-		h.ctx,
-		h.ipam,
-		h.dhcp,
+		ctx,
+		era.ipam,
+		era.dhcp,
 		h.metrics,
-		h.cache,
+		era.cache,
 		h.kubeConfigFile,
 		h.kubeContext,
 		nil,
 		nil,
-		h.appStatus,
-		h.ippoolCountCurrent,
+		era.appStatus,
+		era.ippoolCountCurrent,
 	)
 	if err := h.ippoolEventHandler.Init(); err != nil {
 		handleErr(err)
@@ -431,15 +431,15 @@ func (h *handler) RunServices(ctx context.Context) error {
 
 	// wait for the ippool handler to gather all the pools before proceeding the vmnetcfg controller
 	// this prevents race conditions
-	if err := h.waitForStartupGate(ctx, "IPPool", h.ippoolCountCurrent, h.ippoolCountTarget, 5*time.Second,
+	if err := h.waitForStartupGate(ctx, "IPPool", era.ippoolCountCurrent, ippoolCountTarget, 5*time.Second,
 		func(tick int, count int) {
 			switch {
 			case tick == 12:
-				log.Warnf("app.RunServices) still waiting for IPPool initialization [%d out of %d] after 1 min.", count, h.ippoolCountTarget)
+				log.Warnf("app.RunServices) still waiting for IPPool initialization [%d out of %d] after 1 min.", count, ippoolCountTarget)
 				h.metrics.UpdateLogStatus("warning")
 			case tick == 24:
 				log.Errorf("app.RunServices) DHCP services are still NOT running [%d out of %d]! There might be something wrong with one of the IPPools!"+
-					" Check above logs for errors and fix them. The startup gives up when the count stops progressing.", count, h.ippoolCountTarget)
+					" Check above logs for errors and fix them. The startup gives up when the count stops progressing.", count, ippoolCountTarget)
 				h.metrics.UpdateLogStatus("error")
 			}
 		},
@@ -466,22 +466,22 @@ func (h *handler) RunServices(ctx context.Context) error {
 
 		return fmt.Errorf("cannot gather the VirtualMachineNetworkConfig list: %s", err.Error())
 	}
-	h.vmnetcfgCountTarget = len(vmnetcfgList)
-	h.vmnetcfgCountCurrent.Store(0)
+	vmnetcfgCountTarget := len(vmnetcfgList)
+	era.vmnetcfgCountCurrent.Store(0)
 
 	// initialize the vmnetcfgEventListener handler
 	h.vmnetcfgEventHandler = vmnetcfg.NewEventHandler(
-		h.ctx,
-		h.ipam,
-		h.dhcp,
+		ctx,
+		era.ipam,
+		era.dhcp,
 		h.metrics,
-		h.cache,
+		era.cache,
 		h.kubeConfigFile,
 		h.kubeContext,
 		nil,
 		nil,
-		h.appStatus,
-		h.vmnetcfgCountCurrent,
+		era.appStatus,
+		era.vmnetcfgCountCurrent,
 	)
 	if err := h.vmnetcfgEventHandler.Init(); err != nil {
 		handleErr(err)
@@ -494,18 +494,18 @@ func (h *handler) RunServices(ctx context.Context) error {
 
 	// wait for the vmnetcfg handler to gather all the network configs before proceeding the vm controller
 	// this prevents race conditions
-	if err := h.waitForStartupGate(ctx, "VirtualMachineNetworkConfiguration", h.vmnetcfgCountCurrent, h.vmnetcfgCountTarget, 10*time.Second,
+	if err := h.waitForStartupGate(ctx, "VirtualMachineNetworkConfiguration", era.vmnetcfgCountCurrent, vmnetcfgCountTarget, 10*time.Second,
 		func(tick int, count int) {
 			switch {
 			case tick == 30:
-				log.Warnf("app.RunServices) still waiting for VirtualMachineNetworkConfiguration initialization [%d out of %d] after 5 mins.", count, h.vmnetcfgCountTarget)
+				log.Warnf("app.RunServices) still waiting for VirtualMachineNetworkConfiguration initialization [%d out of %d] after 5 mins.", count, vmnetcfgCountTarget)
 				h.metrics.UpdateLogStatus("warning")
 			case tick == 60:
-				log.Warnf("app.RunServices) still waiting for VirtualMachineNetworkConfiguration initialization [%d out of %d] after 10 mins.", count, h.vmnetcfgCountTarget)
+				log.Warnf("app.RunServices) still waiting for VirtualMachineNetworkConfiguration initialization [%d out of %d] after 10 mins.", count, vmnetcfgCountTarget)
 				h.metrics.UpdateLogStatus("warning")
 			case tick == 90:
 				log.Errorf("app.RunServices) VirtualMachineNetworkConfiguration initialization is still not complete [%d out of %d] after > 15 mins! There might be something wrong with the VmNetCfgs count!"+
-					" Check above logs for errors and fix them. The startup gives up when the count stops progressing.", count, h.vmnetcfgCountTarget)
+					" Check above logs for errors and fix them. The startup gives up when the count stops progressing.", count, vmnetcfgCountTarget)
 				h.metrics.UpdateLogStatus("error")
 			}
 		},
@@ -520,11 +520,11 @@ func (h *handler) RunServices(ctx context.Context) error {
 
 	// initialize the vmEventListener handler
 	h.vmEventHandler = vm.NewEventHandler(
-		h.ctx,
-		h.ipam,
-		h.dhcp,
+		ctx,
+		era.ipam,
+		era.dhcp,
 		h.metrics,
-		h.cache,
+		era.cache,
 		h.kubeConfigFile,
 		h.kubeContext,
 		nil,
@@ -677,20 +677,22 @@ func (h *handler) getVmNetCfgs(ctx context.Context) (vmnetcfgs []v1.VirtualMachi
 	return vmnetcfgList.Items, err
 }
 
+// NetworkCleanup removes the server ip of every pool registered in this
+// process era from its bind interface, sourced from the local pool cache:
+// the shutdown paths must never depend on the api (a stale leader which
+// lost the api is exactly the case these fences exist for). the startup
+// cleanup of a previously killed process is a separate concern: a fresh
+// process has no local pool cache yet, so StartupNetworkCleanup gathers
+// the pools from the api instead.
 func (h *handler) NetworkCleanup() {
-	// bound the gather: the cleanup runs on the shutdown paths where a hang
-	// must not block the exit
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	IPPoolList, err := h.getIPPools(ctx)
-	if err != nil {
-		log.Errorf("(app.NetworkCleanup) %s", err.Error())
-
+	era := h.era.Load()
+	if era == nil || era.cache == nil {
+		// this process never ran services (it never acquired the
+		// leadership): it holds no server addresses of its own to remove
 		return
 	}
 
-	for _, pool := range IPPoolList {
+	for _, pool := range era.cache.List("pool") {
 		// remove the IP address from the bind interface
 		ipnet, err := netip.ParsePrefix(pool.Spec.IPv4Config.Subnet)
 		if err != nil {
@@ -712,30 +714,59 @@ func (h *handler) NetworkCleanup() {
 	}
 }
 
-func (h *handler) stopDHCPListeners() {
-	if h.dhcp == nil {
-		// this pod never ran services (it never acquired the leadership):
-		// there are no listeners of its own to stop
-		return
-	}
-
+// StartupNetworkCleanup removes the server ips of all pools of the cluster
+// from the local interfaces at process start: it is the workaround for a
+// previously killed process which could not clean up after itself, so the
+// pools must be gathered from the api (a fresh process has no local pool
+// cache yet). an unreachable api only skips the workaround.
+func (h *handler) StartupNetworkCleanup() {
+	// bound the gather: the cleanup runs before the leader election starts
+	// where a hang must not block the startup
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	IPPoolList, err := h.getIPPools(ctx)
 	if err != nil {
-		log.Errorf("(app.stopDHCPListeners) %s", err.Error())
+		log.Errorf("(app.StartupNetworkCleanup) %s", err.Error())
 
 		return
 	}
 
 	for _, pool := range IPPoolList {
-		if err := h.dhcp.Stop(pool.Spec.NetworkName); err != nil {
-			// this is defined as a debug log because some listeners could have been already stopped and this will cause an error
-			log.Debugf("(app.stopDHCPListeners) error while shutting down DHCP listener running on nic [%s] for network [%s]: %s",
-				pool.Spec.BindInterface, pool.Spec.NetworkName, err.Error())
+		// remove the IP address from the bind interface
+		ipnet, err := netip.ParsePrefix(pool.Spec.IPv4Config.Subnet)
+		if err != nil {
+			log.Errorf("(app.StartupNetworkCleanup) error while parsing subnet [%s] during network cleanup for network [%s]: %s",
+				pool.Spec.IPv4Config.Subnet, pool.Spec.NetworkName, err.Error())
+
+			continue
+		}
+		ip4 := fmt.Sprintf("%s/%d", pool.Spec.IPv4Config.ServerIP, ipnet.Bits())
+
+		log.Debugf("(app.StartupNetworkCleanup) removing the IP4 address [%s] on nic [%s] for network [%s]",
+			ip4, pool.Spec.BindInterface, pool.Spec.NetworkName)
+
+		if err := network.RemoveIpFromNic(pool.Spec.BindInterface, ip4); err != nil {
+			// this is defined as a debug log because the ip could have been already removed and this will cause an error
+			log.Debugf("(app.StartupNetworkCleanup) error while removing IP4 address [%s] from bind interface [%s] for network [%s]: %s",
+				ip4, pool.Spec.BindInterface, pool.Spec.NetworkName, err.Error())
 		}
 	}
+}
+
+// stopDHCPListeners stops every DHCP listener this process era started,
+// straight from the dhcp registry: the shutdown paths must never depend on
+// the api (a stale leader which lost the api is exactly the case these
+// fences exist for), so the pool list is not gathered here anymore.
+func (h *handler) stopDHCPListeners() {
+	era := h.era.Load()
+	if era == nil || era.dhcp == nil {
+		// this process never ran services (it never acquired the
+		// leadership): there are no listeners of its own to stop
+		return
+	}
+
+	era.dhcp.StopAll()
 }
 
 // The addLeaderPodLabel and removeLeaderPodLabel funtions are managing the kubevirtiphelper/leader label.

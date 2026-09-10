@@ -87,6 +87,27 @@ func (c *CacheAllocator) Get(t string, name string) (i interface{}, err error) {
 	return
 }
 
+// List returns a deep copy of every cached pool of the given type: the
+// shutdown paths of the application enumerate the locally registered pools
+// without the api, and the copies keep the callers from mutating the cached
+// objects while they keep interpreting them as kihv1.IPPool values (the
+// same contract as Get).
+func (c *CacheAllocator) List(t string) (pools []kihv1.IPPool) {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+
+	switch t {
+	case "pool":
+		log.Debugf("(cache.List) returning %d pools", len(c.ipPoolCache))
+
+		for _, stored := range c.ipPoolCache {
+			pools = append(pools, *stored.DeepCopy())
+		}
+	}
+
+	return
+}
+
 func (c *CacheAllocator) Delete(t string, name string) (err error) {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()

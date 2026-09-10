@@ -5,19 +5,27 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	log "github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/leaderelection"
 
+	v1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/cache"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/dhcp"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/metrics"
 )
 
 // The tests in this file cover the app handler's configuration, listing,
@@ -135,8 +143,11 @@ func TestHandler_Register(t *testing.T) {
 	if h == nil {
 		t.Fatal("Register() returned nil")
 	}
-	if h.appStatus.Load() != APP_INIT {
-		t.Errorf("fresh handler appStatus = %d, want %d (APP_INIT)", h.appStatus.Load(), APP_INIT)
+	if h.listenerWg == nil {
+		t.Error("fresh handler listenerWg is nil, want an allocated WaitGroup")
+	}
+	if h.era.Load() != nil {
+		t.Error("fresh handler era is set, want no era before the leadership is acquired")
 	}
 	if h.kubeConfigFile != "" {
 		t.Errorf("fresh handler kubeConfigFile = %q, want empty", h.kubeConfigFile)
@@ -385,6 +396,76 @@ func TestHandler_getVmNetCfgs(t *testing.T) {
 }
 
 func TestHandler_NetworkCleanup(t *testing.T) {
+	t.Run("removes the addresses of the locally registered pools without the api", func(t *testing.T) {
+		hook := attachLogCapture(t)
+
+		cacheAllocator := cache.New()
+		if err := cacheAllocator.Add(&v1.IPPool{
+			ObjectMeta: metav1.ObjectMeta{Name: "pool-a"},
+			Spec: v1.IPPoolSpec{
+				NetworkName:   "net-a",
+				BindInterface: "",
+				IPv4Config: v1.IPv4Config{
+					ServerIP: "192.168.1.1",
+					Subnet:   "192.168.1.0/24",
+				},
+			},
+		}); err != nil {
+			t.Fatalf("adding the pool to the cache: %s", err)
+		}
+		if err := cacheAllocator.Add(&v1.IPPool{
+			ObjectMeta: metav1.ObjectMeta{Name: "pool-bad"},
+			Spec: v1.IPPoolSpec{
+				NetworkName:   "net-bad",
+				BindInterface: "eth0",
+				IPv4Config: v1.IPv4Config{
+					ServerIP: "not-an-ip",
+					Subnet:   "not-a-subnet",
+				},
+			},
+		}); err != nil {
+			t.Fatalf("adding the bad pool to the cache: %s", err)
+		}
+
+		// an unreachable kubeconfig proves the api is never contacted
+		h := &handler{kubeConfigFile: filepath.Join(t.TempDir(), "kubeconfig")}
+		h.era.Store(&eraState{cache: cacheAllocator})
+		h.NetworkCleanup() // must not panic
+
+		// the good pool is processed from the local cache and its removal is
+		// attempted (no interface named "" can exist, so the removal fails
+		// and is logged at debug), while the bad subnet only skips its own
+		// pool
+		if !hook.contains("removing the IP4 address [192.168.1.1/24] on nic [] for network [net-a]") {
+			t.Errorf("expected the cached pool to be cleaned up, got:\n%s", hook.entriesText())
+		}
+		if !hook.contains("error while removing IP4 address [192.168.1.1/24] from bind interface [] for network [net-a]") {
+			t.Errorf("expected the debug log for the missing interface, got:\n%s", hook.entriesText())
+		}
+		if !hook.contains("error while parsing subnet [not-a-subnet]") {
+			t.Errorf("expected a log entry about the unparsable subnet, got:\n%s", hook.entriesText())
+		}
+		if hook.contains("app.StartupNetworkCleanup") {
+			t.Errorf("the shutdown cleanup must not gather pools from the api, got:\n%s", hook.entriesText())
+		}
+	})
+
+	t.Run("no era means no cleanup and no api call", func(t *testing.T) {
+		hook := attachLogCapture(t)
+		h := &handler{
+			// an unreachable kubeconfig proves the api is never contacted
+			kubeConfigFile: filepath.Join(t.TempDir(), "kubeconfig"),
+			namespace:      "testns",
+		}
+		h.NetworkCleanup() // must not panic
+
+		if len(hook.entries) != 0 {
+			t.Errorf("expected no cleanup logs without an era, got:\n%s", hook.entriesText())
+		}
+	})
+}
+
+func TestHandler_StartupNetworkCleanup(t *testing.T) {
 	const cleanupPoolsJSON = `{
   "kind": "IPPoolList",
   "apiVersion": "kubevirtiphelper.k8s.binbash.org/v1",
@@ -427,7 +508,7 @@ func TestHandler_NetworkCleanup(t *testing.T) {
 			kubeConfigFile: writeTestKubeconfig(t, srv.URL),
 			namespace:      "testns",
 		}
-		h.NetworkCleanup()
+		h.StartupNetworkCleanup()
 
 		if !hook.contains("error while parsing subnet [not-a-subnet]") {
 			t.Errorf("expected a log entry about the unparsable subnet, got:\n%s", hook.entriesText())
@@ -454,9 +535,9 @@ func TestHandler_NetworkCleanup(t *testing.T) {
 			kubeConfigFile: writeTestKubeconfig(t, url),
 			namespace:      "testns",
 		}
-		h.NetworkCleanup() // must not panic
+		h.StartupNetworkCleanup() // must not panic
 
-		if !hook.contains("app.NetworkCleanup") {
+		if !hook.contains("app.StartupNetworkCleanup") {
 			t.Errorf("expected an error logged for the unreachable API, got:\n%s", hook.entriesText())
 		}
 	})
@@ -471,32 +552,38 @@ func TestHandler_NetworkCleanup(t *testing.T) {
 		if err := os.WriteFile(badFile, []byte("not: [valid"), 0600); err != nil {
 			t.Fatalf("writing malformed kubeconfig: %s", err)
 		}
-		h.NetworkCleanup() // must not panic
+		h.StartupNetworkCleanup() // must not panic
 
-		if !hook.contains("app.NetworkCleanup") {
+		if !hook.contains("app.StartupNetworkCleanup") {
 			t.Errorf("expected an error logged for the invalid kubeconfig, got:\n%s", hook.entriesText())
 		}
 	})
 }
 
 func TestHandler_stopDHCPListeners(t *testing.T) {
-	t.Run("proceeds when the API is unreachable", func(t *testing.T) {
-		srv := httptest.NewServer(http.NotFoundHandler())
-		url := srv.URL
-		srv.Close()
-
+	t.Run("stops from the local registry without the api", func(t *testing.T) {
 		hook := attachLogCapture(t)
+
 		h := &handler{
-			kubeConfigFile: writeTestKubeconfig(t, url),
+			// an unreachable kubeconfig proves the api is never contacted
+			kubeConfigFile: filepath.Join(t.TempDir(), "kubeconfig"),
 			namespace:      "testns",
-			// the nil-guarded path (no services ever ran) is covered
-			// separately; here the listener shutdown itself must proceed
-			dhcp: dhcp.New(),
 		}
+		h.era.Store(&eraState{dhcp: dhcp.New()})
 		h.stopDHCPListeners() // must not panic
 
-		if !hook.contains("app.stopDHCPListeners") {
-			t.Errorf("expected an error logged for the unreachable API, got:\n%s", hook.entriesText())
+		if len(hook.entries) != 0 {
+			t.Errorf("the registry stop needs no api and logs nothing on an empty registry, got:\n%s", hook.entriesText())
+		}
+	})
+
+	t.Run("no era means no listeners of this process", func(t *testing.T) {
+		hook := attachLogCapture(t)
+		h := &handler{}
+		h.stopDHCPListeners() // must not panic
+
+		if len(hook.entries) != 0 {
+			t.Errorf("expected no logs without an era, got:\n%s", hook.entriesText())
 		}
 	})
 }
@@ -838,8 +925,8 @@ func TestHandler_Init(t *testing.T) {
 		if h.kubeContext != "test" {
 			t.Errorf("kubeContext = %q, want %q", h.kubeContext, "test")
 		}
-		if h.appStatus.Load() != APP_INIT {
-			t.Errorf("appStatus = %d, want %d (APP_INIT)", h.appStatus.Load(), APP_INIT)
+		if h.era.Load() != nil {
+			t.Error("era is set after Init, want no era before the leadership is acquired")
 		}
 		if h.leaderId == "" {
 			t.Error("leaderId is empty after Init")
@@ -882,4 +969,76 @@ func (h *captureHook) entriesText() string {
 		fmt.Fprintf(&sb, "%s: %s\n", e.Level, e.Message)
 	}
 	return sb.String()
+}
+
+// The health endpoints are process-global, so a standby replica must stay
+// live (a non-leader never fails the leaderElection check) while only the
+// readiness reflects the serving state of the current era. This pins the
+// contract the pod's kubelet probes rely on, against the real HTTP server.
+func TestRegisterHealthChecksStandbyAndEraStates(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserving a metrics port: %s", err)
+	}
+	metricsPort := listener.Addr().(*net.TCPAddr).Port
+	if err := listener.Close(); err != nil {
+		t.Fatalf("releasing the reserved metrics port: %s", err)
+	}
+	t.Setenv("METRICS_PORT", strconv.Itoa(metricsPort))
+
+	h := Register()
+	h.leaderWatchdog = leaderelection.NewLeaderHealthzAdaptor(10 * time.Second)
+	h.metrics = metrics.New()
+	h.registerHealthChecks()
+	go h.metrics.Run()
+
+	baseURL := fmt.Sprintf("http://127.0.0.1:%d", metricsPort)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		resp, err := http.Get(baseURL + "/healthz")
+		if err == nil {
+			resp.Body.Close()
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the metrics server never came up: %s", err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	getStatusCode := func(path string) int {
+		t.Helper()
+		resp, err := http.Get(baseURL + path)
+		if err != nil {
+			t.Fatalf("GET %s: %s", path, err)
+		}
+		defer resp.Body.Close()
+
+		return resp.StatusCode
+	}
+
+	// a standby never acquires the leadership: liveness must pass (this is
+	// the check which used to kill every standby) while readiness fails
+	if code := getStatusCode("/healthz"); code != http.StatusOK {
+		t.Errorf("standby /healthz = %d, want %d", code, http.StatusOK)
+	}
+	if code := getStatusCode("/ready"); code != http.StatusServiceUnavailable {
+		t.Errorf("standby /ready = %d, want %d", code, http.StatusServiceUnavailable)
+	}
+
+	// an era which is still initializing serves no leases yet
+	era := &eraState{appStatus: new(atomic.Int32)}
+	era.appStatus.Store(APP_INIT)
+	h.era.Store(era)
+	if code := getStatusCode("/ready"); code != http.StatusServiceUnavailable {
+		t.Errorf("initializing /ready = %d, want %d", code, http.StatusServiceUnavailable)
+	}
+
+	// once the era runs its services the pod becomes ready
+	era.appStatus.Store(APP_RUNNING)
+	if code := getStatusCode("/ready"); code != http.StatusOK {
+		t.Errorf("running /ready = %d, want %d", code, http.StatusOK)
+	}
+
+	h.metrics.Stop()
 }
