@@ -1,6 +1,7 @@
 package vmnetcfg
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"sync/atomic"
@@ -25,6 +26,7 @@ func newGateTestEnv(t *testing.T) (*testEnv, *Controller, *atomic.Int32) {
 	var appStatus, count atomic.Int32
 	appStatus.Store(APP_INIT)
 	controller := NewController(
+		context.Background(),
 		newTestQueue(),
 		newTestIndexer(),
 		nil,

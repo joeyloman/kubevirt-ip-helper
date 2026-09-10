@@ -77,6 +77,7 @@ func newTestController(t *testing.T, queue workqueue.RateLimitingInterface, inde
 	t.Helper()
 
 	controller := NewController(
+		context.Background(),
 		queue,
 		indexer,
 		informer,

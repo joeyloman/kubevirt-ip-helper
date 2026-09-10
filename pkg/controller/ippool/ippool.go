@@ -1,7 +1,6 @@
 package ippool
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -83,6 +82,12 @@ func (c *Controller) registerIPPool(pool *kihv1.IPPool) (cleanup bool, err error
 		return cleanup, fmt.Errorf("networkname [%s] is already registered by another IPPool, not touching its live state: %w", pool.Spec.NetworkName, ErrPoolUnregistrable)
 	}
 
+	// from here pool sub resources needs to be cleaned up when something
+	// goes wrong; the flag is set before the host-state mutation so a
+	// rejected add (a stale or duplicated server ip the idempotent add
+	// cannot make sense of) still tears the interface state down
+	cleanup = true
+
 	ip4 := fmt.Sprintf("%s/%d", pool.Spec.IPv4Config.ServerIP, ipnet.Bits())
 	if err := network.AddIpToNic(pool.Spec.BindInterface, ip4); err != nil {
 		return cleanup, fmt.Errorf("error while adding IP4 address [%s] to bind interface [%s] for network [%s]: %s",
@@ -92,16 +97,13 @@ func (c *Controller) registerIPPool(pool *kihv1.IPPool) (cleanup bool, err error
 	log.Debugf("(ippool.registerIPPool) added IP4 address [%s] to nic [%s] for network [%s]",
 		ip4, pool.Spec.BindInterface, pool.Spec.NetworkName)
 
-	// from here pool sub resources needs to be cleaned up when something goes wrong
-	cleanup = true
-
 	// create the new dhcp pool
 	if err := c.createOrUpdateDHCPPool(pool); err != nil {
 		return cleanup, fmt.Errorf("error while registering DHCP pool for network [%s]: %s", pool.Spec.NetworkName, err.Error())
 	}
 
 	// start a dhcp service thread for the pool identity (networkname)
-	if err := c.dhcp.Run(pool.Spec.NetworkName, pool.Spec.BindInterface, pool.Spec.IPv4Config.ServerIP); err != nil {
+	if err := c.dhcp.Run(pool.Spec.NetworkName, pool.Spec.BindInterface); err != nil {
 		return cleanup, fmt.Errorf("error while starting DHCP service thread for network [%s]: %s", pool.Spec.NetworkName, err.Error())
 	}
 
@@ -422,7 +424,7 @@ type specClaim struct {
 // allocator which may hand bound addresses to new vms.
 func (c *Controller) protectPersistedClaims(pool *kihv1.IPPool) (map[string]string, error) {
 	cPool, err := c.kihClientset.KubevirtiphelperV1().IPPools().Get(
-		context.TODO(), pool.Name, metav1.GetOptions{},
+		c.ctx, pool.Name, metav1.GetOptions{},
 	)
 	if err != nil {
 		// without the persisted status the claims cannot be known: fail
@@ -507,7 +509,7 @@ func (c *Controller) protectPersistedClaims(pool *kihv1.IPPool) (map[string]stri
 	// every namespace and every nic, and a claim whose ledger entry was
 	// lost (a historical partial write) is protected like any other
 	vmnetcfgList, err := c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs("").List(
-		context.TODO(), metav1.ListOptions{},
+		c.ctx, metav1.ListOptions{},
 	)
 	if err != nil {
 		// an incomplete snapshot must not publish the pool: an unseen claim
@@ -687,7 +689,7 @@ func (c *Controller) protectPersistedClaims(pool *kihv1.IPPool) (map[string]stri
 	// never resurrect the claim on the next restart
 	for _, claim := range pinnedClaims {
 		vmnetcfg, getErr := c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs(claim.namespace).Get(
-			context.TODO(), claim.name, metav1.GetOptions{},
+			c.ctx, claim.name, metav1.GetOptions{},
 		)
 		if getErr != nil {
 			if apierrors.IsNotFound(getErr) {
@@ -781,7 +783,7 @@ func ipWithinPoolRange(pool *kihv1.IPPool, ip string) bool {
 // ownership records again while the addresses stay unavailable to fresh
 // allocations.
 func (c *Controller) resetIPPoolStatus(pool *kihv1.IPPool, protectedClaims map[string]string) (uPool *kihv1.IPPool, err error) {
-	cPool, err := c.kihClientset.KubevirtiphelperV1().IPPools().Get(context.TODO(), pool.Name, metav1.GetOptions{})
+	cPool, err := c.kihClientset.KubevirtiphelperV1().IPPools().Get(c.ctx, pool.Name, metav1.GetOptions{})
 	if err != nil {
 		return uPool, err
 	}
@@ -807,7 +809,7 @@ func (c *Controller) resetIPPoolStatus(pool *kihv1.IPPool, protectedClaims map[s
 	cPool.Status.IPv4.Used = c.ipam.Used(pool.Spec.NetworkName)
 	cPool.Status.IPv4.Available = c.ipam.Available(pool.Spec.NetworkName)
 
-	uPool, err = c.kihClientset.KubevirtiphelperV1().IPPools().UpdateStatus(context.TODO(), cPool, metav1.UpdateOptions{})
+	uPool, err = c.kihClientset.KubevirtiphelperV1().IPPools().UpdateStatus(c.ctx, cPool, metav1.UpdateOptions{})
 	if err != nil {
 		return uPool, err
 	}
@@ -816,7 +818,7 @@ func (c *Controller) resetIPPoolStatus(pool *kihv1.IPPool, protectedClaims map[s
 }
 
 func (c *Controller) resetIPPoolMetrics(pool *kihv1.IPPool) (err error) {
-	cPool, err := c.kihClientset.KubevirtiphelperV1().IPPools().Get(context.TODO(), pool.Name, metav1.GetOptions{})
+	cPool, err := c.kihClientset.KubevirtiphelperV1().IPPools().Get(c.ctx, pool.Name, metav1.GetOptions{})
 	if err != nil {
 		return
 	}

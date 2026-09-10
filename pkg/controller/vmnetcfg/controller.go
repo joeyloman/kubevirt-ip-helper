@@ -1,6 +1,7 @@
 package vmnetcfg
 
 import (
+	"context"
 	"errors"
 	"net"
 	"sync"
@@ -30,6 +31,7 @@ const (
 )
 
 type Controller struct {
+	ctx                  context.Context
 	indexer              cache.Indexer
 	queue                workqueue.RateLimitingInterface
 	informer             cache.Controller
@@ -56,6 +58,7 @@ type Controller struct {
 }
 
 func NewController(
+	ctx context.Context,
 	queue workqueue.RateLimitingInterface,
 	indexer cache.Indexer,
 	informer cache.Controller,
@@ -67,7 +70,15 @@ func NewController(
 	appStatus *atomic.Int32,
 	vmnetcfgCountCurrent *atomic.Int32,
 ) *Controller {
+	// the API calls of a reconciliation run under the era context: a
+	// canceled era (application reinit or shutdown) aborts in-flight
+	// syncs instead of blocking the era join until every client timeout
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	return &Controller{
+		ctx:                  ctx,
 		informer:             informer,
 		indexer:              indexer,
 		queue:                queue,

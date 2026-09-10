@@ -67,3 +67,48 @@ func TestRemoveIpFromNicMissingLink(t *testing.T) {
 		t.Fatal("expected error for a missing link")
 	}
 }
+
+func TestIPMaskEqual(t *testing.T) {
+	cases := []struct {
+		name string
+		a    net.IPMask
+		b    net.IPMask
+		want bool
+	}{
+		{
+			name: "same-4-byte-mask",
+			a:    net.CIDRMask(24, 32),
+			b:    net.CIDRMask(24, 32),
+			want: true,
+		},
+		{
+			name: "same-prefix-16-byte-mask",
+			a:    net.CIDRMask(24, 32),
+			b:    net.CIDRMask(24, 128),
+			want: true,
+		},
+		{
+			name: "different-prefix",
+			a:    net.CIDRMask(24, 32),
+			b:    net.CIDRMask(25, 32),
+			want: false,
+		},
+		{
+			name: "different-prefix-16-byte-mask",
+			a:    net.CIDRMask(24, 128),
+			b:    net.CIDRMask(25, 128),
+			want: false,
+		},
+		{
+			name: "mask-without-v4-width",
+			a:    net.CIDRMask(24, 32),
+			b:    net.CIDRMask(24, 64),
+			want: false,
+		},
+	}
+	for _, tc := range cases {
+		if got := ipMaskEqual(tc.a, tc.b); got != tc.want {
+			t.Errorf("ipMaskEqual(%s) = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}

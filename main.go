@@ -47,12 +47,13 @@ func main() {
 	// The same applies for the LeaderPodLabel.
 	mainApp.NetworkCleanup()
 
+	// canceling the main context releases the leader lease and runs the
+	// OnStoppedLeading cleanup (leader label + network state) exactly once;
+	// the explicit cleanup workaround for killed processes stays as the
+	// NetworkCleanup call at startup
 	go func() {
 		<-sig
 		cancel()
-		mainApp.RemoveLeaderPodLabel()
-		mainApp.NetworkCleanup()
-		os.Exit(1)
 	}()
 
 	mainApp.Init()

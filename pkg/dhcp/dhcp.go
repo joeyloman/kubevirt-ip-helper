@@ -519,7 +519,12 @@ func (a *DHCPAllocator) dhcpHandler(conn net.PacketConn, peer net.Addr, m *dhcpv
 	reply.UpdateOption(dhcpv4.OptMessageType(replyType))
 	reply.UpdateOption(dhcpv4.OptServerIdentifier(pool.ServerIP))
 	reply.UpdateOption(dhcpv4.OptSubnetMask(pool.SubnetMask))
-	reply.UpdateOption(dhcpv4.OptRouter(pool.Router))
+
+	// an unset router must not produce a zero-length option (code 3 with
+	// no payload), which strict client parsers drop
+	if len(pool.Router) > 0 {
+		reply.UpdateOption(dhcpv4.OptRouter(pool.Router))
+	}
 
 	if len(pool.DNS) > 0 {
 		reply.UpdateOption(dhcpv4.OptDNS(pool.DNS...))
@@ -601,7 +606,7 @@ func (a *DHCPAllocator) sendNak(conn net.PacketConn, m *dhcpv4.DHCPv4, serverIP 
 // for the same network is rejected instead of overwriting the registry
 // entry and orphaning the live server (socket and serve goroutine) which
 // Stop could then never reach.
-func (a *DHCPAllocator) Run(networkName string, nic string, serverip string) (err error) {
+func (a *DHCPAllocator) Run(networkName string, nic string) (err error) {
 	log.Infof("(dhcp.Run) starting DHCP service for network %s on nic %s", networkName, nic)
 
 	// we need to listen on 0.0.0.0 otherwise client discovers will not be answered

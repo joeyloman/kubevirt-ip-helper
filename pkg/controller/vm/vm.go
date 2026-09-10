@@ -1,13 +1,10 @@
 package vm
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
-	"strings"
-	"time"
 
 	log "github.com/sirupsen/logrus"
 
@@ -19,13 +16,14 @@ import (
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/dhcp"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/ippoolstatus"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/util"
 )
 
 func (c *Controller) handleVirtualMachineObjectChange(vm *kubevirtV1.VirtualMachine) (err error) {
-	vmnetcfg, err := c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs(vm.Namespace).Get(context.TODO(), vm.Name, metav1.GetOptions{})
+	vmnetcfg, err := c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs(vm.Namespace).Get(c.ctx, vm.Name, metav1.GetOptions{})
 	if err != nil {
-		if strings.Contains(err.Error(), "not found") {
+		if apierrors.IsNotFound(err) {
 			return c.createVirtualMachineNetworkConfigObject(vm)
 		} else {
 			return
@@ -59,7 +57,7 @@ func (c *Controller) createVirtualMachineNetworkConfigObject(vm *kubevirtV1.Virt
 	}
 	newVmNetCfg.Spec.NetworkConfig = netCfgs
 
-	vmNetCfgObj, err := c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs(newVmNetCfg.Namespace).Create(context.TODO(), &newVmNetCfg, metav1.CreateOptions{})
+	vmNetCfgObj, err := c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs(newVmNetCfg.Namespace).Create(c.ctx, &newVmNetCfg, metav1.CreateOptions{})
 	if err != nil {
 		return fmt.Errorf("(vm.createVirtualMachineNetworkConfig) [%s/%s] cannot create VirtualMachineNetworkConfig object for vm: %s",
 			vm.Namespace, vm.Name, err.Error())
@@ -110,7 +108,7 @@ func (c *Controller) updateVirtualMachineNetworkConfigObject(vm *kubevirtV1.Virt
 		}
 	}
 
-	vmNetCfgObj, err := c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs(newVmNetCfg.Namespace).Update(context.TODO(), newVmNetCfg, metav1.UpdateOptions{})
+	vmNetCfgObj, err := c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs(newVmNetCfg.Namespace).Update(c.ctx, newVmNetCfg, metav1.UpdateOptions{})
 	if err != nil {
 		return fmt.Errorf("(vm.updateVirtualMachineNetworkConfigObject) [%s/%s] cannot update VirtualMachineNetworkConfig object for vm: %s",
 			vm.Namespace, vm.Name, err.Error())
@@ -130,7 +128,7 @@ func (c *Controller) deleteVirtualMachineNetworkConfigObject(vmNamespace string,
 		return
 	}
 
-	if err = c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs(vmNamespace).Delete(context.TODO(), vmName, metav1.DeleteOptions{}); err != nil {
+	if err = c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs(vmNamespace).Delete(c.ctx, vmName, metav1.DeleteOptions{}); err != nil {
 		if apierrors.IsNotFound(err) {
 			// another worker or a concurrent cleanup already removed the object
 			log.Debugf("(vm.deleteVirtualMachineNetworkConfigObject) [%s/%s] vmnetcfg object already deleted",
@@ -152,7 +150,7 @@ func (c *Controller) deleteVirtualMachineNetworkConfigObject(vmNamespace string,
 }
 
 func (c *Controller) checkVirtualMachineNetworkConfigObject(vmNamespace string, vmName string) bool {
-	if _, err := c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs(vmNamespace).Get(context.TODO(), vmName, metav1.GetOptions{}); err != nil {
+	if _, err := c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs(vmNamespace).Get(c.ctx, vmName, metav1.GetOptions{}); err != nil {
 		return false
 	}
 
@@ -364,80 +362,5 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 }
 
 func (c *Controller) updateIPPoolStatus(event string, vmnetcfgNamespace string, vmnetcfgVMName string, ip string, networkName string, hwAddr string, poolName string) (err error) {
-	// Retry max 10 attempts for conflicts
-	maxRetries := 10
-	retryDelay := 100 * time.Millisecond
-
-	for retry := 0; retry < maxRetries; retry++ {
-		currentPool, err := c.kihClientset.KubevirtiphelperV1().IPPools().Get(context.TODO(), poolName, metav1.GetOptions{})
-		if err != nil {
-			return fmt.Errorf("cannot get IPPool %s: %s", poolName, err.Error())
-		}
-
-		updatedPool := currentPool.DeepCopy()
-		updatedAllocated := make(map[string]string)
-
-		// allocation references carry the canonical mac address spelling so
-		// add and delete computations agree on the owner identity
-		ownerRef := util.AllocationRef(vmnetcfgNamespace, vmnetcfgVMName, hwAddr)
-
-		switch event {
-		case ADD:
-			for k, v := range currentPool.Status.IPv4.Allocated {
-				if k == ip {
-					if v == ownerRef {
-						// the allocation reference is already recorded, so a
-						// retry after a partially applied update treats it as
-						// done
-						return nil
-					}
-
-					return fmt.Errorf("ip %s already found in IPPool status: %w", ip, util.ErrForeignOwner)
-				}
-				updatedAllocated[k] = v
-			}
-			updatedAllocated[ip] = ownerRef
-		case DELETE:
-			for k, v := range currentPool.Status.IPv4.Allocated {
-				if k != ip {
-					updatedAllocated[k] = v
-				}
-			}
-
-			if existing, exists := currentPool.Status.IPv4.Allocated[ip]; exists && existing != ownerRef {
-				return fmt.Errorf("allocation for ip %s belongs to %s, not removing it from the %s status: %w", ip, existing, poolName, util.ErrForeignOwner)
-			}
-		default:
-			// any unknown event must never reach the persisted status:
-			// falling through would rebuild the allocation map from scratch
-			// and erase every live allocation entry
-			return fmt.Errorf("unsupported ippool status event %s for ip %s in pool %s", event, ip, poolName)
-		}
-		updatedPool.Status.IPv4.Allocated = updatedAllocated
-		updatedPool.Status.IPv4.Used = c.ipam.Used(networkName)
-		updatedPool.Status.IPv4.Available = c.ipam.Available(networkName)
-		updatedPool.Status.LastUpdate = metav1.Now()
-
-		if _, err := c.kihClientset.KubevirtiphelperV1().IPPools().UpdateStatus(context.TODO(), updatedPool, metav1.UpdateOptions{}); err == nil {
-			// return success
-			return nil
-		} else {
-			// If it's a conflict error try again
-			if apierrors.IsConflict(err) || strings.Contains(err.Error(), "please apply your changes to the latest version and try again") {
-				if retry == maxRetries-1 {
-					return fmt.Errorf("cannot update status of IPPool %s after %d retries: %s", updatedPool.Name, maxRetries, err.Error())
-				}
-			} else {
-				return fmt.Errorf("cannot update status of IPPool %s: %s", updatedPool.Name, err.Error())
-			}
-
-			// Wait before retrying
-			log.Warnf("(vm.updateIPPoolStatus) [%s/%s] cannot update status of IPPool %s after %d attempt(s), retrying in a bit",
-				vmnetcfgNamespace, vmnetcfgVMName, updatedPool.Name, retry+1)
-			time.Sleep(time.Duration(retry) * retryDelay)
-			continue
-		}
-	}
-
-	return fmt.Errorf("cannot update status of IPPool %s after max retries: %s", poolName, err.Error())
+	return ippoolstatus.UpdateStatus(c.ctx, c.kihClientset, c.ipam, event, vmnetcfgNamespace, vmnetcfgVMName, ip, networkName, hwAddr, poolName)
 }

@@ -1,6 +1,7 @@
 package vmnetcfg
 
 import (
+	"context"
 	"sync/atomic"
 	"testing"
 
@@ -21,7 +22,7 @@ func TestInitPendingNicWithLiveLeaseKeepsReachedState(t *testing.T) {
 	// a controller on the environment's shared app status so the test can
 	// flip the initialization phase after the deferral assertions
 	var count atomic.Int32
-	controller := NewController(newTestQueue(), newTestIndexer(), nil, e.cache, e.ipam, e.dhcp, e.metrics, e.client, e.appStatus, &count)
+	controller := NewController(context.Background(), newTestQueue(), newTestIndexer(), nil, e.cache, e.ipam, e.dhcp, e.metrics, e.client, e.appStatus, &count)
 
 	e.addSubnet("10.0.0.1", "10.0.0.2")
 

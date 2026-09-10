@@ -1,6 +1,7 @@
 package vmnetcfg
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -116,7 +117,7 @@ func newTestEnv(t *testing.T) *testEnv {
 	// requeued events through the controller
 	e.indexer = newTestIndexer()
 	e.queue = newTestQueue()
-	e.controller = NewController(e.queue, e.indexer, nil, e.cache, e.ipam, e.dhcp, e.metrics, e.client, &appStatus, &count)
+	e.controller = NewController(context.Background(), e.queue, e.indexer, nil, e.cache, e.ipam, e.dhcp, e.metrics, e.client, &appStatus, &count)
 	e.appStatus = &appStatus
 
 	return e
@@ -714,7 +715,11 @@ func TestVMNetCfgOwnershipRejection(t *testing.T) {
 	}
 }
 
-func TestVMNetCfgStickyError(t *testing.T) {
+// TestVMNetCfgStickyErrorDuringStartupReplay pins that a nic in the ERROR
+// status keeps its reached state untouched while the application is still
+// in the startup replay: the ADD sync and the APP_INIT UPDATEs must not
+// allocate or tear down for an interface which the gate already counted.
+func TestVMNetCfgStickyErrorDuringStartupReplay(t *testing.T) {
 	e := newTestEnv(t)
 	e.seedPool(nil)
 	vmnetcfg := newVMNetCfg("", testMAC)
@@ -742,6 +747,103 @@ func TestVMNetCfgStickyError(t *testing.T) {
 	}
 	if n := e.countRequests(http.MethodPut, vmnetcfgStatusPath); n != 1 {
 		t.Errorf("status update requests = %d, want 1", n)
+	}
+}
+
+// TestVMNetCfgErrorRetryHealsOnUpdate pins the steady-state retry of a
+// transient ERROR: once the underlying cause is gone (the pool freed the
+// address), the next resynced UPDATE restores the interface instead of
+// keeping the sticky error forever.
+func TestVMNetCfgErrorRetryHealsOnUpdate(t *testing.T) {
+	e := newTestEnv(t)
+	e.appStatus.Store(APP_RUNNING)
+	e.addSubnet("10.0.0.1", "10.0.0.1")
+	e.seedPool(nil)
+	vmnetcfg := newVMNetCfg("", testMAC)
+	vmnetcfg.Status.NetworkConfig = []kihv1.NetworkConfigStatus{
+		{MACAddress: testMAC, NetworkName: testNetwork, Status: "ERROR", Message: "ipam error: no more ips left in network net-test"},
+	}
+	e.seedVMNetCfg(vmnetcfg)
+
+	if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, vmnetcfg); err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	}
+
+	stored := e.getStoredVMNetCfg()
+	if got := stored.Status.NetworkConfig[0]; got.Status != "OK" {
+		t.Errorf("status = %+v, want OK after the healed retry", got)
+	}
+	if got := stored.Spec.NetworkConfig[0].IPAddress; got != "10.0.0.1" {
+		t.Errorf("spec ip = %q, want the freed 10.0.0.1", got)
+	}
+	if lease := e.dhcp.GetLease(testMAC); lease.ClientIP.String() != "10.0.0.1" {
+		t.Errorf("lease ip = %s, want 10.0.0.1", lease.ClientIP.String())
+	}
+}
+
+// TestVMNetCfgErrorRetryRecordsFreshError pins that a re-attempted ERROR
+// nic which still fails records the new failure instead of escalating or
+// leaking state.
+func TestVMNetCfgErrorRetryRecordsFreshError(t *testing.T) {
+	e := newTestEnv(t)
+	e.appStatus.Store(APP_RUNNING)
+	// a one-address pool which is already taken: the retried allocation
+	// must fail again, recording a fresh ERROR
+	e.addSubnet("10.0.0.1", "10.0.0.1")
+	if _, err := e.ipam.AllocateIP(testNetwork, "other-owner"); err != nil {
+		t.Fatalf("occupying the only address: %s", err)
+	}
+	e.seedPool(nil)
+	vmnetcfg := newVMNetCfg("", testMAC)
+	vmnetcfg.Status.NetworkConfig = []kihv1.NetworkConfigStatus{
+		{MACAddress: testMAC, NetworkName: testNetwork, Status: "ERROR", Message: "ipam error: no more ips left in network net-test"},
+	}
+	e.seedVMNetCfg(vmnetcfg)
+
+	if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, vmnetcfg); err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	}
+
+	stored := e.getStoredVMNetCfg()
+	if got := stored.Status.NetworkConfig[0]; got.Status != "ERROR" || !strings.Contains(got.Message, "no more ips left") {
+		t.Errorf("status = %+v, want a fresh ERROR", got)
+	}
+	if e.dhcp.CheckLease(testMAC) {
+		t.Error("no lease must be created for a still-failing retry")
+	}
+	if used := e.ipam.Used(testNetwork); used != 1 {
+		t.Errorf("ipam used = %d, want the single foreign allocation only", used)
+	}
+}
+
+// TestVMNetCfgErrorSkipHijackMarker pins that the terminal hijack rejection
+// is never re-attempted: an object which was created while the operator was
+// down must stay unrserved even though the steady-state retries re-run
+// every other error.
+func TestVMNetCfgErrorSkipHijackMarker(t *testing.T) {
+	e := newTestEnv(t)
+	e.appStatus.Store(APP_RUNNING)
+	e.addSubnet("10.0.0.1", "10.0.0.1")
+	e.seedPool(nil)
+	vmnetcfg := newVMNetCfg("10.0.0.1", testMAC)
+	vmnetcfg.Status.NetworkConfig = []kihv1.NetworkConfigStatus{
+		{MACAddress: testMAC, NetworkName: testNetwork, Status: "ERROR", Message: hijackErrorStatusMessage},
+	}
+	e.seedVMNetCfg(vmnetcfg)
+
+	if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, vmnetcfg); err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	}
+
+	stored := e.getStoredVMNetCfg()
+	if got := stored.Status.NetworkConfig[0]; got.Status != "ERROR" || got.Message != hijackErrorStatusMessage {
+		t.Errorf("status = %+v, want the preserved hijack ERROR", got)
+	}
+	if e.dhcp.CheckLease(testMAC) {
+		t.Error("no lease must be created for a hijack-marked nic")
+	}
+	if used := e.ipam.Used(testNetwork); used != 0 {
+		t.Errorf("ipam used = %d, want 0 for the hijack-marked nic", used)
 	}
 }
 
@@ -1927,8 +2029,13 @@ func TestVMNetCfgQuarantinedRollbackKeepsAccountingConsistent(t *testing.T) {
 		t.Fatalf("ipam used = %d, want the quarantined claim kept", used)
 	}
 
+	// the ledger must record the address the lease actually holds; the
+	// allocator hands out the first free address of the pool range, whose
+	// map iteration order is unspecified, so the assertion keys on the
+	// lease identity instead of a fixed address
+	allocatedIP := e.dhcp.GetLease(testMAC).ClientIP.String()
 	pool := e.getStoredPool()
-	if got := pool.Status.IPv4.Allocated["10.0.0.1"]; got == "" {
+	if got := pool.Status.IPv4.Allocated[allocatedIP]; got == "" {
 		t.Fatalf("allocations = %v, want the quarantined record kept", pool.Status.IPv4.Allocated)
 	}
 	if pool.Status.IPv4.Used != 1 {

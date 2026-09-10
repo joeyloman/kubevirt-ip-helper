@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -53,6 +54,7 @@ func vmBehaviorNewTestController(t *testing.T) (*Controller, *fakeAPI) {
 	}
 
 	return &Controller{
+		ctx:          context.Background(),
 		cache:        kihcache.NewCacheAllocator(),
 		ipam:         ipam.NewIPAllocator(),
 		dhcp:         dhcp.NewDHCPAllocator(),

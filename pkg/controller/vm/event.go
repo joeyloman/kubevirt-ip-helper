@@ -20,15 +20,19 @@ import (
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/dhcp"
 	kihclientset "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/clientset/versioned"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/ippoolstatus"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/metrics"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/util"
 	log "github.com/sirupsen/logrus"
 )
 
 const (
-	ADD    = "add"
+	// the add/delete tokens are the ledger mutations of ippoolstatus; the
+	// aliases keep the event values and the status-write switch from
+	// drifting apart
+	ADD    = ippoolstatus.EventAdd
 	UPDATE = "update"
-	DELETE = "delete"
+	DELETE = ippoolstatus.EventDelete
 )
 
 // resyncPeriod re-delivers every watched object periodically: virtual
@@ -147,7 +151,7 @@ func (e *EventHandler) EventListener() (err error) {
 		},
 	}, cache.Indexers{})
 
-	controller := NewController(queue, indexer, informer, e.cache, e.ipam, e.dhcp, e.metrics, e.kihClientset)
+	controller := NewController(e.ctx, queue, indexer, informer, e.cache, e.ipam, e.dhcp, e.metrics, e.kihClientset)
 	stop := make(chan struct{})
 
 	// join the controller on shutdown: EventListener only returns after

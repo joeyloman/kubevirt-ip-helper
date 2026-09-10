@@ -86,11 +86,14 @@ func TestIpam(t *testing.T) {
 			want:   fmt.Errorf("end address 172.16.255.255 equals the broadcast address 172.16.255.255: %w", ErrSubnetInvalid),
 		},
 		{
+			// a /8-wide pool would materialize millions of bitmap entries
+			// at registration: the range cap rejects it before the memory
+			// blowup instead of retrying the registration forever
 			name:   "default/network-class-a-ok",
 			subnet: "10.0.0.0/8",
 			start:  "10.0.0.10",
 			end:    "10.255.255.254",
-			want:   nil,
+			want:   fmt.Errorf("pool range 10.0.0.10 - 10.255.255.254 is larger than the maximum of %d addresses: %w", MaxPoolAddrs, ErrSubnetInvalid),
 		},
 		{
 			name:   "default/network-class-a-start-error",
@@ -126,6 +129,22 @@ func TestIpam(t *testing.T) {
 			start:  "192.168.10.64",
 			end:    "192.168.10.64",
 			want:   nil,
+		},
+		{
+			// exactly the cap (65536 addresses) stays registrable
+			name:   "default/network-class-b-max-ok",
+			subnet: "172.16.0.0/15",
+			start:  "172.16.0.1",
+			end:    "172.17.0.0",
+			want:   nil,
+		},
+		{
+			// one address above the cap is rejected with the classification
+			name:   "default/network-class-b-max-too-big",
+			subnet: "172.16.0.0/15",
+			start:  "172.16.0.1",
+			end:    "172.17.0.1",
+			want:   fmt.Errorf("pool range 172.16.0.1 - 172.17.0.1 is larger than the maximum of %d addresses: %w", MaxPoolAddrs, ErrSubnetInvalid),
 		},
 	}
 

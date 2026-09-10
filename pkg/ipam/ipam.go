@@ -70,6 +70,13 @@ type IPSubnet struct {
 // address.
 const ExcludedOwner = "EXCLUDED"
 
+// MaxPoolAddrs caps the size of a pool: every address of the range
+// occupies one bitmap entry at registration, so an accidentally huge
+// range (for example a /8 projection) would present as a registration-time
+// memory blowup followed by an OOM restart loop. pools up to a full /16
+// stay below the cap.
+const MaxPoolAddrs = 65536
+
 type IPAllocator struct {
 	ipam  map[string]IPSubnet
 	mutex sync.Mutex
@@ -133,7 +140,28 @@ func ValidateSubnetSpec(subnet string, start string, end string) error {
 		return fmt.Errorf("end address %s equals the broadcast address %s: %w", end, subnetBroadcast.String(), ErrSubnetInvalid)
 	}
 
+	if v4RangeLen(startIP, endIP) > MaxPoolAddrs {
+		return fmt.Errorf("pool range %s - %s is larger than the maximum of %d addresses: %w",
+			start, end, MaxPoolAddrs, ErrSubnetInvalid)
+	}
+
 	return nil
+}
+
+// v4RangeLen returns the number of addresses of the inclusive v4 range
+// start..end; the callers have already classified the range as v4, so the
+// uint32 projection cannot overflow.
+func v4RangeLen(start, end netip.Addr) uint64 {
+	s := start.Unmap().As4()
+	e := end.Unmap().As4()
+
+	var startU, endU uint32
+	for i := 0; i < 4; i++ {
+		startU = startU<<8 | uint32(s[i])
+		endU = endU<<8 | uint32(e[i])
+	}
+
+	return uint64(endU) - uint64(startU) + 1
 }
 func (a *IPAllocator) NewSubnet(name string, subnet string, start string, end string) (err error) {
 	a.mutex.Lock()

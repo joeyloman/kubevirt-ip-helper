@@ -189,7 +189,10 @@ func (h *handler) Run(mainCtx context.Context) {
 				log.Infof("(app.Run) leader lost: %s", h.leaderId)
 				h.RemoveLeaderPodLabel()
 				h.NetworkCleanup()
-				os.Exit(1)
+
+				// run to the end of RunOrDie and let main return, so a
+				// graceful shutdown exits with status 0 instead of being
+				// surfaced as a crash by the kubelet
 			},
 			OnNewLeader: func(identity string) {
 				if identity == h.leaderId {

@@ -1,6 +1,7 @@
 package ippool
 
 import (
+	"context"
 	"encoding/json"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/rest"
@@ -78,6 +79,7 @@ func ippoolBehaviorNewTestController(t *testing.T, srv *httptest.Server) (*Contr
 	}
 
 	c := &Controller{
+		ctx:                context.Background(),
 		cache:              kihcache.New(),
 		ipam:               kihipam.New(),
 		dhcp:               kihdhcp.New(),

@@ -252,7 +252,7 @@ func TestDeferredObjectSettlesTheStartupGate(t *testing.T) {
 		t.Fatalf("seeding the recorded object: %s", err)
 	}
 	var count atomic.Int32
-	controller := NewController(newTestQueue(), indexer, nil, e.cache, e.ipam, e.dhcp, e.metrics, e.client, e.appStatus, &count)
+	controller := NewController(context.Background(), newTestQueue(), indexer, nil, e.cache, e.ipam, e.dhcp, e.metrics, e.client, e.appStatus, &count)
 
 	// the deferred object is processed and counted during APP_INIT
 	if err := controller.sync(Event{key: testNamespace + "/vm-a", action: ADD}); err != nil {
