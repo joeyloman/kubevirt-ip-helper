@@ -60,6 +60,11 @@ type handler struct {
 	listenerWg *sync.WaitGroup
 	lock       *resourcelock.LeaseLock
 	leaderId   string
+	// led records whether this process ever acquired the leadership
+	// lease: client-go fires OnStoppedLeading even when the election
+	// never succeeded, so the shutdown paths distinguish a real lease
+	// loss (error-level) from the routine shutdown of a standby
+	led atomic.Bool
 	// leaderWatchdog is the leader-election healthz adaptor of the
 	// process: the liveness probe and the force-exit fence both check the
 	// freshness of the leader lease through it. it is created in Run and
@@ -237,11 +242,25 @@ func (h *handler) registerHealthChecks() {
 // controllers drain first and the host state is cleaned after the era
 // joined.
 func (h *handler) onStartedLeading(ctx context.Context) {
+	// this callback only runs after the lease was acquired: the flag
+	// separates its shutdown (a real lease loss, error-level) from the
+	// stopped-leading callback of a standby which never led
+	h.led.Store(true)
+
 	eraCtx, eraCancel := context.WithCancel(ctx)
 
 	if err := h.RunServices(eraCtx); err != nil {
 		log.Errorf("(app.Run) services failed to start: %s", err)
 		h.drainStoppedEra(eraCancel)
+
+		return
+	}
+	// the leadership may have been lost while the services started
+	// (RunServices returns nil on a canceled era): a dead era must not be
+	// published as running - the readiness would briefly serve a pod
+	// which leads nothing, and onStoppedLeading owns the cleanup
+	if ctx.Err() != nil {
+		eraCancel()
 
 		return
 	}
@@ -283,7 +302,16 @@ func (h *handler) onStartedLeading(ctx context.Context) {
 			h.RemoveLeaderPodLabel()
 			h.NetworkCleanup()
 
-			time.Sleep(time.Second * 10)
+			// the restart backoff is interruptible: the leadership may be
+			// lost while it runs, and restarting on a canceled era would
+			// publish a dead era and re-add the leader label after the
+			// shutdown path removed it. onStoppedLeading completes the
+			// cleanup for this path
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Second * 10):
+			}
 
 			// the new per-era appStatus (APP_INIT) and startup counters are
 			// allocated by RunServices itself
@@ -291,6 +319,11 @@ func (h *handler) onStartedLeading(ctx context.Context) {
 			if err := h.RunServices(eraCtx); err != nil {
 				log.Errorf("(app.Run) services failed to restart: %s", err)
 				h.drainStoppedEra(eraCancel)
+
+				return
+			}
+			if ctx.Err() != nil {
+				eraCancel()
 
 				return
 			}
@@ -326,9 +359,21 @@ func (h *handler) drainStoppedEra(eraCancel context.CancelFunc) {
 // never led). the exit status stays 0 for a graceful shutdown; the
 // lease-loss is surfaced through the error metric and the error-level log.
 func (h *handler) onStoppedLeading() {
-	log.Errorf("(app.Run) leader lost: %s", h.leaderId)
-	if h.metrics != nil {
-		h.metrics.UpdateLogStatus("error")
+	if !h.led.Load() {
+		// client-go registers OnStoppedLeading as a deferred callback of
+		// the election run and fires it even when acquire never
+		// succeeded: every routine standby shutdown (a rollout
+		// scale-down, a node drain, a SIGTERM of a never-leader) would
+		// otherwise produce an error-level 'leader lost' log and an
+		// error-metric increment - false alerts for any monitoring wired
+		// to those signals. the cleanup backstops below still run: they
+		// are all no-ops for a process which never led.
+		log.Infof("(app.Run) election stopped without this process ever leading (standby shutdown)")
+	} else {
+		log.Errorf("(app.Run) leader lost: %s", h.leaderId)
+		if h.metrics != nil {
+			h.metrics.UpdateLogStatus("error")
+		}
 	}
 
 	h.listenerWg.Wait()
@@ -392,10 +437,10 @@ func (h *handler) RunServices(ctx context.Context) error {
 	era.appStatus.Store(APP_INIT)
 	h.era.Store(era)
 
-	// add the kubevirtiphelper/leader pod label
-	h.addLeaderPodLabel()
-
-	// gather the ippool count so we know how many pools we should initialize during startup before initializing the next controller
+	// add the kubevirtiphelper/leader pod label. the write is bound to
+	// the era context: a canceled era must not re-add the label after a
+	// shutdown path removed it
+	h.addLeaderPodLabel(ctx)
 	IPPoolList, err := retryList(ctx, h.metrics, "the IPPoolList", func(attemptCtx context.Context) ([]v1.IPPool, error) {
 		return h.getIPPools(attemptCtx)
 	})
@@ -827,7 +872,7 @@ func (h *handler) stopDHCPListeners() {
 // The addLeaderPodLabel and removeLeaderPodLabel funtions are managing the kubevirtiphelper/leader label.
 // This label is used by the metrics-service to determine the active leader.
 // If the function(s) fail the application should ignore it and still service DHCP requests.
-func (h *handler) addLeaderPodLabel() {
+func (h *handler) addLeaderPodLabel(ctx context.Context) {
 	podName, err := os.Hostname()
 	if err != nil {
 		log.Errorf("(app.addLeaderPodLabel) cannot get current pod name: %s", err.Error())
@@ -849,8 +894,10 @@ func (h *handler) addLeaderPodLabel() {
 		return
 	}
 
-	// bound the api calls: a hang must never block the startup phase
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// bound the api calls: a hang must never block the startup phase. the
+	// bound derives from the caller's era context, so a canceled era
+	// aborts the label write instead of completing it behind the shutdown
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
 	// the pod is mutated by the kubelet and the label callbacks run during

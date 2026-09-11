@@ -705,7 +705,7 @@ func TestHandler_addLeaderPodLabel(t *testing.T) {
 			kubeConfigFile: writeTestKubeconfig(t, srv.URL),
 			namespace:      "testns",
 		}
-		h.addLeaderPodLabel()
+		h.addLeaderPodLabel(context.Background())
 
 		p := store.pod(hostname)
 		if p == nil {
@@ -740,7 +740,7 @@ func TestHandler_addLeaderPodLabel(t *testing.T) {
 			kubeConfigFile: writeTestKubeconfig(t, srv.URL),
 			namespace:      "testns",
 		}
-		h.addLeaderPodLabel()
+		h.addLeaderPodLabel(context.Background())
 
 		p := store.pod(hostname)
 		if got := p.Labels[leaderLabel]; got != "active" {
@@ -755,6 +755,47 @@ func TestHandler_addLeaderPodLabel(t *testing.T) {
 		}
 	})
 
+	t.Run("never writes the label of a canceled era", func(t *testing.T) {
+		hostname, err := os.Hostname()
+		if err != nil {
+			t.Fatalf("os.Hostname(): %s", err)
+		}
+		store := newPodStore(&corev1.Pod{
+			TypeMeta:   metav1.TypeMeta{Kind: "Pod", APIVersion: "v1"},
+			ObjectMeta: metav1.ObjectMeta{Name: hostname, Namespace: "testns", Labels: map[string]string{"app": "demo"}},
+		})
+		srv := httptest.NewServer(store.handler())
+		defer srv.Close()
+
+		hook := attachLogCapture(t)
+		h := &handler{
+			kubeConfigFile: writeTestKubeconfig(t, srv.URL),
+			namespace:      "testns",
+		}
+
+		// the era context is already canceled: the leadership was lost
+		// during the restart backoff, and a label write which completed
+		// behind the shutdown would keep the metrics service routing to
+		// a pod which leads nothing
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		h.addLeaderPodLabel(ctx)
+
+		p := store.pod(hostname)
+		if p == nil {
+			t.Fatal("pod was not stored")
+		}
+		if got, labeled := p.Labels[leaderLabel]; labeled {
+			t.Errorf("leader label = %q, want unset: a canceled era must not label its pod", got)
+		}
+		if _, updates := store.counts(); updates != 0 {
+			t.Errorf("updates = %d, want 0 for a canceled era", updates)
+		}
+		if !hook.contains("cannot set the leader pod label") {
+			t.Error("the refused label write must be surfaced as an error log")
+		}
+	})
+
 	t.Run("logs and continues when the pod cannot be fetched", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusInternalServerError)
@@ -766,7 +807,7 @@ func TestHandler_addLeaderPodLabel(t *testing.T) {
 			kubeConfigFile: writeTestKubeconfig(t, srv.URL),
 			namespace:      "testns",
 		}
-		h.addLeaderPodLabel() // must not panic
+		h.addLeaderPodLabel(context.Background()) // must not panic
 
 		if !hook.contains("cannot set the leader pod label") {
 			t.Errorf("expected an error about the label update, got:\n%s", hook.entriesText())
@@ -777,7 +818,7 @@ func TestHandler_addLeaderPodLabel(t *testing.T) {
 		clearInClusterEnv(t)
 		hook := attachLogCapture(t)
 		h := &handler{kubeConfigFile: filepath.Join(t.TempDir(), "does-not-exist")}
-		h.addLeaderPodLabel() // must not panic
+		h.addLeaderPodLabel(context.Background()) // must not panic
 
 		if !hook.contains("cannot get kubeRestConfig") {
 			t.Errorf("expected an error about the kubeconfig, got:\n%s", hook.entriesText())
@@ -902,6 +943,50 @@ func TestHandler_RemoveLeaderPodLabel(t *testing.T) {
 
 		if !hook.contains("cannot remove the leader pod label") {
 			t.Errorf("expected an error about the label update, got:\n%s", hook.entriesText())
+		}
+	})
+}
+
+// TestOnStoppedLeadingNeverLedStaysQuiet pins the shutdown classification:
+// client-go registers OnStoppedLeading as a deferred callback of the
+// election run and fires it even when acquire never succeeded, so every
+// routine standby shutdown (a rollout scale-down, a node drain, a SIGTERM
+// of a never-leader) used to produce an error-level 'leader lost' log and
+// an error-metric increment - false alerts for any monitoring wired to
+// those signals. a process which never led logs its routine shutdown at
+// info level without the error metric; a real lease loss keeps the
+// error-level signal.
+func TestOnStoppedLeadingNeverLedStaysQuiet(t *testing.T) {
+	t.Run("standby which never led logs info without the error metric", func(t *testing.T) {
+		clearInClusterEnv(t)
+		hook := attachLogCapture(t)
+
+		h := &handler{metrics: metrics.New(), kubeConfigFile: filepath.Join(t.TempDir(), "does-not-exist"), listenerWg: &sync.WaitGroup{}}
+		h.onStoppedLeading()
+
+		if hook.contains("leader lost") {
+			t.Error("a standby which never led must not log a lease loss")
+		}
+		if !hook.contains("standby shutdown") {
+			t.Error("the never-led shutdown must be logged as the routine standby case")
+		}
+		for _, entry := range hook.entries {
+			if entry.Level == log.ErrorLevel && strings.Contains(entry.Message, "leader lost") {
+				t.Errorf("the never-led shutdown logged at error level: %s", entry.Message)
+			}
+		}
+	})
+
+	t.Run("a real lease loss keeps the error-level signal", func(t *testing.T) {
+		clearInClusterEnv(t)
+		hook := attachLogCapture(t)
+
+		h := &handler{metrics: metrics.New(), leaderId: "test-leader", kubeConfigFile: filepath.Join(t.TempDir(), "does-not-exist"), listenerWg: &sync.WaitGroup{}}
+		h.led.Store(true)
+		h.onStoppedLeading()
+
+		if !hook.contains("leader lost: test-leader") {
+			t.Error("a real lease loss must keep the error-level lease-loss log")
 		}
 	})
 }
