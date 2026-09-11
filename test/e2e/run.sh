@@ -211,9 +211,14 @@ remove_owned_data_network() { # <name>, only after successful owned-cluster dele
     | select((.Name // .name) == $name and ((.Labels // .labels)[$label]) == $owner)
     | (.Id // .id) | select(type == "string" and test("^[0-9a-f]{64}$"))
   ' <<< "${object}")" || return 1
-  # Immutable identity avoids deleting a replacement with the same name.
-  # Plain removal refuses a network still used by another endpoint.
-  timeout 20s "${RUNTIME}" network rm "${id}"
+  if [ "${RUNTIME}" = podman ]; then
+    # Podman accepts IDs for removal but checks container attachments by name.
+    # Use the just-verified name so non-force removal retains that safety check.
+    timeout 20s "${RUNTIME}" network rm "${name}"
+  else
+    # Docker checks attachments when removing by immutable identity.
+    timeout 20s "${RUNTIME}" network rm "${id}"
+  fi
 }
 
 worker_record() { # <node>
