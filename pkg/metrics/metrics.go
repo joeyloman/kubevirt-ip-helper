@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -210,7 +211,14 @@ func (m *MetricsAllocator) Run() {
 		Handler: mux,
 	}
 
-	log.Infof("(metrics.Run) %s", m.httpServer.ListenAndServe())
+	// the health and metrics endpoints are the liveness surface of the
+	// process: a server which died silently (the old info-level log)
+	// leaves the probes firing against a dead port until the kubelet
+	// kills the pod, with no error signal to alert on. the routine
+	// Stop-initiated shutdown (http.ErrServerClosed) stays quiet.
+	if err := m.httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Errorf("(metrics.Run) the metrics and health server terminated: %s", err.Error())
+	}
 }
 
 // SetHealthCheck registers a named check evaluated by the /healthz and

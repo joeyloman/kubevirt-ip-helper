@@ -42,3 +42,29 @@ func TestParseAllocationRefRejectsGarbage(t *testing.T) {
 		}
 	}
 }
+
+func TestParseAllocationRefCanonicalizesTheMac(t *testing.T) {
+	// the parse output itself is canonical whatever spelling the
+	// reference carries: a future consumer which compares the returned
+	// hardware address verbatim must never split one logical owner in
+	// two (net.ParseMAC accepts the dash and uppercase spellings of
+	// older revisions and hand-edited status)
+	cases := []struct {
+		ref  string
+		want string
+	}{
+		{"default/vm-test [02-00-00-00-00-01]", "02:00:00:00:00:01"},
+		{"default/vm-test [02:00:00:00:00:01]", "02:00:00:00:00:01"},
+		{"default/vm-test [02:AA:BB:CC:DD:01]", "02:aa:bb:cc:dd:01"},
+	}
+	for _, tc := range cases {
+		ns, vm, hw, ok := ParseAllocationRef(tc.ref)
+		if !ok {
+			t.Errorf("ParseAllocationRef(%q) rejected a parseable legacy spelling", tc.ref)
+			continue
+		}
+		if ns != "default" || vm != "vm-test" || hw != tc.want {
+			t.Errorf("ParseAllocationRef(%q) = %q/%q/%q, want default/vm-test/%s", tc.ref, ns, vm, hw, tc.want)
+		}
+	}
+}

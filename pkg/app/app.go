@@ -82,7 +82,6 @@ type handler struct {
 // workers of a dying era can never write into the startup gate or the
 // status of the next era.
 type eraState struct {
-	ctx          context.Context
 	appStatus    *atomic.Int32
 	ippoolGate   *gate.Gate
 	vmnetcfgGate *gate.Gate
@@ -426,7 +425,6 @@ func (h *handler) RunServices(ctx context.Context) error {
 	// era. the metrics and health endpoints are process-global (started in
 	// Run) and are never restarted per era
 	era := &eraState{
-		ctx:          ctx,
 		appStatus:    new(atomic.Int32),
 		ippoolGate:   gate.New(),
 		vmnetcfgGate: gate.New(),

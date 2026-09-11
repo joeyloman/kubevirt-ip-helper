@@ -100,6 +100,18 @@ func TestIPMaskEqual(t *testing.T) {
 			want: false,
 		},
 		{
+			name: "zero-extended-16-byte-mask",
+			a:    net.CIDRMask(24, 32),
+			b:    net.IPMask(append(make([]byte, 12), net.CIDRMask(24, 32)...)),
+			want: true,
+		},
+		{
+			name: "zero-extended-16-byte-mask-different-prefix",
+			a:    net.CIDRMask(24, 32),
+			b:    net.IPMask(append(make([]byte, 12), net.CIDRMask(25, 32)...)),
+			want: false,
+		},
+		{
 			name: "mask-without-v4-width",
 			a:    net.CIDRMask(24, 32),
 			b:    net.CIDRMask(24, 64),

@@ -239,6 +239,12 @@ func TestMetricsRunWithOccupiedPortReturnsAndStopSucceeds(t *testing.T) {
 	if !strings.Contains(out, "address already in use") {
 		t.Errorf("Run log missing bind failure: %s", out)
 	}
+	// the health and metrics endpoints are the liveness surface of the
+	// process: a dead server must surface at error level, not the old
+	// info line which no alerting ever saw
+	if !strings.Contains(out, "level=error") {
+		t.Errorf("Run log missing the error-level termination: %s", out)
+	}
 	if !strings.Contains(out, "stopping the Metrics service") {
 		t.Errorf("Run log missing stop message: %s", out)
 	}

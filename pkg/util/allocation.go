@@ -25,9 +25,13 @@ func AllocationRef(namespace string, vmName string, hwAddr string) string {
 }
 
 // ParseAllocationRef splits an allocation reference built by AllocationRef
-// back into its components. references which do not follow the canonical
-// spelling (older revision or hand-edited status) are reported as
-// unparseable (ok=false) and must be treated as unprotectable claims.
+// back into its components. the mac address is returned in its canonical
+// colon form whatever spelling the reference carries (net.ParseMAC accepts
+// the dash and uppercase spellings of older revisions and hand-edited
+// status), so a consumer never splits one logical owner in two by
+// comparing the returned hardware address verbatim. references which do
+// not parse at all are reported as unparseable (ok=false) and must be
+// treated as unprotectable claims.
 func ParseAllocationRef(ref string) (namespace string, vmName string, hwAddr string, ok bool) {
 	const ownerSeparator = " ["
 
@@ -53,11 +57,12 @@ func ParseAllocationRef(ref string) (namespace string, vmName string, hwAddr str
 
 	// only a valid mac address may act as the owner identity, so garbage
 	// reference tails from hand-edited status are unprotectable
-	if _, err := net.ParseMAC(mac); err != nil {
+	parsed, err := net.ParseMAC(mac)
+	if err != nil {
 		return "", "", "", false
 	}
 
-	return namespace, vmName, mac, true
+	return namespace, vmName, CanonicalHWAddr(parsed.String()), true
 }
 
 // IsAlreadyReleased reports ipam outcomes which state that nothing about

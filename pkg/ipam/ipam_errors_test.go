@@ -54,3 +54,39 @@ func TestIPAMReleaseOutcomesAreSentinelErrors(t *testing.T) {
 		t.Errorf("unparseable-ip release = %v, want ErrIPInvalid", err)
 	}
 }
+
+// a non-canonical address spelling must never strand a reservation: the
+// v4-in-v6 spelling is classified by the cidr gate (ErrIPNotInCidr,
+// which the cleanup paths treat as converged) and leaves the reservation
+// intact, while the release lookup itself runs on the canonical key -
+// the same Unmap form every mutator stores - so the gate and the lookup
+// can never diverge on a spelling which passes both.
+func TestReleaseIPCanonicalizesTheAddressLookup(t *testing.T) {
+	allocator := New()
+	if err := allocator.NewSubnet("net", "192.168.53.0/29", "192.168.53.1", "192.168.53.6"); err != nil {
+		t.Fatalf("NewSubnet: %v", err)
+	}
+
+	ip, err := allocator.GetIP("net", "")
+	if err != nil {
+		t.Fatalf("GetIP: %v", err)
+	}
+
+	// the v4-in-v6 spelling is stopped by the cidr gate and the
+	// reservation survives the attempt
+	spelling := "::ffff:" + ip
+	if err := allocator.ReleaseIP("net", spelling); !errors.Is(err, ErrIPNotInCidr) {
+		t.Fatalf("ReleaseIP of the v4-in-v6 spelling = %v, want the ErrIPNotInCidr classification of the cidr gate", err)
+	}
+	if used := allocator.Used("net"); used != 1 {
+		t.Errorf("used after the rejected spelling = %d, want the reservation intact", used)
+	}
+
+	// the canonical spelling releases it
+	if err := allocator.ReleaseIP("net", ip); err != nil {
+		t.Fatalf("ReleaseIP of the canonical spelling: %v", err)
+	}
+	if used := allocator.Used("net"); used != 0 {
+		t.Errorf("used after the canonical release = %d, want 0", used)
+	}
+}

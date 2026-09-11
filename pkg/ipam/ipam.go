@@ -530,6 +530,11 @@ func (a *IPAllocator) AdoptIP(name string, givenIP string, owner string) (err er
 	return nil
 }
 
+// ReleaseIP releases the given address of the named network. the lookup
+// runs on the canonical spelling (the v4 form of any v4-in-v6 input,
+// exactly like every other mutator of the allocation state), so a
+// non-canonical spelling finds its own reservation instead of reporting
+// an already-free address while the reservation survives.
 func (a *IPAllocator) ReleaseIP(name string, givenIP string) (err error) {
 	a.mutex.Lock()
 	defer a.mutex.Unlock()
@@ -550,24 +555,23 @@ func (a *IPAllocator) ReleaseIP(name string, givenIP string) (err error) {
 	if !gIPCheck {
 		return fmt.Errorf("given ip %s is not cidr %s: %w", givenIP, a.ipam[name].cidr, ErrIPNotInCidr)
 	}
+	ip := gIP.Unmap().String()
 
-	for ip, allocated := range a.ipam[name].ips {
-		if ip == givenIP {
-			if allocated {
-				a.ipam[name].ips[ip] = false
-				// a released address forgets its owner: a later reclaim
-				// starts over instead of matching a stale identity
-				delete(a.ipam[name].owners, ip)
-				delete(a.ipam[name].attributed, ip)
-
-				return
-			} else {
-				return fmt.Errorf("given ip %s: %w", givenIP, ErrIPAlreadyFree)
-			}
-		}
+	allocated, withinRange := a.ipam[name].ips[ip]
+	if !withinRange {
+		return fmt.Errorf("given ip %s not found in network %s: %w", ip, name, ErrIPAlreadyFree)
+	}
+	if !allocated {
+		return fmt.Errorf("given ip %s: %w", ip, ErrIPAlreadyFree)
 	}
 
-	return fmt.Errorf("given ip %s not found in network %s: %w", givenIP, name, ErrIPAlreadyFree)
+	a.ipam[name].ips[ip] = false
+	// a released address forgets its owner: a later reclaim starts over
+	// instead of matching a stale identity
+	delete(a.ipam[name].owners, ip)
+	delete(a.ipam[name].attributed, ip)
+
+	return
 }
 
 // ReleaseIPOwnedBy releases the exact address only while its reservation
