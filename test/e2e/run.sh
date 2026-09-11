@@ -439,7 +439,11 @@ wait_until() { # <case-id> <absolute SECONDS> <description> <predicate> [args...
     [ "${attempt}" -le "${remaining}" ] || attempt="${remaining}"
     run_pred_once "${attempt}" "$@" && rc=0 || rc=$?
     if [ "${rc}" -eq 2 ]; then
-      die "${description}: owner DHCP lease missing after duplicate deletion (ownership regression signature)"
+      if [ "$1" = boot_network_or_lease_loss ]; then
+        die "${description}: repeated DHCP lease lookup failures for guest MAC ${KIH_VM_MAC}"
+      else
+        die "${description}: predicate $1 exited with status ${rc}"
+      fi
     fi
     if [ "${rc}" -eq 0 ] && [ "${SECONDS}" -lt "${deadline}" ]; then
       log "ok: ${description}"
