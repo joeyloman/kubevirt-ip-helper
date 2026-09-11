@@ -140,6 +140,19 @@ spec:
         # leader lease but could not renew it (or its process is wedged),
         # so the kubelet restarts a stale leader instead of leaving its
         # DHCP servers answering on the segment with a diverging allocator
+        # the health server starts only inside Run, after Init and the
+        # startup network cleanup: without a startup probe the liveness
+        # probe below (15s initial delay, 3 failures) would kill a pod
+        # whose startup legitimately exceeds ~45s - a slow apiserver -
+        # before the process ever listens. the startup probe tolerates
+        # the full startup budget (the 15-minute gate stall timeout of
+        # the application) before the liveness probe arms.
+        startupProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          periodSeconds: 10
+          failureThreshold: 90
         # the liveness probe checks the leader-election freshness through
         livenessProbe:
           httpGet:
