@@ -343,12 +343,18 @@ func (c *Controller) sync(event Event) (err error) {
 		// UPDATE: an object whose ADD failed transiently recovers through
 		// the resync and must not leave the gate waiting forever.
 		// vmnetcfgs with nics in the ERROR status settle as well because
-		// their sync completed, and a definitively rejected ADD settles so
-		// a broken vmnetcfg does not block the vm controller startup
-		// forever. a transiently failed restore stays unsettled instead:
-		// the rate-limited retry must stay able to protect the existing
+		// their sync completed, and a definitively rejected sync settles
+		// on either action so a broken vmnetcfg does not block the vm
+		// controller startup forever: the settled classification is
+		// definitive (a foreign ownership conflict needs an edit, a
+		// networkname without a live pool needs its IPPool repaired, an
+		// unusable macaddress needs a spec correction), so no retry of
+		// the same object can protect an additional reservation - waiting
+		// for the retry exhaustion would only delay the gate. a
+		// transiently failed restore stays unsettled instead: the
+		// rate-limited retry must stay able to protect the existing
 		// reservation before the vm controller opens new allocations
-		if err == nil || (event.action == ADD && c.initSyncSettled(err)) {
+		if err == nil || c.initSyncSettled(err) {
 			c.markInitAttempt(event.key)
 		}
 	case DELETE:

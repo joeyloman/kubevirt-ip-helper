@@ -196,3 +196,34 @@ func TestSyncAddMixedFailureClassifiesOnTheRecordedFailure(t *testing.T) {
 		t.Fatalf("gate count = %d, want 1: the pool-less interface settles the gate", startupGate.Settled())
 	}
 }
+
+// C02 regression: a definitively rejected sync settles the startup gate
+// on the UPDATE action as well. an object which is first delivered as a
+// resynced UPDATE during the initialization (e.g. written by the vm
+// controller while the gate is open) and fails with a settled-class error
+// must not wait for the full rate-limited retry exhaustion before the
+// gate counts it - the classification is definitive, so no retry of the
+// same object can protect an additional reservation.
+func TestSyncUpdateSettledErrorCountsAsHandledDuringInit(t *testing.T) {
+	e, controller, startupGate := newGateTestEnv(t)
+
+	e.addSubnet("10.0.0.1", "10.0.0.2")
+	e.seedPool(map[string]string{"10.0.0.1": "other-ns/other-vm [02:00:00:00:00:99]"})
+
+	vmnetcfg := newVMNetCfg("10.0.0.1", testMAC)
+	e.seedVMNetCfg(vmnetcfg)
+	if err := controller.indexer.Add(vmnetcfg); err != nil {
+		t.Fatalf("seeding indexer: %s", err)
+	}
+
+	err := controller.sync(Event{key: testNamespace + "/" + testVMNetCfgName, action: UPDATE})
+	if err == nil {
+		t.Fatal("want the ownership conflict to fail the sync")
+	}
+	if !errors.Is(err, util.ErrForeignOwner) {
+		t.Errorf("error = %v, want the util.ErrForeignOwner classification", err)
+	}
+	if startupGate.Settled() != 1 {
+		t.Errorf("gate settled = %d, want 1: the definitively rejected UPDATE must settle the gate without waiting for the retry exhaustion", startupGate.Settled())
+	}
+}
