@@ -71,7 +71,7 @@ func UpdateStatus(
 	for retry := 0; retry < maxRetries; retry++ {
 		currentPool, err := client.KubevirtiphelperV1().IPPools().Get(ctx, poolName, metav1.GetOptions{})
 		if err != nil {
-			return fmt.Errorf("cannot get IPPool %s: %s", poolName, err.Error())
+			return fmt.Errorf("cannot get IPPool %s: %w", poolName, err)
 		}
 
 		updatedPool := currentPool.DeepCopy()

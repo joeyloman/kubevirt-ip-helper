@@ -3,9 +3,12 @@ package vmnetcfg
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 
 	log "github.com/sirupsen/logrus"
 
@@ -57,6 +60,13 @@ type Controller struct {
 	// whose persisted assignment is still waiting in another object's
 	// spec during the startup replay
 	deferredInitAllocations map[string]bool
+
+	// pendingUnwinds records the ledger deletions whose compensating or
+	// unwind attempt failed while the nic was concurrently removed: the
+	// tuple cannot be reconstructed from the spec anymore, so the
+	// reconciliations of the owning object replay them. guarded by mutex
+	// like deferredInitAllocations
+	pendingUnwinds map[string][]pendingLedgerDelete
 }
 
 func NewController(
@@ -171,6 +181,87 @@ func (c *Controller) releaseDeferredInitAllocations() (keys []string) {
 	c.deferredInitAllocations = make(map[string]bool)
 
 	return keys
+}
+
+// rememberPendingUnwind records a ledger deletion which failed while its
+// nic was concurrently removed: the retried reconciliation of the owning
+// object cannot reconstruct the tuple from the spec anymore (the removal
+// is durable by then), so this record is the only thing which keeps the
+// owner-validated deletion reachable.
+func (c *Controller) rememberPendingUnwind(key string, entry pendingLedgerDelete) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	if c.pendingUnwinds == nil {
+		c.pendingUnwinds = make(map[string][]pendingLedgerDelete)
+	}
+
+	c.pendingUnwinds[key] = append(c.pendingUnwinds[key], entry)
+}
+
+// retryPendingUnwinds replays the failed ledger deletions of an object at
+// the start of its reconciliation. a deletion which converged - the
+// record is gone, a foreign owner recorded the address in the meantime,
+// or the pool itself is gone with its ledger - is dropped from the
+// pending list; a transiently failing one stays recorded and fails the
+// reconciliation, so the rate-limited retry and the resync keep replaying
+// it. without this replay the orphaned record would block a later
+// binding's ledger write until the next pool registration revalidates
+// the persisted ledger.
+func (c *Controller) retryPendingUnwinds(vmnetcfg *kihv1.VirtualMachineNetworkConfig) error {
+	key := fmt.Sprintf("%s/%s", vmnetcfg.Namespace, vmnetcfg.Name)
+
+	c.mutex.Lock()
+	pending := c.pendingUnwinds[key]
+	delete(c.pendingUnwinds, key)
+	c.mutex.Unlock()
+
+	if len(pending) == 0 {
+		return nil
+	}
+
+	var retryErr error
+
+	for _, entry := range pending {
+		err := c.updateIPPoolStatus(
+			DELETE,
+			entry.namespace,
+			entry.vmName,
+			entry.ip,
+			entry.networkName,
+			entry.macAddress,
+			entry.poolName,
+		)
+		if err == nil {
+			log.Warnf("(vmnetcfg.retryPendingUnwinds) [%s/%s] removed the pending ledger record of ip %s in pool %s",
+				vmnetcfg.Namespace, vmnetcfg.Name, entry.ip, entry.poolName)
+			c.metrics.UpdateLogStatus("warning")
+
+			continue
+		}
+
+		if errors.Is(err, util.ErrForeignOwner) || apierrors.IsNotFound(err) {
+			// the record belongs to another owner now, or the pool is gone
+			// with its ledger: converged, nothing left to replay
+			log.Warnf("(vmnetcfg.retryPendingUnwinds) [%s/%s] the pending ledger record of ip %s in pool %s converged: %s",
+				vmnetcfg.Namespace, vmnetcfg.Name, entry.ip, entry.poolName, err)
+			c.metrics.UpdateLogStatus("warning")
+
+			continue
+		}
+
+		log.Errorf("(vmnetcfg.retryPendingUnwinds) [%s/%s] cannot remove the pending ledger record of ip %s in pool %s: %s",
+			vmnetcfg.Namespace, vmnetcfg.Name, entry.ip, entry.poolName, err)
+		c.metrics.UpdateLogStatus("error")
+
+		c.rememberPendingUnwind(key, entry)
+
+		if retryErr == nil {
+			retryErr = err
+		}
+	}
+
+	return retryErr
 }
 
 // runDeferredInitAllocations waits until the application left its

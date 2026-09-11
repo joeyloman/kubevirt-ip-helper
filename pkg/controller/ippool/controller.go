@@ -269,6 +269,37 @@ func (c *Controller) sync(event Event) (err error) {
 		// startup forever. counted pools are deduplicated by name.
 		c.markInitAttempt(event.poolName)
 
+		// the deleted object carries only its final networkname, but a
+		// pool which was renamed while the application was initializing
+		// keeps its live registration under the OLD one: the rename was
+		// swallowed (updates are ignored during the initialization), so
+		// no registration under the new networkname exists and the
+		// lookup below cannot find the registration this deletion must
+		// tear down. resolve the recorded networkname exactly like the
+		// update path does and run the regular cleanup on the installed
+		// entry: the cleanup releases by the pool's own spec networkname
+		// (the old name), so it tears down exactly the leaked
+		// registration and drops the record itself
+		if registeredNet, live := c.registeredPools[event.poolName]; live && registeredNet != event.poolNetworkName {
+			if oldPool, oldErr := c.cache.Get("pool", registeredNet); oldErr == nil && oldPool.(kihv1.IPPool).Name == event.poolName {
+				p := oldPool.(kihv1.IPPool)
+				if err = c.cleanupIPPoolObjects(&p); err != nil {
+					log.Errorf("(ippool.sync) failed to cleanup the renamed pool %s under networkname %s: %s", event.poolName, registeredNet, err.Error())
+					c.metrics.UpdateLogStatus("error")
+				}
+
+				return
+			}
+
+			// the recorded registration is not live anymore (its cache
+			// entry was released with it, or another pool owns the
+			// networkname by now): drop the stale record and fall through
+			// to the regular handling of the event's networkname
+			log.Warnf("(ippool.sync) the recorded registration of pool %s under networkname %s is not live anymore, dropping the stale record",
+				event.poolName, registeredNet)
+			delete(c.registeredPools, event.poolName)
+		}
+
 		pool, poolErr := c.cache.Get("pool", event.poolNetworkName)
 		if poolErr != nil {
 			// no live registration exists under this networkname: the pool

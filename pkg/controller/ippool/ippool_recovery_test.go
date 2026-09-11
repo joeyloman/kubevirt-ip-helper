@@ -103,8 +103,13 @@ func recoveryRegistrationSteps(t *testing.T, c *Controller, pool *kihv1.IPPool) 
 	}
 
 	// publish the pool: this is the point from which fresh allocations
-	// can see the allocator
-	if err := c.cache.Add(rPool); err != nil {
+	// can see the allocator. the published projection mirrors the
+	// registration: the input spec (what the allocator actually
+	// installed) carrying the freshly rebuilt status of the write
+	// response
+	installed := pool.DeepCopy()
+	installed.Status = rPool.Status
+	if err := c.cache.Add(installed); err != nil {
 		t.Fatalf("publishing the pool into the cache: %s", err)
 	}
 

@@ -2154,3 +2154,77 @@ func TestVMNetCfgQuarantinedRollbackKeepsAccountingConsistent(t *testing.T) {
 		t.Errorf("available gauge after quarantine = %v (present %v), want 1", v, ok)
 	}
 }
+
+// a mac whose spec entry moved to another network must migrate even when
+// it keeps its numeric address: the lease identity is the (address,
+// network) pair, so a same-ip network move must not take the
+// existing-lease path (which would adopt the address in the new
+// network's allocator and repair its ledger while the dhcp lease keeps
+// serving the old network's configuration and the old network's claim
+// and ledger entry leak)
+func TestVMNetCfgSameIPNetworkMoveMigratesTheLease(t *testing.T) {
+	e := newTestEnv(t)
+	e.appStatus.Store(APP_RUNNING)
+
+	// the old network: the mac's live lease serves the very same numeric
+	// address there (two isolated networks with identical subnets)
+	if err := e.ipam.NewSubnet("net-old", "10.0.0.0/29", "10.0.0.1", "10.0.0.1"); err != nil {
+		t.Fatalf("adding the old subnet: %s", err)
+	}
+	ownRef := testNamespace + "/" + testVMName + " [" + testMAC + "]"
+	poolOld := &kihv1.IPPool{
+		ObjectMeta: metav1.ObjectMeta{Name: "ippool-old"},
+		Spec: kihv1.IPPoolSpec{
+			NetworkName: "net-old",
+			IPv4Config:  kihv1.IPv4Config{Subnet: "10.0.0.0/29", ServerIP: "10.0.0.1"},
+		},
+		Status: kihv1.IPPoolStatus{
+			IPv4: kihv1.IPv4Status{Allocated: map[string]string{"10.0.0.1": ownRef}},
+		},
+	}
+	e.seedPoolWith(poolOld)
+	if _, err := e.ipam.ReclaimIP("net-old", "10.0.0.1", ownRef); err != nil {
+		t.Fatalf("seeding the old claim: %s", err)
+	}
+	if err := e.dhcp.AddLease(testMAC, "net-old", "10.0.0.1", testNamespace+"/"+testVMName); err != nil {
+		t.Fatalf("seeding the old lease: %s", err)
+	}
+
+	// the new network: the spec moved the nic to it and asks for the same
+	// address
+	e.addSubnet("10.0.0.1", "10.0.0.1")
+	e.seedPool(nil)
+	vmnetcfg := newVMNetCfg("10.0.0.1", testMAC)
+	e.seedVMNetCfg(vmnetcfg)
+
+	if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, vmnetcfg); err != nil {
+		t.Fatalf("the same-ip network move must converge: %s", err)
+	}
+
+	// the old network's claim and ledger entry are gone
+	if used := e.ipam.Used("net-old"); used != 0 {
+		t.Errorf("old network used = %d, want 0 (the old claim is released)", used)
+	}
+	oldPool := e.api.ippools["ippool-old"].DeepCopy()
+	if _, exists := oldPool.Status.IPv4.Allocated["10.0.0.1"]; exists {
+		t.Errorf("old pool status = %v, want the moved-away entry removed", oldPool.Status.IPv4.Allocated)
+	}
+
+	// the nic serves the address of the NEW network now: the lease carries
+	// the new pool, the new network's allocator holds the claim and the
+	// new pool's ledger records the owner
+	lease := e.dhcp.GetLease(testMAC)
+	if lease.ClientIP == nil || lease.ClientIP.String() != "10.0.0.1" || lease.PoolName != testNetwork {
+		t.Errorf("lease = %+v, want a 10.0.0.1 lease of %s (the migrated pool)", lease, testNetwork)
+	}
+	if used := e.ipam.Used(testNetwork); used != 1 {
+		t.Errorf("new network used = %d, want 1", used)
+	}
+	if got := e.getStoredPool().Status.IPv4.Allocated["10.0.0.1"]; got != ownRef {
+		t.Errorf("allocated[10.0.0.1] = %q, want the new owner record", got)
+	}
+	stored := e.getStoredVMNetCfg()
+	if got := stored.Spec.NetworkConfig[0]; got.IPAddress != "10.0.0.1" || got.NetworkName != testNetwork {
+		t.Errorf("spec entry = %+v, want the same address committed on the new network", got)
+	}
+}

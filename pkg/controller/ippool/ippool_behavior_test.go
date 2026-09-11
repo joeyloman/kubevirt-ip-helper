@@ -1227,3 +1227,120 @@ func TestHandleIPPoolObjectChangeRejectsExcludeOverlappingLiveClaim(t *testing.T
 		t.Error("the ledger conflict check never consulted the pool status")
 	}
 }
+
+// TestRegisterIPPoolCachesTheInstalledSpecNotTheStatusReadback pins the
+// review finding: the status rebuild is built on a fresh api GET, so a
+// spec which was updated on the api between the informer delivery and
+// that GET (for example while the application was still initializing
+// and ignoring updates) used to be cached as the "installed"
+// projection - although the OLDER delivery is what was actually
+// installed on the nic, the dhcp pool and the ipam subnet. the cache
+// must hold the input spec, with only the rebuilt status adopted from
+// the write response.
+func TestRegisterIPPoolCachesTheInstalledSpecNotTheStatusReadback(t *testing.T) {
+	stubNicMutation(t)
+
+	// the api already serves a newer spec than the informer delivery
+	stored := ippoolBehaviorNewTestPool("pool1", "net-a")
+	stored.Spec.IPv4Config.LeaseTime = 7200
+	rs := ippoolBehaviorNewRestState(stored)
+	srv := httptest.NewServer(rs.ippoolBehaviorHandler())
+	t.Cleanup(srv.Close)
+
+	c, _, d, ca, _ := ippoolBehaviorNewTestController(t, srv)
+	// the listener seam keeps the registration off the host network
+	c.runListener = func(networkName string, nic string) error {
+		return nil
+	}
+
+	// the registration installs the input spec, whose lease time is the
+	// older one
+	pool := ippoolBehaviorNewTestPool("pool1", "net-a")
+	if _, err := c.registerIPPool(pool); err != nil {
+		t.Fatalf("the registration failed: %s", err)
+	}
+
+	// the dhcp pool was built from the input spec (the older lease time)
+	ippoolBehaviorAssertDHCPPoolOptions(t, d, "net-a",
+		"10.10.10.1", "255.255.255.0", "10.10.10.254",
+		[]net.IP{net.ParseIP("10.10.10.2"), net.ParseIP("10.10.10.3")},
+		[]net.IP{net.ParseIP("10.10.10.4")},
+		"example.local",
+		[]string{"example.local"},
+		3600, "eth-test")
+
+	// the cached projection is the installed spec, not the readback of
+	// the api GET
+	cached, err := ca.Get("pool", "net-a")
+	if err != nil {
+		t.Fatalf("the registration did not publish the pool into the cache: %s", err)
+	}
+	cachedPool := cached.(kihv1.IPPool)
+	if got := cachedPool.Spec.IPv4Config.LeaseTime; got != 3600 {
+		t.Errorf("cached lease time = %d, want 3600 (the spec which was actually installed)", got)
+	}
+
+	// the rebuilt status of the write response is still what the readers
+	// of the cached pool see
+	if cachedPool.Status.IPv4.Allocated["10.10.10.20"] != kihipam.ExcludedOwner {
+		t.Errorf("cached status misses the rebuilt allocation map: %v", cachedPool.Status.IPv4.Allocated)
+	}
+	if cachedPool.Status.LastUpdate.IsZero() {
+		t.Error("cached status misses the rebuilt last-update timestamp of the write response")
+	}
+}
+
+// TestResyncUpdateAfterRegistrationSpecRaceIsStillDetected pins the
+// consequence of the readback projection: when the registration raced a
+// spec update, the resync which delivers the newer spec used to compare
+// it against the cached newer projection and take the NOCHANGE branch,
+// so the newer configuration was never reconciled. against the cached
+// installed spec (the older one) the same resync detects the change and
+// reloads the dhcp options.
+func TestResyncUpdateAfterRegistrationSpecRaceIsStillDetected(t *testing.T) {
+	stubNicMutation(t)
+
+	// the api already serves a newer spec than the informer delivery
+	stored := ippoolBehaviorNewTestPool("pool1", "net-a")
+	stored.Spec.IPv4Config.LeaseTime = 7200
+	rs := ippoolBehaviorNewRestState(stored)
+	srv := httptest.NewServer(rs.ippoolBehaviorHandler())
+	t.Cleanup(srv.Close)
+
+	c, _, d, ca, _ := ippoolBehaviorNewTestController(t, srv)
+	c.runListener = func(networkName string, nic string) error {
+		return nil
+	}
+
+	pool := ippoolBehaviorNewTestPool("pool1", "net-a")
+	if _, err := c.registerIPPool(pool); err != nil {
+		t.Fatalf("the registration failed: %s", err)
+	}
+
+	// the resync delivers the newer spec: a reload-class field, so no
+	// restart is triggered
+	cached, err := ca.Get("pool", "net-a")
+	if err != nil {
+		t.Fatalf("the registration did not publish the pool into the cache: %s", err)
+	}
+	newer := stored.DeepCopy()
+	if err := c.handleIPPoolObjectChange(cached.(kihv1.IPPool), newer); err != nil {
+		t.Fatalf("the resync of the newer spec failed: %s", err)
+	}
+
+	// the change was reconciled instead of swallowed as a no-change: the
+	// dhcp pool and the cache carry the newer lease time
+	if got := d.GetPool("net-a").LeaseTime; got != 7200 {
+		t.Errorf("dhcp pool lease time = %d, want 7200 (the resync must reload the newer options)", got)
+	}
+	cached, err = ca.Get("pool", "net-a")
+	if err != nil {
+		t.Fatalf("the resync dropped the pool from the cache: %s", err)
+	}
+	if got := cached.(kihv1.IPPool).Spec.IPv4Config.LeaseTime; got != 7200 {
+		t.Errorf("cached lease time = %d, want 7200 (the resync must replace the cached projection)", got)
+	}
+	if c.appStatus.Load() != APP_RUNNING {
+		t.Errorf("app status = %d, want %d: a lease time change is a reload, not a restart", c.appStatus.Load(), APP_RUNNING)
+	}
+}

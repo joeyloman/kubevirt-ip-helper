@@ -222,3 +222,80 @@ func TestRepairWithoutRaceStaysDone(t *testing.T) {
 // deleted-vmnetcfg side of the raced cleanup: the tombstone resource must
 // have the removed object name so no reconciliation recreates state for it.
 var _ = kihv1.IPPool{}
+
+// A05 regression: the compensating delete of a raced cleanup fails
+// transiently AND the vm controller removes the nic before the retried
+// sync re-reads the object. the tuple of the failed deletion is not
+// reconstructible from the spec anymore, so without the pending replay
+// the orphaned ledger record would survive every later reconciliation of
+// the object and block a successor's ledger write until a process
+// restart revalidated the pool.
+func TestFailedCompensationStaysReachableAfterTheNicLeftTheSpec(t *testing.T) {
+	e := repairRaceSetup(t)
+
+	// the ownership record is missing: an earlier status write failure
+	// left the lease and the claim retained without the record, which is
+	// why this reconcile takes the repair path at all
+	e.api.mu.Lock()
+	e.api.ippools[testPoolName].Status.IPv4.Allocated = map[string]string{}
+	e.api.mu.Unlock()
+
+	// the raced cleanup lands after the repair write: it removes the
+	// lease (and its claim), and the status api starts failing so the
+	// compensating delete of the resurrected record cannot get through
+	var hooked atomic.Bool
+	e.api.poolPutHook = func() {
+		if !hooked.CompareAndSwap(false, true) {
+			return
+		}
+
+		_ = e.dhcp.DeleteLeaseOwnedBy(testMAC, legacyVMRef)
+		_ = e.ipam.ReleaseIP(testNetwork, "10.0.0.1")
+		e.api.mu.Lock()
+		e.api.poolStatusPutCode = http.StatusInternalServerError
+		e.api.mu.Unlock()
+	}
+
+	vmnetcfg := newVMNetCfg("10.0.0.1", testMAC)
+
+	// the first reconcile fails on the compensating delete, and the
+	// resurrected record survives it
+	if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, vmnetcfg); err == nil {
+		t.Fatal("the failed compensating delete must fail the sync so the retry replays it")
+	}
+	if pool := e.getStoredPool(); pool.Status.IPv4.Allocated["10.0.0.1"] != canonicalLegacy {
+		t.Fatalf("pool status = %v, want the resurrected record to survive the failed compensation", pool.Status.IPv4.Allocated)
+	}
+
+	// the vm controller removes the nic: the retried sync sees a spec
+	// without the binding, so the pending deletion is the only path left
+	// to the orphaned record
+	removed := newVMNetCfg("10.0.0.1", testMAC)
+	removed.Spec.NetworkConfig = nil
+	e.seedVMNetCfg(removed)
+
+	// the status api heals
+	e.api.mu.Lock()
+	e.api.poolStatusPutCode = 0
+	e.api.mu.Unlock()
+
+	if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, removed); err != nil {
+		t.Fatalf("the retried sync must replay the pending deletion and converge: %s", err)
+	}
+
+	// the orphaned record is gone although no spec entry references its
+	// tuple anymore
+	if pool := e.getStoredPool(); len(pool.Status.IPv4.Allocated) != 0 {
+		t.Errorf("pool status = %v, want the pending ledger record removed by the replay", pool.Status.IPv4.Allocated)
+	}
+
+	// the replayed record must not come back and the object stays
+	// converged: a further reconcile issues no ledger writes at all
+	puts := e.countRequests(http.MethodPut, ippoolStatusPath)
+	if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, removed); err != nil {
+		t.Fatalf("the settled sync must succeed: %s", err)
+	}
+	if got := e.countRequests(http.MethodPut, ippoolStatusPath); got != puts {
+		t.Errorf("ledger writes %d -> %d on the settled sync, want none", puts, got)
+	}
+}

@@ -121,14 +121,29 @@ func (c *Controller) updateVirtualMachineNetworkConfigObject(vm *kubevirtV1.Virt
 }
 
 func (c *Controller) deleteVirtualMachineNetworkConfigObject(vmNamespace string, vmName string) (err error) {
-	if !c.checkVirtualMachineNetworkConfigObject(vmNamespace, vmName) {
+	obj, exists, err := c.checkVirtualMachineNetworkConfigObject(vmNamespace, vmName)
+	if err != nil {
+		// a transient get failure must not be mistaken for a missing
+		// object: propagate it so the rate-limited retry re-runs the
+		// deletion while the binding stays retained
+		return fmt.Errorf("(vm.deleteVirtualMachineNetworkConfigObject) [%s/%s] cannot check VirtualMachineNetworkConfig object for vm: %s",
+			vmNamespace, vmName, err.Error())
+	}
+
+	if !exists {
 		log.Warnf("(vm.deleteVirtualMachineNetworkConfigObject) [%s/%s] vmnetcfg %s/%s does not exists",
 			vmNamespace, vmName, vmNamespace, vmName)
 
 		return
 	}
 
-	if err = c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs(vmNamespace).Delete(c.ctx, vmName, metav1.DeleteOptions{}); err != nil {
+	// the delete is conditioned on the uid the preflight get observed: a
+	// same-name replacement created between the get and the delete is
+	// rejected by the apiserver instead of destroyed, and the retry
+	// converges through the informer-store replacement guard
+	if err = c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs(vmNamespace).Delete(c.ctx, vmName, metav1.DeleteOptions{
+		Preconditions: &metav1.Preconditions{UID: &obj.UID},
+	}); err != nil {
 		if apierrors.IsNotFound(err) {
 			// another worker or a concurrent cleanup already removed the object
 			log.Debugf("(vm.deleteVirtualMachineNetworkConfigObject) [%s/%s] vmnetcfg object already deleted",
@@ -149,12 +164,21 @@ func (c *Controller) deleteVirtualMachineNetworkConfigObject(vmNamespace string,
 	return
 }
 
-func (c *Controller) checkVirtualMachineNetworkConfigObject(vmNamespace string, vmName string) bool {
-	if _, err := c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs(vmNamespace).Get(c.ctx, vmName, metav1.GetOptions{}); err != nil {
-		return false
+// checkVirtualMachineNetworkConfigObject checks whether the vmnetcfg object
+// of a vm exists and returns the observed object. a missing object is
+// (nil, false, nil); every other api failure is propagated so a transient
+// error can never be mistaken for absence.
+func (c *Controller) checkVirtualMachineNetworkConfigObject(vmNamespace string, vmName string) (obj *kihv1.VirtualMachineNetworkConfig, exists bool, err error) {
+	obj, err = c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs(vmNamespace).Get(c.ctx, vmName, metav1.GetOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, false, nil
+		}
+
+		return nil, false, err
 	}
 
-	return true
+	return obj, true, nil
 }
 
 func (c *Controller) getNetworkConfigs(vm *kubevirtV1.VirtualMachine, curNetCfg []kihv1.NetworkConfig) (netCfgs []kihv1.NetworkConfig, err error) {

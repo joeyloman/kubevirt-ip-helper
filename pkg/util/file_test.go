@@ -58,3 +58,26 @@ func TestFileExistsSymlink(t *testing.T) {
 		t.Error("FileExists = true for a symlink to a missing target")
 	}
 }
+
+// a path stat reports an error for (a symlink loop, an unreadable
+// directory) must report false, not panic on the nil file info: an
+// unstatable kubeconfig falls back to the caller's in-cluster config path.
+func TestFileExistsSymlinkLoop(t *testing.T) {
+	dir := t.TempDir()
+
+	a := filepath.Join(dir, "a")
+	b := filepath.Join(dir, "b")
+	if err := os.Symlink(b, a); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+	if err := os.Symlink(a, b); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+
+	if FileExists(a) {
+		t.Error("FileExists = true for a symlink loop")
+	}
+	if FileExists(b) {
+		t.Error("FileExists = true for a symlink loop")
+	}
+}

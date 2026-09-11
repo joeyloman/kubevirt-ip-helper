@@ -109,3 +109,61 @@ func TestVMNetCfgLeaseIdempotencyForeignOwnerFailsVisibly(t *testing.T) {
 		t.Errorf("foreign record = %q, want preserved", got)
 	}
 }
+
+// A08 regression: a binding whose explicit-address allocation lost its
+// status write (the pool status write failed after the lease was applied)
+// and which carries no previous status entry must acquire its success
+// status on the recovered reconcile: the lease-idempotent path verifies
+// and adopts the lease, and without the synthesis the object kept serving
+// with an empty status.networkconfig and no metric, because the tail
+// skips the status write of an empty list.
+func TestVMNetCfgRecoveredBindingWithoutPriorStatusAcquiresItsStatus(t *testing.T) {
+	e := newTestEnv(t)
+	e.addSubnet("10.0.0.1", "10.0.0.1")
+	e.seedPool(nil)
+
+	// no status entry at all: the first sync's generated one was discarded
+	// with its failed pool write
+	vmnetcfg := newVMNetCfg("10.0.0.1", testMAC)
+	e.seedVMNetCfg(vmnetcfg)
+
+	// the status write of the first sync fails after the lease was applied:
+	// the reservation is retained, the pool record and the vmnetcfg status
+	// stay missing
+	e.api.poolStatusPutCode = http.StatusInternalServerError
+	if err := e.controller.updateVirtualMachineNetworkConfig(ADD, vmnetcfg); err == nil {
+		t.Fatal("want the transient status failure to fail the sync")
+	}
+	if !e.dhcp.CheckLease(testMAC) {
+		t.Fatal("the lease must be retained")
+	}
+	if stored := e.getStoredVMNetCfg(); len(stored.Status.NetworkConfig) != 0 {
+		t.Fatalf("vmnetcfg status = %v, want it empty after the failed first sync", stored.Status.NetworkConfig)
+	}
+
+	// the recovered reconcile takes the lease-idempotent path without any
+	// previous status entry: it must synthesize the success status and
+	// publish it with its metric
+	e.api.poolStatusPutCode = 0
+	if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, vmnetcfg); err != nil {
+		t.Fatalf("the recovered sync must succeed: %s", err)
+	}
+
+	if n := e.countRequests(http.MethodPut, vmnetcfgStatusPath); n != 1 {
+		t.Errorf("vmnetcfg status writes = %d, want 1 (the synthesized success status)", n)
+	}
+	stored := e.getStoredVMNetCfg()
+	if len(stored.Status.NetworkConfig) != 1 {
+		t.Fatalf("vmnetcfg status = %v, want the synthesized entry", stored.Status.NetworkConfig)
+	}
+	nic := stored.Status.NetworkConfig[0]
+	if nic.MACAddress != testMAC || nic.NetworkName != testNetwork || nic.Status != "OK" {
+		t.Errorf("synthesized status entry = %+v, want the OK entry of the recovered binding", nic)
+	}
+
+	// the pool ownership record is repaired as well
+	pool := e.getStoredPool()
+	if got := pool.Status.IPv4.Allocated["10.0.0.1"]; got != testNamespace+"/"+testVMName+" ["+testMAC+"]" {
+		t.Errorf("pool status entry = %q, want the repaired owner record", got)
+	}
+}

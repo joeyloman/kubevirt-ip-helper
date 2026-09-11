@@ -192,6 +192,18 @@ func (c *Controller) registerIPPool(pool *kihv1.IPPool) (cleanup bool, err error
 	if c.dhcp.CheckPool(pool.Spec.NetworkName) {
 		return cleanup, fmt.Errorf("networkname [%s] is already registered by another IPPool, not touching its live state: %w", pool.Spec.NetworkName, ErrPoolUnregistrable)
 	}
+	// one bind interface serves one pool: a second pool on the same
+	// interface would share the broadcast segment with the first one, and
+	// every socket of the interface receives both pools' traffic (the
+	// so_reuseport delivery semantics depend on the deployment kernel, so
+	// which pool answers a request is not deterministic). the second pool
+	// is rejected before any of its sub-resources exist, and the rejection
+	// is unregistrable so the startup gate counts the pool instead of
+	// retrying the conflict forever
+	if otherNetwork, inUse := c.dhcp.NicClaimedByAnotherPool(pool.Spec.BindInterface, pool.Spec.NetworkName); inUse {
+		return cleanup, fmt.Errorf("bindinterface [%s] of network [%s] is already registered by the pool of network [%s]: %w",
+			pool.Spec.BindInterface, pool.Spec.NetworkName, otherNetwork, ErrPoolUnregistrable)
+	}
 
 	// from here pool sub resources needs to be cleaned up when something
 	// goes wrong; the flag is set before the host-state mutation so a
@@ -263,8 +275,19 @@ func (c *Controller) registerIPPool(pool *kihv1.IPPool) (cleanup bool, err error
 	}
 
 	// cache the pool with a status carrying the protected claims and the
-	// excluded addresses
-	if err = c.cache.Add(rPool); err != nil {
+	// excluded addresses. the cached projection is the spec which was
+	// actually installed on the nic, the dhcp pool and the ipam subnet:
+	// the status write is built on a fresh api GET, so its response may
+	// carry a spec which was updated on the api after the informer
+	// delivered this object (for example while the application was still
+	// initializing and ignoring updates). caching that readback would
+	// swallow the update forever - the next resync compares the event
+	// against the newer cached projection and takes the NOCHANGE branch -
+	// so only the freshly rebuilt status of the response is adopted, on
+	// a deep copy of the input spec
+	installed := pool.DeepCopy()
+	installed.Status = rPool.Status
+	if err = c.cache.Add(installed); err != nil {
 		return cleanup, fmt.Errorf("error while caching the IPPool for network [%s]: %s", pool.Spec.NetworkName, err.Error())
 	}
 

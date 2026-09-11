@@ -177,6 +177,29 @@ func (a *DHCPAllocator) CheckPool(name string) bool {
 	return exists
 }
 
+// NicClaimedByAnotherPool reports the network of the registered dhcp pool
+// which already claims the given bind interface when it is not the given
+// network: two pools on one interface share the broadcast segment, and
+// every socket of the interface receives both pools' traffic (the
+// so_reuseport delivery semantics depend on the deployment kernel), so a
+// registration must reject the second pool before any host or allocator
+// mutation instead of only warning at the listener start. the lookup runs
+// over the pool registry rather than the listener registry, so a pool
+// whose listener died keeps its interface claimed until its registration
+// is torn down.
+func (a *DHCPAllocator) NicClaimedByAnotherPool(nic string, networkName string) (string, bool) {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	for network, pool := range a.pools {
+		if pool.Nic == nic && network != networkName {
+			return network, true
+		}
+	}
+
+	return "", false
+}
+
 func (a *DHCPAllocator) GetPool(name string) (pool DHCPPool) {
 	a.mutex.Lock()
 	defer a.mutex.Unlock()
@@ -709,9 +732,33 @@ func (a *DHCPAllocator) dhcpHandler(conn net.PacketConn, peer net.Addr, m *dhcpv
 		log.Infof("(dhcp.dhcpHandler) [txid=%s] DHCPACK on %s to %s via %s", m.TransactionID.String(), lease.ClientIP, m.ClientHWAddr.String(), pool.Nic)
 	}
 
-	if _, err := conn.WriteTo(reply.ToBytes(), peer); err != nil {
+	// rfc 2131 section 4.1: a request which arrived through a bootp relay
+	// agent gets the successful reply unicast to the relay agent
+	// (giaddr:67), which forwards it towards the client - never to the udp
+	// peer the relayed packet arrived from, and without the broadcast bit
+	// the nak path needs. a directly received request is answered at the
+	// peer address as before.
+	dst := peer
+	if relay := relayDestination(m); relay != nil {
+		dst = relay
+	}
+	if _, err := conn.WriteTo(reply.ToBytes(), dst); err != nil {
 		log.Errorf("(dhcp.dhcpHandler) Cannot reply to client: %v", err)
 	}
+}
+
+// relayDestination returns the bootp relay agent destination (giaddr:67) for
+// a request which arrived through a relay agent, or nil for a directly
+// received request. the len guard keeps a synthetic packet with a nil
+// giaddr from passing the zero comparison and yielding a "<nil>:67"
+// unicast destination.
+func relayDestination(m *dhcpv4.DHCPv4) *net.UDPAddr {
+	if len(m.GatewayIPAddr) > 0 && !m.GatewayIPAddr.Equal(net.IPv4zero) {
+		// rfc 2131 section 4.1: the reply goes to the relay agent, which
+		// forwards it to the client
+		return &net.UDPAddr{IP: m.GatewayIPAddr, Port: dhcpv4.ServerPort}
+	}
+	return nil
 }
 
 // sendNak tells the client that its request does not match the lease state,
@@ -734,7 +781,7 @@ func (a *DHCPAllocator) sendNak(conn net.PacketConn, m *dhcpv4.DHCPv4, serverIP 
 	reply.UpdateOption(dhcpv4.OptServerIdentifier(serverIP))
 
 	dst := &net.UDPAddr{IP: net.IPv4bcast, Port: dhcpv4.ClientPort}
-	if !m.GatewayIPAddr.Equal(net.IPv4zero) {
+	if relay := relayDestination(m); relay != nil {
 		// rfc 2131 section 4.3.2: a relayed client may not hold a valid
 		// network address or subnet mask and may not answer arp requests:
 		// the server MUST set the broadcast bit in the nak so the relay
@@ -744,7 +791,7 @@ func (a *DHCPAllocator) sendNak(conn net.PacketConn, m *dhcpv4.DHCPv4, serverIP 
 
 		// the relay agent forwards the nak towards the client's hardware
 		// address
-		dst = &net.UDPAddr{IP: m.GatewayIPAddr, Port: dhcpv4.ServerPort}
+		dst = relay
 	}
 
 	if _, err := conn.WriteTo(reply.ToBytes(), dst); err != nil {

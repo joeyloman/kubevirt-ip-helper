@@ -341,6 +341,98 @@ func TestDHCPHandlerRequestAddressing(t *testing.T) {
 	})
 }
 
+// TestDHCPHandlerRelayedReplyDestination: rfc 2131 section 4.1 requires a
+// request which arrived through a bootp relay agent to get its successful
+// reply unicast to giaddr:67 - the relay agent forwards it towards the
+// client - never to the udp peer the relayed packet arrived from (which is
+// the relay's own socket, not the client). the broadcast bit stays unset in
+// successful replies: the relay unicasts towards the client. a directly
+// received discover keeps the peer destination.
+func TestDHCPHandlerRelayedReplyDestination(t *testing.T) {
+	t.Run("relayed discover is offered to the relay agent", func(t *testing.T) {
+		a := newTestPooledAllocator(t)
+		conn := &recordingPacketConn{}
+		relayPeer := &net.UDPAddr{IP: net.ParseIP("198.51.100.2"), Port: dhcpv4.ClientPort}
+
+		req := newBootRequest(t, mustHWAddr(t, "aa:bb:cc:dd:ee:01"), dhcpv4.MessageTypeDiscover)
+		req.GatewayIPAddr = net.ParseIP("192.0.2.1")
+		req.Flags = 0
+		a.dhcpHandler(conn, relayPeer, req)
+
+		if conn.len() != 1 {
+			t.Fatalf("expected 1 reply, got %d", conn.len())
+		}
+		resp, err := dhcpv4.FromBytes(conn.payloads[0])
+		if err != nil {
+			t.Fatalf("parsing reply: %v", err)
+		}
+		if mt := resp.MessageType(); mt != dhcpv4.MessageTypeOffer {
+			t.Errorf("got message type %v, want Offer", mt)
+		}
+		if resp.IsBroadcast() {
+			t.Errorf("offer flags = %#x, want no broadcast bit: the relay unicasts a successful reply towards the client", resp.Flags)
+		}
+		dst, ok := conn.peers[0].(*net.UDPAddr)
+		if !ok || !dst.IP.Equal(net.ParseIP("192.0.2.1")) || dst.Port != dhcpv4.ServerPort {
+			t.Errorf("offer destination = %v, want 192.0.2.1:%d (giaddr), not the relay peer %v", conn.peers[0], dhcpv4.ServerPort, relayPeer)
+		}
+	})
+
+	t.Run("relayed request is acked to the relay agent", func(t *testing.T) {
+		a := newTestPooledAllocator(t)
+		conn := &recordingPacketConn{}
+		relayPeer := &net.UDPAddr{IP: net.ParseIP("198.51.100.2"), Port: dhcpv4.ClientPort}
+
+		req := newBootRequest(t, mustHWAddr(t, "aa:bb:cc:dd:ee:01"), dhcpv4.MessageTypeRequest)
+		req.UpdateOption(dhcpv4.OptServerIdentifier(net.ParseIP("192.168.0.1")))
+		req.UpdateOption(dhcpv4.OptRequestedIPAddress(net.ParseIP("192.168.0.50")))
+		req.GatewayIPAddr = net.ParseIP("192.0.2.1")
+		req.Flags = 0
+		a.dhcpHandler(conn, relayPeer, req)
+
+		if conn.len() != 1 {
+			t.Fatalf("expected 1 reply, got %d", conn.len())
+		}
+		resp, err := dhcpv4.FromBytes(conn.payloads[0])
+		if err != nil {
+			t.Fatalf("parsing reply: %v", err)
+		}
+		if mt := resp.MessageType(); mt != dhcpv4.MessageTypeAck {
+			t.Errorf("got message type %v, want Ack", mt)
+		}
+		if resp.IsBroadcast() {
+			t.Errorf("ack flags = %#x, want no broadcast bit: the relay unicasts a successful reply towards the client", resp.Flags)
+		}
+		dst, ok := conn.peers[0].(*net.UDPAddr)
+		if !ok || !dst.IP.Equal(net.ParseIP("192.0.2.1")) || dst.Port != dhcpv4.ServerPort {
+			t.Errorf("ack destination = %v, want 192.0.2.1:%d (giaddr), not the relay peer %v", conn.peers[0], dhcpv4.ServerPort, relayPeer)
+		}
+	})
+
+	t.Run("direct discover is offered to the peer", func(t *testing.T) {
+		a := newTestPooledAllocator(t)
+		conn := &recordingPacketConn{}
+		peer := testPeer()
+
+		req := newBootRequest(t, mustHWAddr(t, "aa:bb:cc:dd:ee:01"), dhcpv4.MessageTypeDiscover)
+		a.dhcpHandler(conn, peer, req)
+
+		if conn.len() != 1 {
+			t.Fatalf("expected 1 reply, got %d", conn.len())
+		}
+		resp, err := dhcpv4.FromBytes(conn.payloads[0])
+		if err != nil {
+			t.Fatalf("parsing reply: %v", err)
+		}
+		if mt := resp.MessageType(); mt != dhcpv4.MessageTypeOffer {
+			t.Errorf("got message type %v, want Offer", mt)
+		}
+		if got := conn.peers[0].String(); got != peer.String() {
+			t.Errorf("offer destination = %v, want the udp peer %v", conn.peers[0], peer)
+		}
+	})
+}
+
 func TestDHCPHandlerReleaseGetsNoReply(t *testing.T) {
 	a := newTestPooledAllocator(t)
 	conn := &recordingPacketConn{}

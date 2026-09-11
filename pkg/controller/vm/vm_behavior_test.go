@@ -16,6 +16,7 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
 
 	kubevirtv1 "kubevirt.io/api/core/v1"
@@ -174,6 +175,7 @@ type fakeAPI struct {
 	// response override knobs; 0 means default behavior
 	vmnetcfgGetStatus        int
 	vmnetcfgGetErr           string
+	vmnetcfgGetUIDOverride   string // when set, GETs serve this UID instead of the stored one (a stale pre-replacement read)
 	vmnetcfgCreateStatus     int
 	vmnetcfgCreateErr        string
 	vmnetcfgUpdateStatus     int
@@ -237,7 +239,13 @@ func (f *fakeAPI) handleVMNetCfg(w http.ResponseWriter, r *http.Request, ns stri
 				fmt.Sprintf("virtualmachinenetworkconfigs.kubevirtiphelper.k8s.binbash.org %q not found", name))
 			return
 		}
-		vmBehaviorWriteJSON(w, http.StatusOK, existing)
+		served := existing.DeepCopy()
+		if f.vmnetcfgGetUIDOverride != "" {
+			// models a stale read: the caller observes the pre-replacement
+			// object while the store already holds the replacement
+			served.ObjectMeta.UID = types.UID(f.vmnetcfgGetUIDOverride)
+		}
+		vmBehaviorWriteJSON(w, http.StatusOK, served)
 	case http.MethodPost:
 		if f.vmnetcfgCreateStatus != 0 {
 			writeAPIError(w, f.vmnetcfgCreateStatus, f.vmnetcfgCreateErr)
@@ -291,6 +299,23 @@ func (f *fakeAPI) handleVMNetCfg(w http.ResponseWriter, r *http.Request, ns stri
 	case http.MethodDelete:
 		if f.vmnetcfgDeleteStatus != 0 {
 			writeAPIError(w, f.vmnetcfgDeleteStatus, f.vmnetcfgDeleteErr)
+			return
+		}
+		// a uid precondition must match the stored object, like a real
+		// apiserver: a same-name replacement created after the caller's
+		// get is rejected with a conflict instead of being destroyed
+		opts := &metav1.DeleteOptions{}
+		if len(body) > 0 {
+			if err := json.Unmarshal(body, opts); err != nil {
+				writeAPIError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+		}
+		if opts.Preconditions != nil && opts.Preconditions.UID != nil && found &&
+			string(existing.UID) != string(*opts.Preconditions.UID) {
+			writeAPIError(w, http.StatusConflict,
+				fmt.Sprintf("Operation cannot be fulfilled on virtualmachinenetworkconfigs %q: the UID in the precondition (%s) does not match the UID in record (%s)",
+					name, *opts.Preconditions.UID, existing.UID))
 			return
 		}
 		f.mu.Lock()
@@ -900,16 +925,121 @@ func TestDeleteVirtualMachineNetworkConfigObjectPropagatesDeleteError(t *testing
 func TestCheckVirtualMachineNetworkConfigObject(t *testing.T) {
 	c, f := vmBehaviorNewTestController(t)
 
-	if c.checkVirtualMachineNetworkConfigObject("ns1", "missing") {
-		t.Error("expected false for missing vmnetcfg")
+	obj, exists, err := c.checkVirtualMachineNetworkConfigObject("ns1", "missing")
+	if err != nil {
+		t.Fatalf("expected no error for missing vmnetcfg, got %v", err)
+	}
+	if exists || obj != nil {
+		t.Error("expected exists=false and nil object for missing vmnetcfg")
 	}
 
 	f.mu.Lock()
 	f.vmnetcfgs["ns1/vm1"] = &kihv1.VirtualMachineNetworkConfig{ObjectMeta: metav1.ObjectMeta{Name: "vm1", Namespace: "ns1"}}
 	f.mu.Unlock()
 
-	if !c.checkVirtualMachineNetworkConfigObject("ns1", "vm1") {
-		t.Error("expected true for existing vmnetcfg")
+	obj, exists, err = c.checkVirtualMachineNetworkConfigObject("ns1", "vm1")
+	if err != nil {
+		t.Fatalf("expected no error for existing vmnetcfg, got %v", err)
+	}
+	if !exists || obj == nil {
+		t.Error("expected exists=true and the observed object for existing vmnetcfg")
+	}
+
+	// a transient get failure must surface as an error, never as absence
+	f.vmnetcfgGetStatus = http.StatusInternalServerError
+	f.vmnetcfgGetErr = "boom"
+	if _, _, err = c.checkVirtualMachineNetworkConfigObject("ns1", "vm1"); err == nil {
+		t.Error("expected error for failing vmnetcfg get")
+	}
+}
+
+// a transient failure of the preflight get must not be mistaken for a missing
+// object: the deletion returns an error so the rate-limited retry re-runs it,
+// no delete reaches the api and the binding stays retained
+func TestDeleteVirtualMachineNetworkConfigObjectPropagatesGetError(t *testing.T) {
+	c, f := vmBehaviorNewTestController(t)
+	f.vmnetcfgGetStatus = http.StatusInternalServerError
+	f.vmnetcfgGetErr = "boom"
+
+	f.mu.Lock()
+	f.vmnetcfgs["ns1/vm1"] = &kihv1.VirtualMachineNetworkConfig{ObjectMeta: metav1.ObjectMeta{Name: "vm1", Namespace: "ns1"}}
+	f.mu.Unlock()
+
+	err := c.deleteVirtualMachineNetworkConfigObject("ns1", "vm1")
+	if err == nil || !strings.Contains(err.Error(), "cannot check VirtualMachineNetworkConfig object for vm") {
+		t.Fatalf("expected wrapped get error, got %v", err)
+	}
+	if n := len(f.requestsFor(http.MethodDelete, "/virtualmachinenetworkconfigs/vm1")); n != 0 {
+		t.Errorf("expected no delete after failing get, got %d", n)
+	}
+	if f.storedVMNetCfg("ns1/vm1") == nil {
+		t.Error("expected vmnetcfg to be retained after failing get")
+	}
+}
+
+// the delete must be conditioned on the uid the preflight get observed, so a
+// same-name replacement landing between get and delete is rejected by the
+// apiserver instead of destroyed
+func TestDeleteVirtualMachineNetworkConfigObjectSendsUIDPrecondition(t *testing.T) {
+	c, f := vmBehaviorNewTestController(t)
+
+	f.mu.Lock()
+	f.vmnetcfgs["ns1/vm1"] = &kihv1.VirtualMachineNetworkConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: "vm1", Namespace: "ns1", UID: types.UID("1111-2222-3333")},
+	}
+	f.mu.Unlock()
+
+	if err := c.deleteVirtualMachineNetworkConfigObject("ns1", "vm1"); err != nil {
+		t.Fatalf("deleteVirtualMachineNetworkConfigObject: %v", err)
+	}
+
+	deletes := f.requestsFor(http.MethodDelete, "/virtualmachinenetworkconfigs/vm1")
+	if len(deletes) != 1 {
+		t.Fatalf("expected 1 delete, got %d", len(deletes))
+	}
+	opts := &metav1.DeleteOptions{}
+	if err := json.Unmarshal(deletes[0].body, opts); err != nil {
+		t.Fatalf("decoding delete options from request body: %v", err)
+	}
+	if opts.Preconditions == nil || opts.Preconditions.UID == nil {
+		t.Fatalf("expected a uid precondition on the delete, got %+v", opts.Preconditions)
+	}
+	if *opts.Preconditions.UID != types.UID("1111-2222-3333") {
+		t.Errorf("expected precondition uid 1111-2222-3333, got %s", *opts.Preconditions.UID)
+	}
+	if f.storedVMNetCfg("ns1/vm1") != nil {
+		t.Error("expected vmnetcfg to be gone after delete")
+	}
+}
+
+// a same-name replacement created between the preflight get and the delete
+// must survive: the uid precondition no longer matches the stored object, the
+// apiserver rejects the delete with a conflict and the retried sync converges
+// through the informer-store replacement guard instead
+func TestDeleteVirtualMachineNetworkConfigObjectSparesReplacementOnUIDConflict(t *testing.T) {
+	c, f := vmBehaviorNewTestController(t)
+	// the store already holds the replacement (uid-b) while the get serves
+	// the stale pre-replacement object (uid-a)
+	f.vmnetcfgGetUIDOverride = "uid-a"
+
+	f.mu.Lock()
+	f.vmnetcfgs["ns1/vm1"] = &kihv1.VirtualMachineNetworkConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: "vm1", Namespace: "ns1", UID: types.UID("uid-b")},
+	}
+	f.mu.Unlock()
+
+	err := c.deleteVirtualMachineNetworkConfigObject("ns1", "vm1")
+	if err == nil || !strings.Contains(err.Error(), "cannot delete VirtualMachineNetworkConfig object for vm") {
+		t.Fatalf("expected wrapped conflict error, got %v", err)
+	}
+
+	// the replacement must still be there, unharmed
+	stored := f.storedVMNetCfg("ns1/vm1")
+	if stored == nil {
+		t.Fatal("expected the replacement vmnetcfg to survive the preconditioned delete")
+	}
+	if stored.UID != types.UID("uid-b") {
+		t.Errorf("expected the replacement uid uid-b to be intact, got %s", stored.UID)
 	}
 }
 

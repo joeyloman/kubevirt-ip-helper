@@ -6,12 +6,13 @@ import (
 	"net"
 	"reflect"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/dhcp"
 	ipam "github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/ippoolstatus"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/util"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	log "github.com/sirupsen/logrus"
 )
@@ -33,6 +34,23 @@ type allocatedNetworkConfig struct {
 	// for another owner; such a claim must never survive the rollback,
 	// while an uncontested one may already be served to its guest
 	contested bool
+}
+
+// pendingLedgerDelete records the ledger entry of a nic whose compensating
+// or unwind delete failed while a concurrent cleanup removed the nic: the
+// tuple is not reconstructible from the spec anymore once the removal is
+// durable, so the controller keeps it reachable and replays the
+// owner-validated deletion on the reconciliations of the owning object
+// until it converges (a restart loses the record, but the pool
+// registration revalidates the persisted ledger and drops the orphaned
+// entry of a positively removed binding).
+type pendingLedgerDelete struct {
+	namespace   string
+	vmName      string
+	ip          string
+	networkName string
+	macAddress  string
+	poolName    string
 }
 
 // rollbackNetworkAllocation reverts the allocation side effects of a
@@ -159,6 +177,27 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 	log.Tracef("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] processing new vmnetcfg [%+v]",
 		vmnetcfg.Namespace, vmnetcfg.Name, vmnetcfg)
 
+	// restoreErr records the first per-interface failure of this sync whose
+	// repair needs a retry (a network without a registered pool, or an
+	// unusable macaddress), while the remaining interfaces are still
+	// processed: one interface's failure must never block the restoration
+	// of the other interfaces (their assignments are protected through this
+	// same sync). the error is reported after every interface was handled;
+	// the startup gate counts the object through its settled classification
+	// and the resynced retry converges once the failure is repaired.
+	var restoreErr error
+
+	// replay the ledger deletions whose compensating or unwind attempt
+	// failed while the nic was concurrently removed: their tuple is not
+	// reconstructible from the spec anymore, so this replay is the only
+	// path which keeps them reachable. a transiently failing replay
+	// defers the failure like a per-interface one, so the remaining
+	// interfaces are still reconciled while the rate-limited retry or
+	// the resync keeps replaying the deletion
+	if unwindErr := c.retryPendingUnwinds(vmnetcfg); unwindErr != nil && restoreErr == nil {
+		restoreErr = unwindErr
+	}
+
 	// cleanup the network configuration if the object is marked for deletion
 	if vmnetcfg.ObjectMeta.DeletionTimestamp != nil {
 		if err := c.cleanupVirtualMachineNetworkConfig(vmnetcfg); err != nil {
@@ -215,16 +254,6 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 			contested:   contested,
 		})
 	}
-
-	// restoreErr records the first per-interface failure of this sync whose
-	// repair needs a retry (a network without a registered pool, or an
-	// unusable macaddress), while the remaining interfaces are still
-	// processed: one interface's failure must never block the restoration
-	// of the other interfaces (their assignments are protected through this
-	// same sync). the error is reported after every interface was handled;
-	// the startup gate counts the object through its settled classification
-	// and the resynced retry converges once the failure is repaired.
-	var restoreErr error
 
 	for _, v := range vmnetcfg.Spec.NetworkConfig {
 		// create a fresh nic status
@@ -374,10 +403,17 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 			continue
 		}
 
-		// handle ip changes in the vmnetcfg object
+		// handle address and network changes in the vmnetcfg object: the
+		// lease identity is the (address, network) pair it was served
+		// under, so a mac which moved to another network must migrate
+		// even when it keeps its numeric address - treating a same-ip
+		// network move as an unchanged lease would adopt the address in
+		// the NEW network's allocator and repair its ledger while the
+		// dhcp lease keeps serving the OLD network's configuration and
+		// the old network's claim and ledger entry leak
 		if c.dhcp.CheckLease(v.MACAddress) {
 			lease := c.dhcp.GetLease(v.MACAddress)
-			if lease.ClientIP.String() != v.IPAddress {
+			if lease.ClientIP.String() != v.IPAddress || lease.PoolName != v.NetworkName {
 				// two-phase startup replay: a pending nic (no recorded
 				// address) whose lease is live must keep its intact lease,
 				// claim and status record during the initialization
@@ -409,8 +445,8 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 					continue
 				}
 
-				log.Warnf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] ip address update found for hwaddr=%s, oldip=%s, newip=%s, starting cleanup of old ip address",
-					vmnetcfg.Namespace, vmnetcfg.Name, v.MACAddress, lease.ClientIP.String(), v.IPAddress)
+				log.Warnf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] address or network change found for hwaddr=%s: the lease holds ip=%s in network=%s, the spec records ip=%s in network=%s, starting cleanup of the leased state",
+					vmnetcfg.Namespace, vmnetcfg.Name, v.MACAddress, lease.ClientIP.String(), lease.PoolName, v.IPAddress, v.NetworkName)
 				c.metrics.UpdateLogStatus("warning")
 
 				oldNetcfg := kihv1.NetworkConfig{}
@@ -458,12 +494,16 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 
 				newVmNetCfgs = append(newVmNetCfgs, v)
 
-				// set the old status
+				// set the old status; a binding whose verification and
+				// repair succeed without any previous entry synthesizes its
+				// success status below instead of serving silently
+				statusRecorded := false
 				for _, nic := range vmnetcfg.Status.NetworkConfig {
 					if v.MACAddress == nic.MACAddress && v.NetworkName == nic.NetworkName {
 						netcfgStatus.Status = nic.Status
 						netcfgStatus.Message = nic.Message
 						newNetCfgStatusList = append(newNetCfgStatusList, netcfgStatus)
+						statusRecorded = true
 
 						break
 					}
@@ -605,6 +645,25 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 						c.metrics.UpdateLogStatus("error")
 
 						repairErr = err
+
+						// the tuple of this compensating delete is about to
+						// leave the spec (the concurrent cleanup removes the
+						// nic before the retried sync re-reads the object),
+						// so it must stay reachable independently of the
+						// nic list: the retried sync cannot reconstruct it
+						// from the spec anymore and replays it through the
+						// pending unwinds instead
+						c.rememberPendingUnwind(
+							fmt.Sprintf("%s/%s", vmnetcfg.Namespace, vmnetcfg.Name),
+							pendingLedgerDelete{
+								namespace:   vmnetcfg.Namespace,
+								vmName:      vmnetcfg.Spec.VMName,
+								ip:          v.IPAddress,
+								networkName: v.NetworkName,
+								macAddress:  v.MACAddress,
+								poolName:    pool.(kihv1.IPPool).Name,
+							},
+						)
 					}
 
 					// the claim this reconciliation adopted for the removed
@@ -619,6 +678,19 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 
 				if repairErr != nil && restoreErr == nil {
 					restoreErr = repairErr
+				}
+
+				// a binding whose lease was verified and adopted but which
+				// carries no previous status entry (its status write was
+				// lost before a restart, or an earlier sync discarded the
+				// freshly generated one when its pool write failed) must
+				// not serve silently without its success status:
+				// synthesize it so the tail publishes the status and its
+				// metric exactly like the fresh allocation path does
+				if !statusRecorded {
+					netcfgStatus.Status = "OK"
+					netcfgStatus.Message = "IP address successfully allocated"
+					newNetCfgStatusList = append(newNetCfgStatusList, netcfgStatus)
 				}
 
 				continue
@@ -1221,6 +1293,22 @@ func (c *Controller) unwindClaim(vmnetcfg *kihv1.VirtualMachineNetworkConfig, nc
 		log.Errorf("(vmnetcfg.unwindClaim) [%s/%s] failed to remove the ip %s record from the IPPool %s status: %s",
 			vmnetcfg.Namespace, vmnetcfg.Name, nc.ipAddress, nc.poolName, err)
 		c.metrics.UpdateLogStatus("error")
+
+		// the nic of this unwind is gone from the live spec by definition,
+		// so a failed record deletion has no reconstructible tuple left:
+		// keep it reachable for the reconciliations of this object, which
+		// replay it through the pending unwinds
+		c.rememberPendingUnwind(
+			fmt.Sprintf("%s/%s", vmnetcfg.Namespace, vmnetcfg.Name),
+			pendingLedgerDelete{
+				namespace:   vmnetcfg.Namespace,
+				vmName:      vmnetcfg.Spec.VMName,
+				ip:          nc.ipAddress,
+				networkName: nc.networkName,
+				macAddress:  nc.macAddress,
+				poolName:    nc.poolName,
+			},
+		)
 	}
 
 	if err := c.updateIPPoolMetrics(nc.poolName); err != nil {

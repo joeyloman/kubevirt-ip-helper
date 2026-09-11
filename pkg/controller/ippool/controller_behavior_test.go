@@ -26,6 +26,7 @@ import (
 	kihclientset "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/clientset/versioned"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/metrics"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/network"
 )
 
 // newTestGate builds a startup gate whose snapshot holds the given keys:
@@ -1272,6 +1273,119 @@ func TestSyncUpdateResyncReroutesSwallowedNetworkNameChange(t *testing.T) {
 	}
 }
 
+// TestSyncDeleteOfRenamedPoolTearsDownTheRecordedRegistration pins the
+// review finding: a pool which was renamed while the application was
+// initializing keeps its live registration under the OLD networkname
+// (the rename is swallowed during APP_INIT). when the object is then
+// deleted, the event carries only the final networkname, so the delete
+// path used to report "never registered; skipping cleanup" and leak the
+// whole registration: the dhcp pool, the ipam subnet, the cache entry,
+// the nic address and the registeredPools record all stayed behind. the
+// deletion must resolve the recorded networkname (exactly like the
+// update path) and tear the live registration down.
+func TestSyncDeleteOfRenamedPoolTearsDownTheRecordedRegistration(t *testing.T) {
+	stubNicMutation(t)
+
+	// the cleanup releases the server ip from the bind interface: record
+	// the seam so the teardown of the old registration is observable
+	var removedNicIPs []string
+	origRemove := network.RemoveIpFromNic
+	network.RemoveIpFromNic = func(nic string, ip4 string) error {
+		removedNicIPs = append(removedNicIPs, nic+" "+ip4)
+
+		return nil
+	}
+	t.Cleanup(func() {
+		network.RemoveIpFromNic = origRemove
+	})
+
+	// the pool status the registration consults survives at the api
+	stored := testPool("pool-d", "net-old", 60)
+	rs := ippoolBehaviorNewRestState(stored)
+	srv := httptest.NewServer(rs.ippoolBehaviorHandler())
+	t.Cleanup(srv.Close)
+
+	var appStatus atomic.Int32
+	appStatus.Store(APP_INIT)
+	startupGate := newTestGate("pool-d")
+
+	oldSpec := testPool("pool-d", "net-old", 60)
+	newSpec := testPool("pool-d", "net-new", 60)
+
+	indexer := newTestIndexer()
+	if err := indexer.Add(oldSpec); err != nil {
+		t.Fatalf("seeding indexer: %v", err)
+	}
+
+	controller, cacheAllocator := newTestController(t, newTestQueue(), indexer, nil, &appStatus, startupGate)
+	cs, err := kihclientset.NewForConfig(&rest.Config{Host: srv.URL})
+	if err != nil {
+		t.Fatalf("creating clientset: %v", err)
+	}
+	controller.kihClientset = cs
+	// the listener seam keeps the registration off the host network
+	controller.runListener = func(networkName string, nic string) error {
+		return nil
+	}
+
+	// the startup registration settles under the old networkname
+	if err := controller.sync(testPoolEvent("pool-d", ADD, "net-old")); err != nil {
+		t.Fatalf("the startup registration failed: %v", err)
+	}
+	if net, live := controller.registeredPools["pool-d"]; !live || net != "net-old" {
+		t.Fatalf("the settled registration was not recorded: registeredPools[pool-d] = %q, live=%v", net, live)
+	}
+
+	// the rename arrives while the application is initializing and is
+	// swallowed; the rename is persisted, so the api serves the new spec
+	// from now on
+	if err := indexer.Update(newSpec); err != nil {
+		t.Fatalf("applying the rename to the index: %v", err)
+	}
+	rs.pool = newSpec.DeepCopy()
+	renameEvent := testPoolEvent("pool-d", UPDATE, "net-new")
+	renameEvent.oldPoolNetworkName = "net-old"
+	if err := controller.sync(renameEvent); err != nil {
+		t.Fatalf("the initializing application must ignore the rename update: %v", err)
+	}
+
+	// the renamed object is deleted: the event carries only the final
+	// networkname, and the handler must converge on it
+	if err := indexer.Delete(newSpec); err != nil {
+		t.Fatalf("removing the deleted object from the index: %v", err)
+	}
+	if err := controller.sync(testPoolEvent("pool-d", DELETE, "net-new")); err != nil {
+		t.Fatalf("the deletion of the renamed pool returned an error: %v", err)
+	}
+
+	// the registration under the old networkname is fully torn down
+	if controller.dhcp.CheckPool("net-old") {
+		t.Error("the dhcp pool of the old registration survived the deletion")
+	}
+	if used := controller.ipam.Used("net-old"); used != 0 {
+		t.Errorf("ipam used of net-old = %d, want 0 (the subnet must be deleted)", used)
+	}
+	if cacheAllocator.Check(oldSpec) {
+		t.Error("the cache entry of the old registration survived the deletion")
+	}
+	if _, live := controller.registeredPools["pool-d"]; live {
+		t.Error("the registeredPools record of the renamed pool survived the deletion")
+	}
+	if len(removedNicIPs) == 0 {
+		t.Error("the cleanup never removed the server ip from the bind interface")
+	} else if removedNicIPs[0] != "test-fake-iface 192.168.1.1/24" {
+		t.Errorf("removed nic ip = %q, want the server ip of the old registration", removedNicIPs[0])
+	}
+
+	// no registration ever existed under the new networkname
+	if controller.dhcp.CheckPool("net-new") {
+		t.Error("a dhcp pool exists under the new networkname")
+	}
+	if cacheAllocator.Check(newSpec) {
+		t.Error("a cache entry exists under the new networkname")
+	}
+}
+
 // Run must not return while a worker is still syncing: the EventListener
 // join waits for Run, so an early return would let the restart flow
 // observe a stopped era while a reconciler still registers or tears down
@@ -1379,5 +1493,89 @@ func TestRunSettlesSnapshotKeysDeletedBeforeTheInformerStarted(t *testing.T) {
 		if key == "pool-gone" {
 			t.Errorf("the never-observed deletion %s stayed unsettled: Run must settle it through the store reconcile", key)
 		}
+	}
+}
+
+// I05 regression: one bind interface serves one pool. a second pool on an
+// interface another pool already serves would share the broadcast segment
+// with it, and every socket of the interface receives both pools' traffic
+// (the so_reuseport delivery semantics depend on the deployment kernel,
+// so which pool answers a request is not deterministic). the second pool
+// is rejected before any of its sub-resources exist, the rejection is
+// unregistrable (the startup gate counts the pool instead of retrying the
+// conflict forever), and the first registration stays untouched.
+func TestRegisterIPPoolRejectsDuplicateBindInterface(t *testing.T) {
+	stubNicMutation(t)
+
+	// the live registration of pool-a on the shared nic
+	live := testPool("pool-a", "net-a", 60)
+	rs := ippoolBehaviorNewRestState(live)
+	srv := httptest.NewServer(rs.ippoolBehaviorHandler())
+	t.Cleanup(srv.Close)
+
+	var appStatus atomic.Int32
+	appStatus.Store(APP_INIT)
+	startupGate := newTestGate("pool-a", "pool-b")
+
+	indexer := newTestIndexer()
+	if err := indexer.Add(live); err != nil {
+		t.Fatalf("seeding indexer: %v", err)
+	}
+	if err := indexer.Add(testPool("pool-b", "net-b", 60)); err != nil {
+		t.Fatalf("seeding indexer: %v", err)
+	}
+
+	controller, cacheAllocator := newTestController(t, newTestQueue(), indexer, nil, &appStatus, startupGate)
+	cs, err := kihclientset.NewForConfig(&rest.Config{Host: srv.URL})
+	if err != nil {
+		t.Fatalf("creating clientset: %v", err)
+	}
+	controller.kihClientset = cs
+	controller.runListener = func(networkName string, nic string) error {
+		return nil
+	}
+
+	// pool-a registers on the shared nic
+	if err := controller.sync(testPoolEvent("pool-a", ADD, "net-a")); err != nil {
+		t.Fatalf("the first registration failed: %v", err)
+	}
+	if !controller.dhcp.CheckPool("net-a") {
+		t.Fatal("the first registration did not create its dhcp pool")
+	}
+
+	// the api serves the second pool's object for its claim protection
+	rs.mu.Lock()
+	rs.pool = testPool("pool-b", "net-b", 60)
+	rs.mu.Unlock()
+
+	// pool-b claims the SAME bindinterface with another network: the
+	// registration must reject it definitively
+	err = controller.sync(testPoolEvent("pool-b", ADD, "net-b"))
+	if err == nil {
+		t.Fatal("the duplicate bindinterface registration returned nil, want a rejection")
+	}
+	if !errors.Is(err, ErrPoolUnregistrable) {
+		t.Errorf("error = %v, want the ErrPoolUnregistrable classification", err)
+	}
+
+	// none of pool-b's sub-resources exist
+	if controller.dhcp.CheckPool("net-b") {
+		t.Error("a dhcp pool was created for the rejected duplicate pool")
+	}
+	if controller.ipam.Used("net-b") != 0 {
+		t.Error("an ipam subnet was created for the rejected duplicate pool")
+	}
+	if cacheAllocator.Check(testPool("pool-b", "net-b", 60)) {
+		t.Error("a cache entry was published for the rejected duplicate pool")
+	}
+
+	// the first registration is untouched and both pools settled the gate
+	// (the rejection is unregistrable, so it counts as handled)
+	if !controller.dhcp.CheckPool("net-a") {
+		t.Error("the live registration of the first pool must stay untouched")
+	}
+	if !startupGate.Open() {
+		t.Errorf("gate settled = %d out of %d, want the snapshot complete (the rejected pool counts as handled)",
+			startupGate.Settled(), startupGate.Target())
 	}
 }
