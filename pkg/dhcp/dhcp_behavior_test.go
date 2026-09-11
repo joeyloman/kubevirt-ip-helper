@@ -602,6 +602,57 @@ func TestAddPoolOverwritesExistingPool(t *testing.T) {
 	}
 }
 
+// TestAddPoolRejectsNonIPv4Addresses pins the wire-projection backstop:
+// every address which reaches a reply is encoded through To4(), so an
+// ipv6 literal or an unparseable entry would silently emit a
+// zero-length or short dhcp option (54/3/6) which strict client parsers
+// drop - and a v6 server ip additionally makes the server-identifier
+// comparison of every DHCPREQUEST permanently false. a pool whose dhcp
+// can never work must not register. an unset router stays legitimate
+// (the reply construction omits option 3 instead).
+func TestAddPoolRejectsNonIPv4Addresses(t *testing.T) {
+	cases := []struct {
+		name       string
+		serverIP   string
+		subnetMask string
+		router     string
+		dns        []string
+	}{
+		{"ipv6 server ip", "fd00::1", "255.255.255.0", "192.168.0.254", nil},
+		{"unparseable server ip", "not-an-ip", "255.255.255.0", "192.168.0.254", nil},
+		{"unparseable subnet mask", "192.168.0.1", "not-a-mask", "192.168.0.254", nil},
+		{"ipv6 router", "192.168.0.1", "255.255.255.0", "fd00::2", nil},
+		{"unparseable router", "192.168.0.1", "255.255.255.0", "gateway.example.local", nil},
+		{"ipv6 dns entry", "192.168.0.1", "255.255.255.0", "192.168.0.254", []string{"192.168.0.10", "fd00::3"}},
+		{"unparseable dns entry", "192.168.0.1", "255.255.255.0", "192.168.0.254", []string{"dns.example.local"}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := NewDHCPAllocator()
+
+			err := a.AddPool("pool-x", tc.serverIP, tc.subnetMask, tc.router, tc.dns, "", nil, nil, 300, "eth0")
+			if err == nil {
+				t.Fatal("AddPool accepted a non-ipv4 address projection")
+			}
+			if a.CheckPool("pool-x") {
+				t.Error("the rejected pool must not be registered")
+			}
+		})
+	}
+
+	// an unset router is legitimate: no option 3 is emitted for it
+	t.Run("unset router is admitted", func(t *testing.T) {
+		a := NewDHCPAllocator()
+		if err := a.AddPool("pool-x", "192.168.0.1", "255.255.255.0", "", nil, "", nil, nil, 300, "eth0"); err != nil {
+			t.Fatalf("AddPool rejected an unset router: %v", err)
+		}
+		if !a.CheckPool("pool-x") {
+			t.Error("the pool with the unset router must be registered")
+		}
+	})
+}
+
 // mac addresses are stored under the canonical colon form, so every
 // spelling of the same address must resolve to the same lease and a
 // duplicate spelling must be rejected instead of creating a second

@@ -1167,6 +1167,150 @@ func TestHandleIPPoolObjectChangeRejectsUnclaimableExcludeUpdate(t *testing.T) {
 	}
 }
 
+// TestRegisterIPPoolValidatesAddressProjectionBeforeNetlink pins the P2
+// finding: an ipv6 or unparseable server ip, router or dns entry passes
+// every earlier check and fails only at the reply construction of a live
+// listener - the option encodes through To4() as a zero-length or short
+// dhcp option which strict client parsers drop, and a v6 server ip makes
+// the server-identifier comparison of every DHCPREQUEST permanently
+// false - so the pool would serve a network whose dhcp silently never
+// works. the invalid projection must be rejected as unregistrable before
+// any mutation.
+func TestRegisterIPPoolValidatesAddressProjectionBeforeNetlink(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(pool *kihv1.IPPool)
+	}{
+		{"ipv6 server ip", func(pool *kihv1.IPPool) { pool.Spec.IPv4Config.ServerIP = "fd00::1" }},
+		{"unparseable server ip", func(pool *kihv1.IPPool) { pool.Spec.IPv4Config.ServerIP = "not-an-ip" }},
+		{"ipv6 router", func(pool *kihv1.IPPool) { pool.Spec.IPv4Config.Router = "fd00::2" }},
+		{"unparseable router", func(pool *kihv1.IPPool) { pool.Spec.IPv4Config.Router = "gateway.example.local" }},
+		{"ipv6 dns entry", func(pool *kihv1.IPPool) { pool.Spec.IPv4Config.DNS = []string{"10.10.10.2", "fd00::3"} }},
+		{"unparseable dns entry", func(pool *kihv1.IPPool) { pool.Spec.IPv4Config.DNS = []string{"dns.example.local"} }},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _, d, ca, _ := ippoolBehaviorNewTestController(t, nil)
+
+			pool := ippoolBehaviorNewTestPool("pool1", "net-a")
+			tc.mutate(pool)
+
+			cleanup, err := c.registerIPPool(pool)
+			if err == nil {
+				t.Fatal("the invalid address projection must fail the registration")
+			}
+			if !errors.Is(err, ErrPoolUnregistrable) {
+				t.Errorf("error = %v, want the ErrPoolUnregistrable classification so the startup gate counts the pool", err)
+			}
+			if cleanup {
+				t.Error("cleanup flag = true, want false: the rejection must not tear down state it never created")
+			}
+
+			// the rejection happened before any mutation
+			if d.CheckPool("net-a") {
+				t.Error("no dhcp pool may exist after the pre-mutation rejection")
+			}
+			if ca.Check(pool) {
+				t.Error("no cache entry may exist after the pre-mutation rejection")
+			}
+			if used := c.ipam.Used("net-a"); used != 0 {
+				t.Errorf("ipam used = %d, want 0 (the rejection must precede the subnet registration)", used)
+			}
+		})
+	}
+}
+
+// the update path must reject an invalid address projection before the
+// restart teardown, exactly like the unclaimable exclude entry: the
+// restart would drain the live services of the whole application and the
+// re-registration of the next era would then fail at the same projection
+// forever, leaving the network unserved until the object is repaired by
+// hand. an unset router stays a legitimate projection (the reply omits
+// option 3 instead of emitting a zero-length one).
+func TestHandleIPPoolObjectChangeRejectsInvalidAddressProjectionUpdate(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(pool *kihv1.IPPool)
+	}{
+		{"ipv6 server ip", func(pool *kihv1.IPPool) { pool.Spec.IPv4Config.ServerIP = "fd00::1" }},
+		{"unparseable router", func(pool *kihv1.IPPool) { pool.Spec.IPv4Config.Router = "gateway.example.local" }},
+		{"unparseable dns entry", func(pool *kihv1.IPPool) { pool.Spec.IPv4Config.DNS = []string{"dns.example.local"} }},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _, d, ca, _ := ippoolBehaviorNewTestController(t, nil)
+
+			oldPool := ippoolBehaviorNewTestPool("pool1", "net-a")
+			if err := ca.Add(oldPool); err != nil {
+				t.Fatalf("failed to cache the registered pool: %s", err.Error())
+			}
+
+			if err := d.AddPool(
+				"net-a",
+				"10.10.10.1",
+				"255.255.255.0",
+				"10.10.10.254",
+				[]string{"10.10.10.2", "10.10.10.3"},
+				"example.local",
+				[]string{"example.local"},
+				[]string{"10.10.10.4"},
+				3600,
+				"eth-test",
+			); err != nil {
+				t.Fatalf("failed to seed the active dhcp pool: %s", err.Error())
+			}
+
+			newPool := ippoolBehaviorNewTestPool("pool1", "net-a")
+			tc.mutate(newPool)
+
+			if err := c.handleIPPoolObjectChange(*oldPool, newPool); err == nil {
+				t.Fatal("handleIPPoolObjectChange accepted an invalid address projection")
+			}
+			if c.appStatus.Load() != APP_RUNNING {
+				t.Errorf("the rejected update started an application restart: app status got %d, want %d", c.appStatus.Load(), APP_RUNNING)
+			}
+			if !d.CheckPool("net-a") {
+				t.Error("the rejected update removed the active dhcp pool")
+			}
+			if !ca.Check(oldPool) {
+				t.Error("the rejected update touched the cache")
+			}
+		})
+	}
+
+	// an unset router is legitimate: the reload of a pool without a
+	// router must converge instead of being rejected
+	t.Run("unset router is admitted", func(t *testing.T) {
+		c, _, d, ca, _ := ippoolBehaviorNewTestController(t, nil)
+
+		oldPool := ippoolBehaviorNewTestPool("pool1", "net-a")
+		if err := ca.Add(oldPool); err != nil {
+			t.Fatalf("failed to cache the registered pool: %s", err.Error())
+		}
+		if err := d.AddPool(
+			"net-a",
+			"10.10.10.1",
+			"255.255.255.0",
+			"10.10.10.254",
+			nil, "", nil, nil, 3600, "eth-test",
+		); err != nil {
+			t.Fatalf("failed to seed the active dhcp pool: %s", err.Error())
+		}
+
+		newPool := ippoolBehaviorNewTestPool("pool1", "net-a")
+		newPool.Spec.IPv4Config.Router = ""
+
+		if err := c.handleIPPoolObjectChange(*oldPool, newPool); err != nil {
+			t.Fatalf("the unset router must be admitted: %s", err)
+		}
+		if !d.CheckPool("net-a") {
+			t.Error("the admitted reload must keep the dhcp pool registered")
+		}
+	})
+}
+
 // an exclude entry which the persisted ledger records for a live binding
 // can never converge: the re-registration of the next era rejects it up
 // front, so the update must be refused before the restart teardown as

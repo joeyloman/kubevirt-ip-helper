@@ -156,6 +156,16 @@ func (c *Controller) registerIPPool(pool *kihv1.IPPool) (cleanup bool, err error
 			pool.Name, pool.Spec.NetworkName, excludeErr.Error(), ErrPoolUnregistrable)
 	}
 
+	// the address projection of the wire path must be registrable before
+	// any state is mutated: an invalid entry would otherwise only fail
+	// at the reply construction of a live listener (see
+	// validatePoolProjection), so every retried attempt and resync would
+	// rebuild and tear the half-applied registration down again
+	if projectionErr := validatePoolProjection(pool); projectionErr != nil {
+		return cleanup, fmt.Errorf("error while validating the address projection of pool [%s] for network [%s]: %s: %w",
+			pool.Name, pool.Spec.NetworkName, projectionErr.Error(), ErrPoolUnregistrable)
+	}
+
 	// an exclude entry which the persisted ledger records for a live
 	// binding is a configuration conflict which can never converge: the
 	// exclude pass claims the address as EXCLUDED first, so the later
@@ -176,9 +186,20 @@ func (c *Controller) registerIPPool(pool *kihv1.IPPool) (cleanup bool, err error
 		}
 		if getErr == nil {
 			for _, ex := range pool.Spec.IPv4Config.Pool.Exclude {
-				if ref, claimed := cPool.Status.IPv4.Allocated[ex]; claimed && ref != ipam.ExcludedOwner && c.excludeEntryConflicts(pool, ex, ref) {
-					return cleanup, fmt.Errorf("exclude address [%s] of network [%s] is recorded in the IPPool status as allocated to [%s]; remove the exclude entry or release the claim first: %w",
-						ex, pool.Spec.NetworkName, ref, ErrPoolUnregistrable)
+				if ref, claimed := cPool.Status.IPv4.Allocated[ex]; claimed && ref != ipam.ExcludedOwner {
+					conflict, verifyErr := c.excludeEntryConflicts(pool, ex, ref)
+					if verifyErr != nil {
+						// an unverifiable owner is a transient state, not a
+						// definitive rejection: the plain error keeps the
+						// registration retriable and the startup gate open
+						// until the api read succeeds
+						return cleanup, fmt.Errorf("error while verifying the owner of the exclude address [%s] of network [%s] against its persisted claim: %s",
+							ex, pool.Spec.NetworkName, verifyErr.Error())
+					}
+					if conflict {
+						return cleanup, fmt.Errorf("exclude address [%s] of network [%s] is recorded in the IPPool status as allocated to [%s]; remove the exclude entry or release the claim first: %w",
+							ex, pool.Spec.NetworkName, ref, ErrPoolUnregistrable)
+					}
 				}
 			}
 		}
@@ -374,6 +395,15 @@ func (c *Controller) handleIPPoolObjectChange(oldPool kihv1.IPPool, newPool *kih
 			newPool.Spec.NetworkName, excludeErr.Error())
 	}
 
+	// the address projection is part of the same pre-teardown validation:
+	// an invalid entry would drain the live services here and then fail
+	// the re-registration of the next era forever, so the update is
+	// rejected while the registered configuration keeps serving
+	if projectionErr := validatePoolProjection(newPool); projectionErr != nil {
+		return fmt.Errorf("(ippool.handleIPPoolObjectChange) rejecting update for networkname [%s]: %s, keeping the currently registered configuration",
+			newPool.Spec.NetworkName, projectionErr.Error())
+	}
+
 	if oldPool.Spec.NetworkName != newPool.Spec.NetworkName && c.dhcp.CheckPool(newPool.Spec.NetworkName) {
 		return fmt.Errorf("(ippool.handleIPPoolObjectChange) rejecting update for [%s]: the networkname [%s] is already registered by another IPPool, keeping the currently registered configuration",
 			oldPool.Spec.NetworkName, newPool.Spec.NetworkName)
@@ -397,9 +427,19 @@ func (c *Controller) handleIPPoolObjectChange(oldPool kihv1.IPPool, newPool *kih
 		}
 		if getErr == nil {
 			for _, ex := range newPool.Spec.IPv4Config.Pool.Exclude {
-				if ref, claimed := cPool.Status.IPv4.Allocated[ex]; claimed && ref != ipam.ExcludedOwner && c.excludeEntryConflicts(newPool, ex, ref) {
-					return fmt.Errorf("(ippool.handleIPPoolObjectChange) rejecting update for [%s]: the exclude address [%s] is recorded in the IPPool status as allocated to [%s]; remove the exclude entry or release the claim first, keeping the currently registered configuration",
-						newPool.Name, ex, ref)
+				if ref, claimed := cPool.Status.IPv4.Allocated[ex]; claimed && ref != ipam.ExcludedOwner {
+					conflict, verifyErr := c.excludeEntryConflicts(newPool, ex, ref)
+					if verifyErr != nil {
+						// an unverifiable owner is a transient state: the
+						// update is retried by the requeue and the resync
+						// while the registered configuration keeps serving
+						return fmt.Errorf("(ippool.handleIPPoolObjectChange) error while verifying the owner of the exclude address [%s] of pool [%s]: %s",
+							ex, newPool.Name, verifyErr.Error())
+					}
+					if conflict {
+						return fmt.Errorf("(ippool.handleIPPoolObjectChange) rejecting update for [%s]: the exclude address [%s] is recorded in the IPPool status as allocated to [%s]; remove the exclude entry or release the claim first, keeping the currently registered configuration",
+							newPool.Name, ex, ref)
+					}
 				}
 			}
 		}
@@ -557,8 +597,14 @@ func (c *Controller) createOrUpdateDHCPPool(pool *kihv1.IPPool) (err error) {
 		}
 	}
 
-	// register the new subnet in dhcp
-	c.dhcp.AddPool(
+	// register the new subnet in dhcp. the AddPool validation is the
+	// backstop of the up-front validatePoolProjection admission: a pool
+	// which reaches this point with an invalid address projection has
+	// already destroyed its live dhcp pool above, so the error must
+	// surface instead of being silently dropped (the caller requeues and
+	// the resync re-runs the registration, and the up-front admission
+	// keeps the deterministic defects out of this path entirely)
+	if err := c.dhcp.AddPool(
 		pool.Spec.NetworkName,
 		pool.Spec.IPv4Config.ServerIP,
 		net.IP(subnetMask).String(),
@@ -569,9 +615,40 @@ func (c *Controller) createOrUpdateDHCPPool(pool *kihv1.IPPool) (err error) {
 		pool.Spec.IPv4Config.NTP,
 		pool.Spec.IPv4Config.LeaseTime,
 		pool.Spec.BindInterface,
-	)
+	); err != nil {
+		return fmt.Errorf("(ippool.createOrUpdateDHCPPool) cannot register the dhcp pool of network [%s]: %s",
+			pool.Spec.NetworkName, err.Error())
+	}
 
 	return
+}
+
+// validatePoolProjection verifies the address fields of the pool spec
+// which reach the dhcp wire: the server ip, the router and the dns
+// entries must be ipv4 literals (the router may stay unset). an ipv6 or
+// unparseable entry passes every earlier check and fails only at the
+// reply construction, where it encodes as a zero-length or short dhcp
+// option which strict client parsers drop - and a v6 server ip makes the
+// server-identifier comparison of every DHCPREQUEST permanently false -
+// so the pool would serve a network whose dhcp silently never works. the
+// rejection is deterministic and precedes every host, dhcp and allocator
+// mutation, so it is unregistrable like the other projection defects.
+func validatePoolProjection(pool *kihv1.IPPool) error {
+	if ip := net.ParseIP(pool.Spec.IPv4Config.ServerIP); ip == nil || ip.To4() == nil {
+		return fmt.Errorf("the server ip [%s] is not a valid ipv4 address", pool.Spec.IPv4Config.ServerIP)
+	}
+	if router := pool.Spec.IPv4Config.Router; router != "" {
+		if ip := net.ParseIP(router); ip == nil || ip.To4() == nil {
+			return fmt.Errorf("the router [%s] is not a valid ipv4 address", router)
+		}
+	}
+	for _, dnsServer := range pool.Spec.IPv4Config.DNS {
+		if ip := net.ParseIP(dnsServer); ip == nil || ip.To4() == nil {
+			return fmt.Errorf("the dns entry [%s] is not a valid ipv4 address", dnsServer)
+		}
+	}
+
+	return nil
 }
 
 // specClaim records one admitted claim of the vmnetcfg claim sweep: the
@@ -693,7 +770,7 @@ func (c *Controller) protectPersistedClaims(pool *kihv1.IPPool) (map[string]stri
 		// transiently unreadable object or a vmnetcfg which a live vm is
 		// about to reconstruct must not drop a claim the guest may still
 		// hold)
-		if !c.ledgerOwnerLive(pool, namespace, vmName, hwAddr, ip) {
+		if c.verifyLedgerOwner(pool, namespace, vmName, hwAddr, ip) == ownerGone {
 			log.Warnf("(ippool.protectPersistedClaims) IPPool %s carries the allocation record %q for ip %s whose owner is authoritatively gone, dropping it instead of resurrecting it",
 				pool.Name, ownerRef, ip)
 			c.metrics.UpdateLogStatus("warning")
@@ -1029,7 +1106,20 @@ func (c *Controller) protectPersistedClaims(pool *kihv1.IPPool) (map[string]stri
 	return claims, nil
 }
 
-// ledgerOwnerLive revalidates the owner of a persisted ledger entry
+// ownerLiveness classifies the revalidation of a persisted ledger owner:
+// the authoritative absence (ownerGone) may drop the record, a live owner
+// (ownerLive) keeps it, and an owner whose liveness could not be
+// established (ownerUnverified) is interpreted fail-closed by every
+// consumer which must not drop a record on one failed read.
+type ownerLiveness int
+
+const (
+	ownerGone ownerLiveness = iota
+	ownerLive
+	ownerUnverified
+)
+
+// verifyLedgerOwner revalidates the owner of a persisted ledger entry
 // before the registration republishes it. the verdict distinguishes the
 // authoritative absence, which may drop the record, from the uncertain
 // absence, which must keep it:
@@ -1038,17 +1128,17 @@ func (c *Controller) protectPersistedClaims(pool *kihv1.IPPool) (map[string]stri
 //     (canonical mac, this network, this address): the owner is live.
 //   - the owning vmnetcfg exists but no longer records the binding: the
 //     owner positively removed it (a nic edit or a completed move), so
-//
-// the record is stale and must not be resurrected.
+//     the record is stale and must not be resurrected.
 //   - the owning vmnetcfg is gone: only a VirtualMachine which is gone as
 //     well is the authoritative absence (a live vm's controller recreates
 //     its vmnetcfg, and the recreated binding reclaims the address), so
 //     the vm existence decides. a missing verifier (tests, a client which
-//     could not be built) fails closed and keeps the record.
-//   - any read which fails transiently keeps the record: a claim the
-//     guest may still hold must not be dropped because one api read
-//     failed, and the next registration revalidates it again.
-func (c *Controller) ledgerOwnerLive(pool *kihv1.IPPool, namespace string, vmName string, hwAddr string, ip string) bool {
+//     could not be built) is unverifiable and the consumer keeps the
+//     record.
+//   - any read which fails transiently is unverifiable: a claim the guest
+//     may still hold must not be dropped because one api read failed, and
+//     the next registration revalidates it again.
+func (c *Controller) verifyLedgerOwner(pool *kihv1.IPPool, namespace string, vmName string, hwAddr string, ip string) ownerLiveness {
 	vmnetcfg, getErr := c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs(namespace).Get(
 		c.ctx, vmName, metav1.GetOptions{},
 	)
@@ -1056,71 +1146,85 @@ func (c *Controller) ledgerOwnerLive(pool *kihv1.IPPool, namespace string, vmNam
 		for _, v := range vmnetcfg.Spec.NetworkConfig {
 			if util.CanonicalHWAddr(v.MACAddress) == util.CanonicalHWAddr(hwAddr) &&
 				v.NetworkName == pool.Spec.NetworkName && v.IPAddress == ip {
-				return true
+				return ownerLive
 			}
 		}
 
-		return false
+		return ownerGone
 	}
 
 	if !apierrors.IsNotFound(getErr) {
-		log.Warnf("(ippool.ledgerOwnerLive) cannot verify the owner %s/%s of the recorded ip %s of IPPool %s, keeping the record: %s",
+		log.Warnf("(ippool.verifyLedgerOwner) cannot verify the owner %s/%s of the recorded ip %s of IPPool %s, keeping the record: %s",
 			namespace, vmName, ip, pool.Name, getErr.Error())
 		c.metrics.UpdateLogStatus("warning")
 
-		return true
+		return ownerUnverified
 	}
 
 	if c.verifyVM == nil {
-		log.Warnf("(ippool.ledgerOwnerLive) cannot verify the virtualmachine %s/%s behind the missing VirtualMachineNetworkConfig of the recorded ip %s of IPPool %s, keeping the record",
+		log.Warnf("(ippool.verifyLedgerOwner) cannot verify the virtualmachine %s/%s behind the missing VirtualMachineNetworkConfig of the recorded ip %s of IPPool %s, keeping the record",
 			namespace, vmName, ip, pool.Name)
 
-		return true
+		return ownerUnverified
 	}
 
 	vmExists, vmErr := c.verifyVM(namespace, vmName)
 	if vmErr != nil {
-		log.Warnf("(ippool.ledgerOwnerLive) cannot verify the virtualmachine %s/%s of the recorded ip %s of IPPool %s, keeping the record: %s",
+		log.Warnf("(ippool.verifyLedgerOwner) cannot verify the virtualmachine %s/%s of the recorded ip %s of IPPool %s, keeping the record: %s",
 			namespace, vmName, ip, pool.Name, vmErr.Error())
 		c.metrics.UpdateLogStatus("warning")
 
-		return true
+		return ownerUnverified
 	}
 
-	return vmExists
+	if vmExists {
+		return ownerLive
+	}
+
+	return ownerGone
 }
 
-// excludeEntryConflicts reports whether the persisted ledger record of an
-// exclude entry belongs to a live binding: the up-front admission checks
-// of the registration and the update must reject an exclude entry only
-// when a genuinely live owner holds the address, because a stale record
-// whose owner is authoritatively gone (the helper was down while the vm
-// was deleted, so no cleanup un-recorded it) would otherwise make the
-// pool permanently unregistrable - the rejection settles the startup
-// gate and never retries, although the same registration's claim
-// protection would have dropped the stale record. an unparseable
-// reference stays conservative and blocks: its owner cannot be verified,
-// so the address must not be offered to a guest (fail closed, like the
-// unparseable pins of protectPersistedClaims).
-func (c *Controller) excludeEntryConflicts(pool *kihv1.IPPool, ip string, ref string) bool {
+// excludeEntryConflicts verifies the persisted ledger record of an exclude
+// entry against its owner and reports whether the record belongs to a
+// genuinely live binding, which is a definitive configuration conflict.
+// the up-front admission checks of the registration and the update must
+// reject an exclude entry only in that case, because a stale record whose
+// owner is authoritatively gone (the helper was down while the vm was
+// deleted, so no cleanup un-recorded it) would otherwise make the pool
+// permanently unregistrable although the same registration's claim
+// protection would drop the record. an owner whose liveness cannot be
+// verified is neither a conflict nor a stale record: the returned error
+// keeps the admission retriable (a plain registration error requeues and
+// resyncs, the startup gate stays open), instead of the definitive
+// ErrPoolUnregistrable rejection, which would settle the gate on the
+// first failed api read and tell the operator to hand-edit a possibly
+// healthy object. an unparseable reference stays conservative and blocks:
+// its owner cannot be verified at all, so the address must not be offered
+// to a guest (fail closed, like the unparseable pins of
+// protectPersistedClaims).
+func (c *Controller) excludeEntryConflicts(pool *kihv1.IPPool, ip string, ref string) (bool, error) {
 	namespace, vmName, hwAddr, ok := util.ParseAllocationRef(ref)
 	if !ok {
 		log.Warnf("(ippool.excludeEntryConflicts) IPPool %s carries the unparseable allocation reference %q for the exclude entry %s, treating it as a live claim",
 			pool.Name, ref, ip)
 		c.metrics.UpdateLogStatus("warning")
 
-		return true
+		return true, nil
 	}
 
-	if !c.ledgerOwnerLive(pool, namespace, vmName, hwAddr, ip) {
+	switch c.verifyLedgerOwner(pool, namespace, vmName, hwAddr, ip) {
+	case ownerGone:
 		log.Warnf("(ippool.excludeEntryConflicts) the exclude entry %s of IPPool %s is recorded for the owner %s/%s whose binding is authoritatively gone, ignoring the stale record",
 			ip, pool.Name, namespace, vmName)
 		c.metrics.UpdateLogStatus("warning")
 
-		return false
+		return false, nil
+	case ownerUnverified:
+		return false, fmt.Errorf("cannot verify the owner %s/%s of the recorded exclude entry %s of IPPool %s",
+			namespace, vmName, ip, pool.Name)
 	}
 
-	return true
+	return true, nil
 }
 
 // dropSpecPin releases a spec-claim pin whose recorded nic does not exist

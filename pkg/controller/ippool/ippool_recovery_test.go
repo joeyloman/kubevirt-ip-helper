@@ -797,6 +797,83 @@ func TestRegisterIPPoolAdmitsExcludeOverStaleLedgerRecord(t *testing.T) {
 	}
 }
 
+// TestRegisterIPPoolRetriesExcludeOverUnverifiableOwner pins the transient
+// classification of the exclude admission: the owner revalidation runs
+// against the api, and an owner whose liveness cannot be established (the
+// vmnetcfg read fails transiently) is neither a definitive conflict nor a
+// stale record. wrapping that state in ErrPoolUnregistrable would settle
+// the startup gate on the first failed read - leaving the network without
+// a dhcp server and telling the operator to hand-edit a healthy object -
+// although the resync re-runs the admission and admits the entry as soon
+// as the api read succeeds. the registration returns a plain retriable
+// error and the gate stays open instead.
+func TestRegisterIPPoolRetriesExcludeOverUnverifiableOwner(t *testing.T) {
+	const (
+		ownerNamespace = "default"
+		ownerVMName    = "vm-unreachable"
+		ownerMAC       = "02:00:00:00:00:60"
+	)
+
+	stored := recoveryNewPool("pool1", "net-a")
+	stored.Status.IPv4.Allocated = map[string]string{
+		"10.0.0.2": util.AllocationRef(ownerNamespace, ownerVMName, ownerMAC),
+	}
+
+	c, rs, _ := recoveryNewController(t, stored)
+	// the vmnetcfg read of the owner revalidation fails transiently
+	rs.failVMNetCfgGet = true
+
+	pool := recoveryNewPool("pool1", "net-a")
+	pool.Spec.IPv4Config.Pool.Exclude = []string{"10.0.0.2"}
+
+	// the startup replay is active, so the gate classification of the
+	// registration attempt is observable
+	c.appStatus.Store(APP_INIT)
+
+	cleanup, err := c.registerIPPool(pool)
+	if err == nil {
+		t.Fatal("an unverifiable owner must not silently admit the exclude entry")
+	}
+	if errors.Is(err, ErrPoolUnregistrable) {
+		t.Errorf("error = %v, the unverified owner is a transient state and must not carry the definitive ErrPoolUnregistrable classification", err)
+	}
+	if cleanup {
+		t.Error("cleanup flag = true, want false: the failed verification must not run any teardown of state it never created")
+	}
+
+	// the transient failure stays uncounted: the retried registration
+	// must still be able to settle the pool for the startup gate once
+	// the api read succeeds
+	if c.gate.Settled() != 0 {
+		t.Errorf("ippool gate settled = %d, want 0 for a transiently failed registration", c.gate.Settled())
+	}
+
+	// the next registration attempt runs against a healed api: the owner
+	// is authoritatively gone (no vmnetcfg, no vm), so the stale record
+	// is revalidated away and the exclude entry is admitted
+	rs.failVMNetCfgGet = false
+	c.verifyVM = func(namespace string, name string) (bool, error) {
+		if namespace != ownerNamespace || name != ownerVMName {
+			t.Errorf("the vm verification queried %s/%s, want %s/%s", namespace, name, ownerNamespace, ownerVMName)
+		}
+
+		return false, nil
+	}
+
+	if err := recoveryRegistrationSteps(t, c, pool); err != nil {
+		t.Fatalf("the healed revalidation must admit the exclude entry: %s", err)
+	}
+	if got := rs.lastBody.Status.IPv4.Allocated["10.0.0.2"]; got != ipam.ExcludedOwner {
+		t.Errorf("allocated[10.0.0.2] = %q, want the EXCLUDED owner after the healed admission", got)
+	}
+
+	// the settled registration counts for the gate exactly once the
+	// transient state healed
+	if c.gate.Settled() != 1 {
+		t.Errorf("ippool gate settled = %d after the healed admission, want 1", c.gate.Settled())
+	}
+}
+
 // A02 trigger 1 regression: the mac spelling of a live owner drifts
 // between the LIST snapshot and the per-claim re-verification read
 // (02-AA-BB-CC-DD-01 -> 02:aa:bb:cc:dd:01, e.g. an in-flight edit which

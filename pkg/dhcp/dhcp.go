@@ -164,6 +164,38 @@ func (a *DHCPAllocator) AddPool(
 	leaseTime int,
 	nic string,
 ) (err error) {
+	// validate the address projection before any state is taken: every
+	// address which reaches the wire must be an ipv4 literal, because
+	// the reply construction encodes the options through To4() - an
+	// ipv6 literal or an unparseable entry appends a nil ip which
+	// encodes as a zero-length or short dhcp option (54/3/6) that strict
+	// client parsers drop, and a v6 server ip additionally makes the
+	// server-identifier comparison of every DHCPREQUEST permanently
+	// false. a registration which silently serves a network whose dhcp
+	// can never work must fail instead. the router may stay unset: an
+	// unset router omits option 3 at the reply construction instead of
+	// emitting a zero-length option.
+	server := net.ParseIP(serverIP)
+	if server == nil || server.To4() == nil {
+		return fmt.Errorf("(dhcp.AddPool) the server ip %q of pool %s is not a valid ipv4 address", serverIP, name)
+	}
+	mask := net.ParseIP(subnetMask)
+	if mask == nil || mask.To4() == nil {
+		return fmt.Errorf("(dhcp.AddPool) the subnet mask %q of pool %s is not a valid ipv4 address", subnetMask, name)
+	}
+	if routerIP != "" {
+		router := net.ParseIP(routerIP)
+		if router == nil || router.To4() == nil {
+			return fmt.Errorf("(dhcp.AddPool) the router %q of pool %s is not a valid ipv4 address", routerIP, name)
+		}
+	}
+	for _, dnsServer := range DNSServers {
+		entry := net.ParseIP(dnsServer)
+		if entry == nil || entry.To4() == nil {
+			return fmt.Errorf("(dhcp.AddPool) the dns entry %q of pool %s is not a valid ipv4 address", dnsServer, name)
+		}
+	}
+
 	// resolve the ntp hostnames before taking the lock, the packet
 	// handler must not wait behind a slow resolver
 	ntp := a.resolveNTPServers(NTPServers)
@@ -172,8 +204,8 @@ func (a *DHCPAllocator) AddPool(
 	defer a.mutex.Unlock()
 
 	pool := DHCPPool{}
-	pool.ServerIP = net.ParseIP(serverIP)
-	pool.SubnetMask = net.IPMask(net.ParseIP(subnetMask).To4())
+	pool.ServerIP = server
+	pool.SubnetMask = net.IPMask(mask.To4())
 	pool.Router = net.ParseIP(routerIP)
 	for _, dnsServer := range DNSServers {
 		pool.DNS = append(pool.DNS, net.ParseIP(dnsServer))
