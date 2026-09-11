@@ -43,6 +43,13 @@ var (
 	// a racing listener repair - the pool is serving, which is exactly what
 	// the repair wanted.
 	ErrServerAlreadyRunning = errors.New("dhcp service already running")
+
+	// ErrAllocatorClosed reports a Run against an allocator whose shutdown
+	// path (StopAll) already closed every listener: the shutdown must be
+	// able to fence a draining controller worker which would otherwise
+	// re-open a listener behind the teardown, while the leadership lease
+	// may already have passed to the standby.
+	ErrAllocatorClosed = errors.New("dhcp allocator is closed")
 )
 
 type DHCPPool struct {
@@ -74,6 +81,14 @@ type DHCPAllocator struct {
 	// a second Run on the same interface can surface the kernel-dependent
 	// delivery duplication instead of hiding it
 	serverNics map[string]string
+	// closed is set by StopAll: the shutdown paths stop the listeners
+	// before the era join, and the flag fences a draining controller
+	// worker which would otherwise re-open a listener behind the teardown
+	// (the leadership lease may already have passed to the standby while
+	// the old leader's controllers still drain). the allocator is
+	// era-local, so the flag dies with its era and the next era's
+	// allocator starts open.
+	closed bool
 	// warnMutex guards the throttled warning state of the packet handler:
 	// a broadcast flood of unknown hardware addresses must not produce one
 	// log line (and one string formatting pass) per packet
@@ -859,6 +874,11 @@ func (a *DHCPAllocator) Run(networkName string, nic string) (err error) {
 	}
 
 	a.mutex.Lock()
+	if a.closed {
+		a.mutex.Unlock()
+
+		return fmt.Errorf("%w: network %s", ErrAllocatorClosed, networkName)
+	}
 	if _, exists := a.servers[networkName]; exists {
 		a.mutex.Unlock()
 
@@ -959,6 +979,10 @@ func (a *DHCPAllocator) Stop(networkName string) (err error) {
 // listeners.
 func (a *DHCPAllocator) StopAll() {
 	a.mutex.Lock()
+	// the allocator is closed for the rest of its lifetime: a draining
+	// worker must not re-open a listener behind this teardown (see the
+	// closed field)
+	a.closed = true
 	servers := make(map[string]*server4.Server, len(a.servers))
 	for networkName, server := range a.servers {
 		servers[networkName] = server

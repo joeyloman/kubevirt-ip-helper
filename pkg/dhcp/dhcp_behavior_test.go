@@ -1277,3 +1277,36 @@ func TestStopAllDrainsEveryRegisteredServer(t *testing.T) {
 	// a second sweep has nothing left to drain and must stay a no-op
 	a.StopAll()
 }
+
+// TestStopAllClosesTheAllocatorAgainstDrainingWorkers pins the shutdown
+// fence of the handover ordering: the application stops the dhcp
+// listeners at era-cancel time, before the controller drain joins, so a
+// draining worker which reaches its listener repair (or a registration)
+// after the sweep must be refused instead of re-opening a listener behind
+// the teardown - while the leadership lease may already have passed to
+// the standby, a re-opened listener would put a second server on the
+// segment. the refusal is an error like ErrServerAlreadyRunning (the
+// sync fails and the dying era abandons the item), never a silent
+// no-op which would report the pool as served.
+func TestStopAllClosesTheAllocatorAgainstDrainingWorkers(t *testing.T) {
+	a := NewDHCPAllocator()
+
+	a.StopAll()
+
+	// the closed check runs before any socket work: a refused Run must
+	// not even try to bind (the test process has no permission for :67)
+	err := a.Run("net-a", "lo")
+	if !errors.Is(err, ErrAllocatorClosed) {
+		t.Fatalf("Run after StopAll = %v, want the ErrAllocatorClosed classification", err)
+	}
+	if a.IsRunning("net-a") {
+		t.Error("a refused Run must not register the network as running")
+	}
+
+	// the second sweep stays the converged no-op and the refusal is
+	// stable for the rest of the allocator's lifetime
+	a.StopAll()
+	if err := a.Run("net-b", "lo"); !errors.Is(err, ErrAllocatorClosed) {
+		t.Fatalf("Run after a second StopAll = %v, want the ErrAllocatorClosed classification", err)
+	}
+}

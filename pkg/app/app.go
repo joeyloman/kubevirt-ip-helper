@@ -250,18 +250,30 @@ func (h *handler) onStartedLeading(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			// leadership lost: drain the era; onStoppedLeading joins it and
-			// cleans the host state before the process exits
+			// leadership lost: client-go releases the lease as soon as
+			// renew returns, so the standby can acquire and open its own
+			// listeners while this process still drains. the dhcp
+			// listeners are therefore stopped and the allocator closed
+			// BEFORE the era join: the closed allocator fences a draining
+			// worker which would otherwise re-open a listener behind the
+			// teardown (the ippool controller's repair path re-serves a
+			// pool whose listener died). onStoppedLeading joins the
+			// drained era and finishes the host-state cleanup.
 			eraCancel()
+			h.stopDHCPListeners()
 			h.listenerWg.Wait()
 
 			return
 		case <-time.After(time.Second):
 		}
-
 		era := h.era.Load()
 		if era != nil && era.appStatus.Load() == APP_RESTART {
 			eraCancel()
+
+			// stop the listeners and close the allocator before the era
+			// join: a draining worker must not re-open a listener the
+			// restart teardown just closed
+			h.stopDHCPListeners()
 
 			// join the previous controller era before touching shared host
 			// state or starting the new era: the old informers, controller
@@ -269,7 +281,6 @@ func (h *handler) onStartedLeading(ctx context.Context) {
 			// re-register NIC IPs or DHCP listeners behind the new era's back
 			h.listenerWg.Wait()
 			h.RemoveLeaderPodLabel()
-			h.stopDHCPListeners()
 			h.NetworkCleanup()
 
 			time.Sleep(time.Second * 10)
@@ -294,8 +305,10 @@ func (h *handler) onStartedLeading(ctx context.Context) {
 // the lease while serving nothing and looking healthy.
 func (h *handler) drainStoppedEra(eraCancel context.CancelFunc) {
 	eraCancel()
-	h.listenerWg.Wait()
+	// stop the listeners and close the allocator before the era join: a
+	// draining worker must not re-open a listener behind the teardown
 	h.stopDHCPListeners()
+	h.listenerWg.Wait()
 	h.RemoveLeaderPodLabel()
 	h.NetworkCleanup()
 
@@ -303,13 +316,15 @@ func (h *handler) drainStoppedEra(eraCancel context.CancelFunc) {
 }
 
 // onStoppedLeading joins the era and cleans the host state after the
-// leadership was lost. client-go cancels the leader-election context
-// before this callback runs, so the era's informers/controllers are
-// already draining: the listeners and the nic addresses are removed only
-// after the era joined, so the standby can serve the segment without a
-// second server answering in the meantime. the exit status stays 0 for a
-// graceful shutdown; the lease-loss is surfaced through the error metric
-// and the error-level log.
+// leadership was lost. the dhcp listeners were already stopped and the
+// allocator closed at era-cancel time (see onStartedLeading): client-go
+// releases the lease as soon as renew returns, so the standby may acquire
+// and open its own listeners while this process drains, and the only way
+// to keep a single server on the segment is to stop answering BEFORE the
+// lease can pass. the stopDHCPListeners call below stays as an idempotent
+// backstop for the paths which never ran a service era (a standby which
+// never led). the exit status stays 0 for a graceful shutdown; the
+// lease-loss is surfaced through the error metric and the error-level log.
 func (h *handler) onStoppedLeading() {
 	log.Errorf("(app.Run) leader lost: %s", h.leaderId)
 	if h.metrics != nil {
@@ -605,15 +620,38 @@ func (h *handler) waitForStartupGate(ctx context.Context, what string, startupGa
 	}
 }
 
-// retryList repeatedly gathers a startup snapshot until it succeeds or the
-// era context is cancelled: a transient api error must never leave the
-// leader running without controllers (the silent early return made the
-// whole ip management dead while the pod looked healthy). the first
-// attempts run on a short interval to heal quickly, the later ones back off
-// to a minute so a sustained outage does not spam the api. every attempt is
-// additionally bounded: a gather which hangs on a tcp blackhole must not
-// block the era join (the parent context only aborts between attempts).
+// startupListTimeout bounds one startup snapshot gather of retryList. an
+// unbounded retry would hold the leadership lease forever when the LIST
+// fails permanently while the coordination api stays reachable (a deleted
+// CRD answers 404, an RBAC regression answers 403): nothing else fences
+// that state - the lease keeps renewing, so the liveness probe passes, the
+// stall fence of the startup gate is never reached and the standby can
+// never acquire. the give-up runs the drainStoppedEra path, which exits
+// the process so the kubelet restarts the pod and the fresh attempt
+// (possibly served by a standby) starts with a released lease. the bound
+// stays under startupStallTimeout so one give-up cycle plus one gate
+// stall fits the 30-minute progress deadline of the deployment. it is a
+// variable so the test can shrink it.
+var startupListTimeout = 10 * time.Minute
+
+// startupRetryDelay is the short backoff between the first retryList
+// attempts (the later ones back off to a minute). it is a variable so the
+// test can shrink it.
+var startupRetryDelay = 5 * time.Second
+
+// retryList repeatedly gathers a startup snapshot until it succeeds, the
+// era context is cancelled, or the startupListTimeout budget is exhausted:
+// a transient api error must never leave the leader running without
+// controllers (the silent early return made the whole ip management dead
+// while the pod looked healthy), but a permanently failing gather must
+// also give up so the lease is released instead of being renewed forever
+// by a leader which serves nothing. the first attempts run on a short
+// interval to heal quickly, the later ones back off to a minute so a
+// sustained outage does not spam the api. every attempt is additionally
+// bounded: a gather which hangs on a tcp blackhole must not block the era
+// join (the parent context only aborts between attempts).
 func retryList[T any](ctx context.Context, m *metrics.MetricsAllocator, what string, gather func(ctx context.Context) (T, error)) (result T, err error) {
+	deadline := time.Now().Add(startupListTimeout)
 	for attempt := 1; ; attempt++ {
 		attemptCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		result, err = gather(attemptCtx)
@@ -629,15 +667,23 @@ func retryList[T any](ctx context.Context, m *metrics.MetricsAllocator, what str
 			return result, ctx.Err()
 		}
 
+		if time.Now().After(deadline) {
+			log.Errorf("(app.RunServices) %s still cannot be gathered after %s, giving up so the pod restarts and the leadership lease is released: %s",
+				what, startupListTimeout, err.Error())
+			m.UpdateLogStatus("error")
+
+			return result, fmt.Errorf("%s still cannot be gathered after %s: %w", what, startupListTimeout, err)
+		}
+
 		m.UpdateLogStatus("error")
 
-		delay := time.Second * 5
+		delay := startupRetryDelay
 		if attempt >= 5 {
 			delay = time.Minute
 		}
 
 		if attempt == 10 {
-			log.Errorf("(app.RunServices) %s still cannot be gathered after %d attempts; the cluster api may be unreachable: the controllers cannot serve without the startup snapshot, keeping the retry alive", what, attempt)
+			log.Errorf("(app.RunServices) %s still cannot be gathered after %d attempts; the cluster api may be unreachable: the controllers cannot serve without the startup snapshot, retrying until the startup retry budget is exhausted", what, attempt)
 		}
 
 		select {

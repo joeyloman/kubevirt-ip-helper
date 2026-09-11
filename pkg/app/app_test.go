@@ -1042,3 +1042,94 @@ func TestRegisterHealthChecksStandbyAndEraStates(t *testing.T) {
 
 	h.metrics.Stop()
 }
+
+// TestRetryListGivesUpAfterTheStartupBudget pins the lease-release fence
+// of the startup snapshot: an unbounded retry would renew the leadership
+// lease forever while the LIST fails permanently but the coordination api
+// stays reachable (a deleted CRD, an RBAC regression) - nothing else
+// fences that state, because the liveness probe passes, the startup gate
+// stall fence is never reached and the standby can never acquire. the
+// give-up returns the error so RunServices fails, the drainStoppedEra
+// path exits the process and the kubelet restarts the pod.
+func TestRetryListGivesUpAfterTheStartupBudget(t *testing.T) {
+	hook := attachLogCapture(t)
+
+	oldTimeout := startupListTimeout
+	oldDelay := startupRetryDelay
+	startupListTimeout = time.Nanosecond
+	startupRetryDelay = time.Millisecond
+	defer func() {
+		startupListTimeout = oldTimeout
+		startupRetryDelay = oldDelay
+	}()
+
+	m := metrics.NewMetricsAllocator()
+	gather := func(ctx context.Context) (string, error) {
+		return "", errors.New("boom")
+	}
+
+	_, err := retryList(context.Background(), m, "the test list", gather)
+	if err == nil {
+		t.Fatal("retryList returned nil error, want the give-up after the budget")
+	}
+	if !strings.Contains(err.Error(), "still cannot be gathered after") {
+		t.Errorf("give-up error = %q, want the budget-give-up classification", err.Error())
+	}
+	if !hook.contains("giving up so the pod restarts and the leadership lease is released") {
+		t.Error("the give-up must log the lease-release rationale")
+	}
+}
+
+// TestRetryListHealsTransientFailures pins the retry contract the budget
+func TestRetryListHealsTransientFailures(t *testing.T) {
+	m := metrics.NewMetricsAllocator()
+
+	oldTimeout := startupListTimeout
+	oldDelay := startupRetryDelay
+	startupListTimeout = time.Minute
+	startupRetryDelay = time.Millisecond
+	defer func() {
+		startupListTimeout = oldTimeout
+		startupRetryDelay = oldDelay
+	}()
+	attempts := 0
+	gather := func(ctx context.Context) (int, error) {
+		attempts++
+		if attempts < 3 {
+			return 0, errors.New("transient")
+		}
+
+		return 42, nil
+	}
+
+	result, err := retryList(context.Background(), m, "the test list", gather)
+	if err != nil {
+		t.Fatalf("retryList failed on a healable gather: %s", err)
+	}
+	if result != 42 {
+		t.Errorf("result = %d, want the gathered 42", result)
+	}
+	if attempts != 3 {
+		t.Errorf("attempts = %d, want 3", attempts)
+	}
+}
+
+// TestRetryListReturnsOnCanceledEra pins the drain contract: a canceled
+// era context must win over both the retry loop and the budget, so the
+// graceful drain (leadership loss, restart) is never blocked by the
+// gather.
+func TestRetryListReturnsOnCanceledEra(t *testing.T) {
+	m := metrics.NewMetricsAllocator()
+	ctx, cancel := context.WithCancel(context.Background())
+
+	gather := func(ctx context.Context) (int, error) {
+		cancel()
+
+		return 0, errors.New("boom")
+	}
+
+	_, err := retryList(ctx, m, "the test list", gather)
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("retryList on a canceled era = %v, want context.Canceled", err)
+	}
+}
