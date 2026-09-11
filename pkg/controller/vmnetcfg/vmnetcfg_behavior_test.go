@@ -304,6 +304,15 @@ type fakeAPIServer struct {
 	// a lost response (EOF) for a write the server actually applied,
 	// which is the boundary an Update error does not prove a non-commit
 	vmnetcfgPutDropConn bool
+	// vmnetcfgPutConflict answers the next vmnetcfg main-resource PUTs
+	// with a resourceVersion conflict after applying the competing write
+	// the conflict implies: vmnetcfgPutConflictFn mutates the stored
+	// object first (the vm controller's spec update landing between the
+	// pre-commit verification GET and the commit), so the retried stale
+	// write can never pass. the commit-conflict regression uses it to
+	// place a spec write inside the verification-to-commit window.
+	vmnetcfgPutConflict   int
+	vmnetcfgPutConflictFn func(obj *kihv1.VirtualMachineNetworkConfig)
 	// vmnetcfgGetCode fails the vmnetcfg GET requests while set, so the
 	// pre-commit verification of the claimed nics can be made to fail
 	vmnetcfgGetCode int
@@ -524,7 +533,23 @@ func (f *fakeAPIServer) handleVMNetCfg(w http.ResponseWriter, r *http.Request, n
 		f.mu.Lock()
 		failCode := f.vmnetcfgPutCode
 		dropConn := f.vmnetcfgPutDropConn
+		conflict := f.vmnetcfgPutConflict > 0
+		if conflict {
+			f.vmnetcfgPutConflict--
+			// apply the competing write the conflict implies before the
+			// rejection: the stored object advances like the real apiserver
+			// would have advanced it, so a retried stale write cannot pass
+			if f.vmnetcfgPutConflictFn != nil {
+				if stored, found := f.vmnetcfgs[key]; found {
+					f.vmnetcfgPutConflictFn(stored)
+				}
+			}
+		}
 		f.mu.Unlock()
+		if conflict {
+			writeStatus(w, http.StatusConflict, metav1.StatusReasonConflict, "please apply your changes to the latest version and try again")
+			return
+		}
 		if failCode != 0 {
 			writeStatus(w, failCode, metav1.StatusReasonInternalError, "boom")
 			return

@@ -88,17 +88,22 @@ metadata:
   name: kubevirt-ip-helper
   namespace: kubevirt-ip-helper
 spec:
-  progressDeadlineSeconds: 600
+  # the deadline must exceed the 15-minute startup-gate stall timeout of
+  # the application, plus image pull time, or a legitimately slow startup
+  # is marked ProgressDeadlineExceeded on first install
+  progressDeadlineSeconds: 1800
   replicas: 2
   revisionHistoryLimit: 10
   selector:
     matchLabels:
       app: kubevirt-ip-helper
+  # a surged pod of a RollingUpdate is a lease standby and can never pass
+  # the leadership-gated readiness probe while the old leader still holds
+  # the lease, so the rollout would wedge at the progress deadline;
+  # Recreate terminates the old pods first, which releases the lease
+  # (ReleaseOnCancel + the SIGTERM handler) for a new pod to acquire
   strategy:
-    rollingUpdate:
-      maxSurge: 25%
-      maxUnavailable: 25%
-    type: RollingUpdate
+    type: Recreate
   template:
     metadata:
       annotations:
@@ -135,6 +140,7 @@ spec:
         # leader lease but could not renew it (or its process is wedged),
         # so the kubelet restarts a stale leader instead of leaving its
         # DHCP servers answering on the segment with a diverging allocator
+        # the liveness probe checks the leader-election freshness through
         livenessProbe:
           httpGet:
             path: /healthz

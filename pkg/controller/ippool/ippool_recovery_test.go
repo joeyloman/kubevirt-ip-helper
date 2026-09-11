@@ -709,7 +709,15 @@ func TestRegisterIPPoolRejectsExcludeOverlappingLiveClaim(t *testing.T) {
 	stored := recoveryNewPool("pool1", "net-a")
 	stored.Status.IPv4.Allocated = map[string]string{"10.0.0.2": "default/vm-test [02:00:00:00:00:01]"}
 
-	c, _, _ := recoveryNewController(t, stored)
+	c, rs, _ := recoveryNewController(t, stored)
+	// the recorded owner is genuinely live: its vmnetcfg still records
+	// the binding, so the exclude entry is a real never-converging
+	// conflict. (a stale record whose owner is authoritatively gone is
+	// revalidated away by the admission check instead - see
+	// TestRegisterIPPoolAdmitsExcludeOverStaleLedgerRecord below.)
+	rs.vmnetcfgs = []*kihv1.VirtualMachineNetworkConfig{
+		recoveryNewVMNetCfg("default", "vm-test", "10.0.0.2", "02:00:00:00:00:01", "net-a"),
+	}
 
 	pool := recoveryNewPool("pool1", "net-a")
 	pool.Spec.IPv4Config.Pool.Exclude = []string{"10.0.0.2"}
@@ -735,6 +743,57 @@ func TestRegisterIPPoolRejectsExcludeOverlappingLiveClaim(t *testing.T) {
 	// read-only, unlike an allocation attempt
 	if used := c.ipam.Used("net-a"); used != 0 {
 		t.Errorf("ipam used = %d, want 0 (the rejection must precede the subnet registration)", used)
+	}
+}
+
+// TestRegisterIPPoolAdmitsExcludeOverStaleLedgerRecord pins the review
+// finding: an exclude entry which the persisted ledger records for an
+// owner whose binding is authoritatively gone (the helper was down while
+// the vm was deleted, so no cleanup un-recorded it) is not a conflict -
+// the same registration's claim protection would drop the stale record,
+// so the up-front check must revalidate the recorded owner instead of
+// rejecting the pool as unregistrable forever (the rejection settles the
+// startup gate and never retries, leaving the network without a dhcp
+// server until the status is edited by hand).
+func TestRegisterIPPoolAdmitsExcludeOverStaleLedgerRecord(t *testing.T) {
+	const (
+		ownerNamespace = "default"
+		ownerVMName    = "vm-gone"
+		ownerMAC       = "02:00:00:00:00:50"
+	)
+
+	stored := recoveryNewPool("pool1", "net-a")
+	stored.Status.IPv4.Allocated = map[string]string{
+		"10.0.0.2": util.AllocationRef(ownerNamespace, ownerVMName, ownerMAC),
+	}
+
+	c, rs, _ := recoveryNewController(t, stored)
+	// the vmnetcfg is gone and the vm is gone too: the record is stale
+	c.verifyVM = func(namespace string, name string) (bool, error) {
+		if namespace != ownerNamespace || name != ownerVMName {
+			t.Errorf("the vm verification queried %s/%s, want %s/%s", namespace, name, ownerNamespace, ownerVMName)
+		}
+
+		return false, nil
+	}
+
+	pool := recoveryNewPool("pool1", "net-a")
+	pool.Spec.IPv4Config.Pool.Exclude = []string{"10.0.0.2"}
+
+	if err := recoveryRegistrationSteps(t, c, pool); err != nil {
+		t.Fatalf("the stale ledger record must not block the exclude entry: %s", err)
+	}
+
+	// the exclude pass claimed the address and the stale record was
+	// dropped by the claim protection instead of being republished for
+	// its gone owner
+	if got := rs.lastBody.Status.IPv4.Allocated["10.0.0.2"]; got != ipam.ExcludedOwner {
+		t.Errorf("allocated[10.0.0.2] = %q, want the EXCLUDED owner of the exclude pass", got)
+	}
+
+	// the excluded address is not available to a fresh allocation
+	if ip, err := c.ipam.GetIP("net-a", ""); err == nil {
+		t.Errorf("the excluded address must stay unallocatable, got ip %q", ip)
 	}
 }
 

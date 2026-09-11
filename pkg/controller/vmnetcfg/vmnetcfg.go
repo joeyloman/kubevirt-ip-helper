@@ -6,6 +6,7 @@ import (
 	"net"
 	"reflect"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
@@ -200,6 +201,22 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 
 	// cleanup the network configuration if the object is marked for deletion
 	if vmnetcfg.ObjectMeta.DeletionTimestamp != nil {
+		// a pending ledger unwind whose replay failed again must not be
+		// dropped by the deletion: the cleanup below iterates only the
+		// nics of the present spec, so the tuple of the pending entry is
+		// not reconstructible anymore and its record would survive the
+		// deletion of this object (blocking a later binding of the
+		// address for the whole era). keep the finalizers and let the
+		// retried sync replay the deletion until it converges: every
+		// failure mode of the replay is transient (the converged
+		// foreign-owner and not-found outcomes are classified inside
+		// retryPendingUnwinds), so the finalizer path cannot hot-loop on
+		// a permanent failure
+		if restoreErr != nil {
+			return fmt.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] pending ledger unwind did not converge, keeping the finalizers: %w",
+				vmnetcfg.Namespace, vmnetcfg.Name, restoreErr)
+		}
+
 		if err := c.cleanupVirtualMachineNetworkConfig(vmnetcfg); err != nil {
 			return fmt.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] failed to cleanup vmnetcfg: %s",
 				vmnetcfg.Namespace, vmnetcfg.Name, err.Error())
@@ -946,6 +963,23 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 
 	vmNetCfgObj, err := c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs(newVmNetCfg.Namespace).Update(c.ctx, newVmNetCfg, metav1.UpdateOptions{})
 	if err != nil {
+		// a resourceVersion conflict proves a spec write landed after the
+		// verification GET, so its verdict is stale: re-verify and unwind
+		// the claimed nics which the newer spec removed, or their freshly
+		// recreated lease/claim/ledger entry survives with no cleanup
+		// ever iterating it again (the vm controller never re-runs its
+		// own cleanup after its update succeeded). the unwind is
+		// owner-validated on every layer and a failed record delete is
+		// remembered as a pending unwind, so an unrelated conflicting
+		// write leaves the state untouched
+		if apierrors.IsConflict(err) {
+			if verifyErr := c.verifyClaimedNics(vmnetcfg, claimedNics, &newVmNetCfgs, &newNetCfgStatusList); verifyErr != nil {
+				log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] %s",
+					vmnetcfg.Namespace, vmnetcfg.Name, verifyErr)
+				c.metrics.UpdateLogStatus("error")
+			}
+		}
+
 		// the durable object still holds the previous configuration;
 		// contested claims are unwound and served allocations stay
 		// quarantined (see rollbackNetworkAllocation) until the retried

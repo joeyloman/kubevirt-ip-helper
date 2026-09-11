@@ -176,7 +176,7 @@ func (c *Controller) registerIPPool(pool *kihv1.IPPool) (cleanup bool, err error
 		}
 		if getErr == nil {
 			for _, ex := range pool.Spec.IPv4Config.Pool.Exclude {
-				if ref, claimed := cPool.Status.IPv4.Allocated[ex]; claimed && ref != ipam.ExcludedOwner {
+				if ref, claimed := cPool.Status.IPv4.Allocated[ex]; claimed && ref != ipam.ExcludedOwner && c.excludeEntryConflicts(pool, ex, ref) {
 					return cleanup, fmt.Errorf("exclude address [%s] of network [%s] is recorded in the IPPool status as allocated to [%s]; remove the exclude entry or release the claim first: %w",
 						ex, pool.Spec.NetworkName, ref, ErrPoolUnregistrable)
 				}
@@ -397,7 +397,7 @@ func (c *Controller) handleIPPoolObjectChange(oldPool kihv1.IPPool, newPool *kih
 		}
 		if getErr == nil {
 			for _, ex := range newPool.Spec.IPv4Config.Pool.Exclude {
-				if ref, claimed := cPool.Status.IPv4.Allocated[ex]; claimed && ref != ipam.ExcludedOwner {
+				if ref, claimed := cPool.Status.IPv4.Allocated[ex]; claimed && ref != ipam.ExcludedOwner && c.excludeEntryConflicts(newPool, ex, ref) {
 					return fmt.Errorf("(ippool.handleIPPoolObjectChange) rejecting update for [%s]: the exclude address [%s] is recorded in the IPPool status as allocated to [%s]; remove the exclude entry or release the claim first, keeping the currently registered configuration",
 						newPool.Name, ex, ref)
 				}
@@ -1088,6 +1088,39 @@ func (c *Controller) ledgerOwnerLive(pool *kihv1.IPPool, namespace string, vmNam
 	}
 
 	return vmExists
+}
+
+// excludeEntryConflicts reports whether the persisted ledger record of an
+// exclude entry belongs to a live binding: the up-front admission checks
+// of the registration and the update must reject an exclude entry only
+// when a genuinely live owner holds the address, because a stale record
+// whose owner is authoritatively gone (the helper was down while the vm
+// was deleted, so no cleanup un-recorded it) would otherwise make the
+// pool permanently unregistrable - the rejection settles the startup
+// gate and never retries, although the same registration's claim
+// protection would have dropped the stale record. an unparseable
+// reference stays conservative and blocks: its owner cannot be verified,
+// so the address must not be offered to a guest (fail closed, like the
+// unparseable pins of protectPersistedClaims).
+func (c *Controller) excludeEntryConflicts(pool *kihv1.IPPool, ip string, ref string) bool {
+	namespace, vmName, hwAddr, ok := util.ParseAllocationRef(ref)
+	if !ok {
+		log.Warnf("(ippool.excludeEntryConflicts) IPPool %s carries the unparseable allocation reference %q for the exclude entry %s, treating it as a live claim",
+			pool.Name, ref, ip)
+		c.metrics.UpdateLogStatus("warning")
+
+		return true
+	}
+
+	if !c.ledgerOwnerLive(pool, namespace, vmName, hwAddr, ip) {
+		log.Warnf("(ippool.excludeEntryConflicts) the exclude entry %s of IPPool %s is recorded for the owner %s/%s whose binding is authoritatively gone, ignoring the stale record",
+			ip, pool.Name, namespace, vmName)
+		c.metrics.UpdateLogStatus("warning")
+
+		return false
+	}
+
+	return true
 }
 
 // dropSpecPin releases a spec-claim pin whose recorded nic does not exist

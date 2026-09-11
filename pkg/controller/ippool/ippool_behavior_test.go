@@ -1185,6 +1185,14 @@ func TestHandleIPPoolObjectChangeRejectsExcludeOverlappingLiveClaim(t *testing.T
 
 	c, _, d, ca, _ := ippoolBehaviorNewTestController(t, srv)
 
+	// the recorded owner of 10.10.10.30 is genuinely live: its vmnetcfg
+	// still records the binding, so the added exclude entry is a real
+	// never-converging conflict (a gone owner would be revalidated away
+	// as a stale record instead)
+	rs.vmnetcfgs = []*kihv1.VirtualMachineNetworkConfig{
+		recoveryNewVMNetCfg("default", "vm-test", "10.10.10.30", "02:00:00:00:00:01", "net-a"),
+	}
+
 	oldPool := ippoolBehaviorNewTestPool("pool1", "net-a")
 	if err := ca.Add(oldPool); err != nil {
 		t.Fatalf("failed to cache the registered pool: %s", err.Error())
