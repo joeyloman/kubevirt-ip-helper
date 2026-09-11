@@ -7,13 +7,14 @@ import (
 
 	log "github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/workqueue"
-
-	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
+	"kubevirt.io/client-go/kubecli"
 
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
 	kihcache "github.com/joeyloman/kubevirt-ip-helper/pkg/cache"
@@ -24,6 +25,7 @@ import (
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/ippoolstatus"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/metrics"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/util"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 )
 
 const (
@@ -51,8 +53,11 @@ type EventHandler struct {
 	kubeContext    string
 	kubeRestConfig *rest.Config
 	kihClientset   *kihclientset.Clientset
-	appStatus      *atomic.Int32
-	startupGate    *gate.Gate
+	// kcli serves the one-shot VirtualMachine existence checks of the
+	// orphan sweep
+	kcli        kubecli.KubevirtClient
+	appStatus   *atomic.Int32
+	startupGate *gate.Gate
 }
 
 type Event struct {
@@ -95,6 +100,15 @@ func (e *EventHandler) Init() (err error) {
 	}
 
 	e.kihClientset, err = kihclientset.NewForConfig(e.kubeRestConfig)
+	if err != nil {
+		return
+	}
+
+	// the kubevirt client serves the one-shot VirtualMachine existence
+	// checks of the orphan sweep (the 30s bound of the config stays:
+	// unlike the informer clients there is no watch connection whose
+	// long-poll a timeout would tear down)
+	e.kcli, err = kubecli.GetKubevirtClientFromRESTConfig(e.kubeRestConfig)
 	if err != nil {
 		return
 	}
@@ -170,6 +184,23 @@ func (e *EventHandler) EventListener() (err error) {
 	}, cache.Indexers{})
 
 	controller := NewController(e.ctx, queue, indexer, informer, e.cache, e.ipam, e.dhcp, e.metrics, e.kihClientset, e.appStatus, e.startupGate)
+
+	// the orphan sweep verifies the vm of a controller-managed binding
+	// through the kubevirt api: only a vm which answers NotFound on the
+	// authoritative read is definitively gone, so a live vm which merely
+	// lags in any local cache can never have its binding swept
+	controller.verifyVM = func(namespace string, name string) (bool, error) {
+		_, err := e.kcli.VirtualMachine(namespace).Get(name, &metav1.GetOptions{})
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
+
+			return false, err
+		}
+
+		return true, nil
+	}
 	stop := make(chan struct{})
 
 	// join the controller on shutdown: EventListener only returns after

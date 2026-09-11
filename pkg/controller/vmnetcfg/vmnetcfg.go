@@ -24,6 +24,12 @@ import (
 // marker makes the rejection survive the steady-state error retries.
 const hijackErrorStatusMessage = "vmnetcfg was manually created after this program was (re)started, preventing possible ip hijack"
 
+// vmnetcfgCleanupFinalizer is the finalizer the vm controller puts on
+// every vmnetcfg it creates. its presence marks the object as
+// controller-managed, which is the admission condition of the orphan
+// sweep: a manually created vmnetcfg without it is never swept.
+const vmnetcfgCleanupFinalizer = "kubevirtiphelper.k8s.binbash.org/vmnetcfg-cleanup"
+
 // allocatedNetworkConfig tracks one fully applied interface allocation of a
 // vmnetcfg object so it can be reverted if the durable object update fails.
 type allocatedNetworkConfig struct {
@@ -222,6 +228,22 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 				vmnetcfg.Namespace, vmnetcfg.Name, err.Error())
 		}
 
+		return
+	}
+
+	// an orphaned binding must not hold its reservations forever: the vm
+	// controller is the only writer which deletes the vmnetcfg when its
+	// VirtualMachine is deleted, and a vm deleted while no controller was
+	// watching (the pod was down) produces no event any restart could
+	// replay - the fresh informer lists only what exists. such an object
+	// keeps its finalizer, its recorded binding keeps the ledger owner
+	// alive, and its address stays allocated to a deleted vm until
+	// someone deletes the object by hand. the sweep routes a
+	// controller-managed binding whose vm is definitively gone into the
+	// regular deletion flow, which releases the reservations through the
+	// finalizer cleanup; a vm recreated with the same name rebuilds its
+	// vmnetcfg through the vm controller's resync.
+	if c.sweepOrphanedBinding(vmnetcfg) {
 		return
 	}
 
@@ -1209,6 +1231,70 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 	}
 
 	return
+}
+
+// sweepOrphanedBinding routes a controller-managed vmnetcfg whose
+// VirtualMachine is definitively gone into the deletion flow, and reports
+// whether it did. the vm controller puts the cleanup finalizer on every
+// vmnetcfg it creates and is the only writer which deletes the object when
+// its vm is deleted, so a finalizer-carrying binding whose vm answers
+// NotFound on the authoritative api is an orphan: no event of the gone vm
+// exists anymore which any restart could replay. the delete is conditioned
+// on the uid the informer delivered, so a same-name replacement created
+// between the delivery and the delete is rejected by the apiserver instead
+// of destroyed. the deletion runs through the regular finalizer cleanup of
+// the next sync, which releases the lease, the claim and the ledger entry.
+// the sweep is best-effort by design: a transient verification or delete
+// failure never fails the reconciliation of a possibly live binding - the
+// next resync retries the sweep instead. a nil verifyVM seam fails closed:
+// nothing is swept (tests and any client without a kubevirt api).
+func (c *Controller) sweepOrphanedBinding(vmnetcfg *kihv1.VirtualMachineNetworkConfig) bool {
+	if c.verifyVM == nil || vmnetcfg.Spec.VMName == "" {
+		return false
+	}
+
+	// the cleanup finalizer is only put on the object by the vm
+	// controller, so only a finalizer-carrying binding is known to be
+	// controller-managed: a manually created vmnetcfg is never swept
+	controllerManaged := false
+	for _, finalizer := range vmnetcfg.ObjectMeta.Finalizers {
+		if finalizer == vmnetcfgCleanupFinalizer {
+			controllerManaged = true
+
+			break
+		}
+	}
+	if !controllerManaged {
+		return false
+	}
+
+	vmExists, vmErr := c.verifyVM(vmnetcfg.Namespace, vmnetcfg.Spec.VMName)
+	if vmErr != nil {
+		log.Warnf("(vmnetcfg.sweepOrphanedBinding) [%s/%s] cannot verify the VirtualMachine %s of the binding, skipping the orphan sweep of this sync: %s",
+			vmnetcfg.Namespace, vmnetcfg.Name, vmnetcfg.Spec.VMName, vmErr.Error())
+		c.metrics.UpdateLogStatus("warning")
+
+		return false
+	}
+
+	if vmExists {
+		return false
+	}
+
+	if err := c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs(vmnetcfg.Namespace).Delete(c.ctx, vmnetcfg.Name, metav1.DeleteOptions{
+		Preconditions: &metav1.Preconditions{UID: &vmnetcfg.UID},
+	}); err != nil && !apierrors.IsNotFound(err) {
+		log.Errorf("(vmnetcfg.sweepOrphanedBinding) [%s/%s] cannot delete the orphaned vmnetcfg of the gone VirtualMachine %s: %s",
+			vmnetcfg.Namespace, vmnetcfg.Name, vmnetcfg.Spec.VMName, err.Error())
+		c.metrics.UpdateLogStatus("error")
+
+		return false
+	}
+
+	log.Infof("(vmnetcfg.sweepOrphanedBinding) [%s/%s] the VirtualMachine %s is gone, deleting the orphaned vmnetcfg so its reservations are released through the cleanup",
+		vmnetcfg.Namespace, vmnetcfg.Name, vmnetcfg.Spec.VMName)
+
+	return true
 }
 
 func (c *Controller) cleanupVirtualMachineNetworkConfig(vmnetcfg *kihv1.VirtualMachineNetworkConfig) (err error) {

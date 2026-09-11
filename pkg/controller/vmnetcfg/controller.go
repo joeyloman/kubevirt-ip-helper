@@ -53,6 +53,13 @@ type Controller struct {
 	// let it
 	gate *gate.Gate
 
+	// verifyVM reports whether the VirtualMachine of a given namespace
+	// and name exists. it is an indirection over the kubevirt client so
+	// the orphan sweep is testable without a live cluster (the same seam
+	// shape as the ippool controller's ledger revalidation). a nil seam
+	// fails closed: no vm existence is verified, so nothing is swept.
+	verifyVM func(namespace string, name string) (bool, error)
+
 	mutex sync.Mutex
 	// deferredInitAllocations records the vmnetcfg keys whose startup
 	// sync deferred a fresh allocation until the initialization replay

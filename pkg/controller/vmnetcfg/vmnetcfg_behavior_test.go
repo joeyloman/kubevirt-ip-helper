@@ -3,6 +3,7 @@ package vmnetcfg
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -316,6 +317,12 @@ type fakeAPIServer struct {
 	// vmnetcfgGetCode fails the vmnetcfg GET requests while set, so the
 	// pre-commit verification of the claimed nics can be made to fail
 	vmnetcfgGetCode int
+	// vmnetcfgDeleteStatus fails the vmnetcfg DELETE requests while set,
+	// so the orphan sweep's delete can be made to fail
+	vmnetcfgDeleteStatus int
+	// vmnetcfgDeletes records the DeleteOptions body of every vmnetcfg
+	// DELETE the fake served, so tests can assert the uid precondition
+	vmnetcfgDeletes []metav1.DeleteOptions
 	// blockPoolStatusPut, when non-nil, parks every pool status PUT until
 	// the channel is closed: the Run-join test holds the worker inside its
 	// in-flight reconciliation deterministically
@@ -603,6 +610,67 @@ func (f *fakeAPIServer) handleVMNetCfg(w http.ResponseWriter, r *http.Request, n
 		stored.Status = *obj.Status.DeepCopy()
 		f.mu.Unlock()
 		f.writeVMNetCfg(w, stored)
+	case r.Method == http.MethodDelete && sub == "":
+		f.mu.Lock()
+		obj, ok := f.vmnetcfgs[key]
+		failCode := f.vmnetcfgDeleteStatus
+		f.mu.Unlock()
+		if failCode != 0 {
+			writeStatus(w, failCode, metav1.StatusReasonInternalError, "boom")
+			return
+		}
+		if !ok {
+			writeStatus(w, http.StatusNotFound, metav1.StatusReasonNotFound, "the server could not find the requested resource")
+			return
+		}
+		// a uid precondition must match the stored object, like a real
+		// apiserver: a same-name replacement created after the caller's
+		// snapshot is rejected with a conflict instead of being destroyed
+		opts := metav1.DeleteOptions{}
+		body, readErr := io.ReadAll(r.Body)
+		if readErr != nil {
+			writeStatus(w, http.StatusBadRequest, metav1.StatusReasonBadRequest, readErr.Error())
+			return
+		}
+		if len(body) > 0 {
+			if err := json.Unmarshal(body, &opts); err != nil {
+				writeStatus(w, http.StatusBadRequest, metav1.StatusReasonBadRequest, err.Error())
+				return
+			}
+		}
+		f.mu.Lock()
+		f.vmnetcfgDeletes = append(f.vmnetcfgDeletes, opts)
+		preconditionMismatch := opts.Preconditions != nil && opts.Preconditions.UID != nil && obj.UID != *opts.Preconditions.UID
+		if !preconditionMismatch && len(obj.Finalizers) > 0 {
+			// like the real apiserver, a finalizer-carrying object only
+			// gets its deletionTimestamp: the finalizer cleanup owns the
+			// actual removal
+			now := metav1.Now()
+			obj.ObjectMeta.DeletionTimestamp = &now
+			bumpResourceVersion(&obj.ObjectMeta)
+			f.vmnetcfgs[key] = obj.DeepCopy()
+		} else if !preconditionMismatch {
+			delete(f.vmnetcfgs, key)
+		}
+		f.mu.Unlock()
+		if preconditionMismatch {
+			writeStatus(w, http.StatusConflict, metav1.StatusReasonConflict,
+				"Operation cannot be fulfilled on virtualmachinenetworkconfigs: the UID in the precondition does not match the UID in record")
+			return
+		}
+		if obj.ObjectMeta.DeletionTimestamp != nil {
+			f.writeVMNetCfg(w, obj)
+			return
+		}
+
+		// a finalizer-free object is removed at once, like the real
+		// apiserver answers a delete with a success status
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(&metav1.Status{
+			TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"},
+			Status:   metav1.StatusSuccess,
+		})
 	default:
 		writeStatus(w, http.StatusNotFound, metav1.StatusReasonNotFound, "the server could not find the requested resource")
 	}
