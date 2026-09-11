@@ -134,6 +134,58 @@ func testPool(name, network string, leaseTime int) *kihv1.IPPool {
 	}
 }
 
+// TestSyncDefersAddDuringRestart pins the p3 finding: the ADD path used
+// to register unconditionally while the UPDATE re-registration path
+// already deferred during APP_RESTART - an add processed in the window
+// between the restart-triggering update and the era cancel ran a full
+// registration on the dying era, which the immediately following
+// teardown then tore back down. the deferred add fails the sync so the
+// requeue retries it, and the next era's resync re-delivers it in any
+// case.
+func TestSyncDefersAddDuringRestart(t *testing.T) {
+	pool := testPool("pool-defer", "net-defer", 60)
+	c, _, _ := recoveryNewController(t, pool)
+
+	// the sync-level event drives the object through the indexer, and
+	// the restart phase decides the deferral (the recovery harness keeps
+	// the appStatus running for its own direct registration calls)
+	indexer := newTestIndexer()
+	if err := indexer.Add(pool); err != nil {
+		t.Fatalf("indexing the pool: %v", err)
+	}
+	c.indexer = indexer
+	var appStatus atomic.Int32
+	appStatus.Store(APP_RESTART)
+	c.appStatus = &appStatus
+
+	event := Event{
+		key:             "pool-defer",
+		action:          ADD,
+		poolName:        "pool-defer",
+		poolNetworkName: "net-defer",
+	}
+
+	err := c.sync(event)
+	if err == nil || !strings.Contains(err.Error(), "deferring registration") {
+		t.Fatalf("sync of an add during the restart = %v, want the deferral", err)
+	}
+	if c.dhcp.CheckPool("net-defer") {
+		t.Error("a dying era must not register the pool's dhcp service")
+	}
+	if used := c.ipam.Used("net-defer"); used != 0 {
+		t.Errorf("ipam used = %d, want 0: the deferred add must not register a subnet", used)
+	}
+
+	// once the new era runs, the retried add registers regularly
+	appStatus.Store(APP_RUNNING)
+	if err := c.sync(event); err != nil {
+		t.Fatalf("the retried add after the restart must register: %v", err)
+	}
+	if !c.dhcp.CheckPool("net-defer") {
+		t.Error("the retried add must register the dhcp pool once the era runs")
+	}
+}
+
 func testPoolEvent(key, action, networkName string) Event {
 	return Event{key: key, action: action, poolName: key, poolNetworkName: networkName}
 }

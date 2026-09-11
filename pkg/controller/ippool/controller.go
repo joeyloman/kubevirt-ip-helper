@@ -153,6 +153,16 @@ func (c *Controller) sync(event Event) (err error) {
 
 	switch event.action {
 	case ADD:
+		// a dying era must not register a pool it is about to tear down
+		// (the same fence the UPDATE re-registration path applies): the
+		// registration would re-add the server ip to the nic and open the
+		// dhcp listener after (or during) the application teardown. the
+		// deferred add fails the sync so the requeue retries it, and the
+		// next era's resync re-delivers it in any case
+		if c.appStatus.Load() == APP_RESTART {
+			log.Warnf("(ippool.sync) deferring registration of pool %s while the application is reinitializing", event.poolName)
+			return fmt.Errorf("deferring registration of pool %s while the application is reinitializing", event.poolName)
+		}
 		err = c.registerPoolWithTeardown(obj.(*kihv1.IPPool), "failed to allocate new pool for")
 	case UPDATE:
 		pool, poolErr := c.cache.Get("pool", event.poolNetworkName)

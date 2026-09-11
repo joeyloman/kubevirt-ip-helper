@@ -206,6 +206,54 @@ func (c *Controller) rememberPendingUnwind(key string, entry pendingLedgerDelete
 	c.pendingUnwinds[key] = append(c.pendingUnwinds[key], entry)
 }
 
+// drainPendingUnwinds replays the recorded ledger deletions of a deleted
+// object one last time and drops them. a force-delete strips the
+// finalizers externally, so the object can disappear while its replay is
+// still recorded, and no reconciliation of it will ever arrive again -
+// the resident entries would keep the map bound and the ledger records
+// stranded until the next process era. each entry gets one final
+// owner-validated attempt; whatever still fails is dropped with a
+// warning, because the next era's pool registration revalidates the
+// persisted ledger and drops the orphaned record of a positively
+// removed binding.
+func (c *Controller) drainPendingUnwinds(key string) {
+	c.mutex.Lock()
+	pending := c.pendingUnwinds[key]
+	delete(c.pendingUnwinds, key)
+	c.mutex.Unlock()
+
+	for _, entry := range pending {
+		err := c.updateIPPoolStatus(
+			DELETE,
+			entry.namespace,
+			entry.vmName,
+			entry.ip,
+			entry.networkName,
+			entry.macAddress,
+			entry.poolName,
+		)
+		if err == nil {
+			log.Warnf("(vmnetcfg.drainPendingUnwinds) [%s] removed the pending ledger record of ip %s in pool %s after the deletion",
+				key, entry.ip, entry.poolName)
+			c.metrics.UpdateLogStatus("warning")
+
+			continue
+		}
+
+		if errors.Is(err, util.ErrForeignOwner) || apierrors.IsNotFound(err) {
+			log.Warnf("(vmnetcfg.drainPendingUnwinds) [%s] the pending ledger record of ip %s in pool %s converged: %s",
+				key, entry.ip, entry.poolName, err)
+			c.metrics.UpdateLogStatus("warning")
+
+			continue
+		}
+
+		log.Warnf("(vmnetcfg.drainPendingUnwinds) [%s] dropping the pending ledger record of ip %s in pool %s after the deletion, the next era's registration revalidates the ledger: %s",
+			key, entry.ip, entry.poolName, err)
+		c.metrics.UpdateLogStatus("warning")
+	}
+}
+
 // retryPendingUnwinds replays the failed ledger deletions of an object at
 // the start of its reconciliation. a deletion which converged - the
 // record is gone, a foreign owner recorded the address in the meantime,
@@ -369,6 +417,13 @@ func (c *Controller) sync(event Event) (err error) {
 		// the gate settles it so a startup-time deletion does not block the
 		// controller startup forever
 		c.markInitAttempt(event.key)
+
+		// the object is gone for good (a regular deletion converged its
+		// own cleanup, a force-delete stripped the finalizers externally):
+		// replay its recorded ledger deletions one last time and drop
+		// them, so a stranded record cannot keep the entry resident for
+		// the rest of the era
+		c.drainPendingUnwinds(event.key)
 	}
 
 	return
