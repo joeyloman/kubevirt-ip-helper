@@ -18,6 +18,7 @@ import (
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
 	kihcache "github.com/joeyloman/kubevirt-ip-helper/pkg/cache"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/dhcp"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/gate"
 	kihclientset "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/clientset/versioned"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/ippoolstatus"
@@ -41,17 +42,17 @@ const (
 const resyncPeriod = time.Minute
 
 type EventHandler struct {
-	ctx                  context.Context
-	ipam                 *ipam.IPAllocator
-	dhcp                 *dhcp.DHCPAllocator
-	metrics              *metrics.MetricsAllocator
-	cache                *kihcache.CacheAllocator
-	kubeConfig           string
-	kubeContext          string
-	kubeRestConfig       *rest.Config
-	kihClientset         *kihclientset.Clientset
-	appStatus            *atomic.Int32
-	vmnetcfgCountCurrent *atomic.Int32
+	ctx            context.Context
+	ipam           *ipam.IPAllocator
+	dhcp           *dhcp.DHCPAllocator
+	metrics        *metrics.MetricsAllocator
+	cache          *kihcache.CacheAllocator
+	kubeConfig     string
+	kubeContext    string
+	kubeRestConfig *rest.Config
+	kihClientset   *kihclientset.Clientset
+	appStatus      *atomic.Int32
+	startupGate    *gate.Gate
 }
 
 type Event struct {
@@ -70,20 +71,20 @@ func NewEventHandler(
 	kubeRestConfig *rest.Config,
 	kihClientset *kihclientset.Clientset,
 	appStatus *atomic.Int32,
-	vmnetcfgCountCurrent *atomic.Int32,
+	startupGate *gate.Gate,
 ) *EventHandler {
 	return &EventHandler{
-		ctx:                  ctx,
-		ipam:                 ipam,
-		dhcp:                 dhcp,
-		metrics:              metrics,
-		cache:                cache,
-		kubeConfig:           kubeConfig,
-		kubeContext:          kubeContext,
-		kubeRestConfig:       kubeRestConfig,
-		kihClientset:         kihClientset,
-		appStatus:            appStatus,
-		vmnetcfgCountCurrent: vmnetcfgCountCurrent,
+		ctx:            ctx,
+		ipam:           ipam,
+		dhcp:           dhcp,
+		metrics:        metrics,
+		cache:          cache,
+		kubeConfig:     kubeConfig,
+		kubeContext:    kubeContext,
+		kubeRestConfig: kubeRestConfig,
+		kihClientset:   kihClientset,
+		appStatus:      appStatus,
+		startupGate:    startupGate,
 	}
 }
 
@@ -168,7 +169,7 @@ func (e *EventHandler) EventListener() (err error) {
 		},
 	}, cache.Indexers{})
 
-	controller := NewController(e.ctx, queue, indexer, informer, e.cache, e.ipam, e.dhcp, e.metrics, e.kihClientset, e.appStatus, e.vmnetcfgCountCurrent)
+	controller := NewController(e.ctx, queue, indexer, informer, e.cache, e.ipam, e.dhcp, e.metrics, e.kihClientset, e.appStatus, e.startupGate)
 	stop := make(chan struct{})
 
 	// join the controller on shutdown: EventListener only returns after

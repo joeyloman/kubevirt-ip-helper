@@ -18,10 +18,22 @@ import (
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
 	kihcache "github.com/joeyloman/kubevirt-ip-helper/pkg/cache"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/dhcp"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/gate"
 	kihclientset "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/clientset/versioned"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/metrics"
 )
+
+// newTestGate builds a startup gate whose snapshot holds the given keys:
+// the settle assertions of the tests observe the membership contract, so
+// the key a test syncs must be part of the snapshot for its settlement to
+// count.
+func newTestGate(keys ...string) *gate.Gate {
+	startupGate := gate.New()
+	startupGate.SetTarget(keys)
+
+	return startupGate
+}
 
 // shutdownWait is the bounded amount of time a test waits for a controller
 // goroutine to observe a queue or context shutdown before failing.
@@ -58,7 +70,7 @@ func (s *stubInformer) Run(stopCh <-chan struct{})      {}
 func (s *stubInformer) HasSynced() bool                 { return s.synced }
 func (s *stubInformer) LastSyncResourceVersion() string { return "" }
 
-func newTestController(t *testing.T, queue workqueue.RateLimitingInterface, indexer cache.Indexer, informer cache.Controller, appStatus *atomic.Int32, vmnetcfgCountCurrent *atomic.Int32, kihClientset *kihclientset.Clientset) *Controller {
+func newTestController(t *testing.T, queue workqueue.RateLimitingInterface, indexer cache.Indexer, informer cache.Controller, appStatus *atomic.Int32, startupGate *gate.Gate, kihClientset *kihclientset.Clientset) *Controller {
 	t.Helper()
 
 	controller := NewController(
@@ -72,7 +84,7 @@ func newTestController(t *testing.T, queue workqueue.RateLimitingInterface, inde
 		metrics.NewMetricsAllocator(),
 		kihClientset,
 		appStatus,
-		vmnetcfgCountCurrent,
+		startupGate,
 	)
 	t.Cleanup(queue.ShutDown)
 
@@ -114,8 +126,9 @@ func testVMNetCfg(networkConfigs []kihv1.NetworkConfig) *kihv1.VirtualMachineNet
 
 func TestProcessNextItemReturnsFalseAfterShutdown(t *testing.T) {
 	queue := newTestQueue()
-	var appStatus, countCurrent atomic.Int32
-	controller := newTestController(t, queue, newTestIndexer(), nil, &appStatus, &countCurrent, nil)
+	var appStatus atomic.Int32
+	startupGate := newTestGate("default/vm-test")
+	controller := newTestController(t, queue, newTestIndexer(), nil, &appStatus, startupGate, nil)
 
 	queue.ShutDown()
 
@@ -126,8 +139,9 @@ func TestProcessNextItemReturnsFalseAfterShutdown(t *testing.T) {
 
 func TestProcessNextItemSucceedsForMissingIndexObject(t *testing.T) {
 	queue := newTestQueue()
-	var appStatus, countCurrent atomic.Int32
-	controller := newTestController(t, queue, newTestIndexer(), nil, &appStatus, &countCurrent, nil)
+	var appStatus atomic.Int32
+	startupGate := newTestGate("default/vm-test")
+	controller := newTestController(t, queue, newTestIndexer(), nil, &appStatus, startupGate, nil)
 
 	event := testEvent(ADD)
 	queue.Add(event)
@@ -139,16 +153,17 @@ func TestProcessNextItemSucceedsForMissingIndexObject(t *testing.T) {
 	if n := queue.Len(); n != 0 {
 		t.Errorf("queue has %d items after a successful sync, want 0", n)
 	}
-	if countCurrent.Load() != 1 {
-		t.Errorf("counter for a missing index object: got %d, want 1; the vanished object counts as handled so it cannot block the startup gate", countCurrent.Load())
+	if startupGate.Settled() != 1 {
+		t.Errorf("counter for a missing index object: got %d, want 1; the vanished object counts as handled so it cannot block the startup gate", startupGate.Settled())
 	}
 }
 
 func TestProcessNextItemRequeuesOnIndexerError(t *testing.T) {
 	queue := newTestQueue()
-	var appStatus, countCurrent atomic.Int32
+	var appStatus atomic.Int32
+	startupGate := newTestGate("default/vm-test")
 	indexer := &failingIndexer{Indexer: newTestIndexer(), err: errors.New("store unavailable")}
-	controller := newTestController(t, queue, indexer, nil, &appStatus, &countCurrent, nil)
+	controller := newTestController(t, queue, indexer, nil, &appStatus, startupGate, nil)
 
 	event := testEvent(ADD)
 	queue.Add(event)
@@ -164,8 +179,9 @@ func TestProcessNextItemRequeuesOnIndexerError(t *testing.T) {
 
 func TestHandleErrForgetsOnSuccess(t *testing.T) {
 	queue := newTestQueue()
-	var appStatus, countCurrent atomic.Int32
-	controller := newTestController(t, queue, newTestIndexer(), nil, &appStatus, &countCurrent, nil)
+	var appStatus atomic.Int32
+	startupGate := newTestGate("default/vm-test")
+	controller := newTestController(t, queue, newTestIndexer(), nil, &appStatus, startupGate, nil)
 
 	key := "default/vm-test"
 	queue.Add(key)
@@ -187,8 +203,9 @@ func TestHandleErrForgetsOnSuccess(t *testing.T) {
 
 func TestHandleErrRateLimitsOnFailure(t *testing.T) {
 	queue := newTestQueue()
-	var appStatus, countCurrent atomic.Int32
-	controller := newTestController(t, queue, newTestIndexer(), nil, &appStatus, &countCurrent, nil)
+	var appStatus atomic.Int32
+	startupGate := newTestGate("default/vm-test")
+	controller := newTestController(t, queue, newTestIndexer(), nil, &appStatus, startupGate, nil)
 
 	key := "default/vm-test"
 	queue.Add(key)
@@ -210,8 +227,9 @@ func TestHandleErrRateLimitsOnFailure(t *testing.T) {
 
 func TestHandleErrDropsAfterMaxRequeues(t *testing.T) {
 	queue := newTestQueue()
-	var appStatus, countCurrent atomic.Int32
-	controller := newTestController(t, queue, newTestIndexer(), nil, &appStatus, &countCurrent, nil)
+	var appStatus atomic.Int32
+	startupGate := newTestGate("default/vm-test")
+	controller := newTestController(t, queue, newTestIndexer(), nil, &appStatus, startupGate, nil)
 
 	key := "default/vm-test"
 	syncErr := errors.New("persistent failure")
@@ -250,23 +268,25 @@ func TestHandleErrDropsAfterMaxRequeues(t *testing.T) {
 }
 
 func TestSyncReturnsNilForMissingIndexObject(t *testing.T) {
-	var appStatus, countCurrent atomic.Int32
+	var appStatus atomic.Int32
+	startupGate := newTestGate("default/vm-test")
 	appStatus.Store(APP_INIT)
-	controller := newTestController(t, newTestQueue(), newTestIndexer(), nil, &appStatus, &countCurrent, nil)
+	controller := newTestController(t, newTestQueue(), newTestIndexer(), nil, &appStatus, startupGate, nil)
 
 	if err := controller.sync(testEvent(ADD)); err != nil {
 		t.Errorf("sync() for a missing index object returned error %v, want nil", err)
 	}
-	if countCurrent.Load() != 1 {
-		t.Errorf("counter for a missing index object: got %d, want 1; the vanished object counts as handled so it cannot block the startup gate", countCurrent.Load())
+	if startupGate.Settled() != 1 {
+		t.Errorf("counter for a missing index object: got %d, want 1; the vanished object counts as handled so it cannot block the startup gate", startupGate.Settled())
 	}
 }
 
 func TestSyncReturnsIndexerError(t *testing.T) {
-	var appStatus, countCurrent atomic.Int32
+	var appStatus atomic.Int32
+	startupGate := newTestGate("default/vm-test")
 	appStatus.Store(APP_INIT)
 	indexer := &failingIndexer{Indexer: newTestIndexer(), err: errors.New("store unavailable")}
-	controller := newTestController(t, newTestQueue(), indexer, nil, &appStatus, &countCurrent, nil)
+	controller := newTestController(t, newTestQueue(), indexer, nil, &appStatus, startupGate, nil)
 
 	if err := controller.sync(testEvent(ADD)); err == nil {
 		t.Fatalf("sync() returned nil, want the indexer error")
@@ -276,62 +296,66 @@ func TestSyncReturnsIndexerError(t *testing.T) {
 func TestSyncDeleteCountsObjectForStartupGate(t *testing.T) {
 	// a delete event for an object that still exists in the index settles
 	// the startup gate: the object can never produce a settled sync again
-	var appStatus, countCurrent atomic.Int32
+	var appStatus atomic.Int32
+	startupGate := newTestGate("default/vm-test")
 	appStatus.Store(APP_INIT)
 	indexer := newTestIndexer()
 	indexer.Add(testVMNetCfg(nil))
-	controller := newTestController(t, newTestQueue(), indexer, nil, &appStatus, &countCurrent, nil)
+	controller := newTestController(t, newTestQueue(), indexer, nil, &appStatus, startupGate, nil)
 
 	if err := controller.sync(testEvent(DELETE)); err != nil {
 		t.Errorf("sync(DELETE) returned error %v, want nil", err)
 	}
-	if countCurrent.Load() != 1 {
-		t.Errorf("counter = %d after a delete event, want 1 (the object settles the gate exactly once)", countCurrent.Load())
+	if startupGate.Settled() != 1 {
+		t.Errorf("counter = %d after a delete event, want 1 (the object settles the gate exactly once)", startupGate.Settled())
 	}
 }
 
 func TestSyncDeleteSnapshotCountsObjectForStartupGate(t *testing.T) {
 	// a delete snapshot (object already gone from the index) settles the
 	// startup gate too: the object can never sync anymore
-	var appStatus, countCurrent atomic.Int32
+	var appStatus atomic.Int32
+	startupGate := newTestGate("default/vm-test")
 	appStatus.Store(APP_INIT)
-	controller := newTestController(t, newTestQueue(), newTestIndexer(), nil, &appStatus, &countCurrent, nil)
+	controller := newTestController(t, newTestQueue(), newTestIndexer(), nil, &appStatus, startupGate, nil)
 
 	if err := controller.sync(testEvent(DELETE)); err != nil {
 		t.Errorf("sync(DELETE) returned error %v, want nil", err)
 	}
-	if countCurrent.Load() != 1 {
-		t.Errorf("counter = %d after a delete snapshot, want 1", countCurrent.Load())
+	if startupGate.Settled() != 1 {
+		t.Errorf("counter = %d after a delete snapshot, want 1", startupGate.Settled())
 	}
 }
 
 func TestSyncAddIncrementsCounterWhileInitializing(t *testing.T) {
-	var appStatus, countCurrent atomic.Int32
+	var appStatus atomic.Int32
+	startupGate := newTestGate("default/vm-test")
 	appStatus.Store(APP_INIT)
 	indexer := newTestIndexer()
 	indexer.Add(testVMNetCfg(nil))
-	controller := newTestController(t, newTestQueue(), indexer, nil, &appStatus, &countCurrent, nil)
+	controller := newTestController(t, newTestQueue(), indexer, nil, &appStatus, startupGate, nil)
 
 	if err := controller.sync(testEvent(ADD)); err != nil {
 		t.Errorf("sync(ADD) returned error %v, want nil", err)
 	}
-	if countCurrent.Load() != 1 {
-		t.Errorf("counter = %d after an add while initializing, want 1", countCurrent.Load())
+	if startupGate.Settled() != 1 {
+		t.Errorf("counter = %d after an add while initializing, want 1", startupGate.Settled())
 	}
 }
 
 func TestSyncAddDoesNotCountWhileRunning(t *testing.T) {
-	var appStatus, countCurrent atomic.Int32
+	var appStatus atomic.Int32
+	startupGate := newTestGate("default/vm-test")
 	appStatus.Store(APP_RUNNING)
 	indexer := newTestIndexer()
 	indexer.Add(testVMNetCfg(nil))
-	controller := newTestController(t, newTestQueue(), indexer, nil, &appStatus, &countCurrent, nil)
+	controller := newTestController(t, newTestQueue(), indexer, nil, &appStatus, startupGate, nil)
 
 	if err := controller.sync(testEvent(ADD)); err != nil {
 		t.Errorf("sync(ADD) returned error %v, want nil", err)
 	}
-	if countCurrent.Load() != 0 {
-		t.Errorf("counter = %d after an add while running, want 0", countCurrent.Load())
+	if startupGate.Settled() != 0 {
+		t.Errorf("counter = %d after an add while running, want 0", startupGate.Settled())
 	}
 }
 
@@ -339,17 +363,18 @@ func TestSyncUpdateSuccessCountsForStartupGate(t *testing.T) {
 	// a successful sync settles the startup gate also when it arrived as a
 	// resynced UPDATE: an object whose initial ADD failed transiently must
 	// not leave the gate waiting forever after its recovery
-	var appStatus, countCurrent atomic.Int32
+	var appStatus atomic.Int32
+	startupGate := newTestGate("default/vm-test")
 	appStatus.Store(APP_INIT)
 	indexer := newTestIndexer()
 	indexer.Add(testVMNetCfg(nil))
-	controller := newTestController(t, newTestQueue(), indexer, nil, &appStatus, &countCurrent, nil)
+	controller := newTestController(t, newTestQueue(), indexer, nil, &appStatus, startupGate, nil)
 
 	if err := controller.sync(testEvent(UPDATE)); err != nil {
 		t.Errorf("sync(UPDATE) returned error %v, want nil", err)
 	}
-	if countCurrent.Load() != 1 {
-		t.Errorf("counter = %d after an update while initializing, want 1", countCurrent.Load())
+	if startupGate.Settled() != 1 {
+		t.Errorf("counter = %d after an update while initializing, want 1", startupGate.Settled())
 	}
 }
 
@@ -360,34 +385,36 @@ func TestSyncUpdateSuccessCountsForStartupGate(t *testing.T) {
 // block the vm controller startup forever, and the doubled attempts of
 // the requeue must not overcount past the target
 func TestSyncAddFailureCountsAsHandledForStartupGate(t *testing.T) {
-	var appStatus, countCurrent atomic.Int32
+	var appStatus atomic.Int32
+	startupGate := newTestGate("default/vm-test")
 	appStatus.Store(APP_INIT)
 	indexer := newTestIndexer()
 	indexer.Add(testVMNetCfg([]kihv1.NetworkConfig{
 		{MACAddress: "02:00:00:00:00:01", NetworkName: "missing-net"},
 	}))
-	controller := newTestController(t, newTestQueue(), indexer, nil, &appStatus, &countCurrent, nil)
+	controller := newTestController(t, newTestQueue(), indexer, nil, &appStatus, startupGate, nil)
 
 	if err := controller.sync(testEvent(ADD)); err == nil {
 		t.Error("sync(ADD) returned nil, want a rate-limited requeue error for the failed update")
 	}
-	if countCurrent.Load() != 1 {
-		t.Errorf("counter = %d after a failed update, want 1: the startup gate counts handled objects once", countCurrent.Load())
+	if startupGate.Settled() != 1 {
+		t.Errorf("counter = %d after a failed update, want 1: the startup gate counts handled objects once", startupGate.Settled())
 	}
 
 	// the rate-limited retry of the same event must not double count
 	if err := controller.sync(testEvent(ADD)); err == nil {
 		t.Fatal("the retried sync(ADD) returned nil, want a sync error")
 	}
-	if countCurrent.Load() != 1 {
-		t.Errorf("counter = %d after the retried event, want 1", countCurrent.Load())
+	if startupGate.Settled() != 1 {
+		t.Errorf("counter = %d after the retried event, want 1", startupGate.Settled())
 	}
 }
 
 func TestRunShutsDownTheQueue(t *testing.T) {
 	queue := newTestQueue()
-	var appStatus, countCurrent atomic.Int32
-	controller := newTestController(t, queue, newTestIndexer(), &stubInformer{synced: true}, &appStatus, &countCurrent, nil)
+	var appStatus atomic.Int32
+	startupGate := newTestGate("default/vm-test")
+	controller := newTestController(t, queue, newTestIndexer(), &stubInformer{synced: true}, &appStatus, startupGate, nil)
 
 	stop := make(chan struct{})
 	done := make(chan struct{})
@@ -437,7 +464,7 @@ func TestRunJoinsTheInFlightSyncBeforeReturning(t *testing.T) {
 	if err := indexer.Add(vmnetcfg); err != nil {
 		t.Fatalf("seeding indexer: %s", err)
 	}
-	var count atomic.Int32
+
 	controller := NewController(
 		context.Background(),
 		queue,
@@ -449,7 +476,7 @@ func TestRunJoinsTheInFlightSyncBeforeReturning(t *testing.T) {
 		e.metrics,
 		e.client,
 		e.appStatus,
-		&count,
+		nil,
 	)
 	queue.Add(Event{key: testNamespace + "/" + testVMNetCfgName, action: ADD})
 
@@ -498,8 +525,9 @@ func TestRunJoinsTheInFlightSyncBeforeReturning(t *testing.T) {
 
 func TestRunWorkerExitsWhenQueueShutsDown(t *testing.T) {
 	queue := newTestQueue()
-	var appStatus, countCurrent atomic.Int32
-	controller := newTestController(t, queue, newTestIndexer(), nil, &appStatus, &countCurrent, nil)
+	var appStatus atomic.Int32
+	startupGate := newTestGate("default/vm-test")
+	controller := newTestController(t, queue, newTestIndexer(), nil, &appStatus, startupGate, nil)
 
 	queue.ShutDown()
 
@@ -531,7 +559,7 @@ func TestEventListenerStopsWhenContextIsCancelled(t *testing.T) {
 		nil,
 		newUnavailableClientset(t),
 		new(atomic.Int32),
-		new(atomic.Int32),
+		nil,
 	)
 
 	done := make(chan error, 1)
@@ -546,5 +574,49 @@ func TestEventListenerStopsWhenContextIsCancelled(t *testing.T) {
 		}
 	case <-time.After(shutdownWait):
 		t.Fatal("EventListener did not return after context cancellation")
+	}
+}
+
+// a vmnetcfg of the startup snapshot which was deleted before the informer
+// started generates no event at all: Run must settle it through the store
+// reconcile after the cache sync, or the membership gate would wait for it
+// forever (a count-based gate hid this case by letting unrelated objects
+// substitute)
+func TestRunSettlesSnapshotKeysDeletedBeforeTheInformerStarted(t *testing.T) {
+	var appStatus atomic.Int32
+	appStatus.Store(APP_INIT)
+
+	// the store holds another vmnetcfg but not the snapshot's default/vm-gone:
+	// its deletion happened between the startup LIST and the informer start
+	indexer := newTestIndexer()
+	if err := indexer.Add(testVMNetCfg(nil)); err != nil {
+		t.Fatalf("seeding indexer: %v", err)
+	}
+
+	startupGate := newTestGate("default/vm-gone", "default/vm-test")
+	controller := newTestController(t, newTestQueue(), indexer, &stubInformer{synced: true}, &appStatus, startupGate, nil)
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		controller.Run(1, stop)
+		close(done)
+	}()
+
+	close(stop)
+
+	select {
+	case <-done:
+	case <-time.After(shutdownWait):
+		t.Fatal("Run did not return after the stop channel was closed")
+	}
+
+	// the never-observed deletion settled through the store reconcile;
+	// default/vm-test settles through its own events in production, so it
+	// stays pending here
+	for _, key := range startupGate.Unsettled() {
+		if key == "default/vm-gone" {
+			t.Errorf("the never-observed deletion %s stayed unsettled: Run must settle it through the store reconcile", key)
+		}
 	}
 }

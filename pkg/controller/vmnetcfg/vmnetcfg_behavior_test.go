@@ -101,7 +101,7 @@ func newTestEnv(t *testing.T) *testEnv {
 		t.Fatalf("creating clientset: %s", err)
 	}
 
-	var appStatus, count atomic.Int32
+	var appStatus atomic.Int32
 	appStatus.Store(APP_INIT)
 	e := &testEnv{
 		t:       t,
@@ -117,7 +117,7 @@ func newTestEnv(t *testing.T) *testEnv {
 	// requeued events through the controller
 	e.indexer = newTestIndexer()
 	e.queue = newTestQueue()
-	e.controller = NewController(context.Background(), e.queue, e.indexer, nil, e.cache, e.ipam, e.dhcp, e.metrics, e.client, &appStatus, &count)
+	e.controller = NewController(context.Background(), e.queue, e.indexer, nil, e.cache, e.ipam, e.dhcp, e.metrics, e.client, &appStatus, nil)
 	e.appStatus = &appStatus
 
 	return e

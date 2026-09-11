@@ -322,3 +322,83 @@ func TestCacheConcurrentAccessIsRaceClean(t *testing.T) {
 
 	wg.Wait()
 }
+
+// Upsert replaces an existing pool and creates a missing one, so a reload
+// can refresh the cached projection without knowing whether the entry is
+// already cached: the outcome must match the previous delete-if-cached
+// plus add sequence in both cases, and the replaced value must be the new
+// deep copy, not the stale entry.
+func TestCacheUpsertReplacesAndCreates(t *testing.T) {
+	c := New()
+
+	// create: the entry does not exist yet
+	first := newTestPool("net-a")
+	first.Spec.IPv4Config.ServerIP = "10.0.0.1"
+	if err := c.Upsert(first); err != nil {
+		t.Fatalf("upserting a missing pool: %s", err.Error())
+	}
+
+	// replace: the cached entry must carry the new projection afterwards
+	second := newTestPool("net-a")
+	second.Spec.IPv4Config.ServerIP = "10.0.0.254"
+	if err := c.Upsert(second); err != nil {
+		t.Fatalf("upserting a cached pool: %s", err.Error())
+	}
+
+	got, err := c.Get("pool", "net-a")
+	if err != nil {
+		t.Fatalf("getting the replaced pool: %s", err.Error())
+	}
+	if serverIP := got.(kihv1.IPPool).Spec.IPv4Config.ServerIP; serverIP != "10.0.0.254" {
+		t.Errorf("cached server ip after the replacement: got %q, want %q", serverIP, "10.0.0.254")
+	}
+
+	// the replaced entry keeps the Add collision contract for other writers
+	if err := c.Add(second); err == nil {
+		t.Errorf("adding over an upserted pool must collide like adding over a cached one")
+	}
+}
+
+// Upsert must never expose a "pool missing" window to a concurrent reader:
+// once the pool is cached, every Get which races a replacement loop must
+// find the entry (the old or the new projection, never the gap a
+// delete-then-add sequence leaves between its two lock acquisitions).
+func TestCacheUpsertKeepsThePoolVisibleToConcurrentReaders(t *testing.T) {
+	c := New()
+
+	if err := c.Upsert(newTestPool("net-a")); err != nil {
+		t.Fatalf("seeding the pool: %s", err.Error())
+	}
+
+	var wg sync.WaitGroup
+	missing := make(chan error, 8)
+
+	for worker := range 8 {
+		wg.Add(1)
+
+		go func(worker int) {
+			defer wg.Done()
+
+			for range 500 {
+				if _, err := c.Get("pool", "net-a"); err != nil {
+					missing <- err
+
+					return
+				}
+			}
+		}(worker)
+	}
+
+	for i := range 500 {
+		replacement := newTestPool("net-a")
+		replacement.Spec.IPv4Config.ServerIP = "10.0.0." + strconv.Itoa(2+i%200)
+		_ = c.Upsert(replacement)
+	}
+
+	wg.Wait()
+	close(missing)
+
+	for err := range missing {
+		t.Errorf("a concurrent reader observed the pool missing during the replacements: %s", err.Error())
+	}
+}

@@ -161,7 +161,7 @@ func TestVMNetCfgMissingPoolInterfaceRecoversOncePoolRegisters(t *testing.T) {
 // registered cannot be served or reissued from), but only after the later
 // interface on a registered pool is protected by this same sync.
 func TestVMNetCfgStartupGateMissingPoolKeepsLaterInterfacesProtected(t *testing.T) {
-	e, controller, count := newGateTestEnv(t)
+	e, controller, startupGate := newGateTestEnv(t)
 	seedHealthyPool(e)
 	vmnetcfg := mixedVMNetCfg()
 	e.seedVMNetCfg(vmnetcfg)
@@ -173,8 +173,8 @@ func TestVMNetCfgStartupGateMissingPoolKeepsLaterInterfacesProtected(t *testing.
 	if err == nil {
 		t.Fatal("want the sync to fail while the pool is missing")
 	}
-	if count.Load() != 1 {
-		t.Fatalf("gate count = %d, want 1 (settled classification for the missing pool)", count.Load())
+	if startupGate.Settled() != 1 {
+		t.Fatalf("gate count = %d, want 1 (settled classification for the missing pool)", startupGate.Settled())
 	}
 	if used := e.ipam.Used(healthyNet2); used != 1 {
 		t.Fatalf("healthy network used = %d right after the gate opened, want 1 (later interface protected)", used)

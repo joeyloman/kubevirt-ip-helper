@@ -69,7 +69,6 @@ func ippoolBehaviorNewTestController(t *testing.T, srv *httptest.Server) (*Contr
 
 	var appStatus atomic.Int32
 	appStatus.Store(APP_RUNNING)
-	var ippoolCountCurrent atomic.Int32
 
 	var cs *kihclientset.Clientset
 	if srv != nil {
@@ -81,14 +80,14 @@ func ippoolBehaviorNewTestController(t *testing.T, srv *httptest.Server) (*Contr
 	}
 
 	c := &Controller{
-		ctx:                context.Background(),
-		cache:              kihcache.New(),
-		ipam:               kihipam.New(),
-		dhcp:               kihdhcp.New(),
-		metrics:            metrics.New(),
-		kihClientset:       cs,
-		appStatus:          &appStatus,
-		ippoolCountCurrent: &ippoolCountCurrent,
+		ctx:          context.Background(),
+		cache:        kihcache.New(),
+		ipam:         kihipam.New(),
+		dhcp:         kihdhcp.New(),
+		metrics:      metrics.New(),
+		kihClientset: cs,
+		appStatus:    &appStatus,
+		gate:         newTestGate("pool1"),
 	}
 
 	return c, c.ipam, c.dhcp, c.cache, c.metrics
@@ -394,8 +393,8 @@ func TestHandleIPPoolObjectChangeAppInitIgnoresUpdate(t *testing.T) {
 	if !reflect.DeepEqual(got.(kihv1.IPPool), cached) {
 		t.Errorf("cache was modified during init, want the unchanged cached pool")
 	}
-	if c.ippoolCountCurrent.Load() != 0 {
-		t.Errorf("ippool count changed during init: got %d, want 0", c.ippoolCountCurrent.Load())
+	if c.gate.Settled() != 0 {
+		t.Errorf("ippool count changed during init: got %d, want 0", c.gate.Settled())
 	}
 }
 
@@ -776,8 +775,8 @@ func TestRegisterIPPoolValidatesSubnetBeforeNetlink(t *testing.T) {
 	if c.appStatus.Load() != APP_RUNNING {
 		t.Errorf("app status changed: got %d, want %d", c.appStatus.Load(), APP_RUNNING)
 	}
-	if c.ippoolCountCurrent.Load() != 0 {
-		t.Errorf("ippool count changed: got %d, want 0", c.ippoolCountCurrent.Load())
+	if c.gate.Settled() != 0 {
+		t.Errorf("ippool count changed: got %d, want 0", c.gate.Settled())
 	}
 }
 

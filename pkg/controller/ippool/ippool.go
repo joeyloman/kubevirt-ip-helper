@@ -459,14 +459,15 @@ func (c *Controller) handleIPPoolObjectChange(oldPool kihv1.IPPool, newPool *kih
 		}
 	}
 
-	if c.cache.Check(newPool) {
-		if err := c.cache.Delete("pool", newPool.Spec.NetworkName); err != nil {
-			return fmt.Errorf("(ippool.handleIPPoolObjectChange) failed to delete pool %s from cache: %s", newPool.Name, err.Error())
-		}
-	}
-
-	if err := c.cache.Add(newPool); err != nil {
-		return fmt.Errorf("(ippool.handleIPPoolObjectChange) failed to add pool %s to cache: %s", newPool.Name, err.Error())
+	// the reloaded projection replaces the cached pool in one atomic step:
+	// a delete-then-add sequence would expose a transient "pool missing"
+	// window to the concurrent readers of the shared cache, and a reader
+	// which acts on it (a cleanup which aborts, a binding which fails its
+	// restore) would diverge from the live registration. the replacement
+	// creates the entry when the pool is not cached yet, so the outcome is
+	// identical to the previous delete-if-cached plus add sequence
+	if err := c.cache.Upsert(newPool); err != nil {
+		return fmt.Errorf("(ippool.handleIPPoolObjectChange) failed to replace pool %s in cache: %s", newPool.Name, err.Error())
 	}
 
 	return
@@ -658,6 +659,25 @@ func (c *Controller) protectPersistedClaims(pool *kihv1.IPPool) (map[string]stri
 				pool.Name, ref, ip, ownerRef)
 		}
 
+		// revalidate the recorded owner before the entry is pinned and
+		// republished: the ledger is the previous era's decision, but a
+		// record whose owner positively removed the binding (the nic is
+		// gone from the live spec) or whose objects are authoritatively
+		// gone must not be resurrected - a republished orphan permanently
+		// consumes the address, because no reconciliation is left which
+		// could ever release it. an owner whose absence cannot be
+		// established keeps its conservative protection (fail closed: a
+		// transiently unreadable object or a vmnetcfg which a live vm is
+		// about to reconstruct must not drop a claim the guest may still
+		// hold)
+		if !c.ledgerOwnerLive(pool, namespace, vmName, hwAddr, ip) {
+			log.Warnf("(ippool.protectPersistedClaims) IPPool %s carries the allocation record %q for ip %s whose owner is authoritatively gone, dropping it instead of resurrecting it",
+				pool.Name, ownerRef, ip)
+			c.metrics.UpdateLogStatus("warning")
+
+			continue
+		}
+
 		// a claim outside the pool range can never be handed out by the
 		// allocator, so publishing it keeps the durable record without an
 		// exposure window; the range may grow back (which triggers an
@@ -766,9 +786,15 @@ func (c *Controller) protectPersistedClaims(pool *kihv1.IPPool) (map[string]stri
 				namespace: vmnetcfg.Namespace,
 				name:      vmnetcfg.Name,
 				vmRef:     fmt.Sprintf("%s/%s", vmnetcfg.Namespace, vmnetcfg.Spec.VMName),
-				mac:       v.MACAddress,
-				ip:        v.IPAddress,
-				named:     macErr == nil,
+				// the claim identity carries the canonical mac spelling:
+				// the re-verification compares it against a fresh read of
+				// the spec, and a spelling drift between the list snapshot
+				// and the fresh read (02-AA-BB-CC-DD-01 ->
+				// 02:aa:bb:cc:dd:01) must not turn the unchanged logical
+				// owner into a removed one whose pin gets dropped
+				mac:   util.CanonicalHWAddr(v.MACAddress),
+				ip:    v.IPAddress,
+				named: macErr == nil,
 			}
 			if claim.named {
 				claim.ownerRef = util.AllocationRef(vmnetcfg.Namespace, vmnetcfg.Spec.VMName, v.MACAddress)
@@ -790,20 +816,30 @@ func (c *Controller) protectPersistedClaims(pool *kihv1.IPPool) (map[string]stri
 	// no orphan record behind which a fresh helper restart would treat
 	// as authoritative and reserve again
 	pinnedClaims := []specClaim{}
+	// skippedClaims records the claims a decided address displaced: when
+	// the winner of an address is dropped during the re-verification, the
+	// survivors are re-evaluated so the address never becomes allocatable
+	// while a live object still records it (the dropped winner reopens
+	// its own pin, so the promotion re-runs the exact admission rules)
+	skippedClaims := make(map[string][]specClaim)
 
 	pinClaim := func(claim specClaim) {
 		if pinnedIPs[claim.ip] {
 			// the ledger already decided this address: a spec claim which
 			// disagrees with a recorded owner is a genuine conflict which
 			// stays with the recorded owner (the binding restore surfaces
-			// it visibly), and an agreeing claim is already pinned
+			// it visibly), and an agreeing claim is already pinned. a
+			// displaced claimant of a spec-pinned address is recorded as
+			// a survivor, because the pin it lost to can still be dropped
+			// by the re-verification below
+			skippedClaims[claim.ip] = append(skippedClaims[claim.ip], claim)
+
 			return
 		}
 
 		if !ipWithinPoolRange(pool, claim.ip) {
 			// outside the pool range the allocator can never hand the
 			// address out, and the binding restore of such a claim fails
-			// visibly on its own
 			log.Warnf("(ippool.protectPersistedClaims) VirtualMachineNetworkConfig %s/%s records the ip %s outside the pool range of network %s, skipping the pin",
 				claim.namespace, claim.name, claim.ip, pool.Spec.NetworkName)
 
@@ -856,6 +892,72 @@ func (c *Controller) protectPersistedClaims(pool *kihv1.IPPool) (map[string]stri
 		pinClaim(claim)
 	}
 
+	// specStillRecordsClaim reports whether the fresh read of a claiming
+	// object still carries the nic the claim was made for: the comparison
+	// matches the canonical mac spelling of both sides, so a formatting
+	// drift of the unchanged logical owner is not a removal
+	specStillRecordsClaim := func(vmnetcfg *kihv1.VirtualMachineNetworkConfig, claim specClaim) bool {
+		for _, v := range vmnetcfg.Spec.NetworkConfig {
+			if util.CanonicalHWAddr(v.MACAddress) == claim.mac &&
+				v.NetworkName == pool.Spec.NetworkName && v.IPAddress == claim.ip {
+				return true
+			}
+		}
+
+		return false
+	}
+
+	// promoteSurvivors re-evaluates the claims a dropped winner displaced:
+	// the drop reopened the address, so a survivor whose live object still
+	// records it retakes the protection through the regular admission
+	// rules before the registration publishes anything. without the
+	// promotion the address would be allocatable although a live object
+	// records it, and a fresh allocation could double-bind it. a survivor
+	// which verifies as stale is skipped; one which cannot be verified
+	// fails the registration (fail closed, the retried registration
+	// re-runs the whole protection)
+	promoteSurvivors := func(dropped specClaim) error {
+		if len(skippedClaims[dropped.ip]) == 0 {
+			return nil
+		}
+
+		pinnedIPs[dropped.ip] = false
+
+		survivors := skippedClaims[dropped.ip]
+		delete(skippedClaims, dropped.ip)
+
+		for _, survivor := range survivors {
+			vmnetcfg, getErr := c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs(survivor.namespace).Get(
+				c.ctx, survivor.name, metav1.GetOptions{},
+			)
+			if getErr != nil {
+				if apierrors.IsNotFound(getErr) {
+					// the survivor is stale by definition: its object is
+					// gone, so nothing records the address on its behalf
+					continue
+				}
+
+				return fmt.Errorf("error while re-evaluating the displaced claim of VirtualMachineNetworkConfig %s/%s for IPPool %s: %w",
+					survivor.namespace, survivor.name, pool.Name, getErr)
+			}
+
+			if !specStillRecordsClaim(vmnetcfg, survivor) {
+				continue
+			}
+
+			log.Warnf("(ippool.protectPersistedClaims) promoting the surviving claim of VirtualMachineNetworkConfig %s/%s for the ip %s of IPPool %s after its winning claimant was dropped",
+				survivor.namespace, survivor.name, survivor.ip, pool.Name)
+
+			// the promotion is the survivor's own admission: a further
+			// displaced claimant of the same address records as a survivor
+			// again, because this pin can also be dropped by a later
+			// iteration of the re-verification
+			pinClaim(survivor)
+		}
+
+		return nil
+	}
+
 	// re-verify every pinned spec claim against a fresh read of its object
 	// before the registration publishes anything: the list snapshot can
 	// capture a nic which a concurrent vm cleanup removed while the pool
@@ -866,7 +968,9 @@ func (c *Controller) protectPersistedClaims(pool *kihv1.IPPool) (map[string]stri
 	// a cleanup which lands after it releases the pin itself through the
 	// owner-validated release, and the spec pins carry no ledger entry,
 	// so even a process crash between the pin and this verification can
-	// never resurrect the claim on the next restart
+	// never resurrect the claim on the next restart. a dropped winner
+	// promotes its displaced survivors, so the address keeps the
+	// protection of whichever live object still records it
 	for _, claim := range pinnedClaims {
 		vmnetcfg, getErr := c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs(claim.namespace).Get(
 			c.ctx, claim.name, metav1.GetOptions{},
@@ -875,6 +979,10 @@ func (c *Controller) protectPersistedClaims(pool *kihv1.IPPool) (map[string]stri
 			if apierrors.IsNotFound(getErr) {
 				// the object is gone, so its claim is stale by definition
 				c.dropSpecPin(pool, claim)
+
+				if err := promoteSurvivors(claim); err != nil {
+					return nil, err
+				}
 
 				continue
 			}
@@ -886,21 +994,77 @@ func (c *Controller) protectPersistedClaims(pool *kihv1.IPPool) (map[string]stri
 				claim.namespace, claim.name, pool.Name, getErr)
 		}
 
-		nicRecorded := false
-		for _, v := range vmnetcfg.Spec.NetworkConfig {
-			if v.MACAddress == claim.mac && v.NetworkName == pool.Spec.NetworkName && v.IPAddress == claim.ip {
-				nicRecorded = true
-
-				break
-			}
-		}
-
-		if !nicRecorded {
+		if !specStillRecordsClaim(vmnetcfg, claim) {
 			c.dropSpecPin(pool, claim)
+
+			if err := promoteSurvivors(claim); err != nil {
+				return nil, err
+			}
 		}
 	}
 
 	return claims, nil
+}
+
+// ledgerOwnerLive revalidates the owner of a persisted ledger entry
+// before the registration republishes it. the verdict distinguishes the
+// authoritative absence, which may drop the record, from the uncertain
+// absence, which must keep it:
+//
+//   - the owning vmnetcfg exists and its spec still records the binding
+//     (canonical mac, this network, this address): the owner is live.
+//   - the owning vmnetcfg exists but no longer records the binding: the
+//     owner positively removed it (a nic edit or a completed move), so
+//
+// the record is stale and must not be resurrected.
+//   - the owning vmnetcfg is gone: only a VirtualMachine which is gone as
+//     well is the authoritative absence (a live vm's controller recreates
+//     its vmnetcfg, and the recreated binding reclaims the address), so
+//     the vm existence decides. a missing verifier (tests, a client which
+//     could not be built) fails closed and keeps the record.
+//   - any read which fails transiently keeps the record: a claim the
+//     guest may still hold must not be dropped because one api read
+//     failed, and the next registration revalidates it again.
+func (c *Controller) ledgerOwnerLive(pool *kihv1.IPPool, namespace string, vmName string, hwAddr string, ip string) bool {
+	vmnetcfg, getErr := c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs(namespace).Get(
+		c.ctx, vmName, metav1.GetOptions{},
+	)
+	if getErr == nil {
+		for _, v := range vmnetcfg.Spec.NetworkConfig {
+			if util.CanonicalHWAddr(v.MACAddress) == util.CanonicalHWAddr(hwAddr) &&
+				v.NetworkName == pool.Spec.NetworkName && v.IPAddress == ip {
+				return true
+			}
+		}
+
+		return false
+	}
+
+	if !apierrors.IsNotFound(getErr) {
+		log.Warnf("(ippool.ledgerOwnerLive) cannot verify the owner %s/%s of the recorded ip %s of IPPool %s, keeping the record: %s",
+			namespace, vmName, ip, pool.Name, getErr.Error())
+		c.metrics.UpdateLogStatus("warning")
+
+		return true
+	}
+
+	if c.verifyVM == nil {
+		log.Warnf("(ippool.ledgerOwnerLive) cannot verify the virtualmachine %s/%s behind the missing VirtualMachineNetworkConfig of the recorded ip %s of IPPool %s, keeping the record",
+			namespace, vmName, ip, pool.Name)
+
+		return true
+	}
+
+	vmExists, vmErr := c.verifyVM(namespace, vmName)
+	if vmErr != nil {
+		log.Warnf("(ippool.ledgerOwnerLive) cannot verify the virtualmachine %s/%s of the recorded ip %s of IPPool %s, keeping the record: %s",
+			namespace, vmName, ip, pool.Name, vmErr.Error())
+		c.metrics.UpdateLogStatus("warning")
+
+		return true
+	}
+
+	return vmExists
 }
 
 // dropSpecPin releases a spec-claim pin whose recorded nic does not exist

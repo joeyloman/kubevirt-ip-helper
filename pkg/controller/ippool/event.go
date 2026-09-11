@@ -7,6 +7,8 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
@@ -18,10 +20,14 @@ import (
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
 	kihcache "github.com/joeyloman/kubevirt-ip-helper/pkg/cache"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/dhcp"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/gate"
 	kihclientset "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/clientset/versioned"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/metrics"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/util"
+
+	"kubevirt.io/client-go/kubecli"
+
 	log "github.com/sirupsen/logrus"
 )
 
@@ -38,17 +44,18 @@ const (
 const resyncPeriod = time.Minute
 
 type EventHandler struct {
-	ctx                context.Context
-	ipam               *ipam.IPAllocator
-	dhcp               *dhcp.DHCPAllocator
-	metrics            *metrics.MetricsAllocator
-	cache              *kihcache.CacheAllocator
-	kubeConfig         string
-	kubeContext        string
-	kubeRestConfig     *rest.Config
-	kihClientset       *kihclientset.Clientset
-	appStatus          *atomic.Int32
-	ippoolCountCurrent *atomic.Int32
+	ctx            context.Context
+	ipam           *ipam.IPAllocator
+	dhcp           *dhcp.DHCPAllocator
+	metrics        *metrics.MetricsAllocator
+	cache          *kihcache.CacheAllocator
+	kubeConfig     string
+	kubeContext    string
+	kubeRestConfig *rest.Config
+	kihClientset   *kihclientset.Clientset
+	kcli           kubecli.KubevirtClient
+	appStatus      *atomic.Int32
+	startupGate    *gate.Gate
 }
 
 type Event struct {
@@ -70,20 +77,20 @@ func NewEventHandler(
 	kubeRestConfig *rest.Config,
 	kihClientset *kihclientset.Clientset,
 	appStatus *atomic.Int32,
-	ippoolCountCurrent *atomic.Int32,
+	startupGate *gate.Gate,
 ) *EventHandler {
 	return &EventHandler{
-		ctx:                ctx,
-		ipam:               ipam,
-		dhcp:               dhcp,
-		metrics:            metrics,
-		cache:              cache,
-		kubeConfig:         kubeConfig,
-		kubeContext:        kubeContext,
-		kubeRestConfig:     kubeRestConfig,
-		kihClientset:       kihClientset,
-		appStatus:          appStatus,
-		ippoolCountCurrent: ippoolCountCurrent,
+		ctx:            ctx,
+		ipam:           ipam,
+		dhcp:           dhcp,
+		metrics:        metrics,
+		cache:          cache,
+		kubeConfig:     kubeConfig,
+		kubeContext:    kubeContext,
+		kubeRestConfig: kubeRestConfig,
+		kihClientset:   kihClientset,
+		appStatus:      appStatus,
+		startupGate:    startupGate,
 	}
 }
 
@@ -94,6 +101,15 @@ func (e *EventHandler) Init() (err error) {
 	}
 
 	e.kihClientset, err = kihclientset.NewForConfig(e.kubeRestConfig)
+	if err != nil {
+		return
+	}
+
+	// the kubevirt client serves the one-shot VirtualMachine existence
+	// checks of the ledger revalidation (the 30s bound of the config
+	// stays: unlike the informer clients there is no watch connection
+	// whose long-poll a timeout would tear down)
+	e.kcli, err = kubecli.GetKubevirtClientFromRESTConfig(e.kubeRestConfig)
 	if err != nil {
 		return
 	}
@@ -175,7 +191,25 @@ func (e *EventHandler) EventListener() (err error) {
 		},
 	}, cache.Indexers{})
 
-	controller := NewController(queue, indexer, informer, e.ctx, e.cache, e.ipam, e.dhcp, e.metrics, e.kihClientset, e.appStatus, e.ippoolCountCurrent)
+	// the ledger revalidation of the claim protection verifies the
+	// VirtualMachine of a claim whose vmnetcfg is gone through the
+	// kubevirt api: only a vm which is gone as well is the authoritative
+	// absence which may drop the durable record (a live vm reconstructs
+	// its vmnetcfg, so its claim stays protected)
+	verifyVM := func(namespace string, name string) (bool, error) {
+		_, err := e.kcli.VirtualMachine(namespace).Get(name, &metav1.GetOptions{})
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
+
+			return false, err
+		}
+
+		return true, nil
+	}
+
+	controller := NewController(queue, indexer, informer, e.ctx, e.cache, e.ipam, e.dhcp, e.metrics, e.kihClientset, e.appStatus, e.startupGate, verifyVM)
 	stop := make(chan struct{})
 
 	// join the controller on shutdown: EventListener only returns after

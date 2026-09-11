@@ -771,3 +771,289 @@ func TestRegisterIPPoolRejectsExcludeOverlappingLiveClaim(t *testing.T) {
 		t.Errorf("ipam used = %d, want 0 (the rejection must precede the subnet registration)", used)
 	}
 }
+
+// A02 trigger 1 regression: the mac spelling of a live owner drifts
+// between the LIST snapshot and the per-claim re-verification read
+// (02-AA-BB-CC-DD-01 -> 02:aa:bb:cc:dd:01, e.g. an in-flight edit which
+// only reformats the address). the unchanged logical owner must not be
+// classified as removed: dropping its pin would publish the address as
+// free although the same nic still records it, and a fresh allocation
+// could double-bind it.
+func TestRegistrationKeepsThePinOfAMacSpellingDrift(t *testing.T) {
+	const (
+		driftNamespace = "default"
+		driftVMName    = "vm-drift"
+	)
+
+	stored := recoveryNewPool("pool1", "net-a")
+	stored.Status.IPv4.Allocated = map[string]string{}
+
+	c, rs, _ := recoveryNewController(t, stored)
+
+	// the LIST snapshot carries the legacy spelling, like the spec of a
+	// vm which was created before the canonical normalization existed
+	drifted := recoveryNewVMNetCfg(driftNamespace, driftVMName, "10.0.0.2", "02-AA-BB-CC-DD-01", "net-a")
+	rs.vmnetcfgs = []*kihv1.VirtualMachineNetworkConfig{drifted}
+
+	// between the frozen LIST snapshot and the re-verification reads the
+	// object's mac is reformatted to the canonical spelling: the logical
+	// owner is unchanged
+	rs.vmnetcfgListHook = func() {
+		rs.mu.Lock()
+		defer rs.mu.Unlock()
+
+		reformatted := recoveryNewVMNetCfg(driftNamespace, driftVMName, "10.0.0.2", "02:aa:bb:cc:dd:01", "net-a")
+		rs.vmnetcfgs = []*kihv1.VirtualMachineNetworkConfig{reformatted}
+	}
+
+	pool := recoveryNewPool("pool1", "net-a")
+
+	if _, err := recoveryRegistrationSteps(t, c, pool); err != nil {
+		t.Fatalf("the registration steps: %s", err)
+	}
+
+	// the drifted owner keeps its pin: the address is not available to a
+	// fresh allocation
+	if used := c.ipam.Used("net-a"); used != 1 {
+		t.Errorf("ipam used = %d, want 1 (the drifted owner keeps its pin)", used)
+	}
+	if ip, err := c.ipam.GetIP("net-a", ""); err == nil {
+		t.Errorf("the recorded address must stay unavailable to a fresh allocation, got ip %q err %v", ip, err)
+	}
+
+	// the canonical owner reclaims its own address idempotently
+	ownerRef := util.AllocationRef(driftNamespace, driftVMName, "02:aa:bb:cc:dd:01")
+	if _, err := c.ipam.ReclaimIP("net-a", "10.0.0.2", ownerRef); err != nil {
+		t.Errorf("the drifted vm reclaiming its recorded address under the canonical spelling: %s", err)
+	}
+}
+
+// A02 trigger 2 regression: two admitted claimants record the same
+// address, the winner's pin displaces the survivor, and the winner is
+// dropped during the re-verification (its object was deleted between the
+// LIST snapshot and the fresh read). the survivor must be promoted back:
+// without the promotion the pool publishes the address as free although
+// the survivor's live object still records it, and a fresh allocation
+// takes it over.
+func TestRegistrationPromotesTheSurvivorOfADroppedWinner(t *testing.T) {
+	const (
+		winnerNamespace = "default"
+		winnerVMName    = "vm-winner"
+		winnerMAC       = "02:00:00:00:00:30"
+		survivorMAC     = "02:00:00:00:00:31"
+	)
+
+	stored := recoveryNewPool("pool1", "net-a")
+	stored.Status.IPv4.Allocated = map[string]string{}
+
+	c, rs, _ := recoveryNewController(t, stored)
+	rs.vmnetcfgs = []*kihv1.VirtualMachineNetworkConfig{
+		// both claimants are established assignments without a ledger
+		// entry (a historical partial write lost both records)
+		recoveryNewVMNetCfg(winnerNamespace, winnerVMName, "10.0.0.2", winnerMAC, "net-a"),
+		recoveryNewVMNetCfg(winnerNamespace, "vm-survivor", "10.0.0.2", survivorMAC, "net-a"),
+	}
+
+	// the winner disappears between the frozen LIST snapshot and the
+	// re-verification reads: its pin is dropped, the survivor remains
+	rs.vmnetcfgListHook = func() {
+		rs.mu.Lock()
+		defer rs.mu.Unlock()
+
+		rs.vmnetcfgs = []*kihv1.VirtualMachineNetworkConfig{
+			recoveryNewVMNetCfg(winnerNamespace, "vm-survivor", "10.0.0.2", survivorMAC, "net-a"),
+		}
+	}
+
+	pool := recoveryNewPool("pool1", "net-a")
+
+	if _, err := recoveryRegistrationSteps(t, c, pool); err != nil {
+		t.Fatalf("the registration steps: %s", err)
+	}
+
+	// the promoted survivor owns the pin: the address is not available
+	// to a fresh allocation
+	if used := c.ipam.Used("net-a"); used != 1 {
+		t.Errorf("ipam used = %d, want 1 (the promoted survivor owns the pin)", used)
+	}
+	if ip, err := c.ipam.GetIP("net-a", ""); err == nil {
+		t.Errorf("the survivor's recorded address must stay unavailable to a fresh allocation, got ip %q err %v", ip, err)
+	}
+
+	// the survivor reclaims its own address idempotently, the dropped
+	// winner does not
+	survivorRef := util.AllocationRef(winnerNamespace, "vm-survivor", survivorMAC)
+	if _, err := c.ipam.ReclaimIP("net-a", "10.0.0.2", survivorRef); err != nil {
+		t.Errorf("the promoted survivor reclaiming its recorded address: %s", err)
+	}
+	winnerRef := util.AllocationRef(winnerNamespace, winnerVMName, winnerMAC)
+	if _, err := c.ipam.ReclaimIP("net-a", "10.0.0.2", winnerRef); err == nil {
+		t.Error("the dropped winner must not own the pin anymore")
+	}
+}
+
+// A03 regression: a ledger entry whose owning vmnetcfg still exists but
+// positively removed the binding (the nic edit already landed, the pool
+// status write of the cleanup was skipped) must not be resurrected by the
+// registration: the previous behavior republished and pinned the record,
+// permanently consuming the address although no reconciliation is left
+// which could ever release it.
+func TestRegistrationDropsTheLedgerRecordOfAPositivelyRemovedOwner(t *testing.T) {
+	const (
+		ownerNamespace = "default"
+		ownerVMName    = "vm-moved"
+		ownerMAC       = "02:00:00:00:00:40"
+	)
+
+	stored := recoveryNewPool("pool1", "net-a")
+	stored.Status.IPv4.Allocated = map[string]string{
+		"10.0.0.2": util.AllocationRef(ownerNamespace, ownerVMName, ownerMAC),
+	}
+
+	c, rs, _ := recoveryNewController(t, stored)
+
+	// the owner's object exists, but its spec records the binding on
+	// another network: the nic of this pool was removed
+	moved := recoveryNewVMNetCfg(ownerNamespace, ownerVMName, "10.9.9.9", ownerMAC, "net-b")
+	rs.vmnetcfgs = []*kihv1.VirtualMachineNetworkConfig{moved}
+
+	pool := recoveryNewPool("pool1", "net-a")
+
+	claims, err := recoveryRegistrationSteps(t, c, pool)
+	if err != nil {
+		t.Fatalf("the registration steps: %s", err)
+	}
+
+	// the stale record is neither pinned nor republished
+	if _, republished := claims["10.0.0.2"]; republished {
+		t.Errorf("the record of the positively removed owner must not be republished, got %q", claims["10.0.0.2"])
+	}
+	if used := c.ipam.Used("net-a"); used != 0 {
+		t.Errorf("ipam used = %d, want 0 (the stale record pins nothing)", used)
+	}
+	if ip, err := c.ipam.GetIP("net-a", ""); err != nil || ip != "10.0.0.2" {
+		t.Errorf("the reclaimed address must be available to a fresh allocation, got ip %q err %v", ip, err)
+	}
+}
+
+// A03 regression: a ledger entry whose vmnetcfg AND virtualmachine are
+// both authoritatively gone is a orphan record (a hand-edited status, a
+// pre-fix residue): the registration must drop it instead of pinning it
+// forever. the vm existence decides, because a live vm's controller
+// recreates its vmnetcfg and the recreated binding reclaims the address.
+func TestRegistrationDropsTheLedgerRecordOfAGoneVM(t *testing.T) {
+	const (
+		ownerNamespace = "default"
+		ownerVMName    = "vm-gone"
+		ownerMAC       = "02:00:00:00:00:41"
+	)
+
+	stored := recoveryNewPool("pool1", "net-a")
+	stored.Status.IPv4.Allocated = map[string]string{
+		"10.0.0.2": util.AllocationRef(ownerNamespace, ownerVMName, ownerMAC),
+	}
+
+	c, _, _ := recoveryNewController(t, stored)
+
+	// no vmnetcfg exists and the vm is gone too: the authoritative absence
+	c.verifyVM = func(namespace string, name string) (bool, error) {
+		if namespace != ownerNamespace || name != ownerVMName {
+			t.Errorf("the vm verification queried %s/%s, want %s/%s", namespace, name, ownerNamespace, ownerVMName)
+		}
+
+		return false, nil
+	}
+
+	pool := recoveryNewPool("pool1", "net-a")
+
+	claims, err := recoveryRegistrationSteps(t, c, pool)
+	if err != nil {
+		t.Fatalf("the registration steps: %s", err)
+	}
+
+	if _, republished := claims["10.0.0.2"]; republished {
+		t.Errorf("the record of the gone vm must not be republished, got %q", claims["10.0.0.2"])
+	}
+	if used := c.ipam.Used("net-a"); used != 0 {
+		t.Errorf("ipam used = %d, want 0 (the orphan record pins nothing)", used)
+	}
+}
+
+// A03 regression: a ledger entry whose vmnetcfg is gone while its
+// virtualmachine still lives is NOT an authoritative absence - the vm
+// controller recreates the vmnetcfg and the recreated binding reclaims
+// the address - so the record keeps its protection (fail closed).
+func TestRegistrationKeepsTheLedgerRecordOfAReconstructibleOwner(t *testing.T) {
+	const (
+		ownerNamespace = "default"
+		ownerVMName    = "vm-live"
+		ownerMAC       = "02:00:00:00:00:42"
+	)
+
+	stored := recoveryNewPool("pool1", "net-a")
+	stored.Status.IPv4.Allocated = map[string]string{
+		"10.0.0.2": util.AllocationRef(ownerNamespace, ownerVMName, ownerMAC),
+	}
+
+	c, _, _ := recoveryNewController(t, stored)
+
+	// no vmnetcfg exists, but the vm is live and will reconstruct it
+	c.verifyVM = func(namespace string, name string) (bool, error) {
+		return true, nil
+	}
+
+	pool := recoveryNewPool("pool1", "net-a")
+
+	claims, err := recoveryRegistrationSteps(t, c, pool)
+	if err != nil {
+		t.Fatalf("the registration steps: %s", err)
+	}
+
+	if ref, republished := claims["10.0.0.2"]; !republished {
+		t.Errorf("the record of the live vm must be republished, got nothing")
+	} else if ref != util.AllocationRef(ownerNamespace, ownerVMName, ownerMAC) {
+		t.Errorf("the republished record = %q, want the canonical owner reference", ref)
+	}
+	if used := c.ipam.Used("net-a"); used != 1 {
+		t.Errorf("ipam used = %d, want 1 (the reconstructible owner keeps its pin)", used)
+	}
+	if ip, err := c.ipam.GetIP("net-a", ""); err == nil {
+		t.Errorf("the recorded address must stay unavailable to a fresh allocation, got ip %q", ip)
+	}
+}
+
+// A03 regression: an owner whose vmnetcfg cannot be read (a transient api
+// error) keeps its record: a claim the guest may still hold must not be
+// dropped because one api read failed, and the next registration
+// revalidates it again.
+func TestRegistrationKeepsTheLedgerRecordOfAnUnverifiableOwner(t *testing.T) {
+	const (
+		ownerNamespace = "default"
+		ownerVMName    = "vm-unreadable"
+		ownerMAC       = "02:00:00:00:00:43"
+	)
+
+	stored := recoveryNewPool("pool1", "net-a")
+	stored.Status.IPv4.Allocated = map[string]string{
+		"10.0.0.2": util.AllocationRef(ownerNamespace, ownerVMName, ownerMAC),
+	}
+
+	c, rs, _ := recoveryNewController(t, stored)
+
+	// the owner's object cannot be read at all
+	rs.failVMNetCfgGet = true
+
+	pool := recoveryNewPool("pool1", "net-a")
+
+	claims, err := recoveryRegistrationSteps(t, c, pool)
+	if err != nil {
+		t.Fatalf("the registration steps: %s", err)
+	}
+
+	if _, republished := claims["10.0.0.2"]; !republished {
+		t.Errorf("the record of the unverifiable owner must stay republished (fail closed)")
+	}
+	if used := c.ipam.Used("net-a"); used != 1 {
+		t.Errorf("ipam used = %d, want 1 (the unverifiable owner keeps its pin)", used)
+	}
+}

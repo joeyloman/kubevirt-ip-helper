@@ -126,6 +126,29 @@ func (c *CacheAllocator) Delete(t string, name string) (err error) {
 	return
 }
 
+// Upsert replaces the cached pool under a single lock acquisition: a
+// reload which deletes and re-adds the entry in separate steps exposes a
+// transient "pool missing" window to the concurrent readers of the shared
+// cache, and a reader which acts on it (a cleanup which aborts, a binding
+// which fails its restore) diverges from the live state. the entry is
+// created when it does not exist yet, so the caller does not have to know
+// whether the pool is already cached. the value is deep-copied with the
+// same contract as Add.
+func (c *CacheAllocator) Upsert(t interface{}) (err error) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	switch t.(type) {
+	case *kihv1.IPPool:
+		log.Debugf("(cache.Upsert) replacing pool for %s", t.(*kihv1.IPPool).Spec.NetworkName)
+
+		copiedPool := t.(*kihv1.IPPool).DeepCopy()
+		c.ipPoolCache[t.(*kihv1.IPPool).Spec.NetworkName] = *copiedPool
+	}
+
+	return
+}
+
 func (c *CacheAllocator) Usage(t string) {
 	c.mutex.RLock()
 	defer c.mutex.RUnlock()

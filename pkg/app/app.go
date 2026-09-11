@@ -22,6 +22,7 @@ import (
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/controller/vm"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/controller/vmnetcfg"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/dhcp"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/gate"
 	kihclientset "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/clientset/versioned"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/metrics"
@@ -76,13 +77,13 @@ type handler struct {
 // workers of a dying era can never write into the startup gate or the
 // status of the next era.
 type eraState struct {
-	ctx                  context.Context
-	appStatus            *atomic.Int32
-	ippoolCountCurrent   *atomic.Int32
-	vmnetcfgCountCurrent *atomic.Int32
-	ipam                 *ipam.IPAllocator
-	dhcp                 *dhcp.DHCPAllocator
-	cache                *cache.CacheAllocator
+	ctx          context.Context
+	appStatus    *atomic.Int32
+	ippoolGate   *gate.Gate
+	vmnetcfgGate *gate.Gate
+	ipam         *ipam.IPAllocator
+	dhcp         *dhcp.DHCPAllocator
+	cache        *cache.CacheAllocator
 }
 
 func Register() *handler {
@@ -356,14 +357,6 @@ func (h *handler) leaderWatchdogLoop(adaptor *leaderelection.HealthzAdaptor) {
 	}
 }
 
-// initGateOpen reports whether the startup gate has counted enough objects
-// to proceed: the comparison tolerates an overshoot (an object created after
-// the startup snapshot counts too), so the gate opens when no object is
-// still waiting instead of requiring an exact match.
-func initGateOpen(current int, target int) bool {
-	return current >= target
-}
-
 func (h *handler) RunServices(ctx context.Context) error {
 	// allocate the shared state of this service era and publish it through
 	// the atomic era pointer: the handlers constructed below keep the
@@ -373,13 +366,13 @@ func (h *handler) RunServices(ctx context.Context) error {
 	// era. the metrics and health endpoints are process-global (started in
 	// Run) and are never restarted per era
 	era := &eraState{
-		ctx:                  ctx,
-		appStatus:            new(atomic.Int32),
-		ippoolCountCurrent:   new(atomic.Int32),
-		vmnetcfgCountCurrent: new(atomic.Int32),
-		ipam:                 ipam.New(),
-		dhcp:                 dhcp.New(),
-		cache:                cache.New(),
+		ctx:          ctx,
+		appStatus:    new(atomic.Int32),
+		ippoolGate:   gate.New(),
+		vmnetcfgGate: gate.New(),
+		ipam:         ipam.New(),
+		dhcp:         dhcp.New(),
+		cache:        cache.New(),
 	}
 	era.appStatus.Store(APP_INIT)
 	h.era.Store(era)
@@ -403,8 +396,15 @@ func (h *handler) RunServices(ctx context.Context) error {
 
 		return fmt.Errorf("cannot gather the IPPoolList: %s", err.Error())
 	}
-	ippoolCountTarget := len(IPPoolList)
-	era.ippoolCountCurrent.Store(0)
+	// record the exact startup snapshot of the gate: the pool names the
+	// LIST saw are the keys which must settle before the startup proceeds,
+	// so a pool created after the snapshot can never substitute for an
+	// unvisited pre-existing one
+	ippoolGateKeys := make([]string, 0, len(IPPoolList))
+	for i := range IPPoolList {
+		ippoolGateKeys = append(ippoolGateKeys, IPPoolList[i].Name)
+	}
+	era.ippoolGate.SetTarget(ippoolGateKeys)
 
 	// initialize the ippoolEventListener handler
 	h.ippoolEventHandler = ippool.NewEventHandler(
@@ -418,7 +418,7 @@ func (h *handler) RunServices(ctx context.Context) error {
 		nil,
 		nil,
 		era.appStatus,
-		era.ippoolCountCurrent,
+		era.ippoolGate,
 	)
 	if err := h.ippoolEventHandler.Init(); err != nil {
 		handleErr(err)
@@ -431,15 +431,15 @@ func (h *handler) RunServices(ctx context.Context) error {
 
 	// wait for the ippool handler to gather all the pools before proceeding the vmnetcfg controller
 	// this prevents race conditions
-	if err := h.waitForStartupGate(ctx, "IPPool", era.ippoolCountCurrent, ippoolCountTarget, 5*time.Second,
-		func(tick int, count int) {
+	if err := h.waitForStartupGate(ctx, "IPPool", era.ippoolGate, 5*time.Second,
+		func(tick int, settled int, target int) {
 			switch {
 			case tick == 12:
-				log.Warnf("app.RunServices) still waiting for IPPool initialization [%d out of %d] after 1 min.", count, ippoolCountTarget)
+				log.Warnf("app.RunServices) still waiting for IPPool initialization [%d out of %d] after 1 min.", settled, target)
 				h.metrics.UpdateLogStatus("warning")
 			case tick == 24:
 				log.Errorf("app.RunServices) DHCP services are still NOT running [%d out of %d]! There might be something wrong with one of the IPPools!"+
-					" Check above logs for errors and fix them. The startup gives up when the count stops progressing.", count, ippoolCountTarget)
+					" Check above logs for errors and fix them. The startup gives up when the count stops progressing.", settled, target)
 				h.metrics.UpdateLogStatus("error")
 			}
 		},
@@ -466,8 +466,15 @@ func (h *handler) RunServices(ctx context.Context) error {
 
 		return fmt.Errorf("cannot gather the VirtualMachineNetworkConfig list: %s", err.Error())
 	}
-	vmnetcfgCountTarget := len(vmnetcfgList)
-	era.vmnetcfgCountCurrent.Store(0)
+	// record the exact startup snapshot of the gate: the keys the LIST saw
+	// are the keys which must settle before the startup proceeds, so a
+	// vmnetcfg created after the snapshot can never substitute for an
+	// unvisited pre-existing one
+	vmnetcfgGateKeys := make([]string, 0, len(vmnetcfgList))
+	for i := range vmnetcfgList {
+		vmnetcfgGateKeys = append(vmnetcfgGateKeys, vmnetcfgList[i].Namespace+"/"+vmnetcfgList[i].Name)
+	}
+	era.vmnetcfgGate.SetTarget(vmnetcfgGateKeys)
 
 	// initialize the vmnetcfgEventListener handler
 	h.vmnetcfgEventHandler = vmnetcfg.NewEventHandler(
@@ -481,7 +488,7 @@ func (h *handler) RunServices(ctx context.Context) error {
 		nil,
 		nil,
 		era.appStatus,
-		era.vmnetcfgCountCurrent,
+		era.vmnetcfgGate,
 	)
 	if err := h.vmnetcfgEventHandler.Init(); err != nil {
 		handleErr(err)
@@ -494,18 +501,18 @@ func (h *handler) RunServices(ctx context.Context) error {
 
 	// wait for the vmnetcfg handler to gather all the network configs before proceeding the vm controller
 	// this prevents race conditions
-	if err := h.waitForStartupGate(ctx, "VirtualMachineNetworkConfiguration", era.vmnetcfgCountCurrent, vmnetcfgCountTarget, 10*time.Second,
-		func(tick int, count int) {
+	if err := h.waitForStartupGate(ctx, "VirtualMachineNetworkConfiguration", era.vmnetcfgGate, 10*time.Second,
+		func(tick int, settled int, target int) {
 			switch {
 			case tick == 30:
-				log.Warnf("app.RunServices) still waiting for VirtualMachineNetworkConfiguration initialization [%d out of %d] after 5 mins.", count, vmnetcfgCountTarget)
+				log.Warnf("app.RunServices) still waiting for VirtualMachineNetworkConfiguration initialization [%d out of %d] after 5 mins.", settled, target)
 				h.metrics.UpdateLogStatus("warning")
 			case tick == 60:
-				log.Warnf("app.RunServices) still waiting for VirtualMachineNetworkConfiguration initialization [%d out of %d] after 10 mins.", count, vmnetcfgCountTarget)
+				log.Warnf("app.RunServices) still waiting for VirtualMachineNetworkConfiguration initialization [%d out of %d] after 10 mins.", settled, target)
 				h.metrics.UpdateLogStatus("warning")
 			case tick == 90:
 				log.Errorf("app.RunServices) VirtualMachineNetworkConfiguration initialization is still not complete [%d out of %d] after > 15 mins! There might be something wrong with the VmNetCfgs count!"+
-					" Check above logs for errors and fix them. The startup gives up when the count stops progressing.", count, vmnetcfgCountTarget)
+					" Check above logs for errors and fix them. The startup gives up when the count stops progressing.", settled, target)
 				h.metrics.UpdateLogStatus("error")
 			}
 		},
@@ -555,37 +562,39 @@ func (h *handler) RunServices(ctx context.Context) error {
 // restarts instead of sitting on the leader lease while serving nothing.
 const startupStallTimeout = 15 * time.Minute
 
-// waitForStartupGate blocks until the counted objects of a startup
-// snapshot settle (current >= target) or the era context is canceled, and
-// fails the startup when the count stops advancing for startupStallTimeout.
-// the reporting callback is invoked once per tick so the caller keeps its
-// escalating progress logs.
-func (h *handler) waitForStartupGate(ctx context.Context, what string, current *atomic.Int32, target int, tick time.Duration, report func(tick int, count int)) error {
-	var lastCount int32 = -1
+// waitForStartupGate blocks until every object of the startup snapshot
+// settled (the membership gate opens only on the exact snapshot keys, so
+// an object created after the snapshot can never substitute for an
+// unvisited pre-existing one) or the era context is canceled, and fails
+// the startup when the settlement stops advancing for
+// startupStallTimeout. the reporting callback is invoked once per tick so
+// the caller keeps its escalating progress logs.
+func (h *handler) waitForStartupGate(ctx context.Context, what string, startupGate *gate.Gate, tick time.Duration, report func(tick int, settled int, target int)) error {
+	lastSettled := -1
 	var stalledSince time.Time
 	tickCount := 0
 
 	for {
-		count := current.Load()
-		if initGateOpen(int(count), target) {
+		if startupGate.Open() {
 			return nil
 		}
 
-		if count != lastCount {
-			lastCount = count
+		settled, target := startupGate.Settled(), startupGate.Target()
+		if settled != lastSettled {
+			lastSettled = settled
 			stalledSince = time.Now()
 		}
 		if !stalledSince.IsZero() && time.Since(stalledSince) > startupStallTimeout {
 			log.Errorf("app.RunServices) %s initialization has not progressed for %s [%d out of %d], giving up so the pod restarts",
-				what, startupStallTimeout, count, target)
+				what, startupStallTimeout, settled, target)
 			h.metrics.UpdateLogStatus("error")
 
-			return fmt.Errorf("%s initialization has not progressed for %s (%d/%d objects)", what, startupStallTimeout, count, target)
+			return fmt.Errorf("%s initialization has not progressed for %s (%d/%d objects)", what, startupStallTimeout, settled, target)
 		}
 
 		tickCount++
 		if report != nil {
-			report(tickCount, int(count))
+			report(tickCount, settled, target)
 		}
 
 		select {

@@ -2,7 +2,6 @@ package vmnetcfg
 
 import (
 	"context"
-	"sync/atomic"
 	"testing"
 
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
@@ -21,8 +20,8 @@ func TestInitPendingNicWithLiveLeaseKeepsReachedState(t *testing.T) {
 
 	// a controller on the environment's shared app status so the test can
 	// flip the initialization phase after the deferral assertions
-	var count atomic.Int32
-	controller := NewController(context.Background(), newTestQueue(), newTestIndexer(), nil, e.cache, e.ipam, e.dhcp, e.metrics, e.client, e.appStatus, &count)
+	startupGate := newTestGate(testNamespace + "/" + testVMNetCfgName)
+	controller := NewController(context.Background(), newTestQueue(), newTestIndexer(), nil, e.cache, e.ipam, e.dhcp, e.metrics, e.client, e.appStatus, startupGate)
 
 	e.addSubnet("10.0.0.1", "10.0.0.2")
 
@@ -55,8 +54,8 @@ func TestInitPendingNicWithLiveLeaseKeepsReachedState(t *testing.T) {
 	}
 	// the deferred sync settles the object for the gate (it is requeued
 	// once the gate opened); settling must not double count
-	if count.Load() != 1 {
-		t.Errorf("gate count = %d, want 1: the deferred sync settles the object once", count.Load())
+	if startupGate.Settled() != 1 {
+		t.Errorf("gate count = %d, want 1: the deferred sync settles the object once", startupGate.Settled())
 	}
 	if !e.dhcp.CheckLease(testMAC) || e.dhcp.GetLease(testMAC).ClientIP.String() != "10.0.0.1" {
 		t.Fatal("the reached lease was torn down during the initialization replay")
@@ -76,8 +75,8 @@ func TestInitPendingNicWithLiveLeaseKeepsReachedState(t *testing.T) {
 	if used := e.ipam.Used(testNetwork); used != 1 {
 		t.Errorf("ipam used = %d, want 1: the replay must not allocate a second address", used)
 	}
-	if count.Load() != 1 {
-		t.Errorf("gate count = %d after the repeated deferred sync, want 1", count.Load())
+	if startupGate.Settled() != 1 {
+		t.Errorf("gate count = %d after the repeated deferred sync, want 1", startupGate.Settled())
 	}
 
 	// after the gate the object converges: the requeue performs the same
@@ -86,8 +85,8 @@ func TestInitPendingNicWithLiveLeaseKeepsReachedState(t *testing.T) {
 	if err := controller.sync(event); err != nil {
 		t.Fatalf("the post-gate sync failed: %s", err)
 	}
-	if count.Load() != 1 {
-		t.Errorf("gate count = %d, want 1 after the settled post-gate sync", count.Load())
+	if startupGate.Settled() != 1 {
+		t.Errorf("gate count = %d, want 1 after the settled post-gate sync", startupGate.Settled())
 	}
 	stored := e.getStoredVMNetCfg()
 	if len(stored.Spec.NetworkConfig) != 1 || stored.Spec.NetworkConfig[0].IPAddress == "" {

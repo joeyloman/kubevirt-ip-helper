@@ -20,14 +20,14 @@ import (
 func TestSyncDeleteSettlesUnregisteredPoolStartup(t *testing.T) {
 	var appStatus atomic.Int32
 	appStatus.Store(APP_INIT)
-	var countCurrent atomic.Int32
-	controller, _ := newTestController(t, newTestQueue(), newTestIndexer(), nil, &appStatus, &countCurrent)
+	startupGate := newTestGate("ippool-x")
+	controller, _ := newTestController(t, newTestQueue(), newTestIndexer(), nil, &appStatus, startupGate)
 
 	if err := controller.sync(Event{key: "ippool-x", action: DELETE, poolName: "ippool-x", poolNetworkName: "net-x"}); err != nil {
 		t.Fatalf("the delete sync failed: %s", err)
 	}
-	if countCurrent.Load() != 1 {
-		t.Errorf("ippool count = %d after the deleted pool, want 1", countCurrent.Load())
+	if startupGate.Settled() != 1 {
+		t.Errorf("ippool count = %d after the deleted pool, want 1", startupGate.Settled())
 	}
 }
 
@@ -37,9 +37,9 @@ func TestSyncDeleteSettlesUnregisteredPoolStartup(t *testing.T) {
 func TestHandleErrDropSettlesStartupCount(t *testing.T) {
 	var appStatus atomic.Int32
 	appStatus.Store(APP_INIT)
-	var countCurrent atomic.Int32
+	startupGate := newTestGate("pool-e")
 	queue := newTestQueue()
-	controller, _ := newTestController(t, queue, newTestIndexer(), nil, &appStatus, &countCurrent)
+	controller, _ := newTestController(t, queue, newTestIndexer(), nil, &appStatus, startupGate)
 
 	key := "pool-e"
 	syncErr := errors.New("persistent failure")
@@ -54,8 +54,8 @@ func TestHandleErrDropSettlesStartupCount(t *testing.T) {
 		controller.handleErr(syncErr, item)
 		queue.Done(item)
 	}
-	if countCurrent.Load() != 0 {
-		t.Fatalf("ippool count = %d after five requeues, want 0", countCurrent.Load())
+	if startupGate.Settled() != 0 {
+		t.Fatalf("ippool count = %d after five requeues, want 0", startupGate.Settled())
 	}
 
 	// the next failure exceeds the retry threshold: the key is dropped and
@@ -68,8 +68,8 @@ func TestHandleErrDropSettlesStartupCount(t *testing.T) {
 	controller.handleErr(syncErr, item)
 	queue.Done(item)
 
-	if countCurrent.Load() != 1 {
-		t.Errorf("ippool count = %d after the dropped key, want 1", countCurrent.Load())
+	if startupGate.Settled() != 1 {
+		t.Errorf("ippool count = %d after the dropped key, want 1", startupGate.Settled())
 	}
 }
 

@@ -18,6 +18,7 @@ import (
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
 	kihcache "github.com/joeyloman/kubevirt-ip-helper/pkg/cache"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/dhcp"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/gate"
 	kihclientset "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/clientset/versioned"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/metrics"
@@ -30,22 +31,32 @@ const (
 )
 
 type Controller struct {
-	indexer            cache.Indexer
-	queue              workqueue.RateLimitingInterface
-	informer           cache.Controller
-	ctx                context.Context
-	cache              *kihcache.CacheAllocator
-	ipam               *ipam.IPAllocator
-	dhcp               *dhcp.DHCPAllocator
-	metrics            *metrics.MetricsAllocator
-	kihClientset       *kihclientset.Clientset
-	appStatus          *atomic.Int32
-	ippoolCountCurrent *atomic.Int32
+	indexer      cache.Indexer
+	queue        workqueue.RateLimitingInterface
+	informer     cache.Controller
+	ctx          context.Context
+	cache        *kihcache.CacheAllocator
+	ipam         *ipam.IPAllocator
+	dhcp         *dhcp.DHCPAllocator
+	metrics      *metrics.MetricsAllocator
+	kihClientset *kihclientset.Clientset
+	appStatus    *atomic.Int32
 
-	// initAttempted tracks the IPPool objects which the current
-	// initialization phase already handled, so a pool which definitively
-	// cannot register is still counted by the startup gate
-	initAttempted map[string]bool
+	// gate is the startup membership gate of this era: its snapshot holds
+	// the exact keys of the startup LIST, and markInitAttempt settles a
+	// key once its registration attempt settled. a pool created after the
+	// snapshot settles a key which is not part of it, so it can never
+	// substitute for an unvisited pre-existing pool the way a plain count
+	// would let it
+	gate *gate.Gate
+
+	// verifyVM reports whether the VirtualMachine of a given namespace
+	// and name exists. it is an indirection over the kubevirt client so
+	// the ledger revalidation of the claim protection is testable without
+	// a live cluster (the same seam shape as runListener): production
+	// controllers verify through the kubevirt api, tests substitute a
+	// stub. a nil seam fails closed (the claim stays protected)
+	verifyVM func(namespace string, name string) (bool, error)
 
 	// runListener opens the dhcp listener of a pool. it is an indirection
 	// over dhcp.Run so the listener start of a registration and the
@@ -76,45 +87,37 @@ func NewController(
 	metrics *metrics.MetricsAllocator,
 	kihClientset *kihclientset.Clientset,
 	appStatus *atomic.Int32,
-	ippoolCountCurrent *atomic.Int32,
+	startupGate *gate.Gate,
+	verifyVM func(namespace string, name string) (bool, error),
 ) *Controller {
 	return &Controller{
-		informer:           informer,
-		indexer:            indexer,
-		queue:              queue,
-		ctx:                ctx,
-		cache:              cache,
-		ipam:               ipam,
-		dhcp:               dhcp,
-		metrics:            metrics,
-		kihClientset:       kihClientset,
-		appStatus:          appStatus,
-		ippoolCountCurrent: ippoolCountCurrent,
+		informer:     informer,
+		indexer:      indexer,
+		queue:        queue,
+		ctx:          ctx,
+		cache:        cache,
+		ipam:         ipam,
+		dhcp:         dhcp,
+		metrics:      metrics,
+		kihClientset: kihClientset,
+		appStatus:    appStatus,
+		gate:         startupGate,
+		verifyVM:     verifyVM,
 	}
 }
 
-// markInitAttempt counts one settled IPPool object for the startup gate:
-// its registration is either live or definitively rejected (the pool
-// object can also be gone already). counting only settled pools keeps the
+// markInitAttempt settles one IPPool object for the startup gate: its
+// registration is either live or definitively rejected (the pool object
+// can also be gone already). settling only settled pools keeps the
 // vmnetcfg controller from restoring bindings into pools which are not
-// registered yet, while rejected pools still count so a broken object
+// registered yet, while rejected pools still settle so a broken object
 // does not block the controller startup until it is removed first.
 func (c *Controller) markInitAttempt(name string) {
-	if c.appStatus.Load() != APP_INIT {
+	if c.appStatus.Load() != APP_INIT || c.gate == nil {
 		return
 	}
 
-	if c.initAttempted == nil {
-		c.initAttempted = make(map[string]bool)
-	}
-
-	if _, exists := c.initAttempted[name]; exists {
-		return
-	}
-
-	c.initAttempted[name] = true
-
-	c.ippoolCountCurrent.Add(1)
+	c.gate.Settle(name)
 }
 
 func (c *Controller) processNextItem() bool {
@@ -302,9 +305,10 @@ func (c *Controller) sync(event Event) (err error) {
 			c.metrics.UpdateLogStatus("error")
 		}
 
-		// decreasing the ippoolCountCurrent is not necessary during application initialization, because:
-		// if the ippool is ok, then it's already initialized, the counter should still match to proceed the startup phase
-		// if the ippool is not ok, the counter has a mismatch and the application should be restarted
+		// the settled pool stays settled: the startup gate keys are the
+		// exact objects of the startup snapshot, so nothing has to be
+		// un-settled when a pool object disappears during the
+		// initialization
 	}
 
 	return
@@ -329,10 +333,9 @@ func (c *Controller) handleErr(err error, key interface{}) {
 
 	log.Errorf("(ippool.handleErr) dropping IPPool %q out of the queue: %v", key, err)
 	c.metrics.UpdateLogStatus("error")
-
 	// an exhausted key can never settle through its own retries anymore:
-	// the gate counts it so the app startup does not wait forever for an
-	// object which keeps failing (marked exactly once via initAttempted)
+	// the gate settles it so the app startup does not wait forever for an
+	// object which keeps failing
 	if ev, ok := key.(Event); ok {
 		c.markInitAttempt(ev.poolName)
 	}
@@ -350,6 +353,26 @@ func (c *Controller) Run(workers int, stopCh chan struct{}) {
 		c.metrics.UpdateLogStatus("error")
 
 		return
+	}
+
+	// settle the snapshot keys whose object the informer never observed:
+	// a pool deleted between the startup LIST and the informer start
+	// generates no event at all, so without this reconciliation the
+	// membership gate would wait for it forever (a count-based gate
+	// hid this case by letting unrelated objects substitute). the cache
+	// sync guarantees the store holds the complete initial list, so a
+	// snapshot key which is absent from it was deleted before the
+	// informer started and can never settle otherwise
+	if c.gate != nil {
+		for _, key := range c.gate.Unsettled() {
+			if _, exists, getErr := c.indexer.GetByKey(key); getErr == nil && !exists {
+				log.Warnf("(ippool.Run) IPPool %s of the startup snapshot was deleted before the informer started, settling it for the startup gate",
+					key)
+				c.metrics.UpdateLogStatus("warning")
+
+				c.markInitAttempt(key)
+			}
+		}
 	}
 
 	// the workers are joined before Run returns: an in-flight sync may

@@ -40,13 +40,13 @@ func TestSyncUpdateFailedRegistrationTearsDownPartialState(t *testing.T) {
 
 	var appStatus atomic.Int32
 	appStatus.Store(APP_INIT)
-	var countCurrent atomic.Int32
+	startupGate := newTestGate("pool-r2")
 	indexer := newTestIndexer()
 	if err := indexer.Add(testPool("pool-r2", "net-fresh2", 60)); err != nil {
 		t.Fatalf("seeding indexer: %v", err)
 	}
 
-	controller, _ := newTestController(t, newTestQueue(), indexer, nil, &appStatus, &countCurrent)
+	controller, _ := newTestController(t, newTestQueue(), indexer, nil, &appStatus, startupGate)
 
 	event := testPoolEvent("pool-r2", UPDATE, "net-fresh2")
 
@@ -74,8 +74,8 @@ func TestSyncUpdateFailedRegistrationTearsDownPartialState(t *testing.T) {
 
 	// the transient failure keeps the pool uncounted for the startup gate:
 	// the retry settles it once the environment is repaired
-	if countCurrent.Load() != 0 {
-		t.Errorf("ippool count = %d, want 0: the transiently failing registration must stay uncounted", countCurrent.Load())
+	if startupGate.Settled() != 0 {
+		t.Errorf("ippool count = %d, want 0: the transiently failing registration must stay uncounted", startupGate.Settled())
 	}
 }
 
@@ -86,13 +86,13 @@ func TestSyncAddFailedRegistrationTearsDownPartialState(t *testing.T) {
 
 	var appStatus atomic.Int32
 	appStatus.Store(APP_INIT)
-	var countCurrent atomic.Int32
+	startupGate := newTestGate("pool-a2")
 	indexer := newTestIndexer()
 	if err := indexer.Add(testPool("pool-a2", "net-a2", 60)); err != nil {
 		t.Fatalf("seeding indexer: %v", err)
 	}
 
-	controller, _ := newTestController(t, newTestQueue(), indexer, nil, &appStatus, &countCurrent)
+	controller, _ := newTestController(t, newTestQueue(), indexer, nil, &appStatus, startupGate)
 
 	err := controller.sync(testPoolEvent("pool-a2", ADD, "net-a2"))
 	if err == nil {

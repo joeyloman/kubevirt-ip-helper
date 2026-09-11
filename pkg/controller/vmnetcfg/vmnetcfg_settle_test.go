@@ -17,7 +17,7 @@ import (
 // An object whose first ADD fails transiently and recovers through a
 // resynced UPDATE must settle the gate on that successful UPDATE.
 func TestSyncUpdateSuccessSettlesStartupGate(t *testing.T) {
-	e, controller, count := newGateTestEnv(t)
+	e, controller, startupGate := newGateTestEnv(t)
 
 	e.addSubnet("10.0.0.1", "10.0.0.2")
 	e.seedPool(nil)
@@ -34,8 +34,8 @@ func TestSyncUpdateSuccessSettlesStartupGate(t *testing.T) {
 	if err := controller.sync(Event{key: key, action: ADD}); err == nil {
 		t.Fatal("want the transient status failure to fail the sync")
 	}
-	if count.Load() != 0 {
-		t.Fatalf("gate count = %d after the failed ADD, want 0", count.Load())
+	if startupGate.Settled() != 0 {
+		t.Fatalf("gate count = %d after the failed ADD, want 0", startupGate.Settled())
 	}
 
 	// the recovery arrives as a resync UPDATE and must settle the gate
@@ -43,30 +43,30 @@ func TestSyncUpdateSuccessSettlesStartupGate(t *testing.T) {
 	if err := controller.sync(Event{key: key, action: UPDATE}); err != nil {
 		t.Fatalf("the recovered UPDATE sync failed: %s", err)
 	}
-	if count.Load() != 1 {
-		t.Fatalf("gate count = %d after the recovered UPDATE, want 1", count.Load())
+	if startupGate.Settled() != 1 {
+		t.Fatalf("gate count = %d after the recovered UPDATE, want 1", startupGate.Settled())
 	}
 
 	// a further sync of the settled object must not double count
 	if err := controller.sync(Event{key: key, action: UPDATE}); err != nil {
 		t.Fatalf("the repeated sync failed: %s", err)
 	}
-	if count.Load() != 1 {
-		t.Errorf("gate count = %d after the repeated sync, want 1", count.Load())
+	if startupGate.Settled() != 1 {
+		t.Errorf("gate count = %d after the repeated sync, want 1", startupGate.Settled())
 	}
 }
 
 // An object deleted during startup - before its sync ever settled - must
 // count so the startup gate does not wait for a key which can never sync.
 func TestSyncDeleteSettlesUncountedStartupObject(t *testing.T) {
-	_, controller, count := newGateTestEnv(t)
+	_, controller, startupGate := newGateTestEnv(t)
 	key := testNamespace + "/" + testVMNetCfgName
 
 	if err := controller.sync(Event{key: key, action: DELETE}); err != nil {
 		t.Fatalf("the delete sync failed: %s", err)
 	}
-	if count.Load() != 1 {
-		t.Errorf("gate count = %d after the deleted object, want 1", count.Load())
+	if startupGate.Settled() != 1 {
+		t.Errorf("gate count = %d after the deleted object, want 1", startupGate.Settled())
 	}
 }
 
@@ -74,7 +74,7 @@ func TestSyncDeleteSettlesUncountedStartupObject(t *testing.T) {
 // never settle through its own retries anymore, so the gate waiting for it
 // would block the whole controller startup forever.
 func TestHandleErrDropSettlesStartupCount(t *testing.T) {
-	_, controller, count := newGateTestEnv(t)
+	_, controller, startupGate := newGateTestEnv(t)
 	key := testNamespace + "/" + testVMNetCfgName
 	syncErr := errors.New("persistent failure")
 
@@ -88,8 +88,8 @@ func TestHandleErrDropSettlesStartupCount(t *testing.T) {
 		controller.handleErr(syncErr, item)
 		controller.queue.Done(item)
 	}
-	if count.Load() != 0 {
-		t.Fatalf("gate count = %d after five requeues, want 0", count.Load())
+	if startupGate.Settled() != 0 {
+		t.Fatalf("gate count = %d after five requeues, want 0", startupGate.Settled())
 	}
 
 	// the next failure exceeds the retry threshold: the key is dropped and
@@ -102,8 +102,8 @@ func TestHandleErrDropSettlesStartupCount(t *testing.T) {
 	controller.handleErr(syncErr, item)
 	controller.queue.Done(item)
 
-	if count.Load() != 1 {
-		t.Errorf("gate count = %d after the dropped key, want 1", count.Load())
+	if startupGate.Settled() != 1 {
+		t.Errorf("gate count = %d after the dropped key, want 1", startupGate.Settled())
 	}
 }
 
@@ -113,7 +113,7 @@ func TestHandleErrDropSettlesStartupCount(t *testing.T) {
 // included), and after the retry-exhaustion settle the gate may open but
 // no recorded address becomes reissuable.
 func TestGateDropSettleKeepsInterfacesProtected(t *testing.T) {
-	e, controller, count := newGateTestEnv(t)
+	e, controller, startupGate := newGateTestEnv(t)
 	seedHealthyPool(e)
 	e.addSubnet("10.0.0.1", "10.0.0.2")
 	e.seedPool(nil)
@@ -142,8 +142,8 @@ func TestGateDropSettleKeepsInterfacesProtected(t *testing.T) {
 	if err := controller.sync(Event{key: key, action: ADD}); err == nil {
 		t.Fatal("want the status conflict on the first pool to fail the sync")
 	}
-	if count.Load() != 0 {
-		t.Fatalf("gate count = %d after the failed sync, want 0 (transient, uncounted)", count.Load())
+	if startupGate.Settled() != 0 {
+		t.Fatalf("gate count = %d after the failed sync, want 0 (transient, uncounted)", startupGate.Settled())
 	}
 	if !e.dhcp.CheckLease("02:00:00:00:00:02") {
 		t.Fatal("the second interface must be fully restored")
@@ -189,8 +189,8 @@ func TestGateDropSettleKeepsInterfacesProtected(t *testing.T) {
 	controller.handleErr(syncErr, item)
 	controller.queue.Done(item)
 
-	if count.Load() != 1 {
-		t.Fatalf("gate count = %d after the drop, want 1", count.Load())
+	if startupGate.Settled() != 1 {
+		t.Fatalf("gate count = %d after the drop, want 1", startupGate.Settled())
 	}
 	if !e.dhcp.CheckLease("02:00:00:00:00:02") {
 		t.Error("the second interface's lease must survive the gate settle")

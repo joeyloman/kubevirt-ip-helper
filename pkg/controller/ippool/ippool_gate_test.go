@@ -18,24 +18,24 @@ import (
 func TestRegisterIPPoolTransientFailureStaysUncountedDuringInit(t *testing.T) {
 	var appStatus atomic.Int32
 	appStatus.Store(APP_INIT)
-	var countCurrent atomic.Int32
-	controller, _ := newTestController(t, newTestQueue(), newTestIndexer(), nil, &appStatus, &countCurrent)
+	startupGate := newTestGate("pool-t")
+	controller, _ := newTestController(t, newTestQueue(), newTestIndexer(), nil, &appStatus, startupGate)
 
 	pool := testPool("pool-t", "net-t", 60)
 
 	if _, err := controller.registerIPPool(pool); err == nil {
 		t.Fatal("the registration of a pool with a missing bindinterface returned nil, want a transient error")
 	}
-	if countCurrent.Load() != 0 {
-		t.Errorf("ippool count = %d, want 0: a transiently failed registration must stay uncounted", countCurrent.Load())
+	if startupGate.Settled() != 0 {
+		t.Errorf("ippool count = %d, want 0: a transiently failed registration must stay uncounted", startupGate.Settled())
 	}
 
 	// the retried attempt must stay able to settle the gate
 	if _, err := controller.registerIPPool(pool); err == nil {
 		t.Fatal("the retried registration returned nil, want a transient error")
 	}
-	if countCurrent.Load() != 0 {
-		t.Errorf("ippool count = %d after the retried attempt, want 0 until the registration settles", countCurrent.Load())
+	if startupGate.Settled() != 0 {
+		t.Errorf("ippool count = %d after the retried attempt, want 0 until the registration settles", startupGate.Settled())
 	}
 }
 
@@ -45,8 +45,8 @@ func TestRegisterIPPoolTransientFailureStaysUncountedDuringInit(t *testing.T) {
 func TestRegisterIPPoolUnparseableSubnetCountsAsHandledDuringInit(t *testing.T) {
 	var appStatus atomic.Int32
 	appStatus.Store(APP_INIT)
-	var countCurrent atomic.Int32
-	controller, _ := newTestController(t, newTestQueue(), newTestIndexer(), nil, &appStatus, &countCurrent)
+	startupGate := newTestGate("pool-u")
+	controller, _ := newTestController(t, newTestQueue(), newTestIndexer(), nil, &appStatus, startupGate)
 
 	pool := testPool("pool-u", "net-u", 60)
 	pool.Spec.IPv4Config.Subnet = "192.168.1.0/33"
@@ -58,8 +58,8 @@ func TestRegisterIPPoolUnparseableSubnetCountsAsHandledDuringInit(t *testing.T) 
 	if !errors.Is(err, ErrPoolUnregistrable) {
 		t.Errorf("error = %v, want the ErrPoolUnregistrable classification", err)
 	}
-	if countCurrent.Load() != 1 {
-		t.Errorf("ippool count = %d, want 1: a definitively rejected pool must count as handled", countCurrent.Load())
+	if startupGate.Settled() != 1 {
+		t.Errorf("ippool count = %d, want 1: a definitively rejected pool must count as handled", startupGate.Settled())
 	}
 }
 
@@ -68,8 +68,8 @@ func TestRegisterIPPoolUnparseableSubnetCountsAsHandledDuringInit(t *testing.T) 
 func TestRegisterIPPoolSettledCountIsIdempotent(t *testing.T) {
 	var appStatus atomic.Int32
 	appStatus.Store(APP_INIT)
-	var countCurrent atomic.Int32
-	controller, _ := newTestController(t, newTestQueue(), newTestIndexer(), nil, &appStatus, &countCurrent)
+	startupGate := newTestGate("pool-v")
+	controller, _ := newTestController(t, newTestQueue(), newTestIndexer(), nil, &appStatus, startupGate)
 
 	pool := testPool("pool-v", "net-v", 60)
 	pool.Spec.IPv4Config.Subnet = "192.168.1.0/33"
@@ -77,8 +77,8 @@ func TestRegisterIPPoolSettledCountIsIdempotent(t *testing.T) {
 	if _, err := controller.registerIPPool(pool); err == nil {
 		t.Fatal("want the definitive rejection of the unparseable subnet")
 	}
-	if countCurrent.Load() != 1 {
-		t.Fatalf("ippool count = %d after the settled rejection, want 1", countCurrent.Load())
+	if startupGate.Settled() != 1 {
+		t.Fatalf("ippool count = %d after the settled rejection, want 1", startupGate.Settled())
 	}
 
 	// the requeued event repeats the rejected attempt: the gate keeps its
@@ -86,7 +86,7 @@ func TestRegisterIPPoolSettledCountIsIdempotent(t *testing.T) {
 	if _, err := controller.registerIPPool(pool); err == nil {
 		t.Fatal("want the repeated rejection")
 	}
-	if countCurrent.Load() != 1 {
-		t.Errorf("ippool count = %d after the repeated attempt, want 1", countCurrent.Load())
+	if startupGate.Settled() != 1 {
+		t.Errorf("ippool count = %d after the repeated attempt, want 1", startupGate.Settled())
 	}
 }

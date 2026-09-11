@@ -17,6 +17,7 @@ import (
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
 	kihcache "github.com/joeyloman/kubevirt-ip-helper/pkg/cache"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/dhcp"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/gate"
 	kihclientset "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/clientset/versioned"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/metrics"
@@ -30,22 +31,24 @@ const (
 )
 
 type Controller struct {
-	ctx                  context.Context
-	indexer              cache.Indexer
-	queue                workqueue.RateLimitingInterface
-	informer             cache.Controller
-	cache                *kihcache.CacheAllocator
-	ipam                 *ipam.IPAllocator
-	dhcp                 *dhcp.DHCPAllocator
-	metrics              *metrics.MetricsAllocator
-	kihClientset         *kihclientset.Clientset
-	appStatus            *atomic.Int32
-	vmnetcfgCountCurrent *atomic.Int32
+	ctx          context.Context
+	indexer      cache.Indexer
+	queue        workqueue.RateLimitingInterface
+	informer     cache.Controller
+	cache        *kihcache.CacheAllocator
+	ipam         *ipam.IPAllocator
+	dhcp         *dhcp.DHCPAllocator
+	metrics      *metrics.MetricsAllocator
+	kihClientset *kihclientset.Clientset
+	appStatus    *atomic.Int32
 
-	// initAttempted tracks the vmnetcfg objects which the current
-	// initialization phase already handled, so an object which cannot
-	// complete its sync is still counted by the startup gate
-	initAttempted map[string]bool
+	// gate is the startup membership gate of this era: its snapshot holds
+	// the exact keys of the startup LIST, and markInitAttempt settles a
+	// key once its sync settled. a vmnetcfg created after the snapshot
+	// settles a key which is not part of it, so it can never substitute
+	// for an unvisited pre-existing object the way a plain count would
+	// let it
+	gate *gate.Gate
 
 	mutex sync.Mutex
 	// deferredInitAllocations records the vmnetcfg keys whose startup
@@ -67,7 +70,7 @@ func NewController(
 	metrics *metrics.MetricsAllocator,
 	kihClientset *kihclientset.Clientset,
 	appStatus *atomic.Int32,
-	vmnetcfgCountCurrent *atomic.Int32,
+	startupGate *gate.Gate,
 ) *Controller {
 	// the API calls of a reconciliation run under the era context: a
 	// canceled era (application reinit or shutdown) aborts in-flight
@@ -77,43 +80,33 @@ func NewController(
 	}
 
 	return &Controller{
-		ctx:                  ctx,
-		informer:             informer,
-		indexer:              indexer,
-		queue:                queue,
-		cache:                cache,
-		ipam:                 ipam,
-		dhcp:                 dhcp,
-		metrics:              metrics,
-		kihClientset:         kihClientset,
-		appStatus:            appStatus,
-		vmnetcfgCountCurrent: vmnetcfgCountCurrent,
+		ctx:          ctx,
+		informer:     informer,
+		indexer:      indexer,
+		queue:        queue,
+		cache:        cache,
+		ipam:         ipam,
+		dhcp:         dhcp,
+		metrics:      metrics,
+		kihClientset: kihClientset,
+		appStatus:    appStatus,
+		gate:         startupGate,
 	}
 }
 
-// markInitAttempt counts one settled VirtualMachineNetworkConfig object
-// for the startup gate: its sync either completed (nics in the ERROR
-// status included, their object was processed) or was definitively
-// rejected. a transiently failed restore stays uncounted, so the retried
-// sync can still protect the existing reservation before the vm
-// controller opens new allocations; a definitively broken object still
-// counts so it does not block the controller startup until it is removed.
+// markInitAttempt settles one VirtualMachineNetworkConfig object for the
+// startup gate: its sync either completed (nics in the ERROR status
+// included, their object was processed) or was definitively rejected.
+// a transiently failed restore stays unsettled, so the retried sync can
+// still protect the existing reservation before the vm controller opens
+// new allocations; a definitively broken object still settles so it does
+// not block the controller startup until it is removed.
 func (c *Controller) markInitAttempt(key string) {
-	if c.appStatus.Load() != APP_INIT {
+	if c.appStatus.Load() != APP_INIT || c.gate == nil {
 		return
 	}
 
-	if c.initAttempted == nil {
-		c.initAttempted = make(map[string]bool)
-	}
-
-	if _, exists := c.initAttempted[key]; exists {
-		return
-	}
-
-	c.initAttempted[key] = true
-
-	c.vmnetcfgCountCurrent.Add(1)
+	c.gate.Settle(key)
 }
 
 // errNicPoolMissing marks a per-interface restore failure whose networkname
@@ -254,22 +247,22 @@ func (c *Controller) sync(event Event) (err error) {
 			log.Errorf("(vmnetcfg.sync) failed to update vmnetcfg for %s: %s", event.key, err.Error())
 			c.metrics.UpdateLogStatus("error")
 		}
-		// the startup gate counts a vmnetcfg as handled once its sync
-		// settled, whether the settled sync was the initial ADD or a
-		// resynced UPDATE: an object whose ADD failed transiently recovers
-		// through the resync and must not leave the gate waiting forever.
-		// vmnetcfgs with nics in the ERROR status count as well because
-		// their sync completed, and a definitively rejected ADD counts so a
-		// broken vmnetcfg does not block the vm controller startup forever.
-		// a transiently failed restore stays uncounted instead: the
-		// rate-limited retry must stay able to protect the existing
+		// the startup gate settles a vmnetcfg once its sync settled,
+		// whether the settled sync was the initial ADD or a resynced
+		// UPDATE: an object whose ADD failed transiently recovers through
+		// the resync and must not leave the gate waiting forever.
+		// vmnetcfgs with nics in the ERROR status settle as well because
+		// their sync completed, and a definitively rejected ADD settles so
+		// a broken vmnetcfg does not block the vm controller startup
+		// forever. a transiently failed restore stays unsettled instead:
+		// the rate-limited retry must stay able to protect the existing
 		// reservation before the vm controller opens new allocations
 		if err == nil || (event.action == ADD && c.initSyncSettled(err)) {
 			c.markInitAttempt(event.key)
 		}
 	case DELETE:
 		// an object which is gone can never produce a settled sync anymore:
-		// the gate counts it so a startup-time deletion does not block the
+		// the gate settles it so a startup-time deletion does not block the
 		// controller startup forever
 		c.markInitAttempt(event.key)
 	}
@@ -298,8 +291,8 @@ func (c *Controller) handleErr(err error, key interface{}) {
 	c.metrics.UpdateLogStatus("error")
 
 	// an exhausted key can never settle through its own retries anymore:
-	// the gate counts it so the app startup does not wait forever for an
-	// object which keeps failing (marked exactly once via initAttempted)
+	// the gate settles it so the app startup does not wait forever for an
+	// object which keeps failing
 	if ev, ok := key.(Event); ok {
 		c.markInitAttempt(ev.key)
 	}
@@ -317,6 +310,26 @@ func (c *Controller) Run(workers int, stopCh chan struct{}) {
 		c.metrics.UpdateLogStatus("error")
 
 		return
+	}
+
+	// settle the snapshot keys whose object the informer never observed:
+	// a vmnetcfg deleted between the startup LIST and the informer start
+	// generates no event at all, so without this reconciliation the
+	// membership gate would wait for it forever (a count-based gate hid
+	// this case by letting unrelated objects substitute). the cache sync
+	// guarantees the store holds the complete initial list, so a snapshot
+	// key which is absent from it was deleted before the informer started
+	// and can never settle otherwise
+	if c.gate != nil {
+		for _, key := range c.gate.Unsettled() {
+			if _, exists, getErr := c.indexer.GetByKey(key); getErr == nil && !exists {
+				log.Warnf("(vmnetcfg.Run) VirtualMachineNetworkConfig %s of the startup snapshot was deleted before the informer started, settling it for the startup gate",
+					key)
+				c.metrics.UpdateLogStatus("warning")
+
+				c.markInitAttempt(key)
+			}
+		}
 	}
 
 	// the workers are joined before Run returns: the queue shutdown below
