@@ -388,7 +388,7 @@ for pod in $(collector_list "leader pod listing" kubectl -n "${KIH_HELPER_NAMESP
   capture 08-netns.txt "${pod} addresses" kubectl -n "${KIH_HELPER_NAMESPACE}" exec "${pod}" -- ip addr
   capture 08-netns.txt "${pod} routes" kubectl -n "${KIH_HELPER_NAMESPACE}" exec "${pod}" -- ip route
   capture 08-netns.txt "${pod} UDP sockets" kubectl -n "${KIH_HELPER_NAMESPACE}" exec "${pod}" -- cat /proc/net/udp
-  capture 08-netns.txt "${pod} metrics" kubectl -n "${KIH_HELPER_NAMESPACE}" exec "${pod}" -- wget -qO- http://127.0.0.1:8080/
+  capture 08-netns.txt "${pod} metrics" kubectl -n "${KIH_HELPER_NAMESPACE}" exec "${pod}" -- wget -qO- http://127.0.0.1:8080/metrics
 done
 
 if [ -n "${RUNTIME}" ]; then

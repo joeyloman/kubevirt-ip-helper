@@ -536,7 +536,7 @@ metrics_text() {
   local pod
   pod="$(current_leader_pod)" || return 1
   kubectl -n "${KIH_HELPER_NAMESPACE}" exec "${pod}" -- \
-    wget -T 5 -qO- http://127.0.0.1:8080/ 2> /dev/null
+    wget -T 5 -qO- http://127.0.0.1:8080/metrics 2> /dev/null
 }
 
 # Extracts the value of exactly one exposition series: matching lines must

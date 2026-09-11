@@ -354,9 +354,9 @@ _evidence_portable_path() {
 
 
 # _evidence_observations keeps the non-object proof that belongs to a checkpoint:
-# guest console markers, the artifact layout, and per-helper-pod interface and
-# route samples. The labelled leader additionally contributes its UDP listener
-# and metrics scrape; followers intentionally do not expose the listener.
+# guest console markers, the artifact layout, and every helper pod's interface,
+# route, and UDP observations. Checkpoint metrics are collected from the labelled
+# leader; the HTTP listener also exists on standbys.
 _evidence_observations() { # <dir>
   local dir="$1" rc=0 leaders pods pod leader artifact output
   local leader_err pod_err write_error=0
@@ -445,7 +445,7 @@ _evidence_observations() { # <dir>
     if [ "${leader}" -eq 1 ]; then
       if ! output="$(timeout --foreground "${E2E_CAPTURE_TIMEOUT}s" kubectl \
         -n "${KIH_HELPER_NAMESPACE}" exec "${pod}" -- \
-        wget -qO- http://127.0.0.1:8080/)"; then
+        wget -qO- http://127.0.0.1:8080/metrics)"; then
         rc=1
         if ! printf -- '-- pod %s: leader metrics scrape failed\n' \
           "${pod}" >> "${observations}"; then
@@ -458,7 +458,7 @@ _evidence_observations() { # <dir>
         _evidence_record_error "observations" \
           "cannot append leader pod ${pod} metrics output" || true
       fi
-    elif ! printf -- '-- pod %s: follower metrics scrape intentionally skipped (no listener)\n' \
+    elif ! printf -- '-- pod %s: follower metrics scrape intentionally skipped (checkpoint metrics are scoped to the labelled leader)\n' \
       "${pod}" >> "${observations}"; then
       rc=1
       _evidence_record_error "observations" \
