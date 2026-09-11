@@ -74,8 +74,8 @@ LEADER_LEASE="kubevirt-ip-helper-lock"
 METRICS_SERVICE="kubevirt-ip-helper-metrics"
 E2E_VM_BOOT_TIMEOUT="${E2E_VM_BOOT_TIMEOUT:-300}"
 E2E_PRED_SECONDS="${E2E_PRED_SECONDS:-20}"
-# Lease-loss fast-fail: a storm of "NO LEASE FOUND" entries for the owner MAC
-# inside the storm window flags the duplicate-cfg lease-release bug signature.
+# Lease-loss fast-fail: repeated "NO LEASE FOUND" entries for the owner MAC
+# inside the storm window are symptom-based evidence of an ownership regression.
 E2E_LEASE_STORM_COUNT="${E2E_LEASE_STORM_COUNT:-3}"
 E2E_LEASE_STORM_WINDOW="${E2E_LEASE_STORM_WINDOW:-10}"
 LEADER_POD=""
@@ -329,7 +329,7 @@ wait_for() { # <case-id> <seconds> <description> <predicate> [args...]
   while [ "${SECONDS}" -lt "${deadline}" ]; do
     # rc is captured from run_pred_once directly: an `if <cmd>; then ... fi`
     # with no else resets $? to 0 on the false branch, which would silently
-    # downgrade a predicate exit code 2 (bug signature) to a plain failure.
+    # downgrade a predicate exit code 2 (ownership-regression symptom) to a plain failure.
     run_pred_once "${E2E_PRED_SECONDS}" "$@" && rc=0 || rc=$?
     if [ "${rc}" -eq 0 ]; then
       if [ "${SECONDS}" -lt "${deadline}" ]; then
@@ -340,15 +340,15 @@ wait_for() { # <case-id> <seconds> <description> <predicate> [args...]
       break
     fi
     if [ "${rc}" -eq 2 ]; then
-      die "bug signature detected: ${description} (owner DHCP lease destroyed by duplicate-cfg cleanup; lease release is keyed by MAC without ownership check)"
+      die "${description}: owner DHCP lease missing after duplicate-config cleanup (ownership regression signature)"
     fi
     sleep 2
   done
   # One final probe outside the watchdog at the deadline: a predicate that
   # only needs one more event can still pass, and the pass then carries the
   # grace detail instead of a timeout. The rc is captured the same way as in
-  # the polling loop so an exit code 2 bug signature still reports its
-  # attribution message rather than a generic timeout.
+  # the polling loop so an exit code 2 ownership-regression symptom still
+  # reports its attribution message rather than a generic timeout.
   "$@" && rc=0 || rc=$?
   if [ "${rc}" -eq 0 ]; then
     log "ok: ${description}"
@@ -356,7 +356,7 @@ wait_for() { # <case-id> <seconds> <description> <predicate> [args...]
     return 0
   fi
   if [ "${rc}" -eq 2 ]; then
-    die "bug signature detected: ${description} (owner DHCP lease destroyed by duplicate-cfg cleanup; lease release is keyed by MAC without ownership check)"
+    die "${description}: owner DHCP lease missing after duplicate-config cleanup (ownership regression signature)"
   fi
   die "timed out after ${timeout}s: ${description}"
 }
@@ -381,7 +381,7 @@ wait_before_deadline() { # <case-id> <absolute SECONDS> <maximum seconds> <descr
       return 0
     fi
     if [ "${rc}" -eq 2 ]; then
-      die "bug signature detected: ${description} (owner DHCP lease destroyed by duplicate-cfg cleanup; lease release is keyed by MAC without ownership check)"
+      die "${description}: owner DHCP lease missing after duplicate-config cleanup (ownership regression signature)"
     fi
     sleep 2
   done
@@ -729,12 +729,12 @@ console_has_router_marker() { # <file> <router>
     [ "${last}" = "E2E_DHCP_ROUTER=$2" ]
 }
 
-# The duplicate-cfg cleanup released the DHCP lease keyed by MAC without an
-# ownership check (pkg/controller/vmnetcfg/vmnetcfg.go:262,
-# pkg/dhcp/dhcp.go:169-183), so the live owner's lease can be destroyed
-# with the duplicate. Once that happened, every request from the owner
-# MAC hits "NO LEASE FOUND" in the leader log: a storm of those entries is
-# the lease-loss signature.
+# After duplicate-config cleanup, repeated "NO LEASE FOUND" entries for the
+# owner MAC show that the live owner's DHCP lease is missing. The log storm is
+# symptom-based evidence of the ownership-regression/lease-loss condition,
+# without assuming how production cleanup selected or removed the lease.
+#
+# The threshold limits transient noise while preserving a fast failure signal.
 leader_log_storm_for() { # <mac> <since-minutes>
   local mac="$1" since="$2" pod count
   pod="$(current_leader_pod)" || return 1
@@ -743,11 +743,11 @@ leader_log_storm_for() { # <mac> <since-minutes>
   [ "${count}" -ge "${E2E_LEASE_STORM_COUNT}" ]
 }
 
-# Boot predicate for the boot that follows the duplicate config cleanup:
-# the awaited marker passes normally; otherwise a lease-loss storm for the
-# owner MAC is the production-bug signature and must fail fast (exit code
-# 2). The marker is checked before the log scan for clarity, though once
-# the lease is gone it can no longer appear.
+# Boot predicate for the boot that follows duplicate-config cleanup:
+# the awaited marker passes normally; otherwise repeated "NO LEASE FOUND"
+# entries for the owner MAC are an ownership-regression/lease-loss symptom
+# and fail fast (exit code 2). The marker is checked first so observed boot
+# success keeps precedence over symptom-based regression evidence.
 boot_marker_or_lease_loss() { # <log-file> <owner-mac> <expected-ip>
   local log_file="$1" owner_mac="$2" expected_ip="$3"
   if console_has_reserved_ip "${log_file}" "${expected_ip}"; then

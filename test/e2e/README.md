@@ -143,7 +143,7 @@ Metric predicates re-resolve the labelled leader pod on every scrape: each used,
 
 `wait_for` polls each predicate in a subshell with a per-poll watchdog (`E2E_PRED_SECONDS`, default 20), so a wedged kubectl or exec cannot consume the loop budget; at timeout exhaustion it allows one grace re-probe, recorded explicitly. `wait_before_deadline` keeps the watchdog but never takes a grace probe, because its deadlines are window contracts.
 
-A predicate may return exit code 2 to signal a production-bug signature; the driver then dies immediately with a mapped explanation. The duplicate-owner-after-cfg boot uses this: if the leader's log shows repeated `NO LEASE FOUND` for the owner MAC after the refused duplicate VirtualMachineNetworkConfig was deleted, the case fails fast with an attribution to lease release keyed by MAC without ownership verification.
+A predicate may return exit code 2 to identify an ownership regression signature; the driver then dies immediately with a mapped explanation. The existing duplicate-owner-after-cfg boot uses this: if the leader's log repeatedly shows `NO LEASE FOUND` for the owner MAC after deletion of the refused duplicate VirtualMachineNetworkConfig, the case fails fast and reports `owner DHCP lease missing after duplicate-config cleanup`.
 
 `console_has_router_marker` requires the expected router to be the entire non-`unset` marker set and the last non-`unset` marker.
 
