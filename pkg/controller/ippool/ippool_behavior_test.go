@@ -135,7 +135,9 @@ func ippoolBehaviorAssertDHCPPoolOptions(t *testing.T, d *kihdhcp.DHCPAllocator,
 }
 
 // ippoolBehaviorRestState backs a minimal fake API server for the typed IPPool client: it
-// serves GET (stored object), PUT .../status (echo of the submitted body), the
+// serves GET (stored object), PUT .../status (which persists the submitted
+// status into the stored object like the status subresource of a real
+// apiserver, so a later read observes the state this era committed), the
 // cluster-wide VirtualMachineNetworkConfig LIST the claim protection takes its
 // authoritative snapshot from, and can be switched into failing modes.
 type ippoolBehaviorRestState struct {
@@ -207,8 +209,15 @@ func (s *ippoolBehaviorRestState) ippoolBehaviorHandler() http.Handler {
 				return
 			}
 			s.lastBody = &in
+			// a successful status write persists like the status
+			// subresource of a real apiserver: only the status of the
+			// stored object is replaced (a submitted spec or metadata is
+			// ignored), so a later GET - the next registration era, the
+			// resync comparison - reads back the state this era actually
+			// committed instead of a stale pre-write snapshot
+			s.pool.Status = *in.Status.DeepCopy()
 			w.Header().Set("Content-Type", "application/json")
-			if err := json.NewEncoder(w).Encode(&in); err != nil {
+			if err := json.NewEncoder(w).Encode(s.pool); err != nil {
 				return
 			}
 		default:

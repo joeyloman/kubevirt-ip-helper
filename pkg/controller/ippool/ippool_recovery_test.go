@@ -16,18 +16,20 @@ package ippool
 // nic was removed while the pool was still unpublished is dropped instead
 // of being published as an orphan record.
 //
-// The tests execute the real allocator- and state-publication steps of
-// registerIPPool: the subnet registration, the exclude pass, the claim
-// protection, the status rebuild, the metrics reset and the cache
-// publication. The host-level steps of the production registration -
-// adding the server ip to the bind interface and starting the dhcp
-// listener - stay outside the test boundary (they modify host interfaces
-// and open privileged listeners); nothing the claim protection depends on
-// is simulated. The binding restoration is exercised through the exact
-// primitives the vmnetcfg binding path runs (the owner-validated reclaim
-// of the recorded address, the dhcp lease registration and the fresh
-// auto-allocation); the controller-level reconciliation against the
-// published state is covered by the vmnetcfg-side recovery tests.
+// The tests execute the complete production registration path through the
+// same registerPoolWithTeardown the sync runs: the up-front validation,
+// the allocator registration, the exclude pass, the claim protection, the
+// status rebuild, the metrics reset and the cache publication, and the
+// teardown of a failed attempt. The host-level steps - adding the server
+// ip to the bind interface and starting the dhcp listener - run through
+// their test seams (a stubbed nic mutation and a no-op listener), so the
+// fixtures exercise the real registration sequence without touching host
+// interfaces or opening privileged listeners. The binding restoration is
+// exercised through the exact primitives the vmnetcfg binding path runs
+// (the owner-validated reclaim of the recorded address, the dhcp lease
+// registration and the fresh auto-allocation); the controller-level
+// reconciliation against the published state is covered by the
+// vmnetcfg-side recovery tests.
 
 import (
 	"errors"
@@ -60,60 +62,18 @@ func recoveryNewPool(name, network string) *kihv1.IPPool {
 	}
 }
 
-// recoveryRegistrationSteps executes the allocator- and state-publication
-// steps of registerIPPool for a validated pool projection. It returns the
-// protection error instead of failing the test, so the discovery-failure
-// regression can assert that the sequence aborts before the publication.
-func recoveryRegistrationSteps(t *testing.T, c *Controller, pool *kihv1.IPPool) (map[string]string, error) {
+// recoveryRegistrationSteps runs the complete production registration of
+// the pool through the same registerPoolWithTeardown wrapper the sync
+// uses: the up-front validation, the nic address and the dhcp pool and
+// its listener (through the test seams recoveryNewController installs),
+// the allocator registration, the claim protection, the status rebuild,
+// the metrics reset and the cache publication. A failed attempt is torn
+// back down by the same wrapper, so a retried registration starts from a
+// clean registration state exactly like the production recovery.
+func recoveryRegistrationSteps(t *testing.T, c *Controller, pool *kihv1.IPPool) error {
 	t.Helper()
 
-	// register the new subnet in ipam
-	if err := c.ipam.NewSubnet(
-		pool.Spec.NetworkName,
-		pool.Spec.IPv4Config.Subnet,
-		pool.Spec.IPv4Config.Pool.Start,
-		pool.Spec.IPv4Config.Pool.End,
-	); err != nil {
-		t.Fatalf("registering the subnet: %s", err)
-	}
-
-	// mark the exclude ips as used
-	for _, v := range pool.Spec.IPv4Config.Pool.Exclude {
-		if _, err := c.ipam.ReclaimIP(pool.Spec.NetworkName, v, ipam.ExcludedOwner); err != nil {
-			t.Fatalf("excluding ip %s: %s", v, err)
-		}
-	}
-
-	// pin the persisted claims of the pool before it becomes visible to
-	// fresh allocations
-	protectedClaims, err := c.protectPersistedClaims(pool)
-	if err != nil {
-		return nil, err
-	}
-
-	// rebuild the pool status after restarting the process
-	rPool, err := c.resetIPPoolStatus(pool, protectedClaims)
-	if err != nil {
-		t.Fatalf("rebuilding the pool status: %s", err)
-	}
-
-	// reset the pool metrics after restarting the process
-	if err := c.resetIPPoolMetrics(pool); err != nil {
-		t.Fatalf("resetting the pool metrics: %s", err)
-	}
-
-	// publish the pool: this is the point from which fresh allocations
-	// can see the allocator. the published projection mirrors the
-	// registration: the input spec (what the allocator actually
-	// installed) carrying the freshly rebuilt status of the write
-	// response
-	installed := pool.DeepCopy()
-	installed.Status = rPool.Status
-	if err := c.cache.Add(installed); err != nil {
-		t.Fatalf("publishing the pool into the cache: %s", err)
-	}
-
-	return protectedClaims, nil
+	return c.registerPoolWithTeardown(pool, "the recovery registration of")
 }
 
 // recoveryNewController wires a controller against the rest state and
@@ -126,6 +86,15 @@ func recoveryNewController(t *testing.T, stored *kihv1.IPPool) (*Controller, *ip
 	t.Cleanup(srv.Close)
 
 	c, _, _, _, _ := ippoolBehaviorNewTestController(t, srv)
+
+	// the host-level steps of the registration run through their test
+	// seams: the nic address add is stubbed off the host interfaces and
+	// the dhcp listener stays a no-op, so the recovery fixtures run the
+	// real registration sequence without privileged operations
+	stubNicMutation(t)
+	c.runListener = func(networkName string, nic string) error {
+		return nil
+	}
 
 	return c, rs, srv
 }
@@ -174,18 +143,15 @@ func TestRegistrationNormalizesTheLegacyStatusReference(t *testing.T) {
 	c, rs, _ := recoveryNewController(t, stored)
 	pool := recoveryNewPool("pool1", "net-a")
 
-	claims, err := recoveryRegistrationSteps(t, c, pool)
+	err := recoveryRegistrationSteps(t, c, pool)
 	if err != nil {
 		t.Fatalf("the registration steps: %s", err)
 	}
 
 	// the claim is pinned and republished under the canonical spelling:
-	// both representations must agree with the restoring binding's
-	// identity, otherwise the same logical owner is rejected as a foreign
-	// owner
-	if got := claims["10.0.0.2"]; got != canonicalRef {
-		t.Errorf("protected claim = %q, want the canonical reference %q", got, canonicalRef)
-	}
+	// both the written ledger and the published pool must carry the
+	// canonical reference, otherwise the same logical owner is rejected
+	// as a foreign owner of its own lease
 	if got := rs.lastBody.Status.IPv4.Allocated["10.0.0.2"]; got != canonicalRef {
 		t.Errorf("republished ledger entry = %q, want the canonical reference %q", got, canonicalRef)
 	}
@@ -251,7 +217,7 @@ func TestRegistrationProtectsTheSpecOnlyClaim(t *testing.T) {
 	}
 	pool := recoveryNewPool("pool1", "net-a")
 
-	claims, err := recoveryRegistrationSteps(t, c, pool)
+	err := recoveryRegistrationSteps(t, c, pool)
 	if err != nil {
 		t.Fatalf("the registration steps: %s", err)
 	}
@@ -259,9 +225,6 @@ func TestRegistrationProtectsTheSpecOnlyClaim(t *testing.T) {
 	// the spec claim is pinned in the allocator but not republished: the
 	// restoring binding writes the ledger entry itself, so a stale pin
 	// can never survive as an authoritative record
-	if got := claims["10.0.0.2"]; got != "" {
-		t.Errorf("published claim = %q, want none (spec pins are not published)", got)
-	}
 	if got, ok := rs.lastBody.Status.IPv4.Allocated["10.0.0.2"]; ok {
 		t.Errorf("republished ledger entry = %q, want none before the binding restored", got)
 	}
@@ -333,7 +296,7 @@ func TestRegistrationSweepCoversNamespacesAndMalformedNics(t *testing.T) {
 
 	pool := stored.DeepCopy()
 
-	claims, err := recoveryRegistrationSteps(t, c, pool)
+	err := recoveryRegistrationSteps(t, c, pool)
 	if err != nil {
 		t.Fatalf("the registration steps: %s", err)
 	}
@@ -396,9 +359,6 @@ func TestRegistrationSweepCoversNamespacesAndMalformedNics(t *testing.T) {
 	if len(ledger) != 1 {
 		t.Errorf("ledger = %v, want exactly the exclude entry", ledger)
 	}
-	if got := claims["10.0.0.2"]; got != "" {
-		t.Errorf("published claim = %q, want none (spec pins are not published)", got)
-	}
 }
 
 // TestRegistrationWithoutTheClaimSnapshotDoesNotPublish: when the
@@ -417,7 +377,7 @@ func TestRegistrationWithoutTheClaimSnapshotDoesNotPublish(t *testing.T) {
 	}
 	pool := recoveryNewPool("pool1", "net-a")
 
-	if _, err := recoveryRegistrationSteps(t, c, pool); err == nil {
+	if err := recoveryRegistrationSteps(t, c, pool); err == nil {
 		t.Fatal("the registration must fail when the claim snapshot cannot be obtained")
 	}
 
@@ -430,12 +390,12 @@ func TestRegistrationWithoutTheClaimSnapshotDoesNotPublish(t *testing.T) {
 	}
 
 	// the retry re-runs the whole protection once the snapshot is
-	// available: the failed attempt was torn down like the production
-	// registerPoolWithTeardown does (its allocator step removed the
-	// subnet), so the retry starts from a fresh registration state
-	c.ipam.DeleteSubnet("net-a")
+	// available: the failed attempt was torn down by the same
+	// registerPoolWithTeardown the steps helper runs (its allocator step
+	// removed the subnet), so the retry starts from a fresh registration
+	// state
 	rs.failVMNetCfgList = false
-	if _, err := recoveryRegistrationSteps(t, c, pool); err != nil {
+	if err := recoveryRegistrationSteps(t, c, pool); err != nil {
 		t.Fatalf("the retried registration steps: %s", err)
 	}
 	oldRef := util.AllocationRef("default", "vm-old", "02:00:00:00:00:10")
@@ -496,7 +456,7 @@ func TestRegistrationDoesNotHonorTheHijackGuardedClaim(t *testing.T) {
 	}
 	pool := recoveryNewPool("pool1", "net-a")
 
-	if _, err := recoveryRegistrationSteps(t, c, pool); err != nil {
+	if err := recoveryRegistrationSteps(t, c, pool); err != nil {
 		t.Fatalf("the registration steps: %s", err)
 	}
 
@@ -524,7 +484,7 @@ func TestRegistrationLeavesTheGuardedRequestUnclaimed(t *testing.T) {
 	}
 	pool := recoveryNewPool("pool1", "net-a")
 
-	if _, err := recoveryRegistrationSteps(t, c, pool); err != nil {
+	if err := recoveryRegistrationSteps(t, c, pool); err != nil {
 		t.Fatalf("the registration steps: %s", err)
 	}
 
@@ -567,7 +527,7 @@ func TestRegistrationPrefersTheEstablishedAssignmentRegardlessOfListOrder(t *tes
 	}
 	pool := recoveryNewPool("pool1", "net-a")
 
-	if _, err := recoveryRegistrationSteps(t, c, pool); err != nil {
+	if err := recoveryRegistrationSteps(t, c, pool); err != nil {
 		t.Fatalf("the registration steps: %s", err)
 	}
 
@@ -607,7 +567,7 @@ func TestRegistrationDropsTheStaleSpecClaim(t *testing.T) {
 
 	pool := recoveryNewPool("pool1", "net-a")
 
-	if _, err := recoveryRegistrationSteps(t, c, pool); err != nil {
+	if err := recoveryRegistrationSteps(t, c, pool); err != nil {
 		t.Fatalf("the registration steps: %s", err)
 	}
 
@@ -645,7 +605,7 @@ func TestRegistrationDropsTheClaimOfTheDeletedObject(t *testing.T) {
 
 	pool := recoveryNewPool("pool1", "net-a")
 
-	if _, err := recoveryRegistrationSteps(t, c, pool); err != nil {
+	if err := recoveryRegistrationSteps(t, c, pool); err != nil {
 		t.Fatalf("the registration steps: %s", err)
 	}
 
@@ -668,7 +628,7 @@ func TestRegistrationFailsOnUnverifiableClaim(t *testing.T) {
 	}
 	pool := recoveryNewPool("pool1", "net-a")
 
-	if _, err := recoveryRegistrationSteps(t, c, pool); err == nil {
+	if err := recoveryRegistrationSteps(t, c, pool); err == nil {
 		t.Fatal("the registration must fail when a pinned claim cannot be verified")
 	}
 	if rs.putCount != 0 {
@@ -678,10 +638,11 @@ func TestRegistrationFailsOnUnverifiableClaim(t *testing.T) {
 		t.Error("the pool must not be published into the cache")
 	}
 
-	// the retry converges once the verification read succeeds again
-	c.ipam.DeleteSubnet("net-a")
+	// the retry converges once the verification read succeeds again: the
+	// failed attempt was torn down by the same wrapper, so the retry
+	// starts from a fresh registration state
 	rs.failVMNetCfgGet = false
-	if _, err := recoveryRegistrationSteps(t, c, pool); err != nil {
+	if err := recoveryRegistrationSteps(t, c, pool); err != nil {
 		t.Fatalf("the retried registration steps: %s", err)
 	}
 	if used := c.ipam.Used("net-a"); used != 1 {
@@ -709,7 +670,7 @@ func TestRegistrationAttributesTheUnusableMacClaim(t *testing.T) {
 	}
 	pool := stored.DeepCopy()
 
-	if _, err := recoveryRegistrationSteps(t, c, pool); err != nil {
+	if err := recoveryRegistrationSteps(t, c, pool); err != nil {
 		t.Fatalf("the registration steps: %s", err)
 	}
 
@@ -813,7 +774,7 @@ func TestRegistrationKeepsThePinOfAMacSpellingDrift(t *testing.T) {
 
 	pool := recoveryNewPool("pool1", "net-a")
 
-	if _, err := recoveryRegistrationSteps(t, c, pool); err != nil {
+	if err := recoveryRegistrationSteps(t, c, pool); err != nil {
 		t.Fatalf("the registration steps: %s", err)
 	}
 
@@ -872,7 +833,7 @@ func TestRegistrationPromotesTheSurvivorOfADroppedWinner(t *testing.T) {
 
 	pool := recoveryNewPool("pool1", "net-a")
 
-	if _, err := recoveryRegistrationSteps(t, c, pool); err != nil {
+	if err := recoveryRegistrationSteps(t, c, pool); err != nil {
 		t.Fatalf("the registration steps: %s", err)
 	}
 
@@ -924,14 +885,14 @@ func TestRegistrationDropsTheLedgerRecordOfAPositivelyRemovedOwner(t *testing.T)
 
 	pool := recoveryNewPool("pool1", "net-a")
 
-	claims, err := recoveryRegistrationSteps(t, c, pool)
+	err := recoveryRegistrationSteps(t, c, pool)
 	if err != nil {
 		t.Fatalf("the registration steps: %s", err)
 	}
 
 	// the stale record is neither pinned nor republished
-	if _, republished := claims["10.0.0.2"]; republished {
-		t.Errorf("the record of the positively removed owner must not be republished, got %q", claims["10.0.0.2"])
+	if got, republished := rs.lastBody.Status.IPv4.Allocated["10.0.0.2"]; republished {
+		t.Errorf("the record of the positively removed owner must not be republished, got %q", got)
 	}
 	if used := c.ipam.Used("net-a"); used != 0 {
 		t.Errorf("ipam used = %d, want 0 (the stale record pins nothing)", used)
@@ -958,7 +919,7 @@ func TestRegistrationDropsTheLedgerRecordOfAGoneVM(t *testing.T) {
 		"10.0.0.2": util.AllocationRef(ownerNamespace, ownerVMName, ownerMAC),
 	}
 
-	c, _, _ := recoveryNewController(t, stored)
+	c, rs, _ := recoveryNewController(t, stored)
 
 	// no vmnetcfg exists and the vm is gone too: the authoritative absence
 	c.verifyVM = func(namespace string, name string) (bool, error) {
@@ -971,13 +932,13 @@ func TestRegistrationDropsTheLedgerRecordOfAGoneVM(t *testing.T) {
 
 	pool := recoveryNewPool("pool1", "net-a")
 
-	claims, err := recoveryRegistrationSteps(t, c, pool)
+	err := recoveryRegistrationSteps(t, c, pool)
 	if err != nil {
 		t.Fatalf("the registration steps: %s", err)
 	}
 
-	if _, republished := claims["10.0.0.2"]; republished {
-		t.Errorf("the record of the gone vm must not be republished, got %q", claims["10.0.0.2"])
+	if got, republished := rs.lastBody.Status.IPv4.Allocated["10.0.0.2"]; republished {
+		t.Errorf("the record of the gone vm must not be republished, got %q", got)
 	}
 	if used := c.ipam.Used("net-a"); used != 0 {
 		t.Errorf("ipam used = %d, want 0 (the orphan record pins nothing)", used)
@@ -1000,7 +961,7 @@ func TestRegistrationKeepsTheLedgerRecordOfAReconstructibleOwner(t *testing.T) {
 		"10.0.0.2": util.AllocationRef(ownerNamespace, ownerVMName, ownerMAC),
 	}
 
-	c, _, _ := recoveryNewController(t, stored)
+	c, rs, _ := recoveryNewController(t, stored)
 
 	// no vmnetcfg exists, but the vm is live and will reconstruct it
 	c.verifyVM = func(namespace string, name string) (bool, error) {
@@ -1009,12 +970,12 @@ func TestRegistrationKeepsTheLedgerRecordOfAReconstructibleOwner(t *testing.T) {
 
 	pool := recoveryNewPool("pool1", "net-a")
 
-	claims, err := recoveryRegistrationSteps(t, c, pool)
+	err := recoveryRegistrationSteps(t, c, pool)
 	if err != nil {
 		t.Fatalf("the registration steps: %s", err)
 	}
 
-	if ref, republished := claims["10.0.0.2"]; !republished {
+	if ref, republished := rs.lastBody.Status.IPv4.Allocated["10.0.0.2"]; !republished {
 		t.Errorf("the record of the live vm must be republished, got nothing")
 	} else if ref != util.AllocationRef(ownerNamespace, ownerVMName, ownerMAC) {
 		t.Errorf("the republished record = %q, want the canonical owner reference", ref)
@@ -1050,12 +1011,12 @@ func TestRegistrationKeepsTheLedgerRecordOfAnUnverifiableOwner(t *testing.T) {
 
 	pool := recoveryNewPool("pool1", "net-a")
 
-	claims, err := recoveryRegistrationSteps(t, c, pool)
+	err := recoveryRegistrationSteps(t, c, pool)
 	if err != nil {
 		t.Fatalf("the registration steps: %s", err)
 	}
 
-	if _, republished := claims["10.0.0.2"]; !republished {
+	if _, republished := rs.lastBody.Status.IPv4.Allocated["10.0.0.2"]; !republished {
 		t.Errorf("the record of the unverifiable owner must stay republished (fail closed)")
 	}
 	if used := c.ipam.Used("net-a"); used != 1 {

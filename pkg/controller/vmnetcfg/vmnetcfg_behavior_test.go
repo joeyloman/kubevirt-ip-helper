@@ -299,6 +299,11 @@ type fakeAPIServer struct {
 	conflictCount     int
 	poolStatusPutCode int
 	vmnetcfgPutCode   int
+	// vmnetcfgPutDropConn commits every vmnetcfg PUT but closes the
+	// connection before a response byte is written: the client observes
+	// a lost response (EOF) for a write the server actually applied,
+	// which is the boundary an Update error does not prove a non-commit
+	vmnetcfgPutDropConn bool
 	// vmnetcfgGetCode fails the vmnetcfg GET requests while set, so the
 	// pre-commit verification of the claimed nics can be made to fail
 	vmnetcfgGetCode int
@@ -518,6 +523,7 @@ func (f *fakeAPIServer) handleVMNetCfg(w http.ResponseWriter, r *http.Request, n
 	case r.Method == http.MethodPut && sub == "":
 		f.mu.Lock()
 		failCode := f.vmnetcfgPutCode
+		dropConn := f.vmnetcfgPutDropConn
 		f.mu.Unlock()
 		if failCode != 0 {
 			writeStatus(w, failCode, metav1.StatusReasonInternalError, "boom")
@@ -531,6 +537,16 @@ func (f *fakeAPIServer) handleVMNetCfg(w http.ResponseWriter, r *http.Request, n
 		f.mu.Lock()
 		f.vmnetcfgs[key] = obj.DeepCopy()
 		f.mu.Unlock()
+		if dropConn {
+			// the write is committed: lose the response instead, so the
+			// client cannot know whether its update was applied
+			if hj, ok := w.(http.Hijacker); ok {
+				if conn, _, err := hj.Hijack(); err == nil {
+					_ = conn.Close()
+					return
+				}
+			}
+		}
 		f.writeVMNetCfg(w, &obj)
 	case r.Method == http.MethodPut && sub == "status":
 		var obj kihv1.VirtualMachineNetworkConfig
@@ -1774,6 +1790,83 @@ func TestVMNetCfgUpdateFailureQuarantinesServedAllocation(t *testing.T) {
 	}
 	if !e.dhcp.CheckLease(testMAC) {
 		t.Error("lease must survive the converging sync")
+	}
+}
+
+// The committed-write half of the same boundary: the apiserver can apply
+// the spec update and still lose the response, so the Update error the
+// controller observes does not prove the write was not committed. The
+// rollback must behave identically to the uncommitted case - nothing that
+// could be durable is released - so the committed address is never handed
+// to a second vm while the first object's stored spec claims it, and the
+// retried sync converges on the object the server already committed.
+func TestVMNetCfgCommittedUpdateWithLostResponseQuarantinesTheAllocation(t *testing.T) {
+	e := newTestEnv(t)
+	e.appStatus.Store(APP_RUNNING)
+	e.addSubnet("10.0.0.1", "10.0.0.1")
+	e.seedPool(nil)
+	// every PUT is committed but its response is lost: the client sees an
+	// EOF for a write the server applied
+	e.api.vmnetcfgPutDropConn = true
+	vmnetcfg := newVMNetCfg("", testMAC)
+	e.seedVMNetCfg(vmnetcfg)
+
+	err := e.controller.updateVirtualMachineNetworkConfig(ADD, vmnetcfg)
+	if err == nil {
+		t.Fatal("want error on the lost response of the object update")
+	}
+	if !strings.Contains(err.Error(), "cannot update VirtualMachineNetworkConfig object") {
+		t.Errorf("error = %q, want update prefix", err)
+	}
+	// the failed main update must not be followed by a status update
+	if n := e.countRequests(http.MethodPut, vmnetcfgStatusPath); n != 0 {
+		t.Errorf("status update requests = %d, want 0", n)
+	}
+
+	// the server committed the write despite the lost response: the
+	// durable spec already records the allocation
+	stored := e.getStoredVMNetCfg()
+	if len(stored.Spec.NetworkConfig) != 1 || stored.Spec.NetworkConfig[0].IPAddress != "10.0.0.1" {
+		t.Fatalf("stored spec = %+v, want the committed allocation recorded", stored.Spec.NetworkConfig)
+	}
+
+	// the quarantine is identical to the uncommitted case: the lease, the
+	// claim and the status record stay held under this binding's identity
+	if lease := e.dhcp.GetLease(testMAC); lease.ClientIP == nil || lease.ClientIP.String() != "10.0.0.1" {
+		t.Fatalf("lease = %v, want the quarantined lease kept", lease.ClientIP)
+	}
+	if used := e.ipam.Used(testNetwork); used != 1 {
+		t.Errorf("ipam used = %d, want the quarantined claim kept", used)
+	}
+	pool := e.getStoredPool()
+	if got := pool.Status.IPv4.Allocated["10.0.0.1"]; got == "" {
+		t.Errorf("status record = %q, want the quarantined record kept", pool.Status.IPv4.Allocated)
+	}
+	// the one-address pool is exhausted by the quarantine: a second vm
+	// cannot receive the committed-but-unconfirmed address
+	if _, err := e.ipam.AllocateIP(testNetwork, "other-ns/other-vm"); err == nil {
+		t.Error("a second vm must not receive the committed address")
+	}
+
+	// the retried sync converges on the committed object: the durable
+	// assignment is verified, its ownership repaired and the missing
+	// success status published, without any second allocation
+	e.api.vmnetcfgPutDropConn = false
+	if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, e.getStoredVMNetCfg()); err != nil {
+		t.Fatalf("retried sync: %v", err)
+	}
+	stored = e.getStoredVMNetCfg()
+	if len(stored.Spec.NetworkConfig) != 1 || stored.Spec.NetworkConfig[0].IPAddress != "10.0.0.1" {
+		t.Errorf("stored spec = %+v, want the committed assignment unchanged", stored.Spec.NetworkConfig)
+	}
+	if !e.dhcp.CheckLease(testMAC) {
+		t.Error("lease must survive the converging sync")
+	}
+	if used := e.ipam.Used(testNetwork); used != 1 {
+		t.Errorf("ipam used after the retry = %d, want 1 (no second allocation)", used)
+	}
+	if got := stored.Status.NetworkConfig[0]; got.Status != "OK" || got.MACAddress != testMAC {
+		t.Errorf("stored status = %+v, want the synthesized OK entry of the recovered binding", got)
 	}
 }
 
