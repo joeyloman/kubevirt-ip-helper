@@ -261,10 +261,12 @@ func (c *Controller) getNetworkConfigs(vm *kubevirtV1.VirtualMachine, curNetCfg 
 // has. the release is ownership-safe, so a delayed or retried cleanup can
 // never free state another vm acquired in the meantime: the lease is
 // removed under an owner check, an ip whose lease is already held by
-// another vm in the same network is left to that vm, and the ipam release
-// only frees the address while its reservation still carries this nic's
-// owner reference - a successor's named allocation and a registration
-// protection pin both stay untouched.
+// another vm in the same network is left to that vm while this nic's own
+// status entry is still un-recorded (a successor lease is not proof that
+// the bookkeeping completed), and the ipam release only frees the address
+// while its reservation still carries this nic's owner reference - a
+// successor's named allocation and a registration protection pin both
+// stay untouched.
 func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetworkConfig, netCfg *kihv1.NetworkConfig) (err error) {
 	log.Debugf("(vm.cleanupNetworkInterface) [%s/%s] cleaning interface with hwaddr=%s, networkname=%s, ipaddress=%s",
 		vmnetcfg.Namespace, vmnetcfg.Name, netCfg.MACAddress, netCfg.NetworkName, netCfg.IPAddress)
@@ -277,16 +279,30 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 	// stays a network-scoped snapshot check without an owner-validated
 	// release primitive: the same numeric addresses of separate networks
 	// are no claim on this network's allocation
+	successorLive := false
 	if netCfg.IPAddress != "" {
 		if leaseHwAddr, lease, found := c.dhcp.GetLeaseByIPAndNetwork(netCfg.NetworkName, netCfg.IPAddress); found && lease.Reference != ref {
-			// the release already happened in an earlier attempt and a
-			// successor vm owns the ip now: this interface's cleanup
-			// converged
+			// a successor vm owns the ip live: its lease and its
+			// reservation are never touched by this cleanup. but a
+			// successor lease is not proof that this nic's bookkeeping
+			// completed: the local release and the durable un-record are
+			// independent steps, and an un-record which failed or never
+			// ran leaves this nic's own ledger entry behind while the
+			// successor already serves the address - the orphan then
+			// blocks the successor's own ledger write forever and every
+			// registration re-pins the address to the ghost owner. the
+			// owner-checked un-record below still runs: it removes this
+			// nic's own orphan and is a converged no-op when the entry is
+			// already gone, while the successor's entry (a foreign owner)
+			// is never touched. the live release stays skipped: the
+			// successor demonstrably owns the address, and even a claim
+			// which still carries this nic's own reference must not be
+			// freed while the successor's lease keeps serving the address
 			log.Warnf("(vm.cleanupNetworkInterface) [%s/%s] ip %s belongs to %s via hwaddr %s, skipping the release of it",
 				vmnetcfg.Namespace, vmnetcfg.Name, netCfg.IPAddress, lease.Reference, leaseHwAddr)
 			c.metrics.UpdateLogStatus("warning")
 
-			return
+			successorLive = true
 		}
 	}
 
@@ -360,6 +376,15 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 				unrecordedPoolName = pool.(kihv1.IPPool).Name
 			}
 		}
+	}
+
+	// the successor owns the whole live state of the address: only the
+	// durable un-record of this nic's own entry ran above, while the
+	// lease and the reservation below belong to the successor's binding
+	// and a claim which diverges from the live state is never freed under
+	// a foreign lease
+	if successorLive {
+		return
 	}
 
 	// the owner check and the deletion run under one lock acquisition, so

@@ -1241,6 +1241,65 @@ func TestCleanupNetworkInterfaceSkipsSuccessorAllocationOnRetry(t *testing.T) {
 	}
 }
 
+// A04 regression: a successor lease is not proof that this nic's
+// bookkeeping completed. when the own ledger entry survived (a failed or
+// lost un-record of an earlier attempt, or a hand-edited record) while a
+// successor already serves the address, the cleanup must still un-record
+// the own orphan - otherwise it blocks the successor's own ledger write
+// forever and every registration re-pins the address to the ghost owner -
+// but never touch the successor's lease or reservation.
+func TestCleanupNetworkInterfaceUnrecordsOwnOrphanUnderSuccessorLease(t *testing.T) {
+	c, f := vmBehaviorNewTestController(t)
+
+	mac := "aa:bb:cc:00:00:01"
+	successorMac := "aa:bb:cc:00:00:02"
+	networkName := "default/net-a"
+	ip := "10.0.0.11"
+
+	// this nic's own ledger entry survived while its local state is gone
+	storePool(t, c, f, "pool-a", networkName, map[string]string{
+		ip: "ns1/vm1 [" + mac + "]",
+	})
+	// a successor vm already serves the address live
+	if err := c.dhcp.AddLease(successorMac, networkName, ip, "ns1/vm2"); err != nil {
+		t.Fatalf("successor lease: %v", err)
+	}
+	addSubnetWithOwnedIP(t, c.ipam, networkName, ip, "ns1/vm2 ["+successorMac+"]")
+
+	vmnetcfg := &kihv1.VirtualMachineNetworkConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: "vm1", Namespace: "ns1"},
+		Spec:       kihv1.VirtualMachineNetworkConfigSpec{VMName: "vm1"},
+	}
+	netCfg := testNetCfg(mac, networkName, ip)
+
+	if err := c.cleanupNetworkInterface(vmnetcfg, &netCfg); err != nil {
+		t.Fatalf("cleanup under a successor lease must converge: %v", err)
+	}
+
+	// the own orphan ledger entry is removed: the successor's pending
+	// ledger write can succeed and the registration re-pins nothing
+	pool := f.storedPool("pool-a")
+	if _, exists := pool.Status.IPv4.Allocated[ip]; exists {
+		t.Errorf("expected the own orphan entry removed, got %v", pool.Status.IPv4.Allocated)
+	}
+
+	// the successor's live state is untouched
+	if !c.dhcp.CheckLease(successorMac) {
+		t.Error("expected the successor's dhcp lease preserved")
+	}
+	if used := c.ipam.Used(networkName); used != 1 {
+		t.Errorf("expected the successor's ipam allocation preserved, used=%d", used)
+	}
+
+	// the replay converges without resurrecting anything
+	if err := c.cleanupNetworkInterface(vmnetcfg, &netCfg); err != nil {
+		t.Fatalf("retried cleanup: %v", err)
+	}
+	if _, exists := f.storedPool("pool-a").Status.IPv4.Allocated[ip]; exists {
+		t.Errorf("expected the replay to stay converged, got %v", f.storedPool("pool-a").Status.IPv4.Allocated)
+	}
+}
+
 // a mac reassigned to another vm must not be released by a cleanup: the
 // whole interface state belongs to the successor by then and the own
 // reservation is gone
