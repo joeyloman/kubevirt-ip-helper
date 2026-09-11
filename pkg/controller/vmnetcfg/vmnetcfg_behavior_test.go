@@ -398,7 +398,18 @@ func (f *fakeAPIServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	switch p[0] {
 	case "ippools":
 		if len(p) < 2 {
-			writeStatus(w, http.StatusNotFound, metav1.StatusReasonNotFound, "the server could not find the requested resource")
+			// the cluster-wide list serves the deletion-path pool
+			// verification: it decides whether a cache-missed pool is
+			// truly gone (its ledger died with it) or merely missed the
+			// cache
+			f.mu.Lock()
+			list := &kihv1.IPPoolList{}
+			for _, pool := range f.ippools {
+				list.Items = append(list.Items, *pool.DeepCopy())
+			}
+			f.mu.Unlock()
+			writeJSON(w, list)
+
 			return
 		}
 		name := p[1]

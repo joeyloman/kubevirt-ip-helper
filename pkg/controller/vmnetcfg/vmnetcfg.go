@@ -1127,12 +1127,49 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 		// immediate release on VM delete stays the documented behavior: the
 		// lease and the allocation are freed first and the finalizer retry
 		// re-runs the whole cleanup until the status entry converges
+
+		// the tuple of the own live lease is captured before the by-mac
+		// deletion: a quarantined allocation (a sync whose durable object
+		// update failed after the lease was already served) keeps its
+		// claim and its ledger record under a tuple which the present
+		// spec does not record anymore, and a nic which moved networks
+		// keeps its pre-move tuple in the lease - the by-mac deletion
+		// below would remove the last reference to that tuple while its
+		// claim and ledger entry survive the deletion of the object,
+		// orphaning the address for the rest of the era (no
+		// reconciliation ever iterates a tuple which neither the spec
+		// nor any lease records). a foreign lease is never captured: its
+		// tuple belongs to another owner. the captured tuple is cleaned
+		// through the same deleting flow below, owner-validated on every
+		// layer; the recursion cannot cycle, because each level consumed
+		// the lease it captured and a next level needs a concurrently
+		// re-created own lease with yet another tuple.
+		var capturedLease dhcp.DHCPLease
+		if lease := c.dhcp.GetLease(netCfg.MACAddress); lease.Reference == ref && lease.ClientIP != nil {
+			capturedLease = lease
+		}
+
 		if err := removeLease(); err != nil {
 			return err
 		}
 
 		if err := releaseAllocation(); err != nil {
 			return err
+		}
+
+		if capturedLease.ClientIP != nil &&
+			(capturedLease.PoolName != netCfg.NetworkName || capturedLease.ClientIP.String() != netCfg.IPAddress) {
+			log.Warnf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] the deleted lease of hwaddr %s served the unrecorded tuple (network %s, ip %s), releasing its reservations",
+				vmnetcfg.Namespace, vmnetcfg.Name, netCfg.MACAddress, capturedLease.PoolName, capturedLease.ClientIP.String())
+			c.metrics.UpdateLogStatus("warning")
+
+			if err := c.cleanupNetworkInterface(vmnetcfg, &kihv1.NetworkConfig{
+				MACAddress:  netCfg.MACAddress,
+				NetworkName: capturedLease.PoolName,
+				IPAddress:   capturedLease.ClientIP.String(),
+			}, true); err != nil {
+				return err
+			}
 		}
 	}
 
