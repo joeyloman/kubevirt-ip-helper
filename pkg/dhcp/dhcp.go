@@ -24,10 +24,18 @@ var (
 	// lease registered for a different owner reference.
 	ErrLeaseForeignOwner = errors.New("lease belongs to another owner")
 
+	// ErrLeaseIdentityMismatch reports a lease operation for the right
+	// hardware address and owner reference whose lease nevertheless serves
+	// a different binding identity (pool or client ip) than the caller
+	// established: a stale snapshot must not adopt or repair the state of
+	// a replacement lease which a concurrent writer registered for the
+	// same owner under another network or address.
+	ErrLeaseIdentityMismatch = errors.New("lease serves another binding identity")
+
 	// ErrLeaseInvalidHwAddr reports a lease operation for a hardware address
 	// which does not parse at all: no lease can ever carry this identity, so
-	// cleanup callers treat the deletion as converged instead of retrying
-	// forever.
+	// the operation converged and must not wedge a cleanup which can never
+	// succeed otherwise.
 	ErrLeaseInvalidHwAddr = errors.New("invalid hardware address")
 
 	// ErrServerAlreadyRunning reports a Run for a network the allocator
@@ -362,21 +370,26 @@ func (a *DHCPAllocator) DeleteLeaseOwnedBy(hwAddr string, ref string) (err error
 	return
 }
 
-// WithOwnedLease runs fn with the client ip of the lease only while the
-// lease still exists and references the given owner reference: the
-// validation and the callback run under one lock acquisition, so a
-// concurrent cleanup cannot remove the lease between the check and the
-// claim mutation fn performs (the adoption of the leased address into the
-// ipam allocator). the snapshot-based lease checks of a reconciliation
-// cannot provide this guarantee on their own - there is always a window
-// between an unsynchronized check and the allocator mutation.
+// WithOwnedLease runs fn only while the lease of the given hardware
+// address still matches the full binding identity - the owner reference,
+// the pool name and the client ip: the validation and the callback run
+// under one lock acquisition, so a concurrent cleanup cannot remove the
+// lease between the check and the claim mutation fn performs (the
+// adoption of the leased address into the ipam allocator), and a
+// concurrent writer cannot swap the lease for the same owner reference
+// under another network or address between the caller's snapshot and the
+// mutation. the snapshot-based lease checks of a reconciliation cannot
+// provide this guarantee on their own - there is always a window between
+// an unsynchronized check and the allocator mutation, and a stale
+// snapshot must never adopt the identity of a replacement lease it never
+// observed.
 //
 // fn must stay fast and in-memory: it runs while the dhcp allocator lock
 // is held, so it must not make network or kubernetes api calls, and it
 // must only acquire locks which are always taken after the dhcp lock. the
 // ipam allocator lock qualifies: nothing in this codebase takes the dhcp
 // lock while holding the ipam lock.
-func (a *DHCPAllocator) WithOwnedLease(hwAddr string, ref string, fn func(clientIP string) error) (err error) {
+func (a *DHCPAllocator) WithOwnedLease(hwAddr string, ref string, networkName string, clientIP string, fn func() error) (err error) {
 	hw, err := net.ParseMAC(hwAddr)
 	if err != nil {
 		return fmt.Errorf("hwaddr %s is not valid", hwAddr)
@@ -396,19 +409,50 @@ func (a *DHCPAllocator) WithOwnedLease(hwAddr string, ref string, fn func(client
 		return fmt.Errorf("%w: hwaddr %s is registered for %s", ErrLeaseForeignOwner, key, lease.Reference)
 	}
 
-	if lease.ClientIP == nil {
-		return fmt.Errorf("lease of hwaddr %s carries no client ip", key)
+	// the owner reference alone does not identify the state this snapshot
+	// verified: a replacement lease registered for the same owner under
+	// another pool or address must fail the guarded update visibly instead
+	// of letting the stale snapshot adopt or repair the identity it never
+	// observed. a lease without a client ip can never match a requested
+	// binding identity either (a stored lease always carries one).
+	if lease.PoolName != networkName || lease.ClientIP == nil || lease.ClientIP.String() != clientIP {
+		return fmt.Errorf("%w: hwaddr %s serves ip %s in network %s, want ip %s in network %s",
+			ErrLeaseIdentityMismatch, key, lease.ClientIP, lease.PoolName, clientIP, networkName)
 	}
 
-	clientIP := lease.ClientIP.String()
-
-	if err := fn(clientIP); err != nil {
+	if err := fn(); err != nil {
 		return fmt.Errorf("the guarded lease update of hwaddr %s failed: %w", key, err)
 	}
 
 	log.Debugf("(dhcp.WithOwnedLease) guarded lease update for hardware address: %s (%s)", key, ref)
 
 	return
+}
+
+// HasOwnedLease reports whether the lease of the given hardware address
+// exists and matches the full binding identity - the owner reference, the
+// pool name and the client ip - under one lock acquisition. it backs the
+// re-validation of a snapshot lease around a durable ownership write:
+// unlike the CheckLease/GetLease pair it cannot observe a torn state, and
+// unlike the reference-only comparison it detects a replacement lease
+// which a concurrent writer registered for the same owner reference under
+// another network or address.
+func (a *DHCPAllocator) HasOwnedLease(hwAddr string, ref string, networkName string, clientIP string) bool {
+	hw, err := net.ParseMAC(hwAddr)
+	if err != nil {
+		return false
+	}
+
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	lease, exists := a.leases[hw.String()]
+
+	return exists &&
+		lease.Reference == ref &&
+		lease.PoolName == networkName &&
+		lease.ClientIP != nil &&
+		lease.ClientIP.String() == clientIP
 }
 
 func (a *DHCPAllocator) Usage() {

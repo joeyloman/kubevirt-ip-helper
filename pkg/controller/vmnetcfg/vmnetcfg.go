@@ -525,19 +525,25 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 				// ownership record does.
 				ownerRef := util.AllocationRef(vmnetcfg.Namespace, vmnetcfg.Spec.VMName, v.MACAddress)
 				vmRef := fmt.Sprintf("%s/%s", vmnetcfg.Namespace, vmnetcfg.Spec.VMName)
-				adoptErr := c.dhcp.WithOwnedLease(v.MACAddress, vmRef, func(clientIP string) error {
-					return c.ipam.AdoptIP(v.NetworkName, clientIP, ownerRef)
+				adoptErr := c.dhcp.WithOwnedLease(v.MACAddress, vmRef, v.NetworkName, v.IPAddress, func() error {
+					return c.ipam.AdoptIP(v.NetworkName, v.IPAddress, ownerRef)
 				})
 				if adoptErr != nil {
-					if errors.Is(adoptErr, dhcp.ErrLeaseNotFound) || errors.Is(adoptErr, dhcp.ErrLeaseForeignOwner) {
-						// the lease vanished or was reassigned between the
-						// snapshot and the adoption: the nic is being
-						// removed by a concurrent cleanup. the guarded
-						// adopt recreated nothing, and a claim an earlier
-						// reconciliation of this binding left behind is
-						// released while it still carries this owner's
-						// reference, so the removed nic cannot keep the
-						// address blocked and a successor is never touched
+					if errors.Is(adoptErr, dhcp.ErrLeaseNotFound) || errors.Is(adoptErr, dhcp.ErrLeaseForeignOwner) || errors.Is(adoptErr, dhcp.ErrLeaseIdentityMismatch) {
+						// the lease vanished, was reassigned to another owner,
+						// or was replaced for the same owner under another
+						// network or address between the snapshot and the
+						// adoption: the state this snapshot verified is gone,
+						// so the nic is being reworked by a concurrent writer
+						// either way. the guarded adopt recreated nothing, and
+						// a claim an earlier reconciliation of this binding
+						// left behind is released while it still carries this
+						// owner's reference, so the removed nic cannot keep
+						// the address blocked, the replacement lease of the
+						// same owner is never adopted under the stale
+						// snapshot, and a successor is never touched - the
+						// retried sync observes the live identity and
+						// migrates it properly
 						log.Warnf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] the lease of hwaddr %s vanished before its address could be adopted, releasing the stale claim of the removed nic",
 							vmnetcfg.Namespace, vmnetcfg.Name, v.MACAddress)
 						c.metrics.UpdateLogStatus("warning")
@@ -581,17 +587,20 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 
 				// this reconciliation can still hold a stale snapshot whose
 				// nic is concurrently removed: the lease can vanish between
-				// the guarded adoption and this write. the repair must not
-				// resurrect ownership state which the raced cleanup removes,
-				// so the lease is re-validated immediately before the write
-				// and the record is verified again afterwards: a vanished
-				// lease skips the repair and releases the stale claim, and a
-				// lease which vanishes between the write and the
-				// verification is undone by the owner-validated compensating
-				// delete and release (a meanwhile recorded foreign owner or
-				// a successor's allocation is never clobbered - the own
-				// reference only removes the own state).
-				if !c.dhcp.CheckLease(v.MACAddress) || c.dhcp.GetLease(v.MACAddress).Reference != vmRef {
+				// the guarded adoption and this write, or a concurrent writer
+				// can replace it for the same owner reference under another
+				// network or address. the repair must not resurrect ownership
+				// state which the raced cleanup removes, and it must not
+				// confirm the identity of a replacement lease the snapshot
+				// never observed, so the full binding identity is re-validated
+				// immediately before the write and verified again afterwards:
+				// a vanished or replaced lease skips the repair and releases
+				// the stale claim, and a lease which changes between the write
+				// and the verification is undone by the owner-validated
+				// compensating delete and release (a meanwhile recorded
+				// foreign owner or a successor's allocation is never clobbered
+				// - the own reference only removes the own state).
+				if !c.dhcp.HasOwnedLease(v.MACAddress, vmRef, v.NetworkName, v.IPAddress) {
 					log.Warnf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] the lease of hwaddr %s vanished during the ownership repair, skipping it and releasing the stale claim of the removed nic",
 						vmnetcfg.Namespace, vmnetcfg.Name, v.MACAddress)
 					c.metrics.UpdateLogStatus("warning")
@@ -619,11 +628,12 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 				}
 
 				if repairErr == nil &&
-					(!c.dhcp.CheckLease(v.MACAddress) || c.dhcp.GetLease(v.MACAddress).Reference != vmRef) {
-					// the cleanup of the vm controller removed the lease
-					// between the repair decision and the durable write:
-					// undo the resurrected ownership record before it
-					// blocks the address for a later binding
+					!c.dhcp.HasOwnedLease(v.MACAddress, vmRef, v.NetworkName, v.IPAddress) {
+					// the concurrent cleanup removed the lease, or a
+					// concurrent writer replaced it for the same owner under
+					// another identity, between the repair decision and the
+					// durable write: undo the resurrected ownership record
+					// before it blocks the address for a later binding
 					log.Warnf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] the lease of hwaddr %s was removed by a concurrent cleanup during the ownership repair, undoing the record",
 						vmnetcfg.Namespace, vmnetcfg.Name, v.MACAddress)
 					c.metrics.UpdateLogStatus("warning")

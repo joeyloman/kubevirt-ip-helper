@@ -92,6 +92,56 @@ func TestRepairDoesNotResurrectAfterRacedCleanup(t *testing.T) {
 	}
 }
 
+// TestRepairDoesNotResurrectAfterSameRefIdentitySwap: between the repair
+// decision and the record write a concurrent writer replaces the lease of
+// the same owner reference under another network and address (the
+// duplicate-object window of the four-part lease identity). a
+// reference-only post-check would treat the replacement as the verified
+// lease and keep the resurrected record; the full identity check must
+// undo the record of the stale identity and release its claim while the
+// replacement lease is never touched.
+func TestRepairDoesNotResurrectAfterSameRefIdentitySwap(t *testing.T) {
+	e := repairRaceSetup(t)
+	vmnetcfg := newVMNetCfg("10.0.0.1", testMAC)
+
+	// the replacement lands on the pool status GET inside the repair,
+	// after the pre-check validated the original identity
+	var hooked atomic.Bool
+	e.api.poolGetHook = func() {
+		if !hooked.CompareAndSwap(false, true) {
+			return
+		}
+
+		_ = e.dhcp.DeleteLeaseOwnedBy(testMAC, legacyVMRef)
+		_ = e.dhcp.AddLease(testMAC, "net-swapped", "10.0.0.9", legacyVMRef)
+	}
+
+	if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, vmnetcfg); err != nil {
+		t.Fatalf("the raced repair must converge instead of sticking an error: %s", err)
+	}
+
+	// the replacement lease of the same owner survives untouched
+	lease := e.dhcp.GetLease(testMAC)
+	if lease.PoolName != "net-swapped" || lease.ClientIP.String() != "10.0.0.9" {
+		t.Errorf("the replacement lease = network %s ip %s, want net-swapped/10.0.0.9 untouched",
+			lease.PoolName, lease.ClientIP)
+	}
+
+	// the resurrected record of the stale identity is undone
+	if pool := e.getStoredPool(); len(pool.Status.IPv4.Allocated) != 0 {
+		t.Errorf("pool status = %v, want the resurrected record undone", pool.Status.IPv4.Allocated)
+	}
+
+	// the stale claim is released: the old address is reissuable while
+	// the replacement keeps serving its own identity
+	if used := e.ipam.Used(testNetwork); used != 0 {
+		t.Errorf("ipam used = %d, want 0 after the identity swap", used)
+	}
+	if _, err := e.ipam.GetIP(testNetwork, "10.0.0.1"); err != nil {
+		t.Errorf("the freed address must be reissuable after the compensating delete: %s", err)
+	}
+}
+
 // TestRacedCleanupWithFailedStatusDeleteIsCompensated: the raced cleanup
 // releases the lease and the address but its own status delete fails - the
 // resurrected record is on this reconciliation, and the compensating delete

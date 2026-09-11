@@ -683,28 +683,31 @@ func TestDeleteLeaseOwnedBy(t *testing.T) {
 }
 
 // The guarded lease update runs its callback only while the lease still
-// exists and references the given owner: a concurrent cleanup cannot slip
-// between the validation and the callback's allocator mutation.
+// matches the full binding identity - the owner reference, the pool name
+// and the client ip: a concurrent cleanup cannot slip between the
+// validation and the callback's allocator mutation, and a replacement
+// lease registered for the same owner under another network or address
+// never reaches the callback of a stale snapshot.
 func TestWithOwnedLease(t *testing.T) {
 	a := New()
 	if err := a.AddLease("aa:bb:cc:dd:ee:01", "pool1", "192.168.0.50", "ns1/vm1"); err != nil {
 		t.Fatalf("AddLease: %v", err)
 	}
 
-	var seenIP string
-	if err := a.WithOwnedLease("aa-bb-cc-dd-ee-01", "ns1/vm1", func(clientIP string) error {
-		seenIP = clientIP
+	called := false
+	if err := a.WithOwnedLease("aa-bb-cc-dd-ee-01", "ns1/vm1", "pool1", "192.168.0.50", func() error {
+		called = true
 		return nil
 	}); err != nil {
 		t.Fatalf("WithOwnedLease: %v", err)
 	}
-	if seenIP != "192.168.0.50" {
-		t.Errorf("callback ip = %q, want the lease's client ip", seenIP)
+	if !called {
+		t.Error("the callback must run for the matching identity")
 	}
 
 	// a foreign owner reference never reaches the callback
-	called := false
-	if err := a.WithOwnedLease("aa:bb:cc:dd:ee:01", "ns1/other-vm", func(clientIP string) error {
+	called = false
+	if err := a.WithOwnedLease("aa:bb:cc:dd:ee:01", "ns1/other-vm", "pool1", "192.168.0.50", func() error {
 		called = true
 		return nil
 	}); !errors.Is(err, ErrLeaseForeignOwner) {
@@ -714,11 +717,39 @@ func TestWithOwnedLease(t *testing.T) {
 		t.Error("the callback must not run for a foreign owner")
 	}
 
+	// a lease of the right owner which serves another network never
+	// reaches the callback: the stale snapshot must not adopt the
+	// identity of a replacement lease
+	called = false
+	if err := a.WithOwnedLease("aa:bb:cc:dd:ee:01", "ns1/vm1", "pool-other", "192.168.0.50", func() error {
+		called = true
+		return nil
+	}); !errors.Is(err, ErrLeaseIdentityMismatch) {
+		t.Errorf("wrong-pool guard = %v, want ErrLeaseIdentityMismatch", err)
+	}
+	if called {
+		t.Error("the callback must not run for a replacement lease of another network")
+	}
+
+	// a lease of the right owner which serves another address never
+	// reaches the callback either
+	called = false
+	if err := a.WithOwnedLease("aa:bb:cc:dd:ee:01", "ns1/vm1", "pool1", "192.168.0.99", func() error {
+		called = true
+		return nil
+	}); !errors.Is(err, ErrLeaseIdentityMismatch) {
+		t.Errorf("wrong-ip guard = %v, want ErrLeaseIdentityMismatch", err)
+	}
+	if called {
+		t.Error("the callback must not run for a replacement lease of another address")
+	}
+
 	// a vanished lease never reaches the callback
 	if err := a.DeleteLeaseOwnedBy("aa:bb:cc:dd:ee:01", "ns1/vm1"); err != nil {
 		t.Fatalf("DeleteLeaseOwnedBy: %v", err)
 	}
-	if err := a.WithOwnedLease("aa:bb:cc:dd:ee:01", "ns1/vm1", func(clientIP string) error {
+	called = false
+	if err := a.WithOwnedLease("aa:bb:cc:dd:ee:01", "ns1/vm1", "pool1", "192.168.0.50", func() error {
 		called = true
 		return nil
 	}); !errors.Is(err, ErrLeaseNotFound) {
@@ -729,8 +760,50 @@ func TestWithOwnedLease(t *testing.T) {
 	}
 
 	// an invalid macaddress is rejected before the lock
-	if err := a.WithOwnedLease("not-a-mac", "ns1/vm1", func(clientIP string) error { return nil }); err == nil {
+	if err := a.WithOwnedLease("not-a-mac", "ns1/vm1", "pool1", "192.168.0.50", func() error { return nil }); err == nil {
 		t.Error("an invalid macaddress must fail the guarded update")
+	}
+}
+
+// The single-snapshot identity check backs the re-validation of a
+// snapshot lease around a durable ownership write: it must accept the
+// full four-part identity and reject every divergence of one part -
+// including a replacement lease of the same owner reference.
+func TestHasOwnedLease(t *testing.T) {
+	a := New()
+	if err := a.AddLease("aa:bb:cc:dd:ee:01", "pool1", "192.168.0.50", "ns1/vm1"); err != nil {
+		t.Fatalf("AddLease: %v", err)
+	}
+
+	if !a.HasOwnedLease("aa:bb:cc:dd:ee:01", "ns1/vm1", "pool1", "192.168.0.50") {
+		t.Error("the matching identity must be reported as owned")
+	}
+	if a.HasOwnedLease("aa:bb:cc:dd:ee:01", "ns1/other-vm", "pool1", "192.168.0.50") {
+		t.Error("a foreign owner reference must not match")
+	}
+	if a.HasOwnedLease("aa:bb:cc:dd:ee:01", "ns1/vm1", "pool-other", "192.168.0.50") {
+		t.Error("another network must not match")
+	}
+	if a.HasOwnedLease("aa:bb:cc:dd:ee:01", "ns1/vm1", "pool1", "192.168.0.99") {
+		t.Error("another client ip must not match")
+	}
+	if a.HasOwnedLease("aa:bb:cc:dd:ee:01", "ns1/vm1", "pool1", "") {
+		t.Error("an empty client ip must not match")
+	}
+	// the hyphen spelling canonicalizes to the same lease key, like every
+	// other lease operation
+	if !a.HasOwnedLease("aa-bb-cc-dd-ee-01", "ns1/vm1", "pool1", "192.168.0.50") {
+		t.Error("a legacy mac spelling must match the canonical lease key")
+	}
+
+	if err := a.DeleteLeaseOwnedBy("aa:bb:cc:dd:ee:01", "ns1/vm1"); err != nil {
+		t.Fatalf("DeleteLeaseOwnedBy: %v", err)
+	}
+	if a.HasOwnedLease("aa:bb:cc:dd:ee:01", "ns1/vm1", "pool1", "192.168.0.50") {
+		t.Error("a vanished lease must not match")
+	}
+	if a.HasOwnedLease("not-a-mac", "ns1/vm1", "pool1", "192.168.0.50") {
+		t.Error("an invalid macaddress must not match")
 	}
 }
 
@@ -743,7 +816,7 @@ func TestWithOwnedLeasePropagatesTheCallbackError(t *testing.T) {
 	}
 
 	sentinel := errors.New("boom")
-	if err := a.WithOwnedLease("aa:bb:cc:dd:ee:01", "ns1/vm1", func(clientIP string) error {
+	if err := a.WithOwnedLease("aa:bb:cc:dd:ee:01", "ns1/vm1", "pool1", "192.168.0.50", func() error {
 		return sentinel
 	}); !errors.Is(err, sentinel) {
 		t.Errorf("callback error = %v, want the wrapped sentinel", err)
