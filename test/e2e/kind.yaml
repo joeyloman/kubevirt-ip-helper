@@ -1,5 +1,5 @@
-# Disposable kind cluster for the kubevirt-ip-helper E2E suite: one
-# control-plane plus one worker.
+# Disposable kind cluster: one control-plane and two workers. bootstrap.sh
+# connects all three nodes to the isolated shared test data networks.
 #
 # The node image is intentionally not set here: bootstrap.sh passes the
 # digest-pinned ${KINDEST_NODE_IMAGE} from versions.env with
@@ -7,10 +7,10 @@
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 nodes:
-  # The worker hosts helper and guest data-plane workloads. The separate
-  # control-plane proves bootstrap and every CNI layer across both node roles;
-  # the secondary bridge itself remains node-local.
+  # Data-plane workloads use the normal worker scheduling policy. Test gateway
+  # and DNS infrastructure live on the control-plane, outside worker faults.
   - role: control-plane
+  - role: worker
   - role: worker
 networking:
   # kindnet stays the delegate CNI. Multus is installed as the master plugin on

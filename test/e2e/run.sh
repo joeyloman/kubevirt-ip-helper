@@ -61,7 +61,7 @@ fi
 report_note PROFILE "stack ${E2E_STACK}, group ${E2E_GROUP}, cluster ${E2E_CLUSTER_NAME}"
 report_group core
 export E2E_STACK E2E_CLUSTER_NAME E2E_IMAGE E2E_KEEP_CLUSTER E2E_CACHE_DIR E2E_BIN_DIR
-export E2E_ARTIFACTS_DIR VIRTCTL
+export E2E_ARTIFACTS_DIR E2E_RUN_ID VIRTCTL
 export KUBECONFIG="${KUBECONFIG:-${E2E_ARTIFACTS_DIR}/kubeconfig}"
 E2E_CLUSTER_STATE_FILE="${E2E_ARTIFACTS_DIR}/cluster-state"
 export E2E_CLUSTER_STATE_FILE
@@ -86,6 +86,34 @@ CONSOLE_PID=""
 CONSOLE_FEEDER_PID=""
 CONSOLE_FIFO=""
 CLUSTER_STATE=""
+PREDICATE_PID=""
+PREDICATE_WATCHDOG_PID=""
+declare -A CAPTURE_PIDS=() CAPTURE_PODS=() CAPTURE_FILES=() CAPTURE_TOKENS=()
+GUEST_CONSOLE=""
+GUEST_EVENTS=""
+GUEST_EXPECTED=""
+GUEST_IDENTITY=""
+GUEST_BASELINE=""
+GUEST_BASELINE_INDEX=-1
+GUEST_NODE=""
+GUEST_DEADLINE=0
+STOPPED_WORKER=""
+STOPPED_WORKER_ID=""
+SCENARIO_DEADLINE=0
+RELOAD_MARKER='IPPool configuration changes detected, updating the dhcppool'
+REINIT_MARKER='starting application reinitialization'
+
+# Bound direct API calls too. Poll predicates inherit their shorter process-
+# group deadline; explicit long-lived captures use their own outer timeout.
+kubectl() {
+  local budget="${E2E_WAIT_TIMEOUT}" remaining
+  if [ "${SCENARIO_DEADLINE}" -gt 0 ]; then
+    remaining=$((SCENARIO_DEADLINE - SECONDS))
+    [ "${remaining}" -gt 0 ] || return 124
+    [ "${budget}" -le "${remaining}" ] || budget="${remaining}"
+  fi
+  timeout --foreground --kill-after=1s "${budget}s" kubectl "$@"
+}
 
 log() { printf '[e2e] %s\n' "$*"; }
 die() {
@@ -171,28 +199,72 @@ keep_cluster() {
   esac
 }
 
+remove_owned_data_network() { # <name>, only after successful owned-cluster deletion
+  local name="$1" names object id
+  names="$(timeout 20s "${RUNTIME}" network ls --format '{{.Name}}')" || return 1
+  grep -Fxq -- "${name}" <<< "${names}" || return 0
+  object="$(timeout 20s "${RUNTIME}" network inspect "${name}")" || return 1
+  printf '%s\n' "${object}" > "${E2E_ARTIFACTS_DIR}/network-cleanup-${name}.json"
+  id="$(jq -er --arg name "${name}" --arg label "${KIH_RUNTIME_NETWORK_OWNER_LABEL}" \
+    --arg owner "${E2E_CLUSTER_NAME}" '
+    select(length == 1) | .[0]
+    | select((.Name // .name) == $name and ((.Labels // .labels)[$label]) == $owner)
+    | (.Id // .id) | select(type == "string" and test("^[0-9a-f]{64}$"))
+  ' <<< "${object}")" || return 1
+  # Immutable identity avoids deleting a replacement with the same name.
+  # Plain removal refuses a network still used by another endpoint.
+  timeout 20s "${RUNTIME}" network rm "${id}"
+}
+
+worker_record() { # <node>
+  local object
+  object="$(timeout 20s "${RUNTIME}" inspect "$1")" || return 1
+  jq -ce --arg name "$1" --arg cluster "${E2E_CLUSTER_NAME}" '
+    select(length == 1) | .[0]
+    | select((.Name | ltrimstr("/")) == $name
+      and .Config.Labels["io.x-k8s.kind.cluster"] == $cluster)
+    | {id:(.Id // .ID), running:.State.Running}
+    | select((.id|type) == "string" and (.id|test("^[0-9a-f]{64}$"))
+      and (.running|type) == "boolean")
+  ' <<< "${object}"
+}
+
+restore_stopped_worker() { # <absolute SECONDS deadline>
+  local remaining object
+  [ -n "${STOPPED_WORKER}" ] || return 0
+  object="$(worker_record "${STOPPED_WORKER}")" || return 1
+  [ "$(jq -r '.id' <<< "${object}")" = "${STOPPED_WORKER_ID}" ] || return 1
+  remaining=$(($1 - SECONDS))
+  [ "${remaining}" -gt 0 ] || return 1
+  timeout --kill-after=1s "${remaining}s" "${RUNTIME}" start "${STOPPED_WORKER_ID}" || return 1
+  remaining=$(($1 - SECONDS))
+  [ "${remaining}" -gt 0 ] || return 1
+  E2E_RUNTIME="${RUNTIME}" timeout --kill-after=1s "${remaining}s" \
+    "${E2E_DIR}/bootstrap.sh" restore-node-networks "${STOPPED_WORKER}"
+}
+
 finish() {
-  local rc=$? collection_rc=0 report_rc=0 diagnostic_errors cleanup_rc=0
+  local rc=$? collection_rc=0 report_rc=0 diagnostic_errors cleanup_rc=0 network
   trap - EXIT
   trap '' INT TERM HUP
   set +e
-  # Any assertion-failure path that bypasses the success-path teardown in
-  # start_guest_and_assert can still have the console capture running; the
-  # kill -0 guards touch only still-live pids, and clearing the globals
-  # keeps this a single effective teardown even if the trap sequence runs
-  # once more after a signal.
-  if [ -n "${CONSOLE_PID}" ] && kill -0 "${CONSOLE_PID}" > /dev/null 2>&1; then
-    kill "${CONSOLE_PID}" > /dev/null 2>&1 || true
+  stop_predicate_attempt
+  SCENARIO_DEADLINE=0
+  if ! finish_guest_evidence "$((SECONDS + E2E_COLLECT_TOTAL_TIMEOUT))"; then
+    report_case_start SUITE-GUEST-EVIDENCE "guest recorders stopped and captures decoded completely"
+    report_case_fail "a recorder could not be stopped or its final capture was incomplete"
+    rc=1
   fi
-  if [ -n "${CONSOLE_FEEDER_PID}" ] && kill -0 "${CONSOLE_FEEDER_PID}" > /dev/null 2>&1; then
-    kill "${CONSOLE_FEEDER_PID}" > /dev/null 2>&1 || true
+  if [ -n "${STOPPED_WORKER}" ]; then
+    report_case_start SUITE-WORKER-RECOVERY "intentionally stopped worker restored before diagnostics"
+    if restore_stopped_worker "$((SECONDS + E2E_COLLECT_TOTAL_TIMEOUT))"; then
+      report_case_pass "worker ${STOPPED_WORKER} and both test uplinks restored"
+      STOPPED_WORKER="" STOPPED_WORKER_ID=""
+    else
+      report_case_fail "could not restore ${STOPPED_WORKER}; retained for diagnosis"
+      rc=1
+    fi
   fi
-  if [ -n "${CONSOLE_FIFO}" ] && [ -e "${CONSOLE_FIFO}" ]; then
-    rm -f "${CONSOLE_FIFO}"
-  fi
-  CONSOLE_PID=""
-  CONSOLE_FEEDER_PID=""
-  CONSOLE_FIFO=""
   if [ -s "${E2E_CLUSTER_STATE_FILE}" ]; then
     CLUSTER_STATE="$(cat "${E2E_CLUSTER_STATE_FILE}")"
   fi
@@ -243,6 +315,16 @@ finish() {
         report_case_fail "kind binary unavailable; owned cluster retained for diagnosis"
       fi
       rc=1
+    else
+      for network in "${KIH_DATA_NETWORK}" "${KIH_SECOND_DATA_NETWORK}"; do
+        report_case_start "SUITE-NETWORK-CLEANUP-${network}" "owned test network removed after cluster deletion"
+        if remove_owned_data_network "${network}"; then
+          report_case_pass "${network} absent"
+        else
+          report_case_fail "network identity/ownership check or non-forced removal failed: ${network}"
+          rc=1
+        fi
+      done
     fi
   elif [ "${CLUSTER_STATE}" = "reused" ]; then
     log "left pre-existing cluster ${E2E_CLUSTER_NAME} in place"
@@ -299,93 +381,87 @@ trap 'on_signal INT 130' INT
 trap 'on_signal TERM 143' TERM
 trap 'on_signal HUP 129' HUP
 
-# Runs one predicate under a hard per-attempt cap so a single wedged
-# kubectl/exec cannot consume the whole loop budget: the predicate runs in a
-# background subshell, a sleep-based watchdog SIGTERMs it once <seconds> are
-# gone (default E2E_PRED_SECONDS), and the wrapper returns the subshell's
-# status (143 when the watchdog fired, which polling treats as a plain
-# failure). Subshells inherit shell functions, so function predicates work
-# unchanged. A kubectl child the killed subshell strands is bounded by the
-# run's existing EXIT-trap cleanup of stray processes.
+# Predicates run in their own process group. A successful leader observation
+# crosses that boundary as validated data, never as sourced shell code.
+stop_predicate_attempt() {
+  local pid
+  for pid in "${PREDICATE_PID:-}" "${PREDICATE_WATCHDOG_PID:-}"; do
+    [ -n "${pid}" ] || continue
+    kill -KILL -- "-${pid}" > /dev/null 2>&1 || true
+    wait "${pid}" > /dev/null 2>&1 || true
+  done
+  PREDICATE_PID=""
+  PREDICATE_WATCHDOG_PID=""
+}
+
 run_pred_once() { # <seconds> <predicate> [args...]
-  local guard="$1" rc=0
+  local guard="$1" rc=0 monitor_was_on="" pod holder extra
+  local PREDICATE_LEADER_STATE="${E2E_ARTIFACTS_DIR}/predicate-leader.tsv"
   shift
+  [ "${guard}" -gt 0 ] || return 124
+  rm -f "${PREDICATE_LEADER_STATE}"
+  case $- in *m*) monitor_was_on=1 ;; esac
+  set -m
   ( "$@" ) &
-  local pred_pid=$!
-  ( sleep "${guard}" && kill "${pred_pid}" ) &
-  local guard_pid=$!
-  wait "${pred_pid}" || rc=$?
-  kill "${guard_pid}" > /dev/null 2>&1 || true
-  wait "${guard_pid}" > /dev/null 2>&1 || true
+  PREDICATE_PID=$!
+  (
+    sleep "${guard}"
+    kill -KILL -- "-${PREDICATE_PID}" > /dev/null 2>&1 || true
+  ) &
+  PREDICATE_WATCHDOG_PID=$!
+  [ -n "${monitor_was_on}" ] || set +m
+  wait "${PREDICATE_PID}" || rc=$?
+  stop_predicate_attempt
+  if [ "${rc}" -eq 0 ] && [ -e "${PREDICATE_LEADER_STATE}" ]; then
+    IFS=$'\t' read -r pod holder extra < "${PREDICATE_LEADER_STATE}" || return 1
+    [[ "${pod}" =~ ^[a-z0-9][a-z0-9.-]*$ ]] || return 1
+    [[ "${holder}" =~ ^[0-9a-f-]+$ ]] || return 1
+    [ -z "${extra}" ] && [ "$(wc -l < "${PREDICATE_LEADER_STATE}")" -eq 1 ] || return 1
+    LEADER_POD="${pod}"
+    LEADER_ID="${holder}"
+  fi
+  rm -f "${PREDICATE_LEADER_STATE}"
   return "${rc}"
 }
 
-wait_for() { # <case-id> <seconds> <description> <predicate> [args...]
-  local case_id="$1" timeout="$2" description="$3" start rc=0
+wait_until() { # <case-id> <absolute SECONDS> <description> <predicate> [args...]
+  local case_id="$1" deadline="$2" description="$3" start="${SECONDS}" remaining attempt rc nap
   shift 3
-  start="${SECONDS}"
-  local deadline=$((SECONDS + timeout))
   report_case_start "${case_id}" "${description}"
   while [ "${SECONDS}" -lt "${deadline}" ]; do
-    # rc is captured from run_pred_once directly: an `if <cmd>; then ... fi`
-    # with no else resets $? to 0 on the false branch, which would silently
-    # downgrade a predicate exit code 2 (ownership-regression symptom) to a plain failure.
-    run_pred_once "${E2E_PRED_SECONDS}" "$@" && rc=0 || rc=$?
-    if [ "${rc}" -eq 0 ]; then
-      if [ "${SECONDS}" -lt "${deadline}" ]; then
-        log "ok: ${description}"
-        report_case_pass "satisfied $((SECONDS - start))s after the first attempt"
-        return 0
-      fi
-      break
-    fi
+    remaining=$((deadline - SECONDS))
+    attempt="${E2E_PRED_SECONDS}"
+    [ "${attempt}" -le "${remaining}" ] || attempt="${remaining}"
+    run_pred_once "${attempt}" "$@" && rc=0 || rc=$?
     if [ "${rc}" -eq 2 ]; then
-      die "${description}: owner DHCP lease missing after duplicate-config cleanup (ownership regression signature)"
+      die "${description}: owner DHCP lease missing after duplicate deletion (ownership regression signature)"
     fi
-    sleep 2
-  done
-  # One final probe outside the watchdog at the deadline: a predicate that
-  # only needs one more event can still pass, and the pass then carries the
-  # grace detail instead of a timeout. The rc is captured the same way as in
-  # the polling loop so an exit code 2 ownership-regression symptom still
-  # reports its attribution message rather than a generic timeout.
-  "$@" && rc=0 || rc=$?
-  if [ "${rc}" -eq 0 ]; then
-    log "ok: ${description}"
-    report_case_pass "satisfied via grace probe at the ${timeout}s deadline"
-    return 0
-  fi
-  if [ "${rc}" -eq 2 ]; then
-    die "${description}: owner DHCP lease missing after duplicate-config cleanup (ownership regression signature)"
-  fi
-  die "timed out after ${timeout}s: ${description}"
-}
-
-wait_before_deadline() { # <case-id> <absolute SECONDS> <maximum seconds> <description> <predicate> [args...]
-  local case_id="$1" deadline="$2" maximum="$3" description="$4" remaining rc=0 start window
-  shift 4
-  report_case_start "${case_id}" "${description}"
-  remaining=$((deadline - SECONDS))
-  [ "${remaining}" -gt 0 ] ||
-    die "deadline expired before ${description}"
-  [ "${remaining}" -le "${maximum}" ] || remaining="${maximum}"
-  start="${SECONDS}"
-  window=$((start + remaining))
-  # The per-attempt watchdog applies here too, but never a grace probe:
-  # absolute deadlines are window contracts and must not pass after expiry.
-  while [ "${SECONDS}" -lt "${window}" ]; do
-    run_pred_once "${E2E_PRED_SECONDS}" "$@" && rc=0 || rc=$?
-    if [ "${rc}" -eq 0 ]; then
+    if [ "${rc}" -eq 0 ] && [ "${SECONDS}" -lt "${deadline}" ]; then
       log "ok: ${description}"
       report_case_pass "satisfied $((SECONDS - start))s after the first attempt"
       return 0
     fi
-    if [ "${rc}" -eq 2 ]; then
-      die "${description}: owner DHCP lease missing after duplicate-config cleanup (ownership regression signature)"
-    fi
-    sleep 2
+    remaining=$((deadline - SECONDS))
+    [ "${remaining}" -gt 0 ] || break
+    nap=2
+    [ "${nap}" -le "${remaining}" ] || nap="${remaining}"
+    sleep "${nap}"
   done
-  die "timed out after ${remaining}s: ${description}"
+  die "deadline expired: ${description}"
+}
+
+wait_for() { # <case-id> <seconds> <description> <predicate> [args...]
+  local case_id="$1" seconds="$2" description="$3"
+  shift 3
+  wait_until "${case_id}" "$((SECONDS + seconds))" "${description}" "$@"
+}
+
+wait_before_deadline() { # <case-id> <absolute SECONDS> <maximum seconds> <description> <predicate> [args...]
+  local case_id="$1" deadline="$2" maximum="$3" description="$4" window
+  shift 4
+  window=$((SECONDS + maximum))
+  [ "${window}" -le "${deadline}" ] || window="${deadline}"
+  wait_until "${case_id}" "${window}" "${description}" "$@"
 }
 
 resolve_runtime() {
@@ -397,9 +473,11 @@ resolve_runtime() {
   else
     die "no usable Docker or Podman runtime is available"
   fi
-  command -v kubectl > /dev/null 2>&1 || die "kubectl is required"
+  type -P kubectl > /dev/null 2>&1 || die "kubectl is required"
   command -v timeout > /dev/null 2>&1 || die "GNU timeout is required"
   command -v jq > /dev/null 2>&1 || die "jq is required for reports and evidence"
+  command -v python3 > /dev/null 2>&1 || die "Python 3 is required for passive DHCP evidence"
+  export E2E_RUNTIME="${RUNTIME}"
 }
 
 helper_pods_ready() {
@@ -498,45 +576,72 @@ leader_consistent() {
   pods="$(current_leader_pod)" || return 1
   LEADER_POD="${pods}"
   holder="$(kubectl -n "${KIH_HELPER_NAMESPACE}" get lease "${LEADER_LEASE}" \
-    -o jsonpath='{.spec.holderIdentity}' 2> /dev/null)"
+    -o jsonpath='{.spec.holderIdentity}' 2> /dev/null)" || return 1
   [ -n "${holder}" ] || return 1
   generated="$(kubectl -n "${KIH_HELPER_NAMESPACE}" logs "${LEADER_POD}" 2> /dev/null |
-    grep -oE 'generated leader id: [0-9a-f-]+' | awk '{print $4}' | tail -n 1)"
+    grep -oE 'generated leader id: [0-9a-f-]+' | awk '{print $4}' | tail -n 1)" || return 1
   [ "${generated}" = "${holder}" ] || return 1
   endpoint_ips="$(kubectl -n "${KIH_HELPER_NAMESPACE}" get endpoints "${METRICS_SERVICE}" \
-    -o jsonpath='{.subsets[*].addresses[*].ip}' 2> /dev/null)"
+    -o jsonpath='{.subsets[*].addresses[*].ip}' 2> /dev/null)" || return 1
   read -r -a endpoint_addresses <<< "${endpoint_ips}"
   [ "${#endpoint_addresses[@]}" -eq 1 ] || return 1
   pod_ip="$(kubectl -n "${KIH_HELPER_NAMESPACE}" get pod "${LEADER_POD}" \
-    -o jsonpath='{.status.podIP}' 2> /dev/null)"
+    -o jsonpath='{.status.podIP}' 2> /dev/null)" || return 1
   [ "${endpoint_addresses[0]}" = "${pod_ip}" ] || return 1
   LEADER_ID="${holder}"
+  if [ -n "${PREDICATE_LEADER_STATE:-}" ]; then
+    printf '%s\t%s\n' "${LEADER_POD}" "${LEADER_ID}" > "${PREDICATE_LEADER_STATE}" || return 1
+  fi
+  return 0
+}
+
+# Read one initialized API object. Both counters and the empty allocation map
+# use omitempty in the production API; an absent key is not a failed GET.
+pool_snapshot() { # <pool> -> validated {used,available,allocated,capacity}
+  local object
+  object="$(kubectl get ippool "$1" -o json)" || return 1
+  jq -ce '
+    def count_value($key):
+      (if has($key) then .[$key] else 0 end)
+      | if type == "number" and . >= 0 and . == floor then .
+        else error("invalid IPPool counter") end;
+    def ip_number:
+      if type != "string" then error("invalid IPPool address") else . end
+      | split(".")
+      | if length != 4 or any(.[]; test("^[0-9]+$") | not)
+        then error("invalid IPPool address") else map(tonumber) end
+      | if any(.[]; . < 0 or . > 255) then error("invalid IPPool address") else . end
+      | .[0] * 16777216 + .[1] * 65536 + .[2] * 256 + .[3];
+    if (.status.lastupdate | type) != "string" or .status.lastupdate == ""
+       or (.status.ipv4 | type) != "object"
+    then error("IPPool has not initialized") else . end
+    | (.spec.ipv4config.pool.start | ip_number) as $start
+    | (.spec.ipv4config.pool.end | ip_number) as $end
+    | if $end < $start then error("invalid IPPool range") else . end
+    | .status.ipv4
+    | (count_value("used")) as $used
+    | (count_value("available")) as $available
+    | (if has("allocated") then .allocated else {} end) as $allocated
+    | if ($allocated | type) != "object" or any($allocated[]; type != "string")
+         or any($allocated | keys[];
+           (ip_number) as $address | $address < $start or $address > $end)
+         or ($allocated | length) != $used or $used + $available != $end - $start + 1
+      then error("IPPool accounting disagrees")
+      else {used:$used, available:$available, allocated:$allocated, capacity:($end-$start+1)} end
+  ' <<< "${object}"
 }
 
 pool_initialized() {
-  local last used available capacity
-  last="$(kubectl get ippool "${KIH_IPPOOL_NAME}" -o jsonpath='{.status.lastupdate}' 2> /dev/null)"
-  used="$(kubectl get ippool "${KIH_IPPOOL_NAME}" -o jsonpath='{.status.ipv4.used}' 2> /dev/null)"
-  available="$(kubectl get ippool "${KIH_IPPOOL_NAME}" -o jsonpath='{.status.ipv4.available}' 2> /dev/null)"
-  # used is strictly required and must be exactly zero; missing or empty
-  # fails. available is normalized: absent means an exhausted pool (0) and
-  # must then equal the capacity derived from the spec pool range.
-  case "${used}" in '' | *[!0-9]*) return 1 ;; esac
-  [ "${used}" -eq 0 ] || return 1
-  [ -n "${available}" ] || available=0
-  case "${available}" in '' | *[!0-9]*) return 1 ;; esac
-  capacity="$(capacity_from_spec "${KIH_IPPOOL_NAME}")" || return 1
-  [ -n "${last}" ] && [ "${available}" -eq "${capacity}" ]
+  local snapshot
+  snapshot="$(pool_snapshot "${KIH_IPPOOL_NAME}")" || return 1
+  jq -e '.used == 0 and .available == .capacity' <<< "${snapshot}" > /dev/null
 }
 
-# Metrics are scraped from whichever pod currently holds the leader label,
-# resolved per call (never through the cached LEADER_POD). The -T 5
-# watchdog bounds the in-pod wget so one exec cannot hang the caller.
+# Exercise the published Service from an ordinary in-cluster client. Per-pod
+# localhost observations in diagnostic captures are not this delivery check.
 metrics_text() {
-  local pod
-  pod="$(current_leader_pod)" || return 1
-  kubectl -n "${KIH_HELPER_NAMESPACE}" exec "${pod}" -- \
-    wget -T 5 -qO- http://127.0.0.1:8080/metrics 2> /dev/null
+  leader_consistent || return 1
+  helper_service_metrics
 }
 
 # Extracts the value of exactly one exposition series: matching lines must
@@ -544,9 +649,9 @@ metrics_text() {
 # exactly one line may match (duplicate series lines are a helper-side
 # leak and fail the extraction), and the value must be the sole trailing
 # token after the closing brace and strictly numeric.
-metric_value_for() { # <family> <label-substring> [label-substring...]
-  local text matches count value sub
-  text="$(metrics_text)" || return 1
+metric_value_for() { # <scrape> <family> <label-substring> [label-substring...]
+  local text="$1" matches count value sub
+  shift
   matches="$(printf '%s\n' "${text}" | grep "^${1}{" || true)"
   shift
   for sub in "$@"; do
@@ -569,18 +674,20 @@ metric_value_for() { # <family> <label-substring> [label-substring...]
 }
 
 metric_pool_equals() { # <used> <available>
-  local used available
-  used="$(metric_value_for kubevirtiphelper_ippool_used 'ippool="e2e-pool"' \
-    'network="kubevirt-ip-helper/kubevirt-ip-helper-e2e"')" || return 1
-  available="$(metric_value_for kubevirtiphelper_ippool_available 'ippool="e2e-pool"' \
-    'network="kubevirt-ip-helper/kubevirt-ip-helper-e2e"')" || return 1
+  local text used available
+  text="$(metrics_text)" || return 1
+  used="$(metric_value_for "${text}" kubevirtiphelper_ippool_used "ippool=\"${KIH_IPPOOL_NAME}\"" \
+    "network=\"${KIH_HELPER_NAMESPACE}/${KIH_NAD_NAME}\"")" || return 1
+  available="$(metric_value_for "${text}" kubevirtiphelper_ippool_available "ippool=\"${KIH_IPPOOL_NAME}\"" \
+    "network=\"${KIH_HELPER_NAMESPACE}/${KIH_NAD_NAME}\"")" || return 1
   [ "${used}" = "$1" ] && [ "${available}" = "$2" ]
 }
 
 metric_vm_ok() {
-  local value
-  value="$(metric_value_for kubevirtiphelper_vmnetcfg_status \
-    'vm="e2e/e2e-vm"' 'mac="02:00:00:00:00:11"' \
+  local text value
+  text="$(metrics_text)" || return 1
+  value="$(metric_value_for "${text}" kubevirtiphelper_vmnetcfg_status \
+    "vm=\"${KIH_WORKLOAD_NAMESPACE}/${KIH_VM_NAME}\"" "mac=\"${KIH_VM_MAC}\"" \
     "ip=\"${RESERVED_IP}\"" 'status="OK"')" || return 1
   # The helper always exposes the vmnetcfg-status series with value 1.
   [ "${value}" = "1" ]
@@ -622,7 +729,8 @@ vm_reservation_ready() {
   status="$(kubectl -n "${KIH_WORKLOAD_NAMESPACE}" get vmnetcfg "${KIH_VM_NAME}" \
     -o jsonpath='{.status.networkconfig[0].status}' 2> /dev/null)"
   [ -n "${ip}" ] && [ "${mac}" = "${KIH_VM_MAC}" ] &&
-    [ "${network}" = "${KIH_HELPER_NAMESPACE}/${KIH_NAD_NAME}" ] && [ "${status}" = "OK" ]
+    [ "${network}" = "${KIH_HELPER_NAMESPACE}/${KIH_NAD_NAME}" ] && [ "${status}" = "OK" ] &&
+    vm_managed_reservation "${KIH_VM_NAME}" OK
 }
 
 vmnetcfg_pool_name() {
@@ -658,25 +766,13 @@ capacity_from_spec() { # <pool>
 }
 
 pool_allocation_matches() {
-  local allocations pool used available allocated_count capacity
+  local pool snapshot
   pool="$(vmnetcfg_pool_name)" || return 1
   [ -n "${pool}" ] || return 1
-  # shellcheck disable=SC2016
-  allocations="$(kubectl get ippool "${pool}" -o go-template='{{range $ip, $owner := .status.ipv4.allocated}}{{$ip}}={{$owner}}{{"\n"}}{{end}}' 2> /dev/null)" || return 1
-  printf '%s\n' "${allocations}" |
-    grep -F "${RESERVED_IP}=${KIH_WORKLOAD_NAMESPACE}/${KIH_VM_NAME} [${KIH_VM_MAC}]" \
-    > /dev/null || return 1
-  used="$(kubectl get ippool "${pool}" -o jsonpath='{.status.ipv4.used}' 2> /dev/null)" || return 1
-  available="$(kubectl get ippool "${pool}" -o jsonpath='{.status.ipv4.available}' 2> /dev/null)" || return 1
-  # The helper omits status.ipv4.available when the range is exhausted; that
-  # representation is equivalent to zero free addresses for this invariant.
-  [ -n "${available}" ] || available=0
-  case "${used}" in '' | *[!0-9]*) return 1 ;; esac
-  case "${available}" in '' | *[!0-9]*) return 1 ;; esac
-  allocated_count="$(printf '%s\n' "${allocations}" | sed '/^$/d' | wc -l)"
-  capacity="$(capacity_from_spec "${pool}")" || return 1
-  [ "${used}" -eq "${allocated_count}" ] &&
-    [ "${available}" -eq "$((capacity - used))" ]
+  snapshot="$(pool_snapshot "${pool}")" || return 1
+  jq -e --arg ip "${RESERVED_IP}" \
+    --arg owner "${KIH_WORKLOAD_NAMESPACE}/${KIH_VM_NAME} [${KIH_VM_MAC}]" \
+    '.allocated[$ip] == $owner' <<< "${snapshot}" > /dev/null
 }
 
 reservation_stable() {
@@ -705,29 +801,6 @@ vmi_absent() {
   object_absent_not_found -n "${KIH_WORKLOAD_NAMESPACE}" get vmi "${KIH_VM_NAME}"
 }
 
-console_has_reserved_ip() { # <file> [ip]
-  local ip="${2:-${RESERVED_IP}}"
-  grep -q "${E2E_DHCP_MARKER}=${ip}" "$1"
-}
-console_has_dhcp_event() { # <file> <address>
-  grep -qF "E2E_DHCP_EVENT=bound:${2}" "$1" ||
-    grep -qF "E2E_DHCP_EVENT=renew:${2}" "$1"
-}
-
-# The udhcpc deconfig callback reports an empty or `unset` router before a
-# successful bound/renew event. Ignore only those pre-bind markers; any
-# actual option printed by the guest must agree with the expected pool
-# router, and the last non-unset marker must carry the same router: after
-# a pool switch the guest configures itself from that final option.
-console_has_router_marker() { # <file> <router>
-  local routers last
-  routers="$(grep -oE 'E2E_DHCP_ROUTER=[^[:space:]]+' "$1" |
-    grep -vE '=unset$|=$' | sort -u || true)"
-  last="$(grep -oE 'E2E_DHCP_ROUTER=[^[:space:]]+' "$1" |
-    grep -vE '=unset$|=$' | tail -n 1 || true)"
-  [ "${routers}" = "E2E_DHCP_ROUTER=$2" ] &&
-    [ "${last}" = "E2E_DHCP_ROUTER=$2" ]
-}
 
 # After duplicate-config cleanup, repeated "NO LEASE FOUND" entries for the
 # owner MAC show that the live owner's DHCP lease is missing. The log storm is
@@ -748,169 +821,430 @@ leader_log_storm_for() { # <mac> <since-minutes>
 # entries for the owner MAC are an ownership-regression/lease-loss symptom
 # and fail fast (exit code 2). The marker is checked first so observed boot
 # success keeps precedence over symptom-based regression evidence.
-boot_marker_or_lease_loss() { # <log-file> <owner-mac> <expected-ip>
-  local log_file="$1" owner_mac="$2" expected_ip="$3"
-  if console_has_reserved_ip "${log_file}" "${expected_ip}"; then
-    return 0
-  fi
-  if leader_log_storm_for "${owner_mac}" "${E2E_LEASE_STORM_WINDOW}"; then
-    return 2
-  fi
+boot_network_or_lease_loss() { # <exclusive sample sequence cutoff>
+  guest_network_ready "$1" && dhcp_transaction_after 0 0 "${GUEST_LEASE}" initial && return 0
+  leader_log_storm_for "${KIH_VM_MAC}" "${E2E_LEASE_STORM_WINDOW}" && return 2
   return 1
 }
 
-# The router option belongs to the pool that owns the guest's own network: the
-# primary bridge answers on 10.77.0.x and the second bridge answers on
-# 10.78.0.x, so the expectation follows the VMNetCfg network rather than the
-# primary pool name.
-expected_router_for_guest() {
-  local pool
-  pool="$(vmnetcfg_pool_name)" || return 1
-  [ -n "${pool}" ] || return 1
-  kubectl get ippool "${pool}" \
-    -o jsonpath='{.spec.ipv4config.router}' 2> /dev/null
+# One absolute budget covers a one-shot command as well as its completion.
+command_before_deadline() { # <case-id> <deadline> <description> <command...>
+  local id="$1" deadline="$2" description="$3" remaining
+  shift 3
+  report_case_start "${id}" "${description}"
+  remaining=$((deadline - SECONDS))
+  [ "${remaining}" -gt 0 ] || die "deadline expired: ${description}"
+  timeout "${remaining}s" "$@" || die "${description}"
+  [ "${SECONDS}" -lt "${deadline}" ] || die "deadline expired: ${description}"
+  report_case_pass "${description}"
+}
+
+guest_identity() {
+  kubectl -n "${KIH_WORKLOAD_NAMESPACE}" get vmi "${KIH_VM_NAME}" -o json |
+    jq -cer 'select(.metadata.deletionTimestamp == null and .status.phase == "Running")
+      | select(any(.status.conditions[]; .type == "Ready" and .status == "True"))
+      | [.metadata.uid,.status.nodeName]
+      | select(all(.[]; type == "string" and length > 0))'
+}
+
+guest_samples() {
+  # Only newline-terminated records count; a writer's partial final line cannot
+  # pass, and malformed complete records cannot fall back to an older success.
+  jq -Rsce --arg marker "${E2E_NETWORK_MARKER}" '
+    ["seq","uptime","iface","mac","address","router","dns","search",
+     "client_pid","client_alive","gateway_ok","target_ip","target_via","target_ok"] as $keys
+    | [split("\n")[:-1][] | sub("\r$";"")
+      | select(startswith($marker + " ")) | split(" ")[1:]
+      | if length != ($keys|length) then error("malformed guest sample") else . end
+      | to_entries | map(.key as $i | .value
+        | capture("^(?<key>[a-z_]+)=(?<value>[^ =]+)$")
+        | if .key != $keys[$i] then error("unexpected guest sample field") else . end)
+      | if length != ($keys|length) then error("missing guest sample field") else from_entries end
+      | .seq |= (if test("^[0-9]+$") then tonumber else error("invalid sequence") end)
+      | .uptime |= (if test("^[0-9]+([.][0-9]+)?$") then tonumber else -1 end)]
+  ' "${GUEST_CONSOLE}"
+}
+
+guest_sample_healthy() { # <JSON sample>
+  jq -e --argjson want "${GUEST_EXPECTED}" --arg mac "${KIH_VM_MAC}" '
+    .uptime >= 0 and .mac == $mac and .iface != "missing"
+    and (.client_pid | test("^[1-9][0-9]*$")) and .client_alive == "1"
+    and .gateway_ok == "1" and .target_ok == "1"
+    and .address == $want.address and .router == $want.router
+    and .dns == $want.dns and .search == $want.search
+    and .target_ip == $want.target_ip and .target_via == $want.router
+  ' <<< "$1" > /dev/null
+}
+
+guest_sample_cutoff() {
+  guest_samples | jq -er '.[-1].seq // 0'
+}
+
+guest_network_ready() { # <exclusive sample sequence cutoff>
+  local cutoff="$1" records sample
+  kill -0 "${CONSOLE_PID}" 2> /dev/null || return 1
+  records="$(guest_samples)" || return 1
+  sample="$(jq -ce --argjson cutoff "${cutoff}" \
+    '.[-1] // empty | select(.seq > $cutoff)' <<< "${records}")" || return 1
+  guest_sample_healthy "${sample}" || return 1
+  jq -ce '{sample: .[-1], index: (length - 1)}' <<< "${records}" > "${GUEST_CONSOLE}.latest"
+}
+
+capture_streams_ready() {
+  local node
+  for node in "${!CAPTURE_PIDS[@]}"; do
+    kill -0 "${CAPTURE_PIDS[$node]}" 2> /dev/null || return 1
+    grep -q 'listening on ' "${CAPTURE_FILES[$node]}.stderr" || return 1
+  done
+  [ "${#CAPTURE_PIDS[@]}" -eq 3 ]
+}
+
+start_dhcp_captures() { # <label> <deadline> <bridge>
+  local label="$1" deadline="$2" bridge="$3" pods node pod budget file token monitor_was_on
+  [ "${#CAPTURE_PIDS[@]}" -eq 0 ] || return 1
+  pods="$(kubectl -n "${KIH_WORKLOAD_NAMESPACE}" get pods \
+    -l app=kih-network-observer -o json)" || return 1
+  pods="$(jq -er '.items | select(length == 3) | .[]
+    | select(.metadata.deletionTimestamp == null)
+    | select(any(.status.conditions[]; .type == "Ready" and .status == "True"))
+    | [.spec.nodeName,.metadata.name] | @tsv' <<< "${pods}")" || return 1
+  while IFS=$'\t' read -r node pod; do
+    [[ "${node}" =~ ^[a-z0-9][a-z0-9.-]*$ ]] || return 1
+    budget=$((deadline - SECONDS))
+    [ "${budget}" -gt 0 ] || return 1
+    file="${E2E_ARTIFACTS_DIR}/dhcp-${label}-${node}.pcap"
+    token="/tmp/kih-capture-${BASHPID}-${SECONDS}"
+    CAPTURE_FILES["${node}"]="${file}"
+    CAPTURE_PODS["${node}"]="${pod}"
+    CAPTURE_TOKENS["${node}"]="${token}"
+    # The bridge must be captured promiscuously: -p would miss unicast T1
+    # renewals forwarded between a VM tap and the inter-node bridge uplink.
+    # Run each known local wrapper in its own process group so teardown can
+    # signal both the timeout wrapper and its kubectl child.
+    case $- in *m*) monitor_was_on=1 ;; *) monitor_was_on="" ;; esac
+    set -m
+    # shellcheck disable=SC2016
+    timeout --foreground --kill-after=1s "${budget}s" kubectl -n "${KIH_WORKLOAD_NAMESPACE}" exec "${pod}" -c observer -- \
+      sh -ec '
+        [ ! -e "$1" ]
+        printf "%s %s\n" "$$" "$(cut -d " " -f 22 /proc/$$/stat)" > "$1"
+        exec timeout -s INT -k 1 "$2" tcpdump -U -n -i "$3" -s 0 -w - \
+          "udp port 67 or udp port 68"
+      ' sh "${token}" "${budget}" "${bridge}" > "${file}" 2> "${file}.stderr" &
+    CAPTURE_PIDS["${node}"]=$!
+    [ -n "${monitor_was_on}" ] || set +m
+  done <<< "${pods}"
+}
+
+# The wrapper PIDs below are created by this shell with job control enabled, so
+# each is the leader of an owned process group. Check that group first, while
+# also addressing the known wrapper PID in case it has not yet exec'd.
+owned_wrapper_group_running() { # <known wrapper PID>
+  kill -0 -- "-$1" > /dev/null 2>&1
+}
+
+owned_wrapper_reapable() { # <known wrapper PID>
+  [ ! -d "/proc/$1" ] && return 0
+  [ "$(cut -d ' ' -f 3 "/proc/$1/stat" 2> /dev/null)" = Z ]
+}
+
+sleep_before_deadline() { # <absolute SECONDS deadline> <maximum seconds>
+  local remaining=$(( $1 - SECONDS )) duration="$2"
+  [ "${remaining}" -gt 0 ] || return 1
+  [ "${duration}" -le "${remaining}" ] || duration="${remaining}"
+  sleep "${duration}"
+}
+
+terminate_owned_wrapper() { # <known wrapper PID> <absolute SECONDS deadline>
+  local pid="$1" deadline="$2" i
+  kill -TERM -- "-${pid}" > /dev/null 2>&1 || true
+  kill -TERM "${pid}" > /dev/null 2>&1 || true
+  for i in 1 2 3 4 5; do
+    owned_wrapper_reapable "${pid}" && return 0
+    sleep_before_deadline "${deadline}" 1 || break
+  done
+  owned_wrapper_reapable "${pid}" && return 0
+  kill -KILL -- "-${pid}" > /dev/null 2>&1 || true
+  kill -KILL "${pid}" > /dev/null 2>&1 || true
+  for i in 1 2 3 4 5; do
+    owned_wrapper_reapable "${pid}" && return 1
+    sleep_before_deadline "${deadline}" 1 || break
+  done
+  return 1
+}
+
+await_owned_group_gone() { # <known wrapper PID> <absolute SECONDS deadline>
+  local pid="$1" deadline="$2" i
+  for i in 1 2 3 4 5; do
+    owned_wrapper_group_running "${pid}" || return 0
+    sleep_before_deadline "${deadline}" 1 || break
+  done
+  ! owned_wrapper_group_running "${pid}"
+}
+
+wait_reaped_wrapper() { # <known wrapper PID>
+  owned_wrapper_reapable "$1" || return 1
+  wait "$1"
+}
+
+stop_dhcp_capture() { # <node> <absolute SECONDS deadline>
+  local node="$1" deadline="$2" pid="${CAPTURE_PIDS[$1]}" rc=0 i budget
+  # A stale PID file never authorizes killing a reused process.
+  budget=$((deadline - SECONDS))
+  if [ "${budget}" -gt 0 ]; then
+    [ "${budget}" -le 10 ] || budget=10
+    # shellcheck disable=SC2016
+    timeout --foreground --kill-after=1s "${budget}s" kubectl -n "${KIH_WORKLOAD_NAMESPACE}" exec "${CAPTURE_PODS[$node]}" -c observer -- \
+      sh -ec '
+        [ -e "$1" ] || exit 0
+        read -r pid born < "$1"
+        if [ -d "/proc/$pid" ]; then
+          [ "$(cut -d " " -f 22 "/proc/$pid/stat")" = "$born" ]
+          case "$(tr "\000" " " < "/proc/$pid/cmdline")" in
+            *tcpdump*|*timeout*) kill -INT "$pid" ;;
+            *) exit 1 ;;
+          esac
+        fi
+        rm "$1"
+      ' sh "${CAPTURE_TOKENS[$node]}" || rc=1
+  else
+    rc=1
+  fi
+  for i in 1 2 3 4 5; do
+    owned_wrapper_reapable "${pid}" && break
+    sleep_before_deadline "${deadline}" 1 || break
+  done
+  if ! owned_wrapper_reapable "${pid}"; then
+    terminate_owned_wrapper "${pid}" "${deadline}" || true
+    rc=1
+  fi
+  wait_reaped_wrapper "${pid}" || rc=1
+  if owned_wrapper_group_running "${pid}"; then
+    kill -KILL -- "-${pid}" > /dev/null 2>&1 || true
+    await_owned_group_gone "${pid}" "${deadline}" || rc=1
+    rc=1
+  fi
+  budget=$((deadline - SECONDS))
+  if [ "${budget}" -gt 0 ]; then
+    [ "${budget}" -le 20 ] || budget=20
+    timeout --foreground --kill-after=1s "${budget}s" python3 "${E2E_DIR}/dhcp.py" "${CAPTURE_FILES[$node]}" \
+      > "${CAPTURE_FILES[$node]}.jsonl" 2> "${CAPTURE_FILES[$node]}.decode-errors" || rc=1
+  else
+    rc=1
+  fi
+  unset 'CAPTURE_PIDS[$node]' 'CAPTURE_PODS[$node]' 'CAPTURE_TOKENS[$node]'
+  return "${rc}"
+}
+
+finish_guest_evidence() { # <absolute SECONDS deadline>
+  local deadline="$1" node rc=0
+  for node in "${!CAPTURE_PIDS[@]}"; do
+    stop_dhcp_capture "${node}" "${deadline}" || rc=1
+  done
+  if [ -n "${CONSOLE_PID}" ]; then
+    terminate_owned_wrapper "${CONSOLE_PID}" "${deadline}" || rc=1
+    if owned_wrapper_reapable "${CONSOLE_PID}"; then
+      wait_reaped_wrapper "${CONSOLE_PID}" 2> /dev/null || true
+    else
+      rc=1
+    fi
+    if owned_wrapper_group_running "${CONSOLE_PID}"; then
+      kill -KILL -- "-${CONSOLE_PID}" > /dev/null 2>&1 || true
+      await_owned_group_gone "${CONSOLE_PID}" "${deadline}" || rc=1
+    fi
+  fi
+  if [ -n "${CONSOLE_FEEDER_PID}" ]; then
+    terminate_owned_wrapper "${CONSOLE_FEEDER_PID}" "${deadline}" || rc=1
+    if owned_wrapper_reapable "${CONSOLE_FEEDER_PID}"; then
+      wait_reaped_wrapper "${CONSOLE_FEEDER_PID}" 2> /dev/null || true
+    else
+      rc=1
+    fi
+    if owned_wrapper_group_running "${CONSOLE_FEEDER_PID}"; then
+      kill -KILL -- "-${CONSOLE_FEEDER_PID}" > /dev/null 2>&1 || true
+      await_owned_group_gone "${CONSOLE_FEEDER_PID}" "${deadline}" || rc=1
+    fi
+  fi
+  [ -z "${CONSOLE_FIFO}" ] || rm -f "${CONSOLE_FIFO}"
+  CONSOLE_PID="" CONSOLE_FEEDER_PID="" CONSOLE_FIFO=""
+  return "${rc}"
+}
+
+refresh_dhcp_events() {
+  [ -n "${GUEST_NODE}" ] || return 1
+  kill -0 "${CAPTURE_PIDS[$GUEST_NODE]}" 2> /dev/null || return 1
+  python3 "${E2E_DIR}/dhcp.py" --allow-incomplete "${CAPTURE_FILES[$GUEST_NODE]}" \
+    > "${GUEST_EVENTS}.tmp" 2> "${GUEST_EVENTS}.decode-errors" || return 1
+  mv "${GUEST_EVENTS}.tmp" "${GUEST_EVENTS}"
+}
+
+dhcp_transaction_after() { # <event ordinal> <epoch> <lease seconds> <initial|renewal>
+  refresh_dhcp_events || return 1
+  jq -se --argjson cutoff "$1" --argjson epoch "$2" --argjson lease "$3" \
+    --arg mode "$4" --arg mac "${KIH_VM_MAC}" --arg ip "${RESERVED_IP}" \
+    --argjson want "${GUEST_EXPECTED}" '
+    .[$cutoff:] | map(select(.mac == $mac and .time >= $epoch)) as $events
+    | any(range(0; $events|length);
+      . as $i | $events[$i] as $request
+      | $request.message == "REQUEST"
+      and $request.ciaddr == (if $mode == "renewal" then $ip else "0.0.0.0" end)
+      and any($events[($i+1):][];
+        .message == "ACK" and .xid == $request.xid and .time >= $request.time
+        and .yiaddr == $ip and .lease_seconds == $lease
+        and .subnet == $want.subnet and .routers == [$want.router]
+        and .dns == ($want.dns | split(",")) and .server_id == $want.server_id))
+  ' "${GUEST_EVENTS}" > /dev/null
+}
+
+snapshot_guest_continuity() {
+  # The caller's readiness phase has already validated and saved a fresh sample;
+  # consume its immutable ordinal without demanding a second observer record.
+  local latest
+  latest="$(jq -ce 'select((.sample | type) == "object"
+    and (.index | type) == "number" and .index >= 0 and .index == (.index | floor))' \
+    "${GUEST_CONSOLE}.latest")" || return 1
+  GUEST_BASELINE="$(jq -ce '.sample' <<< "${latest}")" || return 1
+  GUEST_BASELINE_INDEX="$(jq -er '.index' <<< "${latest}")" || return 1
+  GUEST_IDENTITY="$(guest_identity)" || return 1
+  refresh_dhcp_events || return 1
+  GUEST_EVENT_CUTOFF="$(wc -l < "${GUEST_EVENTS}")"
+  GUEST_ACTION_EPOCH="$(date +%s.%N)"
+}
+
+guest_continuity_after() { # <post-action sample sequence>
+  local identity samples sample
+  identity="$(guest_identity)" || return 1
+  [ "${identity}" = "${GUEST_IDENTITY}" ] || return 1
+  kill -0 "${CONSOLE_PID}" 2> /dev/null || return 1
+  samples="$(guest_samples | jq -ce --argjson base "${GUEST_BASELINE}" \
+    --argjson baseline_index "${GUEST_BASELINE_INDEX}" --argjson cutoff "$1" '
+    . as $all
+    | select($baseline_index >= 0 and $baseline_index < ($all | length))
+    | select($all[$baseline_index] == $base)
+    | $all[$baseline_index:] as $samples
+    | select(($samples|length) >= 3 and $samples[-1].seq > $cutoff + 1)
+    | select(all(range(0;$samples|length);
+        . as $i | $samples[$i].seq == $base.seq + $i
+        and $samples[$i].iface == $base.iface
+        and $samples[$i].client_pid == $base.client_pid
+        and ($i == 0 or ($samples[$i].uptime > $samples[$i-1].uptime
+          and $samples[$i].uptime - $samples[$i-1].uptime <= 20))))
+    | $samples' )" || return 1
+  while IFS= read -r sample; do
+    guest_sample_healthy "${sample}" || return 1
+  done < <(jq -c '.[]' <<< "${samples}")
 }
 
 start_guest_and_assert() { # <label> [absolute SECONDS deadline]
-  local label="$1" deadline="${2:-}" console_log markers expected_router
-  local console_timeout_minutes console_budget start_budget ready_budget
-  console_log="${E2E_ARTIFACTS_DIR}/console-${label}.log"
-  : > "${console_log}"
-  if [ -n "${deadline}" ]; then
-    start_budget=$((deadline - SECONDS))
-    guard_case "BOOT-${label}-START-WINDOW" \
-      "guest start window remains before the failover deadline (${label})" \
-      test "${start_budget}" -gt 0
-    guard_case "BOOT-${label}-START" \
-      "virtctl start finished before the failover deadline (${label})" \
-      timeout --foreground "${start_budget}s" \
-      "${VIRTCTL}" -n "${KIH_WORKLOAD_NAMESPACE}" start "${KIH_VM_NAME}"
-    wait_before_deadline "BOOT-${label}-VMI" "${deadline}" 60 "VMI object created (${label})" vmi_exists
-    console_budget=$((deadline - SECONDS))
-    guard_case "BOOT-${label}-DHCP-WINDOW" \
-      "console window remains for the DHCP marker (${label})" \
-      test "${console_budget}" -gt 0
-    [ "${console_budget}" -le "${E2E_VM_BOOT_TIMEOUT}" ] ||
-      console_budget="${E2E_VM_BOOT_TIMEOUT}"
-  else
-    guard_case "BOOT-${label}-START" "virtctl start finished (${label})" \
-      "${VIRTCTL}" -n "${KIH_WORKLOAD_NAMESPACE}" start "${KIH_VM_NAME}"
-    wait_for "BOOT-${label}-VMI" 60 "VMI object created (${label})" vmi_exists
-    console_budget="${E2E_VM_BOOT_TIMEOUT}"
-  fi
-  console_timeout_minutes=$(((console_budget + 59) / 60))
-  CONSOLE_FIFO="${console_log}.stdin"
-  rm -f "${CONSOLE_FIFO}"
+  local label="$1" pool config bridge target boot_deadline budget node sample_cutoff monitor_was_on
+  GUEST_DEADLINE="${2:-$((SECONDS + E2E_VM_BOOT_TIMEOUT + 180))}"
+  boot_deadline=$((SECONDS + E2E_VM_BOOT_TIMEOUT))
+  [ "${boot_deadline}" -le "${GUEST_DEADLINE}" ] || boot_deadline="${GUEST_DEADLINE}"
+  pool="$(vmnetcfg_pool_name)"
+  config="$(kubectl get ippool "${pool}" -o json)"
+  case "${pool}" in
+    "${KIH_IPPOOL_NAME}") bridge="${KIH_BRIDGE_NAME}"; target="${KIH_PROBE_IP}" ;;
+    e2e-pool-second) bridge="${KIH_SECOND_BRIDGE_NAME}"; target="${KIH_SECOND_PROBE_IP}" ;;
+    *) die "no external network fixture for IPPool ${pool}" ;;
+  esac
+  GUEST_EXPECTED="$(python3 -c '
+import ipaddress, json, sys
+cfg=json.load(sys.stdin)["spec"]["ipv4config"]
+net=ipaddress.IPv4Network(cfg["subnet"])
+print(json.dumps(dict(address=sys.argv[1]+"/"+str(net.prefixlen),
+    subnet=str(net.netmask), router=cfg["router"], dns=",".join(cfg["dns"]),
+    search=cfg["domainname"], target_ip=sys.argv[2], server_id=cfg["serverip"])))
+' "${RESERVED_IP}" "${target}" <<< "${config}")"
+  GUEST_LEASE="$(jq -er '.spec.ipv4config.leasetime' <<< "${config}")"
+  GUEST_CONSOLE="${E2E_ARTIFACTS_DIR}/console-${label}.log"
+  GUEST_EVENTS="${E2E_ARTIFACTS_DIR}/dhcp-${label}.jsonl"
+  guard_case "BOOT-${label}-CAPTURE-START" "passive captures start before the guest" \
+    start_dhcp_captures "${label}" "${GUEST_DEADLINE}" "${bridge}"
+  wait_before_deadline "BOOT-${label}-CAPTURE-READY" "${boot_deadline}" 30 \
+    "all node bridges are being recorded before DHCP" capture_streams_ready
+  command_before_deadline "BOOT-${label}-START" "${boot_deadline}" "guest start accepted (${label})" \
+    "${VIRTCTL}" -n "${KIH_WORKLOAD_NAMESPACE}" start "${KIH_VM_NAME}"
+  wait_before_deadline "BOOT-${label}-VMI" "${boot_deadline}" 60 "VMI created (${label})" vmi_exists
+  CONSOLE_FIFO="${GUEST_CONSOLE}.stdin"
   mkfifo "${CONSOLE_FIFO}"
+  case $- in *m*) monitor_was_on=1 ;; *) monitor_was_on="" ;; esac
+  set -m
   tail -f /dev/null > "${CONSOLE_FIFO}" &
   CONSOLE_FEEDER_PID=$!
-  timeout --foreground "${console_budget}s" \
-    "${VIRTCTL}" -n "${KIH_WORKLOAD_NAMESPACE}" console "${KIH_VM_NAME}" \
-    --timeout="${console_timeout_minutes}" < "${CONSOLE_FIFO}" \
-    > "${console_log}" 2>&1 &
+  [ -n "${monitor_was_on}" ] || set +m
+  budget=$((GUEST_DEADLINE - SECONDS))
+  [ "${budget}" -gt 0 ] || die "guest observation deadline expired"
+  case $- in *m*) monitor_was_on=1 ;; *) monitor_was_on="" ;; esac
+  set -m
+  timeout --foreground --kill-after=1s "${budget}s" "${VIRTCTL}" -n "${KIH_WORKLOAD_NAMESPACE}" console "${KIH_VM_NAME}" \
+    --timeout="$(((budget+59)/60))" < "${CONSOLE_FIFO}" > "${GUEST_CONSOLE}" 2>&1 &
   CONSOLE_PID=$!
-  if [ -n "${deadline}" ]; then
-    wait_before_deadline "BOOT-${label}-DHCP" "${deadline}" "${E2E_VM_BOOT_TIMEOUT}" \
-      "guest DHCP marker (${label})" console_has_reserved_ip "${console_log}"
-  elif [ "${label}" = "duplicate-owner-after-cfg" ]; then
-    wait_for "BOOT-${label}-DHCP" "${E2E_VM_BOOT_TIMEOUT}" \
-      "guest DHCP marker (${label}) (fails fast on the lease-loss signature)" \
-      boot_marker_or_lease_loss "${console_log}" "${KIH_VM_MAC}" "${RESERVED_IP}"
+  [ -n "${monitor_was_on}" ] || set +m
+  wait_before_deadline "BOOT-${label}-READY" "${boot_deadline}" "${E2E_VM_BOOT_TIMEOUT}" \
+    "guest is Running and Ready (${label})" guest_identity
+  GUEST_IDENTITY="$(guest_identity)"
+  GUEST_NODE="$(jq -r '.[1]' <<< "${GUEST_IDENTITY}")"
+  [ -n "${CAPTURE_PIDS[$GUEST_NODE]:-}" ] || die "guest node was not recorded before boot"
+  for node in "${!CAPTURE_PIDS[@]}"; do
+    [ "${node}" = "${GUEST_NODE}" ] || guard_case "BOOT-${label}-CAPTURE-${node}-STOP" \
+      "unused node capture closes without lost or malformed records" \
+      stop_dhcp_capture "${node}" "${GUEST_DEADLINE}"
+  done
+  if [ "${label}" = duplicate-owner-after-delete ]; then
+    sample_cutoff="$(guest_sample_cutoff)" || die "cannot capture guest sample cutoff"
+    wait_before_deadline "BOOT-${label}-DHCP" "${boot_deadline}" "${E2E_VM_BOOT_TIMEOUT}" \
+      "original owner still receives DHCP after duplicate deletion" \
+      boot_network_or_lease_loss "${sample_cutoff}"
   else
-    wait_for "BOOT-${label}-DHCP" "${E2E_VM_BOOT_TIMEOUT}" "guest DHCP marker (${label})" \
-      console_has_reserved_ip "${console_log}"
+    wait_before_deadline "BOOT-${label}-DHCP" "${boot_deadline}" "${E2E_VM_BOOT_TIMEOUT}" \
+      "fresh REQUEST/ACK carries the configured address, mask, router, DNS and lease" \
+      dhcp_transaction_after 0 0 "${GUEST_LEASE}" initial
   fi
-  # Both DHCP options are read while the console still streams, so a later
-  # renewal stays visible instead of being cut off with the console.
-  expected_router="$(expected_router_for_guest || true)"
-  guard_case "BOOT-${label}-ROUTER-POOL" \
-    "IPPool serving the ${label} guest network declares a router option" \
-    test -n "${expected_router}"
-  if [ -n "${deadline}" ]; then
-    wait_before_deadline "BOOT-${label}-ROUTER" "${deadline}" "${E2E_VM_BOOT_TIMEOUT}" \
-      "guest DHCP router option for ${label} matches ${expected_router}" \
-      console_has_router_marker "${console_log}" "${expected_router}"
-  else
-    wait_for "BOOT-${label}-ROUTER" "${E2E_VM_BOOT_TIMEOUT}" \
-      "guest DHCP router option for ${label} matches ${expected_router}" \
-      console_has_router_marker "${console_log}" "${expected_router}"
-  fi
-  if [ -n "${deadline}" ]; then
-    wait_before_deadline "BOOT-${label}-DHCP-EVENT" "${deadline}" "${E2E_VM_BOOT_TIMEOUT}" \
-      "guest bound/renew event names ${RESERVED_IP} (${label})" \
-      console_has_dhcp_event "${console_log}" "${RESERVED_IP}"
-  else
-    wait_for "BOOT-${label}-DHCP-EVENT" "${E2E_VM_BOOT_TIMEOUT}" \
-      "guest bound/renew event names ${RESERVED_IP} (${label})" \
-      console_has_dhcp_event "${console_log}" "${RESERVED_IP}"
-  fi
-  kill "${CONSOLE_PID}" > /dev/null 2>&1 || true
-  kill "${CONSOLE_FEEDER_PID}" > /dev/null 2>&1 || true
-  wait "${CONSOLE_PID}" > /dev/null 2>&1 || true
-  wait "${CONSOLE_FEEDER_PID}" > /dev/null 2>&1 || true
-  rm -f "${CONSOLE_FIFO}"
-  CONSOLE_PID=""
-  CONSOLE_FEEDER_PID=""
-  CONSOLE_FIFO=""
-  if [ -n "${deadline}" ]; then
-    ready_budget=$((deadline - SECONDS))
-    guard_case "BOOT-${label}-READY-WINDOW" \
-      "Ready window remains before the failover deadline (${label})" \
-      test "${ready_budget}" -gt 0
-    [ "${ready_budget}" -le "${E2E_VM_BOOT_TIMEOUT}" ] ||
-      ready_budget="${E2E_VM_BOOT_TIMEOUT}"
-    assert_case "BOOT-${label}-READY" "VMI Ready before the failover deadline (${label})" \
-      timeout --foreground "${ready_budget}s" kubectl -n "${KIH_WORKLOAD_NAMESPACE}" \
-        wait --for=condition=Ready "vmi/${KIH_VM_NAME}" --timeout="${ready_budget}s"
-  else
-    assert_case "BOOT-${label}-READY" "VMI Ready after boot (${label})" \
-      kubectl -n "${KIH_WORKLOAD_NAMESPACE}" wait --for=condition=Ready \
-        "vmi/${KIH_VM_NAME}" --timeout="${E2E_VM_BOOT_TIMEOUT}s"
-  fi
-  markers="$(grep -o "${E2E_DHCP_MARKER}=[0-9.]*" "${console_log}" | sort -u)"
-  report_case_start "BOOT-${label}-MARKERS" \
-    "guest console markers for ${label} match reservation ${RESERVED_IP}"
-  if [ "${markers}" = "${E2E_DHCP_MARKER}=${RESERVED_IP}" ]; then
-    report_case_pass "${markers}"
-  else
-    die "guest markers for ${label} disagree with reservation ${RESERVED_IP}: ${markers:-none}"
-  fi
+  sample_cutoff="$(guest_sample_cutoff)" || die "cannot capture guest sample cutoff"
+  wait_before_deadline "BOOT-${label}-NETWORK" "${boot_deadline}" "${E2E_VM_BOOT_TIMEOUT}" \
+    "native client installs its network and reaches DNS, gateway and routed target" \
+    guest_network_ready "${sample_cutoff}"
+  guard_case "BOOT-${label}-BASELINE" "live guest identity and client baseline recorded" snapshot_guest_continuity
 }
 
-stop_guest() { # <label> [reservation-predicate [predicate-args...]]
-  local label="${1:-guest}" predicate=reservation_stable
-  if [ "$#" -ge 2 ]; then
-    predicate="$2"
-    shift 2
-  else
-    shift
-  fi
-  guard_case "STOP-${label}-SUBMITTED" "virtctl stop accepted (${label})" \
+finish_guest_evidence_before_deadline() { # <absolute SECONDS deadline>
+  finish_guest_evidence "$1" && test "${SECONDS}" -lt "$1"
+}
+
+stop_guest() { # <label> [deadline] [reservation-predicate [args...]]
+  local label="$1" deadline="${GUEST_DEADLINE}" predicate=reservation_stable
+  shift
+  if [[ "${1:-}" =~ ^[0-9]+$ ]]; then deadline="$1"; shift; fi
+  if [ "$#" -gt 0 ]; then predicate="$1"; shift; fi
+  command_before_deadline "STOP-${label}-SUBMITTED" "${deadline}" "guest stop accepted (${label})" \
     "${VIRTCTL}" -n "${KIH_WORKLOAD_NAMESPACE}" stop "${KIH_VM_NAME}"
-  wait_for "STOP-${label}-VM-GONE" 120 "VMI stopped" vmi_absent
-  wait_for "STOP-${label}-RESERVATION-STABLE" 60 "reservation stable while halted" \
-    "${predicate}" "$@"
+  wait_before_deadline "STOP-${label}-VM-GONE" "${deadline}" 120 "VMI stopped" vmi_absent
+  guard_case "STOP-${label}-EVIDENCE" "console and packet records close cleanly before the parent deadline" \
+    finish_guest_evidence_before_deadline "${deadline}"
+  wait_before_deadline "STOP-${label}-RESERVATION-STABLE" "${deadline}" 60 \
+    "reservation stable while halted" "${predicate}" "$@"
 }
 
-reload_processed() {
-  kubectl -n "${KIH_HELPER_NAMESPACE}" logs "${LEADER_POD}" 2> /dev/null |
-    grep -q 'IPPool configuration changes detected, updating the dhcppool'
+reload_snapshot() { # <log marker> -> pod<TAB>uid<TAB>count
+  local pods pod uid logs count
+  pods="$(kubectl -n "${KIH_HELPER_NAMESPACE}" get pods -l "${HELPER_SELECTOR}" -o json)" || return 1
+  while IFS=$'\t' read -r pod uid; do
+    logs="$(kubectl -n "${KIH_HELPER_NAMESPACE}" logs "${pod}")" || return 1
+    count="$(grep -cF "$1" <<< "${logs}" || true)"
+    printf '%s\t%s\t%s\n' "${pod}" "${uid}" "${count}"
+  done < <(jq -r '.items[] | [.metadata.name,.metadata.uid] | @tsv' <<< "${pods}")
 }
 
-reload_count_exceeds() { # <pod> <baseline>
-  local count
-  count="$(kubectl -n "${KIH_HELPER_NAMESPACE}" logs "$1" 2> /dev/null |
-    grep -c 'IPPool configuration changes detected, updating the dhcppool' || true)"
-  [ "${count}" -gt "$2" ]
-}
-
-# Restart-class changes log a distinct message, so a pool update that only
-# reloads the DHCP pool cannot satisfy this predicate.
-reinit_count_exceeds() { # <baseline>
-  local count
-  count="$(kubectl -n "${KIH_HELPER_NAMESPACE}" logs -l "${HELPER_SELECTOR}" --tail=200 2> /dev/null |
-    grep -c 'starting application reinitialization' || true)"
-  [ "${count}" -gt "$1" ]
+reload_processed() { # <baseline snapshot> <log marker>
+  local current pod uid count old_pod old_uid old_count
+  current="$(reload_snapshot "$2")" || return 1
+  while IFS=$'\t' read -r pod uid count; do
+    while IFS=$'\t' read -r old_pod old_uid old_count; do
+      if [ "${pod}" = "${old_pod}" ] && [ "${uid}" = "${old_uid}" ] &&
+        [ "${count}" -gt "${old_count}" ]; then return 0; fi
+    done <<< "$1"
+  done <<< "${current}"
+  return 1
 }
 
 new_leader_elected() { # <old pod> <old id>
@@ -920,34 +1254,16 @@ new_leader_elected() { # <old pod> <old id>
 }
 
 cleanup_complete() {
-  local used available allocations capacity
   object_absent_not_found -n "${KIH_WORKLOAD_NAMESPACE}" \
     get vmnetcfg "${KIH_VM_NAME}" || return 1
-  used="$(kubectl get ippool "${KIH_IPPOOL_NAME}" -o jsonpath='{.status.ipv4.used}' 2> /dev/null)"
-  available="$(kubectl get ippool "${KIH_IPPOOL_NAME}" -o jsonpath='{.status.ipv4.available}' 2> /dev/null)"
-  # shellcheck disable=SC2016
-  allocations="$(kubectl get ippool "${KIH_IPPOOL_NAME}" -o go-template='{{range $ip, $owner := .status.ipv4.allocated}}{{$ip}}={{$owner}}{{"\n"}}{{end}}' 2> /dev/null)"
-  # used is strictly required and must be exactly zero; missing or empty
-  # fails. available is normalized: absent means an exhausted pool (0),
-  # and the expected free count is the spec-derived capacity.
-  case "${used}" in '' | *[!0-9]*) return 1 ;; esac
-  [ "${used}" -eq 0 ] || return 1
-  [ -n "${available}" ] || available=0
-  case "${available}" in '' | *[!0-9]*) return 1 ;; esac
-  capacity="$(capacity_from_spec "${KIH_IPPOOL_NAME}")" || return 1
-  [ "${available}" -eq "${capacity}" ] && [ -z "${allocations}" ]
+  pool_initialized
 }
 
 pool_counts_equal() { # <pool> <used> <available>
-  local pool="$1" expected_used="$2" expected_available="$3" used available
-  used="$(kubectl get ippool "${pool}" -o jsonpath='{.status.ipv4.used}' 2> /dev/null)" || return 1
-  available="$(kubectl get ippool "${pool}" -o jsonpath='{.status.ipv4.available}' 2> /dev/null)" || return 1
-  # used is strictly numeric; available is normalized: absent means an
-  # exhausted pool (0).
-  case "${used}" in '' | *[!0-9]*) return 1 ;; esac
-  [ -n "${available}" ] || available=0
-  case "${available}" in '' | *[!0-9]*) return 1 ;; esac
-  [ "${used}" = "${expected_used}" ] && [ "${available}" = "${expected_available}" ]
+  local snapshot
+  snapshot="$(pool_snapshot "$1")" || return 1
+  jq -e --argjson used "$2" --argjson available "$3" \
+    '.used == $used and .available == $available' <<< "${snapshot}" > /dev/null
 }
 
 vmnetcfg_status_is() { # <name> <status>
@@ -955,30 +1271,57 @@ vmnetcfg_status_is() { # <name> <status>
     -o jsonpath='{.status.networkconfig[0].status}' 2> /dev/null)" = "$2" ]
 }
 
-duplicate_mac_refused() {
-  local message
+vm_managed_reservation() { # <name> <status>
+  local vm config
+  vm="$(kubectl -n "${KIH_WORKLOAD_NAMESPACE}" get vm "$1" -o json)" || return 1
+  config="$(kubectl -n "${KIH_WORKLOAD_NAMESPACE}" get vmnetcfg "$1" -o json)" || return 1
+  jq -e -n --arg name "$1" --arg status "$2" --argjson vm "${vm}" --argjson config "${config}" '
+    ($vm.spec.template.spec.domain.devices.interfaces // []) as $interfaces
+    | ($vm.spec.template.spec.networks // []) as $networks
+    | [ $networks[]?
+        | select(.multus? | type == "object" and
+            (.networkName | type == "string" and length > 0))
+        | . as $network
+        | ($interfaces[]?
+          | select(.name == $network.name and
+              (.macAddress | type == "string" and length > 0))
+          | {mac: .macAddress, network: $network.multus.networkName})
+      ] as $multus_nics
+    | ($config.spec.networkconfig // []) as $networkconfig
+    | ($config.status.networkconfig // []) as $statusconfig
+    | (
+        $vm.metadata.name == $name
+        and $config.metadata.name == $name
+        and $config.spec.vmname == $name
+        and ($multus_nics | length) == 1
+        and ($networkconfig | length) == 1
+        and $networkconfig[0].macaddress == $multus_nics[0].mac
+        and $networkconfig[0].networkname == $multus_nics[0].network
+        and ($statusconfig | length) == 1
+        and $statusconfig[0].status == $status
+        and (($config.metadata.finalizers // []) | type == "array"
+          and index("kubevirtiphelper.k8s.binbash.org/vmnetcfg-cleanup") != null)
+      )
+  ' > /dev/null
+}
+
+duplicate_mac_refused() { # <baseline snapshot> <duplicate rejection marker>
   vmnetcfg_absent_named pool-vm-duplicate || return 1
-  kubectl -n "${KIH_HELPER_NAMESPACE}" logs -l "${HELPER_SELECTOR}" \
-    --tail=200 2> /dev/null |
-    grep -qF "belongs to e2e/pool-vm-01 instead of e2e/pool-vm-duplicate" || return 1
-  vmnetcfg_status_is pool-vm-duplicate-cfg ERROR || return 1
-  message="$(kubectl -n "${KIH_WORKLOAD_NAMESPACE}" get vmnetcfg pool-vm-duplicate-cfg \
-    -o jsonpath='{.status.networkconfig[0].message}' 2> /dev/null)"
-  [ "${message}" = "macaddress belongs to another vm" ]
+  reload_processed "$1" "$2"
 }
 
 # Named counterpart of pool_allocation_matches: a refused duplicate claim must
 # leave the original owner's address and accounting entry untouched.
 named_reservation_kept() { # <name> <mac>
-  local ip allocations
+  local ip snapshot
   ip="$(kubectl -n "${KIH_WORKLOAD_NAMESPACE}" get vmnetcfg "$1" \
-    -o jsonpath='{.spec.networkconfig[0].ipaddress}' 2> /dev/null)" || return 1
+    -o jsonpath='{.spec.networkconfig[0].ipaddress}')" || return 1
   [ -n "${ip}" ] || return 1
   vmnetcfg_status_is "$1" OK || return 1
-  # shellcheck disable=SC2016
-  allocations="$(kubectl get ippool "${KIH_IPPOOL_NAME}" -o go-template='{{range $ip, $owner := .status.ipv4.allocated}}{{$ip}}={{$owner}}{{"\n"}}{{end}}' 2> /dev/null)"
-  printf '%s\n' "${allocations}" |
-    grep -qF "${ip}=${KIH_WORKLOAD_NAMESPACE}/${1} [${2}]"
+  vm_managed_reservation "$1" OK || return 1
+  snapshot="$(pool_snapshot "${KIH_IPPOOL_NAME}")" || return 1
+  jq -e --arg ip "${ip}" --arg owner "${KIH_WORKLOAD_NAMESPACE}/${1} [${2}]" \
+    '.allocated[$ip] == $owner' <<< "${snapshot}" > /dev/null
 }
 
 vmnetcfg_absent_named() { # <name>
@@ -1014,7 +1357,7 @@ pool_group_allocations_ready() {
   local i name ip all_ips=""
   for i in $(seq 1 11); do
     name="$(printf 'pool-vm-%02d' "${i}")"
-    vmnetcfg_status_is "${name}" OK || return 1
+    vm_managed_reservation "${name}" OK || return 1
     ip="$(kubectl -n "${KIH_WORKLOAD_NAMESPACE}" get vmnetcfg "${name}" \
       -o jsonpath='{.spec.networkconfig[0].ipaddress}' 2> /dev/null)"
     [ -n "${ip}" ] || return 1
@@ -1032,10 +1375,10 @@ cleanup_pool_group() {
     kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete vm "${name}" \
       --ignore-not-found --wait=true --timeout=120s > /dev/null
   done
-  kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete vm pool-vm-duplicate \
+  kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete vm pool-vm-duplicate pool-vm-reclaim \
     --ignore-not-found --wait=true --timeout=120s > /dev/null
   kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete vmnetcfg \
-    pool-vm-reclaim pool-vm-outside pool-vm-duplicate-cfg \
+    pool-vm-outside \
     --ignore-not-found --wait=true --timeout=120s > /dev/null
 }
 cleanup_stale_expanded_resources() {
@@ -1053,8 +1396,9 @@ cleanup_stale_expanded_resources() {
 
 run_pool_group() {
   report_group pool
-  local deadline i name mac manifest refused_ip reclaim_ip old_vm old_mac
+  local deadline i name mac manifest refused_ip reclaim_ip old_vm old_mac duplicate_before duplicate_marker
   deadline=$((SECONDS + 720))
+  SCENARIO_DEADLINE="${deadline}"
   log "group pool: filling all eleven addresses"
   cleanup_pool_group
   for i in $(seq 1 11); do
@@ -1075,7 +1419,7 @@ run_pool_group() {
     "${E2E_ARTIFACTS_DIR}/12-pool-vm-refused.yaml"
   kubectl apply -f "${E2E_ARTIFACTS_DIR}/12-pool-vm-refused.yaml" > /dev/null
   wait_before_deadline POOL-TWELFTH-REFUSED "${deadline}" 90 "twelfth reservation is refused" \
-    vmnetcfg_status_is pool-vm-12 ERROR
+    vm_managed_reservation pool-vm-12 ERROR
   wait_before_deadline POOL-REFUSAL-ACCOUNTING "${deadline}" 60 "refusal leaves pool accounting unchanged" \
     pool_counts_equal "${KIH_IPPOOL_NAME}" 11 0
 
@@ -1085,36 +1429,30 @@ run_pool_group() {
   KIH_VM_MAC="02:00:00:00:01:01"
   RESERVED_IP="$(kubectl -n "${KIH_WORKLOAD_NAMESPACE}" get vmnetcfg "${KIH_VM_NAME}" \
     -o jsonpath='{.spec.networkconfig[0].ipaddress}')"
-  start_guest_and_assert exhausted-pool
-  stop_guest exhausted-pool named_reservation_kept "${KIH_VM_NAME}" "${KIH_VM_MAC}"
+  start_guest_and_assert exhausted-pool "${deadline}"
+  stop_guest exhausted-pool "${deadline}" named_reservation_kept "${KIH_VM_NAME}" "${KIH_VM_MAC}"
   wait_before_deadline POOL-RESERVATION-RETAINED "${deadline}" 60 "served reservation remains allocated" \
     vmnetcfg_status_is "${KIH_VM_NAME}" OK
   KIH_VM_NAME="${old_vm}"
   KIH_VM_MAC="${old_mac}"
+  kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete vm pool-vm-12 --wait=true --timeout=120s
+  wait_before_deadline POOL-TWELFTH-CLEANED "${deadline}" 90 \
+    "refused twelfth VM and its managed reservation are removed before a slot opens" \
+    vmnetcfg_absent_named pool-vm-12
+  wait_before_deadline POOL-TWELFTH-CLEANUP-ACCOUNTING "${deadline}" 60 \
+    "removing the refused twelfth VM preserves full-pool accounting" \
+    pool_counts_equal "${KIH_IPPOOL_NAME}" 11 0
 
   log "group pool: refusing a duplicate MAC without consuming another address"
   capture_checkpoint 21-duplicate-owner-before "pool filled with pool-vm-01 holding its original address"
   render_halted_vm pool-vm-duplicate 02:00:00:00:01:01 \
     "${E2E_ARTIFACTS_DIR}/13-duplicate-mac.yaml"
+  duplicate_marker='belongs to e2e/pool-vm-01 instead of e2e/pool-vm-duplicate'
+  duplicate_before="$(reload_snapshot "${duplicate_marker}")"
   kubectl apply -f "${E2E_ARTIFACTS_DIR}/13-duplicate-mac.yaml" > /dev/null
-  cat > "${E2E_ARTIFACTS_DIR}/16-duplicate-owner-cfg.yaml" <<EOF
-apiVersion: kubevirtiphelper.k8s.binbash.org/v1
-kind: VirtualMachineNetworkConfig
-metadata:
-  name: pool-vm-duplicate-cfg
-  namespace: ${KIH_WORKLOAD_NAMESPACE}
-  finalizers:
-    - kubevirtiphelper.k8s.binbash.org/vmnetcfg-cleanup
-spec:
-  vmname: pool-vm-duplicate-cfg
-  networkconfig:
-    - macaddress: "02:00:00:00:01:01"
-      networkname: "${KIH_HELPER_NAMESPACE}/${KIH_NAD_NAME}"
-EOF
-  kubectl apply -f "${E2E_ARTIFACTS_DIR}/16-duplicate-owner-cfg.yaml" > /dev/null
   wait_before_deadline POOL-DUPLICATE-REFUSED "${deadline}" 90 \
-    "VM precreation guard and VMNetCfg controller both refuse the duplicate MAC" \
-    duplicate_mac_refused
+    "the VM controller refuses the duplicate before creating a reservation" \
+    duplicate_mac_refused "${duplicate_before}" "${duplicate_marker}"
   wait_before_deadline POOL-DUPLICATE-ACCOUNTING "${deadline}" 60 "duplicate MAC leaves pool accounting unchanged" \
     pool_counts_equal "${KIH_IPPOOL_NAME}" 11 0
   assert_case POOL-DUPLICATE-ORIGINAL-RESERVATION \
@@ -1126,19 +1464,19 @@ EOF
   KIH_VM_MAC="02:00:00:00:01:01"
   RESERVED_IP="$(kubectl -n "${KIH_WORKLOAD_NAMESPACE}" get vmnetcfg "${KIH_VM_NAME}" \
     -o jsonpath='{.spec.networkconfig[0].ipaddress}')"
-  start_guest_and_assert duplicate-owner
-  stop_guest duplicate-owner
+  start_guest_and_assert duplicate-owner "${deadline}"
+  stop_guest duplicate-owner "${deadline}"
   KIH_VM_NAME="${old_vm}"
   KIH_VM_MAC="${old_mac}"
-  kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete vmnetcfg pool-vm-duplicate-cfg \
+  kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete vm pool-vm-duplicate \
     --wait=true --timeout=120s
-  wait_before_deadline POOL-DUPLICATE-CFG-CLEANED "${deadline}" 90 \
-    "refused duplicate config is removed" vmnetcfg_absent_named pool-vm-duplicate-cfg
-  wait_before_deadline POOL-DUPLICATE-CFG-ACCOUNTING "${deadline}" 60 \
+  wait_before_deadline POOL-DUPLICATE-VM-CLEANED "${deadline}" 90 \
+    "refused duplicate VM is removed" vm_absent_named pool-vm-duplicate
+  wait_before_deadline POOL-DUPLICATE-DELETE-ACCOUNTING "${deadline}" 60 \
     "accounting still shows the eleven original reservations" \
     pool_counts_equal "${KIH_IPPOOL_NAME}" 11 0
   # Deleting a refused duplicate must not remove the live owner's DHCP lease.
-  # Reboot the original VM after the duplicate config is gone so cleanup
+  # Reboot the original VM after the duplicate VM is gone so cleanup
   # cannot silently make the reservation unreachable.
   old_vm="${KIH_VM_NAME}"
   old_mac="${KIH_VM_MAC}"
@@ -1146,16 +1484,12 @@ EOF
   KIH_VM_MAC="02:00:00:00:01:01"
   RESERVED_IP="$(kubectl -n "${KIH_WORKLOAD_NAMESPACE}" get vmnetcfg "${KIH_VM_NAME}" \
     -o jsonpath='{.spec.networkconfig[0].ipaddress}')"
-  start_guest_and_assert duplicate-owner-after-cfg
-  stop_guest duplicate-owner-after-cfg
+  start_guest_and_assert duplicate-owner-after-delete "${deadline}"
+  stop_guest duplicate-owner-after-delete "${deadline}"
   KIH_VM_NAME="${old_vm}"
   KIH_VM_MAC="${old_mac}"
-  kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete vm pool-vm-duplicate \
-    --wait=true --timeout=120s
-  wait_before_deadline POOL-DUPLICATE-VM-CLEANED "${deadline}" 90 \
-    "refused duplicate VM is removed" vm_absent_named pool-vm-duplicate
   capture_checkpoint 22-duplicate-owner-after \
-    "refused duplicate config gone with pool-vm-01 still holding its address"
+    "refused duplicate VM gone with pool-vm-01 still holding its address"
 
   reclaim_ip="$(kubectl -n "${KIH_WORKLOAD_NAMESPACE}" get vmnetcfg pool-vm-11 \
     -o jsonpath='{.spec.networkconfig[0].ipaddress}')"
@@ -1164,31 +1498,6 @@ EOF
     vmnetcfg_absent_named pool-vm-11
   wait_before_deadline POOL-CAPACITY-RESTORED "${deadline}" 60 "released address returns to capacity" \
     pool_counts_equal "${KIH_IPPOOL_NAME}" 10 1
-
-  cat > "${E2E_ARTIFACTS_DIR}/14-reclaim-vmnetcfg.yaml" <<EOF
-apiVersion: kubevirtiphelper.k8s.binbash.org/v1
-kind: VirtualMachineNetworkConfig
-metadata:
-  name: pool-vm-reclaim
-  namespace: ${KIH_WORKLOAD_NAMESPACE}
-  finalizers:
-    - kubevirtiphelper.k8s.binbash.org/vmnetcfg-cleanup
-spec:
-  vmname: pool-vm-reclaim
-  networkconfig:
-    - macaddress: "02:00:00:00:01:ee"
-      networkname: "${KIH_HELPER_NAMESPACE}/${KIH_NAD_NAME}"
-      ipaddress: "${reclaim_ip}"
-EOF
-  kubectl apply -f "${E2E_ARTIFACTS_DIR}/14-reclaim-vmnetcfg.yaml" > /dev/null
-  wait_before_deadline POOL-CR-RECLAIM "${deadline}" 90 "different MAC reclaims the released CR-requested address" \
-    vmnetcfg_status_is pool-vm-reclaim OK
-  assert_case POOL-CR-RECLAIM-ADDRESS "CR-driven reclaim retained ${reclaim_ip}" \
-    test "$(kubectl -n "${KIH_WORKLOAD_NAMESPACE}" get vmnetcfg pool-vm-reclaim \
-      -o jsonpath='{.spec.networkconfig[0].ipaddress}')" = "${reclaim_ip}"
-  wait_before_deadline POOL-RECLAIM-COUNTS "${deadline}" 60 "reclaim fills the pool again" \
-    pool_counts_equal "${KIH_IPPOOL_NAME}" 11 0
-
   refused_ip="${KIH_IPPOOL_START%.*}.99"
   cat > "${E2E_ARTIFACTS_DIR}/15-out-of-range-vmnetcfg.yaml" <<EOF
 apiVersion: kubevirtiphelper.k8s.binbash.org/v1
@@ -1196,8 +1505,6 @@ kind: VirtualMachineNetworkConfig
 metadata:
   name: pool-vm-outside
   namespace: ${KIH_WORKLOAD_NAMESPACE}
-  finalizers:
-    - kubevirtiphelper.k8s.binbash.org/vmnetcfg-cleanup
 spec:
   vmname: pool-vm-outside
   networkconfig:
@@ -1207,18 +1514,34 @@ spec:
 EOF
   kubectl apply -f "${E2E_ARTIFACTS_DIR}/15-out-of-range-vmnetcfg.yaml" > /dev/null
   wait_before_deadline POOL-OUT-OF-RANGE-REFUSED "${deadline}" 90 \
-    "out-of-range explicit address is refused" vmnetcfg_status_is pool-vm-outside ERROR
+    "invalid raw record is rejected without allocating an address" vmnetcfg_status_is pool-vm-outside ERROR
   wait_before_deadline POOL-OUT-OF-RANGE-ACCOUNTING "${deadline}" 60 \
     "out-of-range refusal leaves accounting unchanged" \
-    pool_counts_equal "${KIH_IPPOOL_NAME}" 11 0
+    pool_counts_equal "${KIH_IPPOOL_NAME}" 10 1
   wait_before_deadline POOL-HEALTH-AFTER-REFUSALS "${deadline}" 60 \
     "helper remains healthy after refusals" leader_services_healthy
   capture_checkpoint 28-pool-refusals-held \
-    "reclaimed address held and out-of-range request refused with accounting at 11 used 0 available"
+    "out-of-range request refused with accounting at 10 used 1 available before normal reclaim"
+
+  render_halted_vm pool-vm-reclaim 02:00:00:00:01:ee \
+    "${E2E_ARTIFACTS_DIR}/14-reclaim-vm.yaml"
+  kubectl apply -f "${E2E_ARTIFACTS_DIR}/14-reclaim-vm.yaml" > /dev/null
+  wait_before_deadline POOL-VM-RECLAIM "${deadline}" 90 \
+    "a new VM reclaims the only free address through a helper-created record" \
+    vm_managed_reservation pool-vm-reclaim OK
+  assert_case POOL-VM-RECLAIM-ADDRESS "new VM received released address ${reclaim_ip}" \
+    test "$(kubectl -n "${KIH_WORKLOAD_NAMESPACE}" get vmnetcfg pool-vm-reclaim \
+      -o jsonpath='{.spec.networkconfig[0].ipaddress}')" = "${reclaim_ip}"
+  wait_before_deadline POOL-RECLAIM-COUNTS "${deadline}" 60 "reclaim fills the pool again" \
+    pool_counts_equal "${KIH_IPPOOL_NAME}" 11 0
+
   cleanup_pool_group
   wait_before_deadline POOL-CLEANUP-CAPACITY "${deadline}" 180 \
     "pool group cleanup returns exact capacity" pool_counts_equal "${KIH_IPPOOL_NAME}" 0 11
   capture_checkpoint 12-pool-cleaned "pool group cleanup restored exact capacity"
+  guard_case POOL-DEADLINE "pool scenarios completed within their original deadline" \
+    test "${SECONDS}" -lt "${deadline}"
+  SCENARIO_DEADLINE=0
   printf 'PASS pool group: exhaustion, refusal, duplicate MAC, reclaim, and out-of-range request\n' \
     > "${E2E_ARTIFACTS_DIR}/11-pool-group.txt"
 }
@@ -1247,17 +1570,54 @@ leader_link_state_is() { # <UP|DOWN>
     grep -q " state $1 "
 }
 
+worker_is_stopped() {
+  local object
+  object="$(worker_record "${STOPPED_WORKER}")" || return 1
+  jq -e '.running == false' <<< "${object}" > /dev/null || return 1
+  kubectl get node "${STOPPED_WORKER}" -o json |
+    jq -e 'any(.status.conditions[]; .type == "Ready" and (.status == "False" or .status == "Unknown"))' > /dev/null
+}
+
+worker_has_recovered() {
+  kubectl get node "${STOPPED_WORKER}" -o json |
+    jq -e 'any(.status.conditions[]; .type == "Ready" and .status == "True")' > /dev/null || return 1
+  kubectl -n "${KIH_WORKLOAD_NAMESPACE}" get pods -l "${KIH_OBSERVER_SELECTOR}" \
+    --field-selector "spec.nodeName=${STOPPED_WORKER}" -o json |
+    jq -e '[.items[] | select(.metadata.deletionTimestamp == null)
+      | select(any(.status.conditions[]; .type == "Ready" and .status == "True"))]
+      | length == 1' > /dev/null
+}
+
 run_ha_group() {
   report_group ha
-  local deadline old_leader follower follower_uid pods old_uids
+  local deadline old_leader old_id follower follower_uid pods old_uids workers fault_node survivor placement record cutoff
   deadline=$((SECONDS + 780))
+  SCENARIO_DEADLINE="${deadline}"
   log "group ha: follower churn"
   assert_case HA-LEADER-BEFORE-CHURN "leader state consistent before HA group" leader_consistent
+  fault_node="$(kubectl -n "${KIH_HELPER_NAMESPACE}" get pod "${LEADER_POD}" -o jsonpath='{.spec.nodeName}')"
+  workers="$(kubectl get nodes -o json | jq -ce '[.items[]
+    | select((.metadata.labels|has("node-role.kubernetes.io/control-plane")|not)
+      and (.metadata.labels|has("node-role.kubernetes.io/master")|not))]
+    | select(length == 2)')"
+  jq -e --arg node "${fault_node}" 'any(.[]; .metadata.name == $node)' <<< "${workers}" > /dev/null
+  survivor="$(jq -er --arg node "${fault_node}" '.[] | select(.metadata.name != $node) | .metadata.name' <<< "${workers}")"
+  placement="$(jq -er --arg node "${survivor}" '.[] | select(.metadata.name == $node)
+    | .metadata.labels["kubernetes.io/hostname"] | select(type == "string" and length > 0)' <<< "${workers}")"
+  pods="$(kubectl -n "${KIH_HELPER_NAMESPACE}" get pods -l "${HELPER_SELECTOR}" -o json)"
+  guard_case HA-SURVIVING-HELPER "normal helper placement includes a replica on the surviving worker" \
+    jq -e --arg node "${survivor}" 'any(.items[]; .spec.nodeName == $node and .metadata.deletionTimestamp == null)' \
+    <<< "${pods}"
   # Every later boundary has to keep a live reservation, its accounting entry,
   # and both metrics intact, so the guest is created before the first transition.
   render_halted_vm "${KIH_VM_NAME}" "${KIH_VM_MAC}" \
     "${E2E_ARTIFACTS_DIR}/20-ha-vm.yaml"
-  kubectl apply -f "${E2E_ARTIFACTS_DIR}/20-ha-vm.yaml" > /dev/null
+  # Only this workload's ordinary scheduling is constrained; the helper's
+  # deployment and scheduling remain byte-for-byte production defaults.
+  kubectl patch --local -f "${E2E_ARTIFACTS_DIR}/20-ha-vm.yaml" --type=merge \
+    -p "$(jq -nc --arg node "${placement}" '{spec:{template:{spec:{nodeSelector:{"kubernetes.io/hostname":$node}}}}}')" \
+    -o yaml > "${E2E_ARTIFACTS_DIR}/20-ha-vm-placed.yaml"
+  kubectl apply -f "${E2E_ARTIFACTS_DIR}/20-ha-vm-placed.yaml" > /dev/null
   wait_before_deadline HA-RESERVATION-CREATED "${deadline}" 120 \
     "halted VM reserves an address before helper topology churn" vm_reservation_ready
   RESERVED_IP="$(kubectl -n "${KIH_WORKLOAD_NAMESPACE}" get vmnetcfg "${KIH_VM_NAME}" \
@@ -1270,6 +1630,46 @@ run_ha_group() {
     "${KIH_VM_NAME} holds ${RESERVED_IP} before helper topology churn"
   wait_before_deadline HA-TWO-REPLICAS-BEFORE-CHURN "${deadline}" 120 \
     "two non-terminating helper replicas are Ready before follower churn" helper_pods_ready
+  start_guest_and_assert ha-live "${deadline}"
+  assert_case HA-GUEST-ON-SURVIVOR "live VM is on the selected surviving worker" test "${GUEST_NODE}" = "${survivor}"
+  assert_case HA-LEADER-BEFORE-WORKER-FAULT "active helper identity remains consistent before worker loss" leader_consistent
+  assert_case HA-FAULT-TARGET-STILL-ACTIVE "worker selected for shutdown still hosts the active helper" \
+    test "$(kubectl -n "${KIH_HELPER_NAMESPACE}" get pod "${LEADER_POD}" -o jsonpath='{.spec.nodeName}')" = "${fault_node}"
+  old_leader="${LEADER_POD}" old_id="${LEADER_ID}"
+  snapshot_guest_continuity
+  record="$(worker_record "${fault_node}")"
+  guard_case HA-WORKER-WAS-RUNNING "fault target is an owned running kind node" \
+    jq -e '.running == true' <<< "${record}"
+  STOPPED_WORKER="${fault_node}"
+  STOPPED_WORKER_ID="$(jq -r '.id' <<< "${record}")"
+  printf '%s\n' "${record}" > "${E2E_ARTIFACTS_DIR}/ha-worker-before-stop.json"
+  command_before_deadline HA-WORKER-STOP "${deadline}" "active helper worker is stopped, not paused" \
+    "${RUNTIME}" stop --time=0 "${STOPPED_WORKER_ID}"
+  wait_before_deadline HA-WORKER-DOWN "${deadline}" 90 "runtime and Kubernetes both observe worker loss" worker_is_stopped
+  wait_before_deadline HA-WORKER-LEADER-TRANSFER "${deadline}" 75 "surviving helper takes the Lease and Service endpoint" \
+    new_leader_elected "${old_leader}" "${old_id}"
+  wait_before_deadline HA-WORKER-SERVICES "${deadline}" 90 "helper service recovers on the survivor" leader_services_healthy
+  # Discard transactions from before recovery, including any ACK generated by
+  # the old helper just before shutdown. The next normal renewal is the proof.
+  refresh_dhcp_events
+  GUEST_EVENT_CUTOFF="$(wc -l < "${GUEST_EVENTS}")"
+  GUEST_ACTION_EPOCH="$(date +%s.%N)"
+  wait_before_deadline HA-WORKER-LIVE-RENEWAL "${deadline}" "${E2E_RETAINED_LEASE_SECONDS}" \
+    "same native client renews normally while the failed worker stays stopped" \
+    dhcp_transaction_after "${GUEST_EVENT_CUTOFF}" "${GUEST_ACTION_EPOCH}" "${GUEST_LEASE}" renewal
+  cutoff="$(guest_samples | jq -er '.[-1].seq')"
+  wait_before_deadline HA-WORKER-LIVE-NETWORK "${deadline}" 30 \
+    "unchanged VMI and client retain successful network samples through worker loss" guest_continuity_after "${cutoff}"
+  assert_case HA-WORKER-RESERVATION "reservation survives the worker outage" reservation_stable
+  assert_case HA-WORKER-METRICS "Service reports exact reservation accounting during worker outage" metric_pool_equals 1 10
+  guard_case HA-WORKER-RESTORE "stopped worker and only its test uplinks are restored" restore_stopped_worker "${deadline}"
+  wait_before_deadline HA-WORKER-RECOVERED "${deadline}" 120 "worker and passive observer recover" worker_has_recovered
+  wait_before_deadline HA-WORKER-HELPERS-RECOVERED "${deadline}" 120 "normal two-replica readiness returns" helper_pods_ready
+  cutoff="$(guest_samples | jq -er '.[-1].seq')"
+  wait_before_deadline HA-WORKER-POST-RECOVERY-NETWORK "${deadline}" 30 \
+    "live guest stays unchanged after worker recovery" guest_continuity_after "${cutoff}"
+  STOPPED_WORKER="" STOPPED_WORKER_ID=""
+  assert_case HA-LEADER-AFTER-WORKER-RECOVERY "leader state consistent before follower churn" leader_consistent
   old_leader="${LEADER_POD}"
   pods="$(kubectl -n "${KIH_HELPER_NAMESPACE}" get pods -l "${HELPER_SELECTOR}" \
     -o jsonpath='{.items[*].metadata.name}')"
@@ -1321,6 +1721,10 @@ run_ha_group() {
   assert_case HA-RESERVATION-AFTER-LINK-BOUNCE "reservation survives the interface bounce" \
     reservation_stable
   capture_checkpoint ha-link-up "leader secondary interface recovered and service remains healthy"
+  cutoff="$(guest_samples | jq -er '.[-1].seq')"
+  wait_before_deadline HA-LIVE-AFTER-CHURN "${deadline}" 30 \
+    "same live guest retains its network through follower churn, scaling and link bounce" guest_continuity_after "${cutoff}"
+  stop_guest ha-live "${deadline}"
 
   log "group ha: simultaneous deletion of both replicas"
   old_uids="$(helper_pod_uids || true)"
@@ -1342,7 +1746,7 @@ run_ha_group() {
   capture_checkpoint 16-ha-after-total-pod-loss \
     "leadership, reservation and metrics reconstructed after total pod loss"
   start_guest_and_assert churn "${deadline}"
-  stop_guest churn
+  stop_guest churn "${deadline}"
   kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete vm "${KIH_VM_NAME}" --wait=true --timeout=120s
   wait_before_deadline HA-RESERVATION-RELEASED "${deadline}" 120 \
     "guest deletion releases the reservation" cleanup_complete
@@ -1351,86 +1755,58 @@ run_ha_group() {
   assert_case HA-VM-METRIC-AFTER-RELEASE "cleanup removes the VM metric" metric_vm_absent
   capture_checkpoint 24-ha-reservation-released \
     "${KIH_VM_NAME} released ${RESERVED_IP} and its metric after helper churn"
-  printf 'PASS HA group: reservation retained through churn, scaling, bounce, and total pod loss\n' \
+  guard_case HA-DEADLINE "HA scenarios completed within their original deadline" test "${SECONDS}" -lt "${deadline}"
+  SCENARIO_DEADLINE=0
+  printf 'PASS HA group: live guest survived worker loss, churn, scaling and bounce; cold boot survived total pod loss\n' \
     > "${E2E_ARTIFACTS_DIR}/12-ha-group.txt"
-}
-
-console_has_live_dhcp_activity() { # <file>
-  grep -qF "E2E_DHCP_EVENT=bound:${RESERVED_IP}" "$1" ||
-    grep -qF "E2E_DHCP_EVENT=renew:${RESERVED_IP}" "$1"
-}
-
-capture_live_dhcp_activity() { # <label> <absolute deadline>
-  local label="$1" deadline="$2" console_log console_budget console_timeout_minutes
-  console_log="${E2E_ARTIFACTS_DIR}/console-${label}.log"
-  : > "${console_log}"
-  console_budget=$((deadline - SECONDS))
-  guard_case "LEASE-${label}-CONSOLE-WINDOW" \
-    "live DHCP console window remains before the deadline (${label})" \
-    test "${console_budget}" -gt 0
-  [ "${console_budget}" -le 75 ] || console_budget=75
-  console_timeout_minutes=$(((console_budget + 59) / 60))
-  CONSOLE_FIFO="${console_log}.stdin"
-  rm -f "${CONSOLE_FIFO}"
-  mkfifo "${CONSOLE_FIFO}"
-  tail -f /dev/null > "${CONSOLE_FIFO}" &
-  CONSOLE_FEEDER_PID=$!
-  timeout --foreground "${console_budget}s" \
-    "${VIRTCTL}" -n "${KIH_WORKLOAD_NAMESPACE}" console "${KIH_VM_NAME}" \
-    --timeout="${console_timeout_minutes}" < "${CONSOLE_FIFO}" \
-    > "${console_log}" 2>&1 &
-  CONSOLE_PID=$!
-  wait_before_deadline LEASE-LIVE-DHCP-EVENT "${deadline}" 60 "live guest emits a subsequent DHCP client event" \
-    console_has_live_dhcp_activity "${console_log}"
-  capture_checkpoint 13-lease-live-dhcp "live guest DHCP activity under a 30 second lease"
-  kill "${CONSOLE_PID}" > /dev/null 2>&1 || true
-  kill "${CONSOLE_FEEDER_PID}" > /dev/null 2>&1 || true
-  wait "${CONSOLE_PID}" > /dev/null 2>&1 || true
-  wait "${CONSOLE_FEEDER_PID}" > /dev/null 2>&1 || true
-  rm -f "${CONSOLE_FIFO}"
-  CONSOLE_PID=""
-  CONSOLE_FEEDER_PID=""
-  CONSOLE_FIFO=""
 }
 
 run_lease_group() {
   report_group lease
-  local deadline manifest lease_leader reloads_before
+  local deadline manifest before cutoff marker
   deadline=$((SECONDS + 420))
-  log "group lease: observing live guest DHCP activity with a short lease"
-  kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete vm "${KIH_VM_NAME}" \
-    --ignore-not-found --wait=true --timeout=120s
+  SCENARIO_DEADLINE="${deadline}"
+  marker='IPPool configuration changes detected, updating the dhcppool'
   wait_before_deadline LEASE-STARTS-EMPTY "${deadline}" 90 "lease group starts from an empty pool" \
     pool_counts_equal "${KIH_IPPOOL_NAME}" 0 11
-  assert_case LEASE-LEADER-BEFORE-PATCH "leader state consistent before the short-lease update" \
-    leader_consistent
-  lease_leader="${LEADER_POD}"
-  reloads_before="$(kubectl -n "${KIH_HELPER_NAMESPACE}" logs "${lease_leader}" 2> /dev/null |
-    grep -c 'IPPool configuration changes detected, updating the dhcppool' || true)"
-  kubectl patch ippool "${KIH_IPPOOL_NAME}" --type=merge \
+  before="$(reload_snapshot "${marker}")"
+  command_before_deadline LEASE-SHORT-LEASE-PATCH "${deadline}" "short lease update accepted" \
+    kubectl patch ippool "${KIH_IPPOOL_NAME}" --type=merge \
     -p '{"spec":{"ipv4config":{"leasetime":30}}}'
-  wait_before_deadline LEASE-SHORT-LEASE-RELOAD "${deadline}" 60 "short-lease update reaches the live DHCP pool" \
-    reload_count_exceeds "${lease_leader}" "${reloads_before}"
-  wait_before_deadline LEASE-POOL-HEALTH "${deadline}" 90 "short-lease pool remains healthy" leader_services_healthy
-
+  wait_before_deadline LEASE-SHORT-LEASE-RELOAD "${deadline}" 60 "short lease update is newly processed" \
+    reload_processed "${before}" "${marker}"
   manifest="${E2E_ARTIFACTS_DIR}/16-lease-vm.yaml"
   render_halted_vm "${KIH_VM_NAME}" "${KIH_VM_MAC}" "${manifest}"
-  kubectl apply -f "${manifest}" > /dev/null
-  wait_before_deadline LEASE-RESERVATION "${deadline}" 120 "short-lease VM reservation" vm_reservation_ready
+  command_before_deadline LEASE-VM-CREATED "${deadline}" "lease test VM created normally" \
+    kubectl apply -f "${manifest}"
+  wait_before_deadline LEASE-RESERVATION "${deadline}" 120 "short lease VM reservation" vm_reservation_ready
   RESERVED_IP="$(kubectl -n "${KIH_WORKLOAD_NAMESPACE}" get vmnetcfg "${KIH_VM_NAME}" \
     -o jsonpath='{.spec.networkconfig[0].ipaddress}')"
   start_guest_and_assert short-lease "${deadline}"
-  capture_live_dhcp_activity live-dhcp "${deadline}"
-  wait_before_deadline LEASE-RESERVATION-STABLE "${deadline}" 60 "live DHCP activity preserves the reservation" reservation_stable
-  stop_guest short-lease
-  kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete vm "${KIH_VM_NAME}" --wait=true --timeout=120s
-  wait_before_deadline LEASE-RESERVATION-RELEASED "${deadline}" 120 "lease group releases its reservation" cleanup_complete
-  kubectl patch ippool "${KIH_IPPOOL_NAME}" --type=merge \
+  before="$(reload_snapshot "${marker}")"
+  snapshot_guest_continuity
+  command_before_deadline LEASE-NORMAL-LEASE-PATCH "${deadline}" "normal lease restored with guest still running" \
+    kubectl patch ippool "${KIH_IPPOOL_NAME}" --type=merge \
     -p "{\"spec\":{\"ipv4config\":{\"leasetime\":${E2E_RETAINED_LEASE_SECONDS}}}}"
-  wait_before_deadline LEASE-NORMAL-LEASE-RESTORED "${deadline}" 90 "normal lease configuration is restored" \
-    leader_services_healthy
-  capture_checkpoint 14-lease-restored "normal lease window restored on ${KIH_IPPOOL_NAME}"
-  printf 'PASS lease group: live guest repeated DHCP activity retained the reservation\n' \
+  wait_before_deadline LEASE-NORMAL-LEASE-RELOAD "${deadline}" 60 "normal lease update is newly processed" \
+    reload_processed "${before}" "${marker}"
+  wait_before_deadline LEASE-NORMAL-LEASE-ACK "${deadline}" 90 \
+    "same native client naturally renews and receives the restored lease duration" \
+    dhcp_transaction_after "${GUEST_EVENT_CUTOFF}" "${GUEST_ACTION_EPOCH}" \
+    "${E2E_RETAINED_LEASE_SECONDS}" renewal
+  cutoff="$(guest_samples | jq -er '.[-1].seq')"
+  wait_before_deadline LEASE-LIVE-CONTINUITY "${deadline}" 30 \
+    "unchanged VMI and client retain working network across the lease change" guest_continuity_after "${cutoff}"
+  assert_case LEASE-RESERVATION-STABLE "renewal preserves exact reservation and accounting" reservation_stable
+  capture_checkpoint 14-lease-restored "live native renewal received the restored lease duration"
+  stop_guest short-lease "${deadline}"
+  command_before_deadline LEASE-VM-DELETED "${deadline}" "lease VM deletion accepted" \
+    kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete vm "${KIH_VM_NAME}" --wait=false
+  wait_before_deadline LEASE-RESERVATION-RELEASED "${deadline}" 120 "lease group releases its reservation" cleanup_complete
+  guard_case LEASE-DEADLINE "lease scenarios completed within their original deadline" \
+    test "${SECONDS}" -lt "${deadline}"
+  SCENARIO_DEADLINE=0
+  printf 'PASS lease group: native renewal confirmed restored lease and uninterrupted sampled networking\n' \
     > "${E2E_ARTIFACTS_DIR}/13-lease-group.txt"
 }
 
@@ -1496,6 +1872,7 @@ run_multipool_group() {
   report_group multipool
   local deadline old_vm old_mac helper_snapshot
   deadline=$((SECONDS + 900))
+  SCENARIO_DEADLINE="${deadline}"
   log "group multipool: attaching an independent second bridge and pool"
   report_case_start MULTI-STALE-RESOURCES-CLEARED \
     "no stale second-pool resources remain from an earlier run"
@@ -1514,12 +1891,9 @@ metadata:
   name: kubevirt-ip-helper-e2e-second
   namespace: ${KIH_HELPER_NAMESPACE}
 spec:
-  config: '{"cniVersion":"0.3.1","type":"bridge","bridge":"br-kih-e2e2"}'
+  config: '{"cniVersion":"0.3.1","type":"bridge","bridge":"${KIH_SECOND_BRIDGE_NAME}"}'
 EOF
   kubectl apply -f "${E2E_ARTIFACTS_DIR}/17-second-nad.yaml" > /dev/null
-  kubectl -n "${KIH_HELPER_NAMESPACE}" scale deployment "${HELPER_DEPLOYMENT}" --replicas=0
-  kubectl -n "${KIH_HELPER_NAMESPACE}" wait --for=delete pod \
-    -l app=kubevirt-ip-helper --timeout="${E2E_WAIT_TIMEOUT}s"
   cat > "${E2E_ARTIFACTS_DIR}/18-second-pool.yaml" <<EOF
 apiVersion: kubevirtiphelper.k8s.binbash.org/v1
 kind: IPPool
@@ -1533,16 +1907,18 @@ spec:
       start: 10.78.0.100
       end: 10.78.0.102
     router: 10.78.0.1
+    dns:
+      - ${KIH_SECOND_DNS_SERVER}
+    domainname: ${KIH_SECOND_DNS_DOMAIN}
     leasetime: 300
   networkname: ${KIH_HELPER_NAMESPACE}/kubevirt-ip-helper-e2e-second
   bindinterface: kihnet1
 EOF
-  kubectl apply -f "${E2E_ARTIFACTS_DIR}/18-second-pool.yaml" > /dev/null
   kubectl -n "${KIH_HELPER_NAMESPACE}" patch deployment "${HELPER_DEPLOYMENT}" \
     --type=merge \
     -p '{"spec":{"template":{"metadata":{"annotations":{"k8s.v1.cni.cncf.io/networks":"[{\"name\":\"kubevirt-ip-helper-e2e\",\"namespace\":\"kubevirt-ip-helper\",\"interface\":\"kihnet0\"},{\"name\":\"kubevirt-ip-helper-e2e-second\",\"namespace\":\"kubevirt-ip-helper\",\"interface\":\"kihnet1\"}]"}}}}}'
-  kubectl -n "${KIH_HELPER_NAMESPACE}" scale deployment "${HELPER_DEPLOYMENT}" --replicas=2
-  kubectl -n "${KIH_HELPER_NAMESPACE}" rollout status \
+  command_before_deadline MULTI-ATTACHMENT-ROLLOUT "${deadline}" "second attachment rolls out normally" \
+    kubectl -n "${KIH_HELPER_NAMESPACE}" rollout status \
     "deployment/${HELPER_DEPLOYMENT}" --timeout="${E2E_WAIT_TIMEOUT}s"
   wait_before_deadline MULTI-PODS-RETURN "${deadline}" 180 "two helper pods return after second attachment" \
     helper_pods_ready
@@ -1550,36 +1926,26 @@ EOF
     helper_pods_have_interface kihnet1
   wait_before_deadline MULTI-PRIMARY-RECONSTRUCTS "${deadline}" 120 "primary pool reconstructs after attachment rollout" \
     leader_services_healthy
+  command_before_deadline MULTI-SECOND-POOL-CREATED "${deadline}" "second pool created after its interface exists" \
+    kubectl apply -f "${E2E_ARTIFACTS_DIR}/18-second-pool.yaml"
 
   wait_before_deadline MULTI-SECOND-INITIALIZED "${deadline}" 120 "second pool initializes independently" \
     pool_initialized_named e2e-pool-second 3
   wait_before_deadline MULTI-SECOND-SERVER "${deadline}" 120 "leader serves the second pool address" \
     second_pool_services_healthy
 
-  cat > "${E2E_ARTIFACTS_DIR}/19-second-pool-vmnetcfg.yaml" <<EOF
-apiVersion: kubevirtiphelper.k8s.binbash.org/v1
-kind: VirtualMachineNetworkConfig
-metadata:
-  name: multipool-vm
-  namespace: ${KIH_WORKLOAD_NAMESPACE}
-  finalizers:
-    - kubevirtiphelper.k8s.binbash.org/vmnetcfg-cleanup
-spec:
-  vmname: multipool-vm
-  networkconfig:
-    - macaddress: "02:00:00:00:02:01"
-      networkname: "${KIH_HELPER_NAMESPACE}/kubevirt-ip-helper-e2e-second"
-EOF
-  kubectl apply -f "${E2E_ARTIFACTS_DIR}/19-second-pool-vmnetcfg.yaml" > /dev/null
+  render_second_nad_vm multipool-vm 02:00:00:00:02:01 \
+    "${E2E_ARTIFACTS_DIR}/19-second-pool-vm.yaml"
+  kubectl apply -f "${E2E_ARTIFACTS_DIR}/19-second-pool-vm.yaml" > /dev/null
   wait_before_deadline MULTI-SECOND-ALLOCATION "${deadline}" 120 "second pool allocates its own reservation" \
-    vmnetcfg_status_is multipool-vm OK
+    vm_managed_reservation multipool-vm OK
   wait_before_deadline MULTI-SECOND-ISOLATED "${deadline}" 60 "second pool accounting is isolated" \
     pool_counts_equal e2e-pool-second 1 2
   capture_checkpoint 17-second-pool-added "second bridge, pool and reservation are independent"
   wait_before_deadline MULTI-PRIMARY-STAYS-EMPTY "${deadline}" 60 "primary pool remains empty" \
     pool_counts_equal "${KIH_IPPOOL_NAME}" 0 11
 
-  kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete vmnetcfg multipool-vm \
+  kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete vm multipool-vm \
     --wait=true --timeout=120s
   wait_before_deadline MULTI-SECOND-RELEASED "${deadline}" 120 "second pool reservation is released" \
     pool_counts_equal e2e-pool-second 0 3
@@ -1589,7 +1955,7 @@ EOF
     "${E2E_ARTIFACTS_DIR}/20-second-nad-vm.yaml"
   kubectl apply -f "${E2E_ARTIFACTS_DIR}/20-second-nad-vm.yaml" > /dev/null
   wait_before_deadline MULTI-GUEST-RESERVATION "${deadline}" 120 \
-    "second bridge reserves the guest address" vmnetcfg_status_is multipool-guest OK
+    "second bridge reserves the guest address" vm_managed_reservation multipool-guest OK
   old_vm="${KIH_VM_NAME}"
   old_mac="${KIH_VM_MAC}"
   KIH_VM_NAME="multipool-guest"
@@ -1611,7 +1977,7 @@ EOF
     pool_counts_equal "${KIH_IPPOOL_NAME}" 0 11
   capture_checkpoint 25-second-nad-guest "second bridge holds ${RESERVED_IP} for multipool-guest"
   start_guest_and_assert second-nad "${deadline}"
-  stop_guest second-nad
+  stop_guest second-nad "${deadline}"
   wait_before_deadline MULTI-GUEST-RESERVATION-HELD "${deadline}" 60 \
     "halted second-NAD guest keeps its address" pool_counts_equal e2e-pool-second 1 2
   kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete vm "${KIH_VM_NAME}" --wait=true --timeout=120s
@@ -1669,12 +2035,17 @@ EOF
     "primary pool remains healthy after second-pool removal" leader_services_healthy
   capture_checkpoint 26-second-resources-absent \
     "primary-only topology with second pool, interface, NAD, and metrics absent"
+  guard_case MULTI-DEADLINE "multipool scenarios completed within their original deadline" \
+    test "${SECONDS}" -lt "${deadline}"
+  SCENARIO_DEADLINE=0
   printf 'PASS multipool group: second bridge attachment, real guest DHCP, live pool removal, and cleanup\n' \
     > "${E2E_ARTIFACTS_DIR}/14-multipool-group.txt"
 }
 
 main() {
   local rendered vm_rendered default_image old_leader old_id octet failover_deadline failover_budget retained_lease_deadline router_original reinit_before
+  local image_id repository image_record nodes node loaded before_deployment install_mode reload_before cutoff
+  local -a kind_nodes=()
   # versions.env composes E2E_ARTIFACTS_DIR as ${root}/runs/${E2E_RUN_ID},
   # and report/evidence derive the artifact root by stripping that exact
   # suffix. An environment override that does not carry it would make those
@@ -1693,12 +2064,36 @@ main() {
   report_case_pass "runtime ${RUNTIME}, kubectl, GNU timeout, and jq available"
   report_case_start CORE-IMAGE-BUILT "helper image ${E2E_IMAGE} built from ${ROOT_DIR}"
   "${RUNTIME}" build -t "${E2E_IMAGE}" "${ROOT_DIR}"
+  image_record="$("${RUNTIME}" image inspect "${E2E_IMAGE}")"
+  image_id="$(jq -er '.[0] | (.Id // .ID) | sub("^sha256:";"")
+    | select(test("^[0-9a-f]{64}$"))' <<< "${image_record}")"
+  repository="${E2E_IMAGE%@*}"
+  case "${repository##*/}" in *:*) repository="${repository%:*}" ;; esac
+  "${RUNTIME}" tag "${E2E_IMAGE}" "${repository}:e2e-${image_id}"
+  E2E_IMAGE="${repository}:e2e-${image_id}"
+  export E2E_IMAGE
+  printf '%s\n' "${image_record}" > "${E2E_ARTIFACTS_DIR}/built-image.json"
   report_case_pass "image ${E2E_IMAGE} present in ${RUNTIME}"
   report_case_start CORE-BOOTSTRAP \
     "disposable cluster bootstrapped with bridge CNI, Multus and KubeVirt"
   REPORT_BOOTSTRAP_STARTED=1
   "${E2E_DIR}/bootstrap.sh"
   report_case_pass "cluster ${E2E_CLUSTER_NAME} up on ${KUBERNETES_VERSION}"
+  CLUSTER_STATE="$(cat "${E2E_CLUSTER_STATE_FILE}")"
+  case "${CLUSTER_STATE}" in owned|reused) ;; *) die "invalid cluster ownership state" ;; esac
+  nodes="$("${KIND}" get nodes --name "${E2E_CLUSTER_NAME}")" ||
+    die "cannot list kind nodes for ${E2E_CLUSTER_NAME}"
+  while IFS= read -r node; do
+    [ -z "${node}" ] || kind_nodes+=("${node}")
+  done <<< "${nodes}"
+  guard_case CORE-KIND-NODE-COUNT "kind cluster has exactly three nodes for image verification" \
+    test "${#kind_nodes[@]}" -eq 3
+  for node in "${kind_nodes[@]}"; do
+    loaded="$("${RUNTIME}" exec "${node}" crictl inspecti "${E2E_IMAGE}")"
+    assert_case "CORE-IMAGE-${node}" "node ${node} loaded the exact built image content" \
+      test "$(jq -er '.status.id | sub("^sha256:";"")' <<< "${loaded}")" = "${image_id}"
+    printf '%s\n' "${loaded}" > "${E2E_ARTIFACTS_DIR}/loaded-image-${node}.json"
+  done
   report_case_start CORE-BOOTSTRAP-JOURNAL \
     "bootstrap gate journal is parseable and imported into the suite report"
   if report_import_bootstrap_cases 1; then
@@ -1708,18 +2103,19 @@ main() {
   fi
   capture_checkpoint 01-bootstrap "cluster, CNI chain and KubeVirt right after bootstrap"
   assert_case CORE-VIRTCTL-INSTALLED "bootstrap installed ${VIRTCTL}" test -x "${VIRTCTL}"
+  # CR registration precedes controller startup and all custom-resource access.
+  kubectl apply -f "${ROOT_DIR}/deployments/crds.yaml"
+  kubectl wait --for=condition=Established --timeout="${E2E_WAIT_TIMEOUT}s" \
+    crd/virtualmachinenetworkconfigs.kubevirtiphelper.k8s.binbash.org \
+    crd/ippools.kubevirtiphelper.k8s.binbash.org
   # A kept cluster can be rerun, but no reservation from the previous run may
   # leak into this one.
   kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete vm "${KIH_VM_NAME}" \
     --ignore-not-found --wait=true --timeout=120s
-  if kubectl get crd virtualmachinenetworkconfigs.kubevirtiphelper.k8s.binbash.org > /dev/null 2>&1; then
     kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete vmnetcfg "${KIH_VM_NAME}" \
       --ignore-not-found --wait=true --timeout=120s
-  fi
-  if kubectl get crd ippools.kubevirtiphelper.k8s.binbash.org > /dev/null 2>&1; then
     kubectl delete ippool "${KIH_IPPOOL_NAME}" \
       --ignore-not-found --wait=true --timeout=120s
-  fi
 
 
   rendered="${E2E_ARTIFACTS_DIR}/helper-rendered.yaml"
@@ -1731,15 +2127,27 @@ main() {
   fi
   assert_case CORE-RENDERED-IMAGE "rendered helper image equals ${E2E_IMAGE}" \
     grep -q "image: ${E2E_IMAGE}" "${rendered}"
+  before_deployment="$(kubectl -n "${KIH_HELPER_NAMESPACE}" get deployment "${HELPER_DEPLOYMENT}" \
+    --ignore-not-found -o json)"
+  printf '%s\n' "${before_deployment}" > "${E2E_ARTIFACTS_DIR}/deployment-before-apply.json"
+  if [ -z "${before_deployment}" ]; then
+    install_mode="first deployment"
+  elif [ "$(jq -r '.spec.template.spec.containers[] | select(.name == "kubevirt-ip-helper") | .image' \
+      <<< "${before_deployment}")" = "${E2E_IMAGE}" ]; then
+    install_mode="existing same-image deployment"
+  else
+    install_mode="ordinary changed-image rollout"
+  fi
   kubectl apply -f "${rendered}"
-  report_case_start CORE-HELPER-ROLLED-OUT "helper deployment restarted and rolled out"
-  kubectl -n "${KIH_HELPER_NAMESPACE}" rollout restart \
-    "deployment/${HELPER_DEPLOYMENT}"
+  report_case_start CORE-HELPER-ROLLED-OUT "${install_mode} reaches normal production readiness"
   kubectl -n "${KIH_HELPER_NAMESPACE}" rollout status \
     "deployment/${HELPER_DEPLOYMENT}" --timeout="${E2E_WAIT_TIMEOUT}s"
-  report_case_pass "deployment/${HELPER_DEPLOYMENT} rolled out"
+  report_case_pass "${install_mode}; no forced restart or readiness override"
   wait_for CORE-HELPER-PODS-READY 120 "two helper pods Ready with ${KIH_HELPER_INTERFACE}" helper_pods_ready
   wait_for CORE-LEADER-CONSISTENT 120 "one labelled leader, matching Lease, and one metrics endpoint" leader_consistent
+  assert_case CORE-DEPLOYED-IMAGE "deployment template uses the exact built image" \
+    test "$(kubectl -n "${KIH_HELPER_NAMESPACE}" get deployment "${HELPER_DEPLOYMENT}" \
+      -o jsonpath='{.spec.template.spec.containers[?(@.name=="kubevirt-ip-helper")].image}')" = "${E2E_IMAGE}"
   capture_checkpoint 02-helper-ready "helper replicas Ready with ${KIH_HELPER_INTERFACE} and one leader"
   report_case_start CORE-STALE-RESOURCES-CLEARED \
     "expanded-group resources from an interrupted run are removed before core setup"
@@ -1776,6 +2184,8 @@ main() {
   assert_case CORE-NO-VMI-BEFORE-RESERVATION \
     "no VMI exists before the helper reserved an address" vmi_absent
   wait_for CORE-HALTED-RESERVATION 120 "VMNetCfg reservation while VM is halted" vm_reservation_ready
+  assert_case CORE-VM-CONTROLLER-METADATA "helper created the VM reservation and cleanup finalizer" \
+    vm_managed_reservation "${KIH_VM_NAME}" OK
   RESERVED_IP="$(kubectl -n "${KIH_WORKLOAD_NAMESPACE}" get vmnetcfg "${KIH_VM_NAME}" \
     -o jsonpath='{.spec.networkconfig[0].ipaddress}')"
   octet="${RESERVED_IP##*.}"
@@ -1806,13 +2216,12 @@ main() {
     -o jsonpath='{.spec.ipv4config.router}' 2> /dev/null)"
   assert_case CORE-ROUTER-BEFORE-PATCH "router reads ${router_original} before the restart-class patch" \
     test -n "${router_original}"
-  reinit_before="$(kubectl -n "${KIH_HELPER_NAMESPACE}" logs -l "${HELPER_SELECTOR}" --tail=200 2> /dev/null |
-    grep -c 'starting application reinitialization' || true)"
+  reinit_before="$(reload_snapshot "${REINIT_MARKER}")"
   capture_checkpoint 19-router-before-restart "leader serving ${RESERVED_IP} before the restart-class router change"
   kubectl patch ippool "${KIH_IPPOOL_NAME}" --type=merge \
     -p '{"spec":{"ipv4config":{"router":"10.77.0.9"}}}'
   wait_for CORE-ROUTER-RESTART-LOG 90 "router change starts application reinitialization" \
-    reinit_count_exceeds "${reinit_before}"
+    reload_processed "${reinit_before}" "${REINIT_MARKER}"
   wait_for CORE-ROUTER-RESTART-SERVICES 120 "leader reconstructs server IP, UDP/67, and metrics after reinitialization" \
     leader_services_healthy
   wait_for CORE-ROUTER-RESTART-RESERVATION 90 "reservation survives application reinitialization" reservation_stable
@@ -1823,12 +2232,11 @@ main() {
   capture_checkpoint 19-router-changed \
     "guest observed router 10.77.0.9 after application reinitialization"
   stop_guest router
-  reinit_before="$(kubectl -n "${KIH_HELPER_NAMESPACE}" logs -l "${HELPER_SELECTOR}" --tail=200 2> /dev/null |
-    grep -c 'starting application reinitialization' || true)"
+  reinit_before="$(reload_snapshot "${REINIT_MARKER}")"
   kubectl patch ippool "${KIH_IPPOOL_NAME}" --type=merge \
     -p "{\"spec\":{\"ipv4config\":{\"router\":\"${router_original}\"}}}"
   wait_for CORE-ROUTER-RESTORE-LOG 90 "restored router starts a second reinitialization" \
-    reinit_count_exceeds "${reinit_before}"
+    reload_processed "${reinit_before}" "${REINIT_MARKER}"
   wait_for CORE-ROUTER-RESTORE-SERVICES 120 "services recover from the restored router" leader_services_healthy
   wait_for CORE-ROUTER-RESTORE-RESERVATION 90 "reservation stable after the restored router" reservation_stable
   wait_for CORE-ROUTER-RESTORE-METRICS 60 "metrics stable after the restored router" metric_pool_equals 1 10
@@ -1840,9 +2248,11 @@ main() {
     "guest observed restored router ${router_original} after the reverse reinitialization"
   stop_guest router-restored
 
+  reload_before="$(reload_snapshot "${RELOAD_MARKER}")"
   kubectl patch ippool "${KIH_IPPOOL_NAME}" --type=merge \
     -p "{\"spec\":{\"ipv4config\":{\"leasetime\":${E2E_RETAINED_LEASE_SECONDS}}}}"
-  wait_for CORE-RELOAD-PROCESSED 60 "reloadable IPPool update processed" reload_processed
+  wait_for CORE-RELOAD-PROCESSED 60 "reloadable IPPool update newly processed" \
+    reload_processed "${reload_before}" "${RELOAD_MARKER}"
   wait_for CORE-HEALTH-AFTER-RELOAD 90 "DHCP and metrics healthy after IPPool reload" leader_services_healthy
   wait_for CORE-STABLE-AFTER-RELOAD 90 "reservation and metrics stable after reload" reservation_stable
   wait_for CORE-METRICS-AFTER-RELOAD 60 "metrics stable after reload" metric_pool_equals 1 10
@@ -1850,9 +2260,9 @@ main() {
   # Start the lease clock before the DHCP boot. The failover proof may use less
   # than its nominal budget after stop latency, but can never pass after expiry.
   retained_lease_deadline=$((SECONDS + E2E_RETAINED_LEASE_SECONDS))
-  start_guest_and_assert reload
+  start_guest_and_assert reload "${retained_lease_deadline}"
   capture_checkpoint 08-boot-reload "guest boot after reload kept ${RESERVED_IP}"
-  stop_guest reload
+  snapshot_guest_continuity
 
   assert_case FAILOVER-LEADER-STABLE-BEFORE \
     "leader state consistent before the active leader is deleted" leader_consistent
@@ -1861,14 +2271,14 @@ main() {
   failover_deadline=$((SECONDS + E2E_FAILOVER_DHCP_TIMEOUT))
   [ "${failover_deadline}" -le "${retained_lease_deadline}" ] ||
     failover_deadline="${retained_lease_deadline}"
+  SCENARIO_DEADLINE="${failover_deadline}"
   failover_budget=$((failover_deadline - SECONDS))
   guard_case FAILOVER-LEASE-WINDOW \
     "retained lease remains before active leader deletion" \
     test "${failover_budget}" -gt 0
-  guard_case FAILOVER-LEADER-DELETE \
-    "active leader deletion is accepted before the failover deadline" \
-    timeout --foreground "${failover_budget}s" kubectl \
-      -n "${KIH_HELPER_NAMESPACE}" delete pod "${old_leader}" --wait=false
+  command_before_deadline FAILOVER-LEADER-DELETE "${failover_deadline}" \
+    "active leader deletion accepted while the guest stays running" \
+    kubectl -n "${KIH_HELPER_NAMESPACE}" delete pod "${old_leader}" --wait=false
   wait_before_deadline FAILOVER-LEADER-TRANSFER "${failover_deadline}" 75 "leader label and Lease transfer" \
     new_leader_elected "${old_leader}" "${old_id}"
   wait_before_deadline FAILOVER-SERVICES "${failover_deadline}" 90 \
@@ -1879,8 +2289,24 @@ main() {
     "new leader reconstructs IPPool metrics" metric_pool_equals 1 10
   wait_before_deadline FAILOVER-VM-METRIC "${failover_deadline}" 60 \
     "new leader reconstructs VM metric" metric_vm_ok
+  refresh_dhcp_events
+  GUEST_EVENT_CUTOFF="$(wc -l < "${GUEST_EVENTS}")"
+  GUEST_ACTION_EPOCH="$(date +%s.%N)"
+  wait_before_deadline FAILOVER-LIVE-RENEWAL "${failover_deadline}" "${E2E_FAILOVER_DHCP_TIMEOUT}" \
+    "unchanged native client naturally renews through the replacement helper" \
+    dhcp_transaction_after "${GUEST_EVENT_CUTOFF}" "${GUEST_ACTION_EPOCH}" \
+    "${E2E_RETAINED_LEASE_SECONDS}" renewal
+  cutoff="$(guest_samples | jq -er '.[-1].seq')"
+  wait_before_deadline FAILOVER-LIVE-NETWORK "${failover_deadline}" 30 \
+    "same VMI and client retain successful network samples across helper loss" guest_continuity_after "${cutoff}"
+  stop_guest reload "${failover_deadline}"
   start_guest_and_assert failover "${failover_deadline}"
   capture_checkpoint 09-leader-failover "new leader served the retained lease during failover"
+  guard_case FAILOVER-EVIDENCE-CLOSED "cold-start packet and console evidence closes cleanly before lease expiry" \
+    finish_guest_evidence_before_deadline "${failover_deadline}"
+  guard_case FAILOVER-DEADLINE "live and cold failover checks completed before lease expiry" \
+    test "${SECONDS}" -lt "${failover_deadline}"
+  SCENARIO_DEADLINE=0
 
   kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete vm "${KIH_VM_NAME}" --wait=true
   wait_for CORE-CLEANUP-COMPLETE 120 "VM deletion releases VMNetCfg and IP allocation" cleanup_complete

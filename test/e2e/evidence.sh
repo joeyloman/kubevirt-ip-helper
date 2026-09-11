@@ -28,7 +28,7 @@ EVIDENCE_SCHEMA_VERSION=1
 #   raw.json                     every captured Kubernetes document, keyed by group
 #   normalized.json              one deterministic object record per object
 #   changes-from-previous.json   added/removed/changed keys plus a unified diff
-#   observations.txt             console markers, leader interface, listener, metrics
+#   observations.txt             native guest samples, interfaces/listeners, Service metrics
 _evidence_now() { date -u +%Y-%m-%dT%H:%M:%SZ 2> /dev/null || date; }
 
 _evidence_root() {
@@ -231,7 +231,7 @@ _evidence_order_final() {
 _evidence_group() { # <dir> <label> <kubectl arguments...>
   local dir="$1" label="$2" rc=0 message
   shift 2
-  timeout --foreground "${E2E_CAPTURE_TIMEOUT}s" kubectl "$@" \
+  _evidence_kubectl "$@" \
     > "${dir}/parts/${label}.json" 2> "${dir}/parts/${label}.err" || rc=$?
   if [ "${rc}" -ne 0 ]; then
     if [ "${EVIDENCE_ALLOW_MISSING_API:-}" = "1" ] &&
@@ -353,12 +353,40 @@ _evidence_portable_path() {
 }
 
 
+# Every checkpoint API operation shares the active scenario's remaining time.
+# The optional local request deadline groups the Service lookup and scrape.
+_evidence_kubectl() {
+  local budget="${E2E_CAPTURE_TIMEOUT}" deadline remaining
+  for deadline in "${SCENARIO_DEADLINE:-0}" "${EVIDENCE_REQUEST_DEADLINE:-0}"; do
+    [ "${deadline}" -gt 0 ] || continue
+    remaining=$((deadline - SECONDS))
+    [ "${remaining}" -gt 0 ] || return 124
+    [ "${budget}" -le "${remaining}" ] || budget="${remaining}"
+  done
+  timeout --foreground --kill-after=1s "${budget}s" kubectl "$@"
+}
+
+# Shared by runner assertions and checkpoint capture. The Service is the
+# externally consumed interface; a localhost listener is not delivery proof.
+helper_service_metrics() {
+  local service port dns
+  local EVIDENCE_REQUEST_DEADLINE=$((SECONDS + E2E_CAPTURE_TIMEOUT))
+  service="$(_evidence_kubectl \
+    -n "${KIH_HELPER_NAMESPACE}" get service "${METRICS_SERVICE:-kubevirt-ip-helper-metrics}" -o json)" || return 1
+  port="$(jq -er '[.spec.ports[] | select(.name == "metrics") | .port]
+    | select(length == 1) | .[0]
+    | select(type == "number" and . >= 1 and . <= 65535 and . == floor)' <<< "${service}")" || return 1
+  dns="$(jq -er '.metadata.name + "." + .metadata.namespace + ".svc"' <<< "${service}")" || return 1
+  _evidence_kubectl \
+    -n "${KIH_WORKLOAD_NAMESPACE}" exec "${KIH_NETWORK_POD}" -c "${KIH_NETWORK_CONTAINER}" -- \
+    curl -fsS --max-time 5 "http://${dns}:${port}/metrics"
+}
+
 # _evidence_observations keeps the non-object proof that belongs to a checkpoint:
-# guest console markers, the artifact layout, and every helper pod's interface,
-# route, and UDP observations. Checkpoint metrics are collected from the labelled
-# leader; the HTTP listener also exists on standbys.
+# guest network samples, artifact layout, and every helper pod's interface,
+# route, and UDP observations. Checkpoint metrics use the published Service.
 _evidence_observations() { # <dir>
-  local dir="$1" rc=0 leaders pods pod leader artifact output
+  local dir="$1" rc=0 leaders pods pod artifact output
   local leader_err pod_err write_error=0
   local observations="${dir}/observations.txt"
   {
@@ -369,11 +397,11 @@ _evidence_observations() { # <dir>
       [ -f "${artifact}" ] || continue
       printf -- '-- %s\n' "$(_evidence_portable_path "${artifact}")" || write_error=1
     done
-    printf '\n===== console markers =====\n' || write_error=1
+    printf '\n===== native guest network samples =====\n' || write_error=1
     for artifact in "${E2E_ARTIFACTS_DIR}"/console-*.log; do
       [ -f "${artifact}" ] || continue
       printf -- '-- %s\n' "$(_evidence_portable_path "${artifact}")" || write_error=1
-      grep -o 'E2E_DHCP_[A-Z]*[^[:space:]]*' "${artifact}" || true
+      grep -E '^E2E_NET_SAMPLE ' "${artifact}" || true
     done
   } > "${observations}" 2>&1 || write_error=1
   if [ "${write_error}" -ne 0 ]; then
@@ -381,12 +409,12 @@ _evidence_observations() { # <dir>
     return 1
   fi
 
-  leaders="$(timeout --foreground "${E2E_CAPTURE_TIMEOUT}s" kubectl \
+  leaders="$(_evidence_kubectl \
     -n "${KIH_HELPER_NAMESPACE}" get pods -l "${LEADER_SELECTOR:-kubevirtiphelper/leader=active}" \
     -o jsonpath='{.items[*].metadata.name}' 2> "${dir}/.leader.err")" || rc=1
   leader_err="$(cat "${dir}/.leader.err" 2> /dev/null || true)"
   rm -f "${dir}/.leader.err" || rc=1
-  pods="$(timeout --foreground "${E2E_CAPTURE_TIMEOUT}s" kubectl \
+  pods="$(_evidence_kubectl \
     -n "${KIH_HELPER_NAMESPACE}" get pods \
     -o jsonpath='{.items[*].metadata.name}' 2> "${dir}/.pods.err")" || rc=1
   pod_err="$(cat "${dir}/.pods.err" 2> /dev/null || true)"
@@ -417,15 +445,14 @@ _evidence_observations() { # <dir>
     fi
   fi
   for pod in ${pods}; do
-    leader=0
     case " ${leaders} " in
-      *" ${pod} "*) leader=1; printf '\n===== helper pod %s (leader) =====\n' "${pod}" ;;
+      *" ${pod} "*) printf '\n===== helper pod %s (leader) =====\n' "${pod}" ;;
       *) printf '\n===== helper pod %s =====\n' "${pod}" ;;
     esac >> "${observations}" || {
       rc=1
       _evidence_record_error "observations" "cannot append helper pod ${pod} header" || true
     }
-    if ! output="$(timeout --foreground "${E2E_CAPTURE_TIMEOUT}s" kubectl \
+    if ! output="$(_evidence_kubectl \
       -n "${KIH_HELPER_NAMESPACE}" exec "${pod}" -- \
       sh -c 'set -eu; ip addr; ip route; cat /proc/net/udp')"; then
       rc=1
@@ -442,29 +469,14 @@ _evidence_observations() { # <dir>
       _evidence_record_error "observations" \
         "cannot append helper pod ${pod} interface/route/UDP output" || true
     fi
-    if [ "${leader}" -eq 1 ]; then
-      if ! output="$(timeout --foreground "${E2E_CAPTURE_TIMEOUT}s" kubectl \
-        -n "${KIH_HELPER_NAMESPACE}" exec "${pod}" -- \
-        wget -qO- http://127.0.0.1:8080/metrics)"; then
-        rc=1
-        if ! printf -- '-- pod %s: leader metrics scrape failed\n' \
-          "${pod}" >> "${observations}"; then
-          _evidence_record_error "observations" "cannot append metrics failure marker" || true
-        fi
-        _evidence_record_error "observations" \
-          "leader pod ${pod} metrics scrape failed" || true
-      elif ! printf '%s\n' "${output}" >> "${observations}"; then
-        rc=1
-        _evidence_record_error "observations" \
-          "cannot append leader pod ${pod} metrics output" || true
-      fi
-    elif ! printf -- '-- pod %s: follower metrics scrape intentionally skipped (checkpoint metrics are scoped to the labelled leader)\n' \
-      "${pod}" >> "${observations}"; then
-      rc=1
-      _evidence_record_error "observations" \
-        "cannot append follower metrics note for ${pod}" || true
-    fi
   done
+  if ! output="$(helper_service_metrics)"; then
+    rc=1
+    _evidence_record_error "observations" "metrics Service scrape from the network client failed" || true
+  elif ! printf '\n===== metrics Service =====\n%s\n' "${output}" >> "${observations}"; then
+    rc=1
+    _evidence_record_error "observations" "cannot append metrics Service output" || true
+  fi
   if [ "${rc}" -ne 0 ]; then
     _evidence_fail "observations" \
       "at least one helper pod observation or observation-file write failed"

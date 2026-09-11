@@ -1,8 +1,8 @@
 # kind, Multus, and KubeVirt end-to-end suite
 
-This suite builds `kubevirt-ip-helper` from the checkout and exercises it in a disposable two-node kind cluster: one control-plane and one worker. It installs the real CNI and virtualization stack: kindnet, Multus thick, the bridge CNI plugin, and KubeVirt with QEMU software emulation. No production Go code or production manifest is replaced.
+This suite builds `kubevirt-ip-helper` from the checkout and exercises it in a disposable three-node kind cluster: one control-plane and two workers. It installs the real CNI and virtualization stack—kindnet, Multus thick, the bridge CNI plugin, and KubeVirt with QEMU software emulation—on two owned shared-L2 data networks attached to every node. No production Go code or production manifest is replaced.
 
-Two stack profiles run side by side. `E2E_STACK=current` is the default and reports whether the helper is compatible with a current stable stack; `E2E_STACK=dependency-era` mirrors the library generation in `go.mod` and is the attribution lane. `E2E_GROUP` selects `all`, `core`, `pool`, `lease`, `ha`, or `multipool`; invalid stack or group values are rejected before cluster mutation.
+Two stack profiles are available. `E2E_STACK=current` is the default and reports whether the helper is compatible with a current stable stack; `E2E_STACK=dependency-era` mirrors the library generation in `go.mod` and is the attribution lane. `E2E_GROUP` selects `all`, `core`, `pool`, `lease`, `ha`, or `multipool`; invalid stack or group values are rejected before cluster mutation.
 
 ## Run
 
@@ -26,20 +26,20 @@ E2E_STACK=dependency-era E2E_GROUP=core ./test/e2e/run.sh
 Required locally:
 
 - Linux on `amd64`.
-- `bash`, `kubectl`, GNU `timeout`, `jq`, and `sha256sum`. `jq` parses the generated reports, `sha256sum` verifies the artifact manifest.
-- A running container runtime with enough capacity for kind, KubeVirt, and one 256 MiB guest. Hardware virtualization is not required.
-- Outbound HTTPS access to GitHub, GHCR, Quay, and the Kubernetes registry.
+- `bash`, `kubectl`, GNU `timeout`, `jq`, `sha256sum`, and `python3`. Python 3 runs the stdlib-only DHCP pcap decoder; `jq` parses generated reports and `sha256sum` verifies the artifact manifest.
+- A running Docker or Podman daemon with enough capacity for the three-node kind cluster, KubeVirt, the test fixtures, and guests. Hardware virtualization is not required.
+- Outbound HTTPS access to GitHub, Docker Hub, GHCR, Quay, and the Kubernetes registry.
 
 The harness downloads checksum-pinned `kind`, `virtctl`, and CNI plugin assets into a per-profile cache, `${XDG_CACHE_HOME:-$HOME/.cache}/kubevirt-ip-helper-e2e/current` for the default lane and `${XDG_CACHE_HOME:-$HOME/.cache}/kubevirt-ip-helper-e2e/dependency-era` for the attribution lane, so the two lanes never overwrite each other's binaries or downloaded manifests. It does not add binaries to the checkout or system paths.
 
-Each profile also owns its cluster and artifact names so a retained lane cannot collide with the other:
+Each profile also owns its cluster and artifact names:
 
 | Profile | kind cluster | Diagnostics directory |
 | --- | --- | --- |
 | `current` | `kubevirt-ip-helper-e2e-current` | `_artifacts/e2e/current` |
 | `dependency-era` | `kubevirt-ip-helper-e2e-dependency-era` | `_artifacts/e2e/dependency-era` |
 
-Non-`all` groups append the group to each name, for example `current-pool`. This prevents parallel group jobs from sharing a cluster, cache, or artifact directory.
+The owned shared data networks use fixed transport CIDRs `10.77.0.0/16` and `10.78.0.0/16`. Therefore only one retained or running E2E cluster may use a Docker or Podman daemon at a time, even when profile, group, cluster, cache, and artifact names differ. Run parallel lanes only on separate daemons or VMs. The CI matrix satisfies that requirement because each matrix job runs in its own VM.
 
 Optional environment variables:
 
@@ -54,7 +54,7 @@ E2E_VM_BOOT_TIMEOUT=300
 ```
 New knobs: `E2E_PRED_SECONDS` (default 20; see Assertions), `E2E_LEASE_STORM_COUNT` (default 3) and `E2E_LEASE_STORM_WINDOW` (default 10, minutes), which bound the lease-storm scenario.
 
-A cluster created by `run.sh` is deleted after diagnostics on success or failure; if bounded deletion itself fails, the report records `SUITE-CLUSTER-CLEANUP` and leaves the cluster for diagnosis. A compatible cluster that already existed is reused but never deleted by the harness. `E2E_KEEP_CLUSTER=1` retains a newly created cluster; resolve `${E2E_ARTIFACTS_ROOT}/latest` to the current run before reading its kubeconfig:
+A cluster created by `run.sh` is deleted after diagnostics on success or failure; if bounded deletion itself fails, the report records `SUITE-CLUSTER-CLEANUP` and leaves the cluster for diagnosis. Its two owned data networks are removed only after that owned-cluster deletion succeeds. A compatible cluster that already existed is reused but never deleted by the harness, and its data networks are retained; `E2E_KEEP_CLUSTER=1` likewise retains a newly created cluster and its networks. Resolve `${E2E_ARTIFACTS_ROOT}/latest` to the current run before reading its kubeconfig:
 
 ```sh
 root=_artifacts/e2e/current
@@ -76,76 +76,68 @@ Every downloaded artifact, manifest, and image is pinned by an exact version plu
 | virtctl | `v1.9.0`, Linux amd64 SHA256 `40ede2ee37c98a1aeed71c9c219616a05247ce2be109e1edddf0477572e8b978` | `v0.54.0`, Linux amd64 SHA256 `a46bf15c4213520c0f969554e87c44e1f277214b1a7e4a460ec39ed72fc65164` |
 | guest | `quay.io/kubevirt/cirros-container-disk-demo:v1.9.0@sha256:ebdb8d8b9b480f6ee7664ed3fdde8428767664f507d98f94090edeff04d7ebf2` | `quay.io/kubevirt/cirros-container-disk-demo:v0.54.0@sha256:00d08fb2f4f3dfc36b43fec4bc8d2d6fd71712377d029dc9927adf7e78ce80ec` |
 
-Both lanes install the same CNI generation: bridge CNI plugins `v1.9.1`, Linux amd64 SHA256 `b98f74a0f8522f0a83867178729c1aa70f2158f90c45a2ca8fa791db1c76b303`, and the Multus `v4.3.0` thick manifest, SHA256 `2d622f697809644a12704497bbf5c3256adc1e7f5b5504655e4993743651b585`, whose moving `snapshot-thick` image tag `bootstrap.sh` rewrites to `ghcr.io/k8snetworkplumbingwg/multus-cni:v4.3.0-thick@sha256:a922a39a78049991d03178c07afc45a198326481049bd7d84626097402fa14bb`. Every download URL, digest, name, address, and timeout lives in `versions.env`, which is what each profile reads; `KIH_GUEST_IMAGE` is the guest image for the selected profile.
+Both lanes install the same CNI generation: bridge CNI plugins `v1.9.1`, Linux amd64 SHA256 `b98f74a0f8522f0a83867178729c1aa70f2158f90c45a2ca8fa791db1c76b303`, and the Multus `v4.3.0` thick manifest, SHA256 `2d622f697809644a12704497bbf5c3256adc1e7f5b5504655e4993743651b585`, whose moving `snapshot-thick` image tag `bootstrap.sh` rewrites to `ghcr.io/k8snetworkplumbingwg/multus-cni:v4.3.0-thick@sha256:a922a39a78049991d03178c07afc45a198326481049bd7d84626097402fa14bb`. The network fixture and three passive observers use `docker.io/nicolaka/netshoot:v0.14@sha256:7f08c4aff13ff61a35d30e30c5c1ea8396eac6ab4ce19fd02d5a4b3b5d0d09a2`; its DNS sidecar uses `registry.k8s.io/coredns/coredns:v1.12.1@sha256:e8c262566636e6bc340ece6473b0eed193cad045384401529721ddbe6463d31c`. Every download URL, digest, name, address, and timeout lives in `versions.env`, which is what each profile reads; `KIH_GUEST_IMAGE` is the guest image for the selected profile.
 
 Each lane answers a different question:
 
 - **`current` is the default and the deployment-compatibility signal.** It runs the helper against a current stable kind, Kubernetes, and KubeVirt generation, which is what the helper actually has to survive in a live cluster. A green `current` job is the answer to "can this build be deployed".
 - **`dependency-era` is the attribution lane.** It matches `go.mod` only: `kubevirt.io/api` and `kubevirt.io/client-go` `v0.54.0`, with the forced `k8s.io/apimachinery`, `k8s.io/client-go`, and `k8s.io/api` replacements at `v0.24.0`, so the API server stays in the 1.24 generation. When only one lane is green, that lane tells you whether a failure comes from this checkout's own logic or from the generation gap between the compiled client libraries and a modern cluster. It is a reference point for reading the other lane, not a target to upgrade toward.
 
-No lane floats on a `latest` tag. Unattended CI must be able to re-run an old commit and get the same schema, CNI chain, and guest image, so every pin pairs a version with the digest of the bytes it downloads, and a version bump has to change its digest in the same commit. The published helper image is addressed the same way: CI builds the checkout under the short-SHA tag `${GITHUB_SHA:0:8}` and loads it straight into kind rather than resolving a moving tag.
+No lane floats on a `latest` tag. Unattended CI must be able to re-run an old commit and get the same schema, CNI chain, and guest image, so every pin pairs a version with the digest of the bytes it downloads, and a version bump has to change its digest in the same commit. The helper is built locally, retagged with its full image content ID as `${repository}:e2e-${content-id}`, loaded into all three kind nodes, and verified there by content ID before deployment.
 
 ## Topology and ordering
 
 `bootstrap.sh` performs these gates in order:
 
-1. Create the pinned kind cluster with one control-plane and one worker, then inspect the existing kindnet CNI configuration on every node.
-2. Install the pinned bridge plugin in every node's `/opt/cni/bin`.
-3. Apply the pinned Multus thick DaemonSet and verify that its generated master configuration chains to the retained kindnet delegate.
-4. Create the bridge NetworkAttachmentDefinition `kubevirt-ip-helper/kubevirt-ip-helper-e2e` with no CNI IPAM.
-5. Start a plain pod and an NAD-attached pod. Both must become Ready; the second must report interface `kihnet0` in `network-status`, and the node must contain bridge `br-kih-e2e`.
-6. Delete both probes.
-7. Install KubeVirt with `spec.configuration.developerConfiguration.useEmulation: true` already present on the first KubeVirt reconciliation.
+1. Create or reuse the pinned kind cluster with one control-plane and two workers.
+2. Create or verify the two owned runtime data networks, attach every kind node to both, and make each new uplink part of the corresponding node-local bridge without changing the kind management route.
+3. Inspect the existing kindnet CNI configuration on every node, install the pinned bridge plugin in every node's `/opt/cni/bin`, and apply the pinned Multus thick DaemonSet. Its generated master configuration must chain to the retained kindnet delegate.
+4. Create the primary bridge NetworkAttachmentDefinition `kubevirt-ip-helper/kubevirt-ip-helper-e2e` with no CNI IPAM, then start the control-plane network-services Pod and its pinned CoreDNS sidecar. The fixtures provide `10.77.0.1`, `10.77.0.9`, `10.78.0.1`, off-subnet probe targets, and the primary and secondary DNS names.
+5. Start the passive host-network observer DaemonSet on all three nodes and prove fixture/DNS reachability on each shared L2 segment. Start and remove plain and NAD-attached CNI probes; the latter must report `kihnet0` in `network-status` and its node must contain `br-kih-e2e`.
+6. Install KubeVirt with `spec.configuration.developerConfiguration.useEmulation: true` already present on the first KubeVirt reconciliation.
 
-The preflight deliberately finishes before KubeVirt installation. A broken kindnet-to-Multus chain is therefore classified as a CNI setup failure, before KubeVirt downloads and a software-emulated guest consume time.
+The preflight deliberately finishes before KubeVirt installation. A broken kindnet-to-Multus chain or unreachable fixture is therefore classified as setup failure before a software-emulated guest consumes time.
 
-`run.sh` then renders the E2E Kustomize overlay with:
+`run.sh` next applies `deployments/crds.yaml` and waits for both helper CRDs to become `Established`, then renders the E2E Kustomize overlay:
 
 ```sh
 kubectl kustomize --load-restrictor=LoadRestrictionsNone test/e2e/manifests
 ```
 
-The unrestricted loader is required because the overlay imports `deployments/crds.yaml` and `deployments/deployment.yaml` as the production sources of truth. The render deletes only the unsupported `ServiceMonitor`, pins the locally loaded image, and attaches both helper replicas to the NAD as `kihnet0`. `manifests/vm.yaml` is the template for the `current` profile: `run.sh` renders it into that profile's artifact directory, substitutes the profile's `KIH_GUEST_IMAGE`, and rejects a render that still carries the template image, so a `dependency-era` run never boots the guest on the `current` Cirros image.
+The unrestricted loader imports the production deployment manifests; CRDs are applied separately before the overlay. The overlay deletes only the unsupported `ServiceMonitor`, pins the locally loaded content-ID image, and attaches both production-default helper replicas to the primary NAD as `kihnet0`; it does not override helper replicas, scheduling, readiness, resources, or environment. The ordinary first Deployment apply and normal rollout readiness are used—there is no forced restart or readiness bypass. `manifests/vm.yaml` is rendered into the profile artifact directory with the selected `KIH_GUEST_IMAGE`, and the render rejects an unreplaced template image.
 
-The IPPool is intentionally separate from the overlay. `run.sh` applies it only after both helper pod sandboxes prove that `kihnet0` exists. The pool contract is:
+The primary IPPool is intentionally separate from the overlay and is applied only after both helper pod sandboxes prove that `kihnet0` exists. Its contract is:
 
 - network: `kubevirt-ip-helper/kubevirt-ip-helper-e2e`
 - subnet/server: `10.77.0.0/24`, `10.77.0.2`
 - allocation range: `10.77.0.100` through `10.77.0.110`
 - bind interface: `kihnet0`
 
-The guest has a normal masqueraded pod-network NIC for KubeVirt management and a bridge-bound Multus NIC with explicit MAC `02:00:00:00:00:11`. Its userdata locates the helper-served NIC by MAC, acquires DHCP there, and writes `E2E_DHCP_OK=<address>` plus DHCP event and router markers to the serial console.
+The guest has only the helper-served Multus bridge NIC with explicit MAC `02:00:00:00:00:11`. It uses stock persistent CirrOS DHCP on that NIC. Observation-only userdata finds the NIC by MAC and repeatedly writes a fresh `E2E_NET_SAMPLE` containing the native client, address, route, DNS, gateway, and routed-target observations; it neither configures networking nor invokes, replaces, signals, or restarts the DHCP client.
 
 ## Assertions
 
 A run fails on any missing invariant:
 
-1. Both helper replicas are Ready, both contain `kihnet0`, and both report that interface in Multus `network-status`.
-2. Exactly one pod has `kubevirtiphelper/leader=active`.
-3. The `kubevirt-ip-helper-lock` Lease holder UUID is the UUID logged by that labelled pod.
-4. The metrics Service has exactly one endpoint and it is the labelled leader pod.
-5. The leader owns `10.77.0.2/24` on `kihnet0`, listens on UDP/67, and serves metrics.
-6. Creating halted VM `e2e/e2e-vm` produces a VMNetCfg reservation and an IPPool allocation before any VMI exists.
-7. The reservation is in range, belongs to the explicit MAC, has VMNetCfg status `OK`, and is reflected by the IPPool and VM metrics.
-8. The first guest boot prints `E2E_DHCP_OK=<reserved address>` and matching DHCP/router event markers; deconfiguration markers may report `unset` before the successful bound event.
-9. A stop/start cycle keeps the reservation and reacquires the same address.
-10. Changing `leasetime` from 300 to 600 drives the live DHCP-pool reload path without losing the allocation, DHCP listener, or metrics; a subsequent guest boot gets the same address.
-11. Changing `router` from `10.77.0.1` to `10.77.0.9` drives the full application-reinitialization path, updates the server interface and the router option observed by a real guest, and preserves its reservation. Restoring `10.77.0.1` repeats the path and restores the guest-visible option.
-12. Deleting the active leader transfers both label and Lease UUID. Election, state reconstruction, and guest reacquisition share a 540-second maximum, but their absolute deadline is capped by the 600-second lease window started before the reload boot; VM stop latency therefore reduces the failover budget instead of moving it past lease expiry.
-13. Deleting the VM removes its VMNetCfg, releases the IPPool allocation, returns metrics to used `0` / available `11`, and removes the VM metric.
-14. The `pool` group fills all eleven addresses, refuses a twelfth allocation without disrupting an existing DHCP lease, exercises both duplicate-MAC refusal paths (VM precreation guard and VMNetCfg `ERROR` status), reclaims a released address through an explicit VMNetCfg request, and rejects an out-of-range address without changing pool accounting.
-15. The `ha` group maintains a live reservation while replacing a follower, scaling from two replicas to one and back, bouncing the leader's `kihnet0`, and deleting both replicas simultaneously. Leadership, listener, address, metrics, pool state, and a real guest DHCP acquisition must converge after the total-loss transition.
-16. The `lease` group shortens the lease, keeps the guest running, observes a subsequent DHCP client event on the serial console, and proves the reservation and accounting remain stable without assuming an exact BusyBox T1 timer.
-17. The `multipool` group adds a second bridge attachment and helper interface, initializes an independent non-overlapping pool, proves a real VM gets a `10.78.0.x` lease from it, then deletes that IPPool while helpers are live. The second server address, pool metric, attachment, and interface must disappear while the primary pool stays healthy.
+1. The normal two-replica helper Deployment is Ready with `kihnet0` in each pod's Multus `network-status`; exactly one active-leader label, matching Lease holder, and metrics-Service endpoint identify the leader.
+2. The leader owns `10.77.0.2/24` on `kihnet0`, listens on UDP/67, and exposes the expected metrics through the Kubernetes Service. The suite does not install or qualify Prometheus Operator discovery.
+3. Creating halted VM `e2e/e2e-vm` causes the controller to create an in-range VMNetCfg reservation, its cleanup finalizer, IPPool allocation, and VM metric before any VMI exists.
+4. Before the guest starts, passive tcpdump captures run on all three observer nodes. The guest-node capture is decoded with the Python 3 stdlib decoder and proves a matching DHCP `REQUEST` followed by `ACK` for the real guest MAC and reservation, including address, mask, router, DNS, server ID, and lease duration.
+5. Fresh native samples prove the same guest address, installed gateway, normal-resolver DNS result, and routed off-subnet target reachability. Samples are continuity observations, not synthetic DHCP event hooks.
+6. A stop/start preserves the controller-created reservation and obtains the same address. A live IPPool lease change is then proven by a later native renewal: the pcap must contain a `REQUEST` with `ciaddr` equal to the reservation and the matching `ACK` with the restored lease duration. The client remains running; neither a client restart nor a forced acquisition is accepted.
+7. Changing the primary router between `10.77.0.1` and `10.77.0.9` verifies the guest-visible route and preserves the reservation.
+8. Deleting the active leader transfers label and Lease state while the original VM remains live. The unchanged VMI and native client must renew normally, retain healthy samples, and remain within the existing lease deadline; a cold-start check after failover is retained.
+9. Deleting the VM removes its controller-created VMNetCfg, releases the IPPool allocation, returns Service-delivered metrics to used `0` / available `11`, and removes the VM metric.
+10. The `pool` group fills all eleven addresses and refuses a twelfth without changing existing reservations. It covers duplicate-MAC refusal both at VM creation and as a VMNetCfg `ERROR`, and checks the owner's DHCP before and after deleting the duplicate VM. After a normal VM deletion leaves one free slot, a raw invalid `.99` VMNetCfg without a finalizer is rejected without changing accounting; a new ordinary VM then receives the freed slot through a controller-created reservation and finalizer.
+11. The `ha` group keeps a live VM through active-worker stop, follower replacement, normal one-to-two replica churn, and leader-interface bounce. The HA VM is placed on the surviving worker solely by its ordinary hostname `nodeSelector`; helper placement remains production-default. It retains identity, reservation, Service metrics, sampled network continuity, and a natural renewal while the other worker is stopped, then checks cold start again after total helper-pod loss.
+12. The `lease` group shortens the lease, keeps the guest running, restores the normal lease, and proves the exact native renewal `REQUEST`/`ACK` and sampled continuity.
+13. The `multipool` group performs a normal secondary-NAD and helper-interface rollout, initializes an independent `10.78.0.x` pool and guest, then performs the inverse cleanup while the primary pool remains healthy.
 
-These assertions are the complete contract of the emulated suite and every executed item receives a stable case ID in `cases.jsonl`, `report.json`, and `report.txt`. The scope is deliberately narrower than physical deployment qualification: kind uses KubeVirt software emulation on Linux `amd64`, so this suite does not claim KVM acceleration, external or VLAN-backed L2 reachability, cross-node broadcast behavior, control-plane network partitions, clock skew, or non-`amd64` coverage. It verifies the assigned address and router DHCP option rather than every optional DHCP field. Those boundaries are explicit exclusions, not silently skipped test cases.
-Metric predicates re-resolve the labelled leader pod on every scrape: each used, available, and VMNetCfg-status read first locates the pod carrying `kubevirtiphelper/leader=active`, and the exec read is bounded by `wget -T`. Series matching is exact: a predicate matches the single `^kubevirtiphelper_ippool_(used|available)` line for its pool label, the trailing value must be strictly numeric, and equality is exact; absence assertions match only that pool label's series lines. Accounting follows invariants: `used` must be a strict number — a missing `used` is a failure — while an empty or absent `available` normalizes to 0, because the helper omits `available` when the pool is exhausted; that omission is an accepted encoding, not an error. Expected capacity derives from the pool spec's inclusive start/end range.
+These assertions are the complete contract of the emulated suite and every executed item receives a stable case ID in `cases.jsonl`, `report.json`, and `report.txt`. The scope is deliberately narrower than physical deployment qualification: kind uses KubeVirt software emulation on Linux `amd64`, so this suite does not claim KVM acceleration, external or VLAN-backed L2 reachability, control-plane network partitions, clock skew, non-`amd64` coverage, perfect packet-loss behavior, or throughput. It verifies the explicit DHCP options and guest observations above, not every optional DHCP field. Those boundaries are explicit exclusions, not silently skipped test cases.
 
-`wait_for` polls each predicate in a subshell with a per-poll watchdog (`E2E_PRED_SECONDS`, default 20), so a wedged kubectl or exec cannot consume the loop budget; at timeout exhaustion it allows one grace re-probe, recorded explicitly. `wait_before_deadline` keeps the watchdog but never takes a grace probe, because its deadlines are window contracts.
+Metric predicates find the labelled leader and fetch `/metrics` through the actual metrics Service from the network-services Pod. Every required series must occur exactly once and contain an integer value; missing, empty, or duplicate series fail. Separately, initialized IPPool API objects may omit zero-valued `used`, `available`, or `allocated` fields. Those omissions decode as `0`, `0`, and `{}` respectively; null or malformed values, missing initialization, out-of-range allocations, and inconsistent accounting still fail.
 
-A predicate may return exit code 2 to identify an ownership regression signature; the driver then dies immediately with a mapped explanation. The existing duplicate-owner-after-cfg boot uses this: if the leader's log repeatedly shows `NO LEASE FOUND` for the owner MAC after deletion of the refused duplicate VirtualMachineNetworkConfig, the case fails fast and reports `owner DHCP lease missing after duplicate-config cleanup`.
-
-`console_has_router_marker` requires the expected router to be the entire non-`unset` marker set and the last non-`unset` marker.
+Every polling command has a deadline-clamped watchdog. A deadline cannot pass by taking a grace re-probe; an ownership-regression signature fails immediately rather than being converted into a later pass.
 
 ## Diagnostics
 
@@ -159,8 +151,9 @@ When cluster state, the kind binary, and a kubeconfig are available, `collect.sh
 - IPPool, VMNetCfg, VM, VMI, workload events, and virt-launcher logs
 - leader interface, route, UDP socket, and labelled-leader metrics state
 - the per-bootstrap-gate `bootstrap-cases.jsonl` journal
-- kind-node CNI files, bridge state, and container-runtime information
-- `console-*.log` for each guest boot and `10-guest-markers.txt` as a compact marker index
+- kind-node CNI files, bridge state, runtime-network identities, and container-runtime information
+- `console-*.log` and `10-guest-samples.txt`, the compact index of fresh native samples
+- top-level `dhcp-*.pcap`, decoded `*.pcap.jsonl`, capture `*.pcap.stderr`, and `*.pcap.decode-errors` files for each passive observer capture
 
 For a retained cluster in the default lane:
 
@@ -183,6 +176,8 @@ Delete it when finished:
 ${XDG_CACHE_HOME:-$HOME/.cache}/kubevirt-ip-helper-e2e/current/bin/kind delete cluster --name kubevirt-ip-helper-e2e-current
 ```
 
+`kind delete cluster` does not remove the separately owned data networks. After deletion, inspect their ownership labels and remove only that retained cluster's now-unused `<cluster>-data` and `<cluster>-data2` networks with the same runtime. Do not force removal of attached networks.
+
 The attribution lane uses the same commands with `dependency-era` in place of `current`.
 
 ## Run history
@@ -193,22 +188,18 @@ Each execution gets its own directory under the profile's artifact root, so repe
 _artifacts/e2e/current-core/                     # E2E_ARTIFACTS_ROOT
 ├── latest                                       # pointer to the newest successful run
 └── runs/
-    ├── 20260903T071422Z/                        # earlier execution
-    └── 20260903T085931Z/                        # newest execution = E2E_ARTIFACTS_DIR
+    └── 20260903T085931Z-18422/                  # E2E_ARTIFACTS_DIR
         ├── report.json
         ├── report.txt
-        ├── bootstrap-cases.jsonl                    # bootstrap gate cases imported into report
-        ├── bootstrap-journal-errors.txt               # empty normally; nonempty on journal append failure
+        ├── bootstrap-cases.jsonl
         ├── artifact-manifest.sha256
-        ├── diagnostics/                         # captured diagnostics for this run
-        ├── evidence/checkpoints/01-bootstrap/
-        │   ├── raw.json
-        │   ├── normalized.json
-        │   ├── changes-from-previous.json
-        │   ├── comparison-to-previous-run.json
-        │   └── observations.txt
-        ├── evidence/capture-errors.txt
-        └── evidence/comparison-to-previous-run.json
+        ├── 10-guest-samples.txt
+        ├── dhcp-<label>-<node>.pcap
+        ├── dhcp-<label>-<node>.pcap.jsonl
+        ├── dhcp-<label>-<node>.pcap.stderr
+        ├── dhcp-<label>-<node>.pcap.decode-errors
+        ├── diagnostics/                         # collected text/log/YAML and kubeconfig
+        └── evidence/
 ```
 
 - The default run id is the UTC second plus the harness process id (`20260903T085931Z-18422`), so directory names sort in execution order while simultaneous starts remain isolated. An explicit `E2E_RUN_ID` is useful for external correlation, but it must be unique: selecting an existing nonempty run directory is rejected rather than overwriting history.
@@ -223,7 +214,7 @@ jq -r '.status, .exitCode' "${run}/report.json"
 ```
 
 - Initialization reads the old `latest` value before writing any run data. If that directory still exists it becomes `E2E_PREVIOUS_RUN_DIR`; otherwise the variable stays empty. Only finalization publishes the new pointer, after reports, evidence comparison, and checksums are written. Earlier runs are never deleted, so the immutable baseline stays next to the new result.
-- The numbered `collect.sh` captures, the generated `kubeconfig`, the rendered helper manifest, and the per-boot `console-*.log` files belong to the current run, and finalize mirrors them into `diagnostics/` so a single directory holds the whole execution. `artifact-manifest.sha256` indexes that run directory.
+- `diagnostics/` mirrors collected `.txt`, `.log`, and `.yaml` files plus the generated kubeconfig. Packet captures, their JSONL decodes, capture stderr, and decode errors deliberately remain top-level run artifacts; `artifact-manifest.sha256` covers all of them rather than treating a mirrored diagnostic copy as evidence.
 
 ## Reports
 
@@ -266,53 +257,38 @@ cat "${run}/report.txt"
 
 ## Kubernetes evidence and checkpoint diffs
 
-Each checkpoint is a named point in the suite where cluster state matters, recorded as five files under `evidence/checkpoints/<NN-name>/`:
+Each checkpoint records Kubernetes object state under `evidence/checkpoints/<NN-name>/`:
 
-- `raw.json` holds every captured Kubernetes document, keyed by its resource group and emitted in a fixed, lexically sorted group order. It preserves the complete API list envelopes and every returned object field; only JSON object-key ordering is canonicalized by `jq -S`.
-- `normalized.json` is the deterministic projection of the same capture: `checkpoint` plus an `objects` array sorted by resource, namespace, and name. Each record preserves `spec`, `status`, finalizers, deletion state, labels, annotations, owners, generation, and UID while removing resource versions, managed fields, known server timestamps (including Lease heartbeat/acquire times and IPPool allocation update times), and the generated EndpointSlice last-change annotation. Consequently a cross-run comparison exposes both semantic drift and intentional object recreation instead of hiding a changed identity.
-- `changes-from-previous.json` compares this checkpoint with the preceding checkpoint of the same run: `checkpoint`, `previousCheckpoint`, `status` (`available`, or `first-checkpoint` when there is no earlier checkpoint), `counts.before` and `counts.after`, then `added`, `removed`, and `changed` object keys — `changed` entries name the section that moved with its before and after values — plus a unified diff of the two normalized files. It shows the mutation a transition caused, such as the leader label moving between pods or an IPPool allocation count changing, without re-reading two full captures.
-- `observations.txt` records what objects alone cannot show: guest console markers, every helper pod's interface address, route, and UDP listener observations, and the elected leader's `/metrics` scrape.
+- `raw.json` preserves every captured Kubernetes document in a fixed, lexically sorted group order; only JSON object-key ordering is canonicalized by `jq -S`.
+- `normalized.json` is a deterministic projection retaining meaningful specs, status, finalizers, deletion state, labels, annotations, owners, generation, and UID while removing resource versions, managed fields, known server timestamps, and generated EndpointSlice timestamps.
+- `changes-from-previous.json` records the added, removed, and changed objects between consecutive checkpoints in the same run.
+- `observations.txt` records guest `E2E_NET_SAMPLE` observations, helper interface/route/UDP observations, and the metrics-Service scrape. The pcap, decoded JSONL, capture stderr, and decode errors remain top-level checksum-covered artifacts, not copies in checkpoint observations or `diagnostics/`.
 
-The stored report, evidence index, and checkpoint observations use paths relative to the downloaded run directory (`.` for the run, `../..` for the artifact root, and `../../runs/<id>` for a prior run); they do not depend on the original checkout path.
-
-The captured object groups include the full cluster CRD inventory, including both helper CRDs (`ippools.kubevirtiphelper.k8s.binbash.org` and `virtualmachinenetworkconfigs.kubevirtiphelper.k8s.binbash.org`) and their instances, plus the KubeVirt CR, VMs/VMIs, NADs, namespaces/events, helper Deployment/pods/Lease/Service/EndpointSlices, and workload pods. This makes CRD installation/removal, resource creation/deletion, spec/status changes, finalizer handshakes, owner references, labels, annotations, generations, UIDs, and pool accounting available for post-run inspection.
+The captured object groups include the full cluster CRD inventory, both helper CRDs and their instances, the KubeVirt CR, VMs/VMIs, NADs, namespaces/events, helper Deployment/pods/Lease/Service/EndpointSlices, and workload pods. This makes CRD installation/removal, resource creation/deletion, controller-created finalizer handshakes, owner references, labels, annotations, generations, UIDs, and pool accounting available for post-run inspection.
 
 ## Verify and compare runs
 
-`artifact-manifest.sha256` lists sorted relative paths and checksums for every file in the run directory, evidence included, and is written last so it covers the whole directory:
+`artifact-manifest.sha256` lists sorted relative paths and checksums for every file in the run directory—including the top-level pcap, JSONL, stderr, and decode-error evidence—and is written last so it covers the whole directory:
 
 ```sh
 cd "${run}" && sha256sum -c artifact-manifest.sha256
 ```
 
-That makes a downloaded CI artifact self-checking before anyone reads it. To compare the newest run with the one before it:
+That makes a downloaded CI artifact self-checking before anyone reads it. To inspect the newest run's recorded comparison with its previous baseline:
 
 ```sh
 pointer="$(readlink "${root}/latest" 2> /dev/null || cat "${root}/latest")"
 now="${root}/${pointer}"
-prev_ref="$(jq -r '.previousRun.run // empty' "${now}/report.json")"
-if [ -n "${prev_ref}" ]; then
-  prev="${now}/${prev_ref}"
-  diff <(jq -r 'select(.kind == "case") | [.id, .status] | @tsv' "${prev}/cases.jsonl") \
-       <(jq -r 'select(.kind == "case") | [.id, .status] | @tsv' "${now}/cases.jsonl")
-else
-  printf 'no previous completed run recorded\n'
-fi
 jq '.previousRun | {caseCount, added, removed, statusChanged}' "${now}/report.json"
-```
-
-For the cluster-state side of the same comparison, read the cross-run diff directly:
-
-```sh
 jq . "${now}/evidence/comparison-to-previous-run.json"
 ```
 
+Prior-run diffs are informational evidence, not a regression verdict. Added, removed, or changed cases and objects may result from intentional suite-semantic changes, so compare only like-for-like runs when judging a regression.
+
 ## CI
 
-`.github/workflows/e2e-kind-kubevirt.yaml` runs the same `test/e2e/run.sh` entry point for pull requests and manual dispatches. Its matrix runs `dependency-era/core` plus `current/core`, `current/pool`, `current/lease`, `current/ha`, and `current/multipool`, with `fail-fast: false`. Each group derives isolated cluster, cache, image, and artifact names from its stack and group.
+`.github/workflows/e2e-kind-kubevirt.yaml` runs the same `test/e2e/run.sh` entry point for pull requests and manual dispatches. Its matrix runs `dependency-era/core` plus `current/core`, `current/pool`, `current/lease`, `current/ha`, and `current/multipool`, with `fail-fast: false`. Each job derives isolated cluster, cache, image, and artifact names from its stack and group, and runs in an isolated VM so its fixed shared-L2 CIDRs do not collide with another matrix lane.
 
-Each job builds the checkout image locally under the short commit SHA and loads it directly with `kind load docker-image`; it performs no registry login or pull. The job has a 50-minute ceiling, while the E2E step has a 40-minute execution budget so collection, bounded cluster cleanup, and report finalization still have time to finish.
+Each job builds the checkout image locally, retags it with the full content ID, loads that exact reference into every kind node, and performs no registry login or helper-image pull. The job has a 50-minute ceiling, while the E2E step has a 40-minute execution budget so collection, bounded cluster cleanup, and report finalization still have time to finish.
 
-The upload step is guarded by `if: always()`, so reports, evidence, and diagnostics are retained for a green job and for a red one alike: the step runs after the suite regardless of its exit status, uploads the whole artifact root `_artifacts/e2e/<stack>-<group>` (pointer file and every `runs/<id>/` directory with its reports, evidence, diagnostics, rendered inputs, and console logs), and keeps it for 14 days. Missing files only warn, so an artifact problem never overrides the suite verdict. Because `run.sh` itself prints `report.txt` on the way out, the job log already shows the case list for both outcomes; no follow-up step is needed to reproduce it, and no follow-up step can change the exit status the suite returned. Downloads unpack with the run-history root intact.
-
-Before the suite starts, each CI lane makes a best-effort `gh`/GitHub Actions API lookup for the newest successful prior workflow run on the same branch and downloads that lane's artifact into the same history root. If no prior artifact exists or the API is unavailable, the run is still executed as the first baseline and reports `previousRun: null`. A successful completed run is the only one allowed to replace `latest`, so failed runs remain downloadable without becoming a comparison baseline.
+The upload step is guarded by `if: always()`, so reports, evidence, and diagnostics are retained for a green job and for a red one alike: the step runs after the suite regardless of its exit status, uploads the whole artifact root `_artifacts/e2e/<stack>-<group>` (pointer file and every `runs/<id>/` directory with reports, evidence, top-level packet artifacts, diagnostics, rendered inputs, and console logs), and keeps it for 14 days. Missing files only warn, so an artifact problem never overrides the suite verdict. Because `run.sh` itself prints `report.txt` on the way out, the job log already shows the case list for both outcomes; no follow-up step is needed to reproduce it, and no follow-up step can change the exit status the suite returned.

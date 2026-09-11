@@ -1,6 +1,6 @@
 # Halted on creation: the helper reserves the address for the explicit MAC
-# before run.sh starts this VM. The pod network remains the guest default; the
-# helper-served Multus NIC is found by its explicit MAC.
+# before run.sh starts this VM. The guest exposes only the helper-served Multus
+# NIC; CirrOS starts and maintains its stock eth0 DHCP client.
 apiVersion: kubevirt.io/v1
 kind: VirtualMachine
 metadata:
@@ -29,14 +29,10 @@ spec:
               disk:
                 bus: virtio
           interfaces:
-            - name: default
-              masquerade: {}
             - name: kihnet0
               bridge: {}
               macAddress: 02:00:00:00:00:11
       networks:
-        - name: default
-          pod: {}
         - name: kihnet0
           multus:
             networkName: kubevirt-ip-helper/kubevirt-ip-helper-e2e
@@ -48,57 +44,198 @@ spec:
           cloudInitNoCloud:
             userData: |
               #!/bin/sh
-              i=0
-              IP=""
-              IFACE=""
-              cat > /tmp/e2e-udhcpc.sh <<'EOF'
-              #!/bin/sh
-              echo "E2E_UDHCPC event=$1 interface=${interface:-unset} ip=${ip:-unset}" > /dev/ttyS0
-              echo "E2E_DHCP_EVENT=${1:-unset}:${ip:-unset}" > /dev/ttyS0
-              echo "E2E_DHCP_ROUTER=${router:-unset}" > /dev/ttyS0
-              case "$1" in
-                bound|renew)
-                  ip -4 addr flush dev "$interface"
-                  ip -4 addr add "$ip/24" dev "$interface"
-                  ;;
-              esac
-              EOF
-              chmod 755 /tmp/e2e-udhcpc.sh
-              while [ "$i" -lt 30 ]; do
-                for path in /sys/class/net/*; do
-                  if [ "$(cat "${path}/address" 2>/dev/null)" = "02:00:00:00:00:11" ]; then
-                    IFACE="${path##*/}"
-                    break
-                  fi
-                done
-                if [ -n "$IFACE" ]; then
-                  ip link set "$IFACE" up 2>/dev/null
-                  udhcpc -i "$IFACE" -n -q -t 5 -T 2 -s /tmp/e2e-udhcpc.sh > /dev/ttyS0 2>&1
-                  # Both helper-served ranges are accepted: the primary pool answers
-                  # 10.77.0.x and the second bridge answers 10.78.0.x. The pod network
-                  # is not matched here, so only a helper lease counts as success.
-                  IP=$(ip -4 addr show dev "$IFACE" 2>/dev/null | sed -n 's/^[[:space:]]*inet \([0-9.]*\)\/.*/\1/p' | grep -E '^10\.7[78]\.0\.' | head -n1)
+              EXPECTED_MAC="02:00:00:00:00:11"
+              SEQ=0
+              LOOKUP_FILE="/tmp/e2e-nslookup.$$"
+
+              csv_or_unset() {
+                awk 'NF {
+                       if (count++) printf ","
+                       printf "%s", $0
+                     }
+                     END {
+                       if (!count) printf "unset"
+                       printf "\n"
+                     }'
+              }
+
+              route_values_for() {
+                awk -v iface="$1" '
+                  {
+                    dev = ""
+                    via = ""
+                    for (i = 1; i <= NF; i++) {
+                      if ($i == "dev" && i < NF) dev = $(i + 1)
+                      if ($i == "via" && i < NF) via = $(i + 1)
+                    }
+                    if (dev == iface) print via == "" ? "unset" : via
+                  }'
+              }
+
+              client_matches_iface() {
+                [ -r "/proc/$1/cmdline" ] || return 1
+                tr '\000' '\n' < "/proc/$1/cmdline" 2>/dev/null |
+                  awk -v iface="$2" '
+                    NR == 1 {
+                      sub(/^.*\//, "", $0)
+                      is_udhcpc = ($0 == "udhcpc")
+                    }
+                    previous == "-i" && $0 == iface { owns_iface = 1 }
+                    { previous = $0 }
+                    END { exit !(is_udhcpc && owns_iface) }'
+              }
+
+              resolve_ipv4() {
+                if ! : > "${LOOKUP_FILE}"; then
+                  printf '%s\n' unset
+                  return
                 fi
-                [ -n "$IP" ] && break
-                i=$((i + 1))
-                sleep 2
-              done
-              if [ -z "$IP" ]; then
-                echo "E2E_DHCP_FAILED interface=${IFACE:-missing}" > /dev/ttyS0
-                exit 1
-              fi
-              n=0
-              while [ "$n" -lt 6 ]; do
-                echo "E2E_DHCP_OK=$IP" > /dev/ttyS0
-                echo "E2E_DHCP_OK=$IP"
-                n=$((n + 1))
-                sleep 1
-              done
-              # Keep exercising the live DHCP client path until the VM is
-              # stopped. BusyBox may renew, rebind, or perform a fresh DORA;
-              # the suite observes the event rather than assuming its timer
-              # semantics, and always requires the same reserved address.
+                nslookup "$1" > "${LOOKUP_FILE}" 2>&1 &
+                lookup_pid=$!
+                (
+                  sleep 2
+                  kill "${lookup_pid}" 2>/dev/null
+                ) &
+                watchdog_pid=$!
+                wait "${lookup_pid}"
+                lookup_rc=$?
+                kill "${watchdog_pid}" 2>/dev/null || true
+                wait "${watchdog_pid}" 2>/dev/null || true
+                if [ "${lookup_rc}" -ne 0 ]; then
+                  printf '%s\n' unset
+                  return
+                fi
+                awk '
+                  function ipv4(value, pieces, piece_count, i) {
+                    piece_count = split(value, pieces, ".")
+                    if (piece_count != 4) return 0
+                    for (i = 1; i <= 4; i++) {
+                      if (pieces[i] !~ /^[0-9][0-9]*$/ || pieces[i] > 255) return 0
+                    }
+                    return 1
+                  }
+                  $1 == "Name:" { answer = 1; next }
+                  answer && $1 == "Address" && ipv4($3) { print $3 }' \
+                  "${LOOKUP_FILE}" | csv_or_unset
+              }
+
               while :; do
-                sleep 20
-                udhcpc -i "$IFACE" -n -q -t 5 -T 2 -s /tmp/e2e-udhcpc.sh > /dev/ttyS0 2>&1
+                SEQ=$((SEQ + 1))
+                IFACE=missing
+                MAC=missing
+                ADDRESS=unset
+                ROUTER=unset
+                CLIENT_PID=unset
+                CLIENT_ALIVE=0
+                GATEWAY_OK=0
+                TARGET_IP=unset
+                TARGET_VIA=unset
+                TARGET_OK=0
+
+                MATCHING_IFACE=""
+                MATCH_COUNT=0
+                for path in /sys/class/net/*; do
+                  [ -r "${path}/address" ] || continue
+                  observed="$(cat "${path}/address" 2>/dev/null)"
+                  [ "${observed}" = "${EXPECTED_MAC}" ] || continue
+                  MATCHING_IFACE="${path##*/}"
+                  MATCH_COUNT=$((MATCH_COUNT + 1))
+                done
+                if [ "${MATCH_COUNT}" -eq 1 ]; then
+                  IFACE="${MATCHING_IFACE}"
+                  MAC="$(cat "/sys/class/net/${IFACE}/address" 2>/dev/null)"
+                  [ -n "${MAC}" ] || MAC=missing
+
+                  ADDRESS="$(
+                    ip -4 addr show dev "${IFACE}" 2>/dev/null |
+                      awk '$1 == "inet" { print $2 }' |
+                      csv_or_unset
+                  )"
+                  ROUTER="$(
+                    ip -4 route show default 2>/dev/null |
+                      route_values_for "${IFACE}" |
+                      csv_or_unset
+                  )"
+
+                  pidfile="/var/run/udhcpc.${IFACE}.pid"
+                  if [ -r "${pidfile}" ]; then
+                    CLIENT_PID="$(
+                      awk '{
+                             for (i = 1; i <= NF; i++) {
+                               values++
+                               value = $i
+                             }
+                           }
+                           END {
+                             if (values == 1 && value ~ /^[0-9][0-9]*$/) print value
+                           }' "${pidfile}" 2>/dev/null
+                    )"
+                    [ -n "${CLIENT_PID}" ] || CLIENT_PID=unset
+                  fi
+                  if [ "${CLIENT_PID}" != unset ] &&
+                     client_matches_iface "${CLIENT_PID}" "${IFACE}"; then
+                    CLIENT_ALIVE=1
+                  fi
+                fi
+
+                DNS="$(
+                  awk '$1 == "nameserver" && NF > 1 { print $2 }' \
+                    /etc/resolv.conf 2>/dev/null |
+                    csv_or_unset
+                )"
+                SEARCH="$(
+                  awk '($1 == "search" || $1 == "domain") {
+                         for (i = 2; i <= NF; i++) {
+                           if ($i ~ /^#/) break
+                           print $i
+                         }
+                       }' /etc/resolv.conf 2>/dev/null |
+                    csv_or_unset
+                )"
+                FIRST_SEARCH="$(
+                  awk '($1 == "search" || $1 == "domain") {
+                         for (i = 2; i <= NF; i++) {
+                           if ($i ~ /^#/) exit
+                           print $i
+                           exit
+                         }
+                       }' /etc/resolv.conf 2>/dev/null
+                )"
+
+                case "${ROUTER}" in
+                  unset|*,*) ;;
+                  *)
+                    ping -q -c 1 -W 1 -w 2 "${ROUTER}" >/dev/null 2>&1 &&
+                      GATEWAY_OK=1
+                    ;;
+                esac
+
+                if [ -n "${FIRST_SEARCH}" ]; then
+                  TARGET_IP="$(resolve_ipv4 "probe.${FIRST_SEARCH}")"
+                fi
+                rm -f "${LOOKUP_FILE}"
+
+                case "${TARGET_IP}" in
+                  unset|*,*) ;;
+                  *)
+                    if [ "${IFACE}" != missing ]; then
+                      TARGET_VIA="$(
+                        ip -4 route get "${TARGET_IP}" 2>/dev/null |
+                          route_values_for "${IFACE}" |
+                          csv_or_unset
+                      )"
+                      ping -q -c 1 -W 1 -w 2 "${TARGET_IP}" >/dev/null 2>&1 &&
+                        TARGET_OK=1
+                    fi
+                    ;;
+                esac
+
+                UPTIME="$(awk '{ print $1; exit }' /proc/uptime 2>/dev/null)"
+                [ -n "${UPTIME}" ] || UPTIME=unset
+                printf 'E2E_NET_SAMPLE seq=%s uptime=%s iface=%s mac=%s address=%s router=%s dns=%s search=%s client_pid=%s client_alive=%s gateway_ok=%s target_ip=%s target_via=%s target_ok=%s\n' \
+                  "${SEQ}" "${UPTIME}" "${IFACE}" "${MAC}" "${ADDRESS}" \
+                  "${ROUTER}" "${DNS}" "${SEARCH}" "${CLIENT_PID}" \
+                  "${CLIENT_ALIVE}" "${GATEWAY_OK}" "${TARGET_IP}" \
+                  "${TARGET_VIA}" "${TARGET_OK}" > /dev/ttyS0
+                sleep 2
               done

@@ -14,6 +14,9 @@ spec:
       start: 10.77.0.100
       end: 10.77.0.110
     router: 10.77.0.1
+    dns:
+      - 10.77.0.1
+    domainname: primary.e2e.test
     leasetime: 300
   networkname: kubevirt-ip-helper/kubevirt-ip-helper-e2e
   bindinterface: kihnet0

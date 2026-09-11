@@ -2,7 +2,7 @@
 # Bootstrap the disposable kind cluster for the kubevirt-ip-helper E2E suite.
 #
 # Order matters and each step is an assertion:
-#   1. kind CLI plus one control-plane and one worker on the pinned node image
+#   1. kind CLI plus one control-plane and two workers on the pinned node image
 #   2. inspect the kindnet delegate CNI that Multus has to chain to
 #   3. bridge CNI plugin into every node's /opt/cni/bin
 #   4. Multus thick as the master CNI
@@ -20,6 +20,16 @@ E2E_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd -- "${E2E_DIR}/../.." && pwd)"
 # shellcheck source=test/e2e/versions.env
 . "${E2E_DIR}/versions.env"
+
+case "$#" in
+  0) BOOTSTRAP_OPERATION=bootstrap; BOOTSTRAP_RESTORE_NODE="" ;;
+  2)
+    [ "$1" = restore-node-networks ] || { printf 'invalid bootstrap operation\n' >&2; exit 1; }
+    BOOTSTRAP_OPERATION=restore-node-networks
+    BOOTSTRAP_RESTORE_NODE="$2"
+    ;;
+  *) printf 'usage: %s [restore-node-networks <kind-node>]\n' "$0" >&2; exit 1 ;;
+esac
 
 # Relative defaults are resolved against the repository root, so the script also
 # works when invoked from another directory.
@@ -39,8 +49,14 @@ BOOTSTRAP_JOURNAL_ERRORS_FILE="${E2E_ARTIFACTS_DIR}/bootstrap-journal-errors.txt
 BOOTSTRAP_CASE_ID=""
 BOOTSTRAP_CASE_NAME=""
 BOOTSTRAP_CASE_T0=""
-: > "${BOOTSTRAP_CASES_FILE}"
-: > "${BOOTSTRAP_JOURNAL_ERRORS_FILE}"
+RUNTIME_NETWORKS_FILE="${E2E_ARTIFACTS_DIR}/runtime-networks.tsv"
+NETWORK_READINESS_FILE="${E2E_ARTIFACTS_DIR}/network-readiness.txt"
+if [ "${BOOTSTRAP_OPERATION}" = bootstrap ]; then
+  : > "${BOOTSTRAP_CASES_FILE}"
+  : > "${BOOTSTRAP_JOURNAL_ERRORS_FILE}"
+  : > "${RUNTIME_NETWORKS_FILE}"
+  : > "${NETWORK_READINESS_FILE}"
+fi
 
 bootstrap_now_ms() {
   local stamp
@@ -121,7 +137,9 @@ capture_evidence() {
       get kubevirt,deploy,pods 2>&1
   } >> "${EVIDENCE_FILE}" 2>&1 || true
 }
-trap capture_evidence ERR
+if [ "${BOOTSTRAP_OPERATION}" = bootstrap ]; then
+  trap capture_evidence ERR
+fi
 bootstrap_exit() {
   local rc=$?
   if [ -n "${BOOTSTRAP_CASE_ID}" ]; then
@@ -133,8 +151,10 @@ trap bootstrap_exit EXIT
 
 die() {
   printf '[bootstrap] ERROR: %s\n' "$*" >&2
-  bootstrap_case_close failed "$*" || true
-  capture_evidence
+  if [ "${BOOTSTRAP_OPERATION}" = bootstrap ]; then
+    bootstrap_case_close failed "$*" || true
+    capture_evidence
+  fi
   exit 1
 }
 
@@ -183,14 +203,29 @@ arch_suffix() {
 upper_arch() { printf '%s' "$1" | tr '[:lower:]-' '[:upper:]_'; }
 
 resolve_runtime() {
-  if command -v docker > /dev/null 2>&1 && docker info > /dev/null 2>&1; then
-    RUNTIME="docker"
-  elif command -v podman > /dev/null 2>&1 && podman info > /dev/null 2>&1; then
-    RUNTIME="podman"
-    export KIND_EXPERIMENTAL_PROVIDER="podman"
-  else
-    die "no usable Docker or Podman runtime is available"
+  case "${E2E_RUNTIME:-}" in
+    docker | podman)
+      RUNTIME="${E2E_RUNTIME}"
+      command -v "${RUNTIME}" > /dev/null 2>&1 || die "runtime ${RUNTIME} is unavailable"
+      "${RUNTIME}" info > /dev/null 2>&1 || die "runtime ${RUNTIME} is unusable"
+      ;;
+    '')
+      if command -v docker > /dev/null 2>&1 && docker info > /dev/null 2>&1; then
+        RUNTIME=docker
+      elif command -v podman > /dev/null 2>&1 && podman info > /dev/null 2>&1; then
+        RUNTIME=podman
+      else
+        die "no usable Docker or Podman runtime is available"
+      fi
+      ;;
+    *) die "E2E_RUNTIME must be docker or podman" ;;
+  esac
+  if [ "${RUNTIME}" = podman ]; then
+    export KIND_EXPERIMENTAL_PROVIDER=podman
   fi
+  command -v jq > /dev/null 2>&1 || die "jq is required to inspect runtime networks"
+  command -v timeout > /dev/null 2>&1 || die "GNU timeout is required"
+  export E2E_RUNTIME="${RUNTIME}"
   log "container runtime: ${RUNTIME}"
 }
 
@@ -236,14 +271,14 @@ verify_cluster_pin() {
   while IFS= read -r node; do
     [ -n "${node}" ] && nodes+=("${node}")
   done <<< "${nodes_output}"
-  # Topology contract: exactly one control-plane and one worker. Every
-  # per-node layer iterates over both nodes via cluster_nodes.
+  # Exactly one control-plane and two ordinary workers; no helper-specific
+  # scheduling modifications make cross-node assertions succeed.
   control_planes="$(kubectl get nodes \
     -l node-role.kubernetes.io/control-plane= --no-headers 2> /dev/null | wc -l)"
   [ "${control_planes}" -eq 1 ] ||
     die "cluster ${E2E_CLUSTER_NAME} has ${control_planes} control-plane nodes; expected exactly one"
-  [ "${#nodes[@]}" -eq 2 ] ||
-    die "cluster ${E2E_CLUSTER_NAME} has ${#nodes[@]} nodes; expected exactly one control-plane and one worker"
+  [ "${#nodes[@]}" -eq 3 ] ||
+    die "cluster ${E2E_CLUSTER_NAME} has ${#nodes[@]} nodes; expected one control-plane and two workers"
   for node in "${nodes[@]}"; do
     image="$("${RUNTIME}" inspect "${node}" --format '{{.Config.Image}}')"
     [ "${image}" = "${KINDEST_NODE_IMAGE}" ] ||
@@ -295,16 +330,240 @@ cluster_nodes() {
   local nodes count
   nodes="$("${KIND}" get nodes --name "${E2E_CLUSTER_NAME}")" || return 1
   count="$(printf '%s\n' "${nodes}" | sed '/^$/d' | wc -l)"
-  [ "${count}" -eq 2 ] || return 1
+  [ "${count}" -eq 3 ] || return 1
   printf '%s\n' "${nodes}"
 }
+
+# These networks are virtual switches for the test LANs. Their runtime IPAM
+# addresses are only used to identify the uplinks, never assigned to a guest.
+runtime_network_command() {
+  timeout --kill-after=1s "${E2E_CAPTURE_TIMEOUT}s" "${RUNTIME}" "$@"
+}
+
+runtime_network_exists() {
+  local names
+  names="$(runtime_network_command network ls --format '{{.Name}}')" || return 2
+  grep -Fxq -- "$1" <<< "${names}"
+}
+
+verified_runtime_network() { # <variable-prefix> -> immutable network ID
+  local prefix="$1" subnet="${1}_SUBNET" range="${1}_IP_RANGE" gateway="${1}_GATEWAY"
+  local first="${1}_IP_RANGE_FIRST" last="${1}_IP_RANGE_LAST" raw
+  raw="$(runtime_network_command network inspect "${!prefix}")" || return 1
+  printf '%s\n' "${raw}" > "${E2E_ARTIFACTS_DIR}/network-${!prefix}.json"
+  jq -er --arg runtime "${RUNTIME}" --arg name "${!prefix}" \
+    --arg label "${KIH_RUNTIME_NETWORK_OWNER_LABEL}" --arg owner "${E2E_CLUSTER_NAME}" \
+    --arg subnet "${!subnet}" --arg range "${!range}" --arg gateway "${!gateway}" \
+    --arg first "${!first}" --arg last "${!last}" '
+    select(length == 1) | .[0]
+    | if $runtime == "docker" then
+        select(.Name == $name and .Driver == "bridge" and .Scope == "local"
+          and .Internal == true and .EnableIPv6 == false
+          and (.Labels // {})[$label] == $owner)
+        | select((.IPAM.Config | length) == 1)
+        | select(.IPAM.Config[0].Subnet == $subnet and .IPAM.Config[0].IPRange == $range
+          and .IPAM.Config[0].Gateway == $gateway) | .Id
+      else
+        select(.name == $name and .driver == "bridge" and .internal == true
+          and .ipv6_enabled == false and (.labels // {})[$label] == $owner)
+        | select((.subnets | length) == 1)
+        | select(.subnets[0].subnet == $subnet and .subnets[0].gateway == $gateway
+          and .subnets[0].lease_range.start_ip == $first
+          and .subnets[0].lease_range.end_ip == $last) | .id
+      end
+    | select(type == "string" and length > 0)
+  ' <<< "${raw}"
+}
+
+ensure_runtime_network() { # <variable-prefix>
+  local prefix="$1" subnet="${1}_SUBNET" range="${1}_IP_RANGE" gateway="${1}_GATEWAY"
+  local rc=0 state=verified id
+  runtime_network_exists "${!prefix}" || rc=$?
+  case "${rc}" in
+    0) ;;
+    1)
+      runtime_network_command network create --driver bridge --internal \
+        --subnet "${!subnet}" --ip-range "${!range}" --gateway "${!gateway}" \
+        --label "${KIH_RUNTIME_NETWORK_OWNER_LABEL}=${E2E_CLUSTER_NAME}" "${!prefix}" > /dev/null || return 1
+      state=created
+      ;;
+    *) return 1 ;;
+  esac
+  id="$(verified_runtime_network "${prefix}")" || return 1
+  printf 'network\truntime=%s\tstate=%s\tname=%s\tid=%s\towner=%s\n' \
+    "${RUNTIME}" "${state}" "${!prefix}" "${id}" "${E2E_CLUSTER_NAME}" >> "${RUNTIME_NETWORKS_FILE}"
+}
+
+node_data_endpoint() { # <node> <network> <verified-id> <IPv4-prefix> <configured|restored>
+  local node="$1" network="$2" id="$3" address_prefix="$4" state="$5" object
+  object="$(runtime_network_command inspect "${node}")" || return 1
+  jq -e --arg cluster "${E2E_CLUSTER_NAME}" '
+    length == 1 and .[0].State.Running == true
+    and .[0].Config.Labels["io.x-k8s.kind.cluster"] == $cluster
+  ' <<< "${object}" > /dev/null || return 1
+  if ! jq -e --arg network "${network}" \
+    '.[0].NetworkSettings.Networks | has($network)' <<< "${object}" > /dev/null; then
+    [ "${state}" = configured ] || return 1
+    runtime_network_command network connect "${network}" "${node}" || return 1
+    object="$(runtime_network_command inspect "${node}")" || return 1
+  fi
+  jq -er --arg network "${network}" --arg id "${id}" --arg prefix "${address_prefix}" '
+    .[0].NetworkSettings.Networks[$network]
+    | select(type == "object" and .IPPrefixLen == 16)
+    | select((.NetworkID // "") == "" or .NetworkID == $id)
+    | select((.IPAddress | startswith($prefix)) and
+      (.IPAddress | split(".") | last | tonumber) <= 255)
+    | select(.MacAddress | test("^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$"))
+    | [(.MacAddress | ascii_downcase), .IPAddress] | @tsv
+  ' <<< "${object}"
+}
+
+configure_node_data_networks() { # <node> <configured|restored> <primary-id> <secondary-id>
+  local node="$1" state="$2" primary_id="$3" secondary_id="$4" default_route first second rows
+  local first_mac first_ip second_mac second_ip
+  default_route="$(runtime_network_command exec "${node}" ip -4 route show default)" || return 1
+  [ -n "${default_route}" ] && [ "$(printf '%s\n' "${default_route}" | wc -l)" -eq 1 ] || return 1
+  # Complete both runtime connects before detaching either runtime-owned address.
+  first="$(node_data_endpoint "${node}" "${KIH_DATA_NETWORK}" "${primary_id}" 10.77.254. "${state}")" || return 1
+  second="$(node_data_endpoint "${node}" "${KIH_SECOND_DATA_NETWORK}" "${secondary_id}" 10.78.254. "${state}")" || return 1
+  IFS=$'\t' read -r first_mac first_ip <<< "${first}"
+  IFS=$'\t' read -r second_mac second_ip <<< "${second}"
+  rows="$(runtime_network_command exec -i "${node}" sh -es -- \
+    "${default_route}" "${first_mac}" "${first_ip}" "${KIH_BRIDGE_NAME}" \
+    "${second_mac}" "${second_ip}" "${KIH_SECOND_BRIDGE_NAME}" <<'NODE_NETWORK'
+default_route=$1
+mac1=$2
+ip1=$3
+br1=$4
+mac2=$5
+ip2=$6
+br2=$7
+fail() { printf 'unsafe test network: %s\n' "$*" >&2; exit 1; }
+[ "$(ip -4 route show default)" = "$default_route" ] || fail 'management route changed'
+default_dev=$(printf '%s\n' "$default_route" | awk '{ for (i=1;i<NF;i++) if ($i=="dev") print $(i+1) }')
+uplink_for() {
+  mac=$1
+  expected_bridge=$2
+  found=''
+  for path in /sys/class/net/*; do
+    [ "$(cat "$path/address")" = "$mac" ] || continue
+    dev=${path##*/}
+    if [ -d "$path/bridge" ]; then
+      [ "$dev" = "$expected_bridge" ] || fail "foreign bridge shares $mac"
+      continue
+    fi
+    [ -z "$found" ] || fail "multiple uplinks share $mac"
+    found=$dev
+  done
+  [ -n "$found" ] || exit 75
+  printf '%s\n' "$found"
+}
+master_for() {
+  if [ -L "/sys/class/net/$1/master" ]; then
+    basename "$(readlink "/sys/class/net/$1/master")"
+  fi
+}
+addresses_for() {
+  address_rows=$(ip -o -4 address show dev "$1" scope global) || {
+    printf 'address-read-failed\n'
+    return 1
+  }
+  printf '%s\n' "$address_rows" | awk '{print $4}'
+}
+preflight() {
+  dev=$1
+  bridge=$2
+  runtime_ip=$3
+  [ "$dev" != "$default_dev" ] || fail 'data uplink is management device'
+  master=$(master_for "$dev")
+  [ -z "$master" ] || [ "$master" = "$bridge" ] || fail "foreign uplink master $master"
+  addresses=$(addresses_for "$dev")
+  [ -z "$addresses" ] || [ "$addresses" = "$runtime_ip/16" ] || fail "foreign uplink address $addresses"
+  if [ -e "/sys/class/net/$bridge" ]; then
+    [ -d "/sys/class/net/$bridge/bridge" ] || fail "$bridge is not a bridge"
+    [ -z "$(addresses_for "$bridge")" ] || fail "$bridge has an address"
+    [ -z "$(master_for "$bridge")" ] || fail "$bridge has a master"
+  fi
+}
+dev1=$(uplink_for "$mac1" "$br1")
+dev2=$(uplink_for "$mac2" "$br2")
+[ "$dev1" != "$dev2" ] || fail 'data uplinks are identical'
+preflight "$dev1" "$br1" "$ip1"
+preflight "$dev2" "$br2" "$ip2"
+[ "$(ip -4 route show default)" = "$default_route" ] || fail 'management route changed before handoff'
+handoff() {
+  dev=$1
+  bridge=$2
+  runtime_ip=$3
+  [ -d "/sys/class/net/$bridge/bridge" ] || ip link add "$bridge" type bridge
+  ip link set dev "$bridge" up
+  if [ -n "$(addresses_for "$dev")" ]; then
+    ip address del "$runtime_ip/16" dev "$dev"
+  fi
+  ip link set dev "$dev" master "$bridge"
+  ip link set dev "$dev" up
+}
+handoff "$dev1" "$br1" "$ip1"
+handoff "$dev2" "$br2" "$ip2"
+for tuple in "$dev1:$br1" "$dev2:$br2"; do
+  dev=${tuple%%:*}
+  bridge=${tuple#*:}
+  [ "$(master_for "$dev")" = "$bridge" ] || fail 'uplink master changed'
+  [ -z "$(addresses_for "$dev")" ] || fail 'uplink still has an address'
+  [ -z "$(addresses_for "$bridge")" ] || fail 'bridge acquired an address'
+done
+[ "$(ip -4 route show default)" = "$default_route" ] || fail 'management route changed after handoff'
+printf '%s\t%s\t%s\t%s\n' "$br1" "$dev1" "$mac1" "$ip1/16"
+printf '%s\t%s\t%s\t%s\n' "$br2" "$dev2" "$mac2" "$ip2/16"
+NODE_NETWORK
+)" || return $?
+  while IFS= read -r row; do
+    printf 'attachment\truntime=%s\tstate=%s\tnode=%s\t%s\n' \
+      "${RUNTIME}" "${state}" "${node}" "${row}" >> "${RUNTIME_NETWORKS_FILE}"
+  done <<< "${rows}"
+}
+
+ensure_shared_data_networks() {
+  local nodes node primary_id secondary_id
+  ensure_runtime_network KIH_DATA_NETWORK || die 'primary runtime network is incompatible'
+  ensure_runtime_network KIH_SECOND_DATA_NETWORK || die 'secondary runtime network is incompatible'
+  primary_id="$(verified_runtime_network KIH_DATA_NETWORK)" || return 1
+  secondary_id="$(verified_runtime_network KIH_SECOND_DATA_NETWORK)" || return 1
+  nodes="$(cluster_nodes)" || return 1
+  while IFS= read -r node; do
+    configure_node_data_networks "${node}" configured "${primary_id}" "${secondary_id}" ||
+      die "node ${node}: shared-network attachment failed"
+  done <<< "${nodes}"
+}
+
+restore_node_networks() {
+  local node="$1" nodes primary_id secondary_id rc=0 deadline
+  bootstrap_select_arch
+  KIND="${E2E_BIN_DIR}/kind"
+  [ -x "${KIND}" ] || die 'pinned kind binary is unavailable for recovery'
+  require_checksum "${KIND}" "${KIND_SHA256_LINUX_AMD64}"
+  resolve_runtime
+  nodes="$(cluster_nodes)" || die 'recovery requires exactly three kind nodes'
+  grep -Fxq -- "${node}" <<< "${nodes}" || die "${node} is not a node of ${E2E_CLUSTER_NAME}"
+  primary_id="$(verified_runtime_network KIH_DATA_NETWORK)" || die 'primary network changed during failure'
+  secondary_id="$(verified_runtime_network KIH_SECOND_DATA_NETWORK)" || die 'secondary network changed during failure'
+  deadline=$((SECONDS + E2E_WAIT_TIMEOUT))
+  while [ "${SECONDS}" -lt "${deadline}" ]; do
+    configure_node_data_networks "${node}" restored "${primary_id}" "${secondary_id}" && return 0
+    rc=$?
+    [ "${rc}" -eq 75 ] || return "${rc}"
+    sleep 1
+  done
+  die "node ${node}: data uplinks did not return before the recovery deadline"
+}
+
 
 # inspect_kindnet checks the delegate CNI each node starts with, before Multus
 # takes over as master plugin. Without it Multus has nothing to chain to.
 inspect_kindnet() {
   local node listing delegate content nodes
   nodes="$(cluster_nodes)" ||
-    die "kind cannot enumerate exactly two nodes for ${E2E_CLUSTER_NAME}"
+    die "kind cannot enumerate exactly three nodes for ${E2E_CLUSTER_NAME}"
   while IFS= read -r node; do
     listing="$("${RUNTIME}" exec "${node}" ls -1 /etc/cni/net.d)"
     delegate="$(printf '%s\n' "${listing}" | awk '!/multus/ && !seen++')"
@@ -333,7 +592,7 @@ ensure_bridge_plugin() {
     tar -xzf "${tgz}" -C "${stage}"
   fi
   nodes="$(cluster_nodes)" ||
-    die "kind cannot enumerate exactly two nodes for ${E2E_CLUSTER_NAME}"
+    die "kind cannot enumerate exactly three nodes for ${E2E_CLUSTER_NAME}"
   while IFS= read -r node; do
     "${RUNTIME}" exec "${node}" mkdir -p /opt/cni/bin
     tar -C "${stage}" -cf - . |
@@ -372,7 +631,7 @@ ensure_multus() {
 assert_multus_chain() {
   local node listing master delegate content nodes
   nodes="$(cluster_nodes)" ||
-    die "kind cannot enumerate exactly two nodes for ${E2E_CLUSTER_NAME}"
+    die "kind cannot enumerate exactly three nodes for ${E2E_CLUSTER_NAME}"
   while IFS= read -r node; do
     master=""
     for _ in $(seq 1 30); do
@@ -430,18 +689,45 @@ wait_for_probe() { # <pod>
     --for=condition=Ready "pod/$1" --timeout="${E2E_PROBE_TIMEOUT}s"
 }
 
-# run_cni_preflight proves both halves of the chain before KubeVirt is touched:
-# a plain pod for the Multus -> kindnet delegation and an NAD-attached pod for
-# the secondary interface that the helper later serves addresses on.
+ensure_network_fixtures() {
+  local fixture="${E2E_DIR}/manifests/network-services.yaml" observers nodes node pod
+  ensure_namespaces
+  [ "$(grep -Fc "image: ${KIH_NETWORK_TOOLS_IMAGE}" "${fixture}")" -eq 3 ] ||
+    die 'network fixture tool image differs from versions.env'
+  [ "$(grep -Fc "image: ${KIH_COREDNS_IMAGE}" "${fixture}")" -eq 1 ] ||
+    die 'network fixture DNS image differs from versions.env'
+  kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete pod "${KIH_NETWORK_POD}" \
+    --ignore-not-found --wait=true --timeout="${E2E_PROBE_TIMEOUT}s"
+  kubectl apply -f "${fixture}"
+  kubectl -n "${KIH_WORKLOAD_NAMESPACE}" wait --for=condition=Ready \
+    "pod/${KIH_NETWORK_POD}" --timeout="${E2E_WAIT_TIMEOUT}s"
+  kubectl -n "${KIH_WORKLOAD_NAMESPACE}" rollout status \
+    daemonset/kih-network-observer --timeout="${E2E_WAIT_TIMEOUT}s"
+  pod="$(kubectl -n "${KIH_WORKLOAD_NAMESPACE}" get pod "${KIH_NETWORK_POD}" -o json)" || return 1
+  node="$(jq -er '.spec.nodeName | select(length > 0)' <<< "${pod}")" || return 1
+  kubectl get node "${node}" -o json | jq -e \
+    '.metadata.labels | has("node-role.kubernetes.io/control-plane")' > /dev/null || return 1
+  jq -e '.status.podIP != null and .status.podIP != ""
+    and ([.metadata.annotations["k8s.v1.cni.cncf.io/network-status"] | fromjson | .[].interface]
+      | index("primary") != null and index("secondary") != null)' <<< "${pod}" > /dev/null || return 1
+  observers="$(kubectl -n "${KIH_WORKLOAD_NAMESPACE}" get pods -l "${KIH_OBSERVER_SELECTOR}" -o json)" || return 1
+  nodes="$(cluster_nodes)" || return 1
+  while IFS= read -r node; do
+    jq -e --arg node "${node}" '
+      [.items[] | select(.spec.nodeName == $node and .metadata.deletionTimestamp == null)
+        | select(any(.status.conditions[]?; .type == "Ready" and .status == "True"))]
+      | length == 1' <<< "${observers}" > /dev/null || return 1
+  done <<< "${nodes}"
+  printf 'network services ready on %s; one passive observer per kind node\n' \
+    "$(jq -r '.spec.nodeName' <<< "${pod}")" >> "${NETWORK_READINESS_FILE}"
+}
+
 run_cni_preflight() {
   ensure_namespaces
   apply_nad
-  local node pod pod_ip status nodes
-  local index=0
-
-  kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete \
-    "pod/${KIH_PLAIN_PROBE_POD}" --ignore-not-found
-  kubectl apply -f - << EOF
+  local node pod pod_ip status nodes octet=239
+  kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete "pod/${KIH_PLAIN_PROBE_POD}" --ignore-not-found
+  kubectl apply -f - <<EOF
 apiVersion: v1
 kind: Pod
 metadata:
@@ -453,20 +739,16 @@ spec:
       image: ${PROBE_IMAGE}
 EOF
   wait_for_probe "${KIH_PLAIN_PROBE_POD}"
-  pod_ip="$(kubectl -n "${KIH_WORKLOAD_NAMESPACE}" get \
-    "pod/${KIH_PLAIN_PROBE_POD}" -o jsonpath='{.status.podIP}')"
-  [ -n "${pod_ip}" ] ||
-    die "plain probe pod has no IP: the Multus to kindnet chain does not work"
-  log "plain probe pod on ${pod_ip}: delegate CNI chain works"
-
+  pod_ip="$(kubectl -n "${KIH_WORKLOAD_NAMESPACE}" get "pod/${KIH_PLAIN_PROBE_POD}" \
+    -o jsonpath='{.status.podIP}')" || return 1
+  [ -n "${pod_ip}" ] || die 'plain kindnet probe has no address'
   kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete pods \
     -l app=kubevirt-ip-helper-e2e-nad-probe --ignore-not-found
-  nodes="$(cluster_nodes)" ||
-    die "kind cannot enumerate exactly two nodes for ${E2E_CLUSTER_NAME}"
+  nodes="$(cluster_nodes)" || return 1
   while IFS= read -r node; do
-    index=$((index + 1))
-    pod="${KIH_NAD_PROBE_POD}-${index}"
-    kubectl apply -f - << EOF
+    octet=$((octet + 1))
+    pod="${KIH_NAD_PROBE_POD}-${octet}"
+    kubectl apply -f - <<EOF
 apiVersion: v1
 kind: Pod
 metadata:
@@ -475,7 +757,7 @@ metadata:
   labels:
     app: kubevirt-ip-helper-e2e-nad-probe
   annotations:
-    k8s.v1.cni.cncf.io/networks: '[{"name":"${KIH_NAD_NAME}","namespace":"${KIH_HELPER_NAMESPACE}","interface":"${KIH_HELPER_INTERFACE}"}]'
+    k8s.v1.cni.cncf.io/networks: '[{"name":"${KIH_NAD_NAME}","namespace":"${KIH_HELPER_NAMESPACE}","interface":"${KIH_HELPER_INTERFACE}"},{"name":"${KIH_NETWORK_SECONDARY_NAD}","namespace":"${KIH_WORKLOAD_NAMESPACE}","interface":"kihready2"}]'
 spec:
   nodeName: ${node}
   tolerations:
@@ -483,22 +765,46 @@ spec:
       effect: NoSchedule
   containers:
     - name: probe
-      image: ${PROBE_IMAGE}
+      image: ${KIH_NETWORK_TOOLS_IMAGE}
+      command: ["/bin/sh", "-ec"]
+      args:
+        - |
+          ip address replace 10.77.0.${octet}/24 dev ${KIH_HELPER_INTERFACE}
+          ip address replace 10.78.0.${octet}/24 dev kihready2
+          ip route replace ${KIH_PROBE_IP}/32 via ${KIH_DNS_SERVER} dev ${KIH_HELPER_INTERFACE}
+          ip route replace ${KIH_SECOND_PROBE_IP}/32 via ${KIH_SECOND_DNS_SERVER} dev kihready2
+          ping -c 1 -W 2 ${KIH_DNS_SERVER}
+          ping -c 1 -W 2 10.77.0.9
+          ping -c 1 -W 2 ${KIH_PROBE_IP}
+          ping -c 1 -W 2 ${KIH_SECOND_DNS_SERVER}
+          ping -c 1 -W 2 ${KIH_SECOND_PROBE_IP}
+          [ "\$(dig +time=1 +tries=1 +short @${KIH_DNS_SERVER} ${KIH_PROBE_FQDN} A)" = ${KIH_PROBE_IP} ]
+          [ "\$(dig +time=1 +tries=1 +short @${KIH_SECOND_DNS_SERVER} ${KIH_SECOND_PROBE_FQDN} A)" = ${KIH_SECOND_PROBE_IP} ]
+          touch /tmp/network-ready
+          trap 'exit 0' TERM INT
+          while :; do sleep 3600 & wait \$!; done
+      securityContext:
+        runAsUser: 0
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+          add: ["NET_ADMIN", "NET_RAW"]
+      readinessProbe:
+        exec:
+          command: ["test", "-f", "/tmp/network-ready"]
+        periodSeconds: 2
+        timeoutSeconds: 2
 EOF
     wait_for_probe "${pod}"
     status="$(kubectl -n "${KIH_WORKLOAD_NAMESPACE}" get "pod/${pod}" \
-      -o jsonpath='{.metadata.annotations.k8s\.v1\.cni\.cncf\.io/network-status}')"
-    case "${status}" in
-      *"${KIH_HELPER_INTERFACE}"*) ;;
-      *) die "NAD probe ${pod} network-status '${status:-empty}' lacks interface ${KIH_HELPER_INTERFACE}" ;;
-    esac
-    "${RUNTIME}" exec "${node}" ip -o link show "${KIH_BRIDGE_NAME}" > /dev/null 2>&1 ||
-      die "node ${node}: bridge ${KIH_BRIDGE_NAME} was not created by its NAD probe"
-    log "node ${node}: NAD probe attached ${KIH_HELPER_INTERFACE}; bridge ${KIH_BRIDGE_NAME} exists"
+      -o jsonpath='{.metadata.annotations.k8s\.v1\.cni\.cncf\.io/network-status}')" || return 1
+    jq -e --arg primary "${KIH_HELPER_INTERFACE}" \
+      '[.[].interface] | index($primary) != null and index("kihready2") != null' \
+      <<< "${status}" > /dev/null || return 1
+    printf '\nnode=%s probe=%s\n' "${node}" "${pod}" >> "${NETWORK_READINESS_FILE}"
+    kubectl -n "${KIH_WORKLOAD_NAMESPACE}" logs "${pod}" >> "${NETWORK_READINESS_FILE}" || return 1
   done <<< "${nodes}"
-
-  kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete \
-    "pod/${KIH_PLAIN_PROBE_POD}" --ignore-not-found
+  kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete "pod/${KIH_PLAIN_PROBE_POD}" --ignore-not-found
   kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete pods \
     -l app=kubevirt-ip-helper-e2e-nad-probe --ignore-not-found
 }
@@ -578,12 +884,14 @@ KubeVirt ${KUBEVIRT_VERSION}, guest ${KIH_GUEST_IMAGE}"
     bootstrap_select_arch
   bootstrap_gate BOOTSTRAP-RUNTIME "container runtime is available" resolve_runtime
   bootstrap_gate BOOTSTRAP-KIND "pinned kind binary is available" ensure_kind
-  bootstrap_gate BOOTSTRAP-CLUSTER "pinned two-node kind cluster is ready" ensure_cluster
+  bootstrap_gate BOOTSTRAP-CLUSTER "pinned three-node kind cluster is ready" ensure_cluster
+  bootstrap_gate BOOTSTRAP-DATA-NETWORKS "all kind nodes share both isolated data networks" ensure_shared_data_networks
   bootstrap_gate BOOTSTRAP-IMAGE "helper image is loaded into the cluster" ensure_helper_image
   bootstrap_gate BOOTSTRAP-KINDNET "kindnet delegate is present on every node" inspect_kindnet
   bootstrap_gate BOOTSTRAP-BRIDGE "pinned bridge CNI is installed on every node" ensure_bridge_plugin
   bootstrap_gate BOOTSTRAP-MULTUS "pinned Multus is installed" ensure_multus
   bootstrap_gate BOOTSTRAP-MULTUS-CHAIN "Multus chains to kindnet on every node" assert_multus_chain
+  bootstrap_gate BOOTSTRAP-NETWORK-FIXTURES "real gateway, DNS, and passive observers are Ready" ensure_network_fixtures
   bootstrap_gate BOOTSTRAP-CNI-PREFLIGHT "plain and NAD-attached CNI probes are Ready" \
     run_cni_preflight
   bootstrap_gate BOOTSTRAP-VIRTCTL "pinned virtctl is available" ensure_virtctl
@@ -591,4 +899,7 @@ KubeVirt ${KUBEVIRT_VERSION}, guest ${KIH_GUEST_IMAGE}"
   log "cluster '${E2E_CLUSTER_NAME}' bootstrapped"
 }
 
-main "$@"
+case "${BOOTSTRAP_OPERATION}" in
+  bootstrap) main ;;
+  restore-node-networks) restore_node_networks "${BOOTSTRAP_RESTORE_NODE}" ;;
+esac

@@ -388,7 +388,8 @@ for pod in $(collector_list "leader pod listing" kubectl -n "${KIH_HELPER_NAMESP
   capture 08-netns.txt "${pod} addresses" kubectl -n "${KIH_HELPER_NAMESPACE}" exec "${pod}" -- ip addr
   capture 08-netns.txt "${pod} routes" kubectl -n "${KIH_HELPER_NAMESPACE}" exec "${pod}" -- ip route
   capture 08-netns.txt "${pod} UDP sockets" kubectl -n "${KIH_HELPER_NAMESPACE}" exec "${pod}" -- cat /proc/net/udp
-  capture 08-netns.txt "${pod} metrics" kubectl -n "${KIH_HELPER_NAMESPACE}" exec "${pod}" -- wget -qO- http://127.0.0.1:8080/metrics
+  capture 08-netns.txt "${pod} localhost metrics (diagnostic only, not Service delivery proof)" \
+    kubectl -n "${KIH_HELPER_NAMESPACE}" exec "${pod}" -- wget -qO- http://127.0.0.1:8080/metrics
 done
 
 if [ -n "${RUNTIME}" ]; then
@@ -406,9 +407,9 @@ fi
   for file in "${E2E_ARTIFACTS_DIR}"/console-*.log; do
     [ -f "${file}" ] || continue
     printf '===== %s =====\n' "$(basename "${file}")"
-    grep -o 'E2E_DHCP_[A-Z]*[^[:space:]]*' "${file}" || true
+    grep -E '^E2E_NET_SAMPLE ' "${file}" || true
   done
-} > "${E2E_ARTIFACTS_DIR}/10-guest-markers.txt"
+} > "${E2E_ARTIFACTS_DIR}/10-guest-samples.txt"
 
 # The remaining work happens in finish: comparison against the previous run plus the
 # sha256 manifest, then this human-readable index of what the run actually kept.

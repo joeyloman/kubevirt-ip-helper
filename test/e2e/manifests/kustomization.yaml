@@ -8,14 +8,14 @@ kind: Kustomization
 #   kubectl kustomize --load-restrictor=LoadRestrictionsNone test/e2e/manifests
 # The production resources live above this kustomization root.
 resources:
-  - ../../../deployments/crds.yaml
   - ../../../deployments/deployment.yaml
   - namespaces.yaml
   - nad.yaml
+  - network-services.yaml
 
 patches:
-  # Helper deployment: pinned local image, IfNotPresent, two replicas, and the
-  # contracted Multus attachment (interface kihnet0) on the helper pod.
+  # Helper deployment: locally built image, IfNotPresent, and the contracted
+  # Multus attachment. Replicas, probes, resources, and env stay as deployed.
   - path: helper-overlay.yaml
   # kind clusters have no monitoring.coreos.com CRD, so the ServiceMonitor from
   # the production manifest must not reach the API server.
