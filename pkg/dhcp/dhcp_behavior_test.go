@@ -1213,6 +1213,63 @@ func TestDHCPHandlerNoMatchedPoolNaksRequest(t *testing.T) {
 	if mt := resp.MessageType(); mt != dhcpv4.MessageTypeNak {
 		t.Errorf("message type = %v, want Nak", mt)
 	}
+
+	// rfc 2131 section 4.3.2: the nak carries the identifier of the
+	// server which sends it. the request carries no identifier (the
+	// renewal and init-reboot forms), so the nak speaks with the ip this
+	// server last served the vanished pool with - never with the
+	// 0.0.0.0 fallback the request's missing option used to produce
+	if sid := resp.ServerIdentifier(); !sid.Equal(net.ParseIP("192.168.0.1")) {
+		t.Errorf("nak server identifier = %s, want this server's last served 192.168.0.1", sid)
+	}
+}
+
+// TestDHCPHandlerNoMatchedPoolNakOwnsItsIdentity pins the p3 finding: a
+// request which selected another server must not be nacked by this one -
+// the old path nacked every request of the vanished pool, echoing the
+// attacker-supplied identifier of the request (or 0.0.0.0) and tearing
+// down bindings this server never made. only a request without an
+// identifier (this server's own client) or one addressed to this server's
+// last served ip is nacked, in this server's name.
+func TestDHCPHandlerNoMatchedPoolNakOwnsItsIdentity(t *testing.T) {
+	t.Run("naks the request which selected this server", func(t *testing.T) {
+		a := newTestPooledAllocator(t)
+		if err := a.DeletePool("pool1"); err != nil {
+			t.Fatalf("deleting the pool: %v", err)
+		}
+		conn := &recordingPacketConn{}
+
+		req := newBootRequest(t, mustHWAddr(t, "aa:bb:cc:dd:ee:01"), dhcpv4.MessageTypeRequest)
+		req.UpdateOption(dhcpv4.OptServerIdentifier(net.ParseIP("192.168.0.1")))
+		a.dhcpHandler(conn, testPeer(), req)
+
+		if conn.len() != 1 {
+			t.Fatalf("expected a nak for the request addressed to this server, got %d", conn.len())
+		}
+		resp, err := dhcpv4.FromBytes(conn.payloads[0])
+		if err != nil {
+			t.Fatalf("parsing reply: %v", err)
+		}
+		if sid := resp.ServerIdentifier(); !sid.Equal(net.ParseIP("192.168.0.1")) {
+			t.Errorf("nak server identifier = %s, want this server's own 192.168.0.1", sid)
+		}
+	})
+
+	t.Run("drops the request which selected another server", func(t *testing.T) {
+		a := newTestPooledAllocator(t)
+		if err := a.DeletePool("pool1"); err != nil {
+			t.Fatalf("deleting the pool: %v", err)
+		}
+		conn := &recordingPacketConn{}
+
+		req := newBootRequest(t, mustHWAddr(t, "aa:bb:cc:dd:ee:01"), dhcpv4.MessageTypeRequest)
+		req.UpdateOption(dhcpv4.OptServerIdentifier(net.ParseIP("203.0.113.9")))
+		a.dhcpHandler(conn, testPeer(), req)
+
+		if conn.len() != 0 {
+			t.Errorf("expected no reply for a request addressed to another server, got %d", conn.len())
+		}
+	})
 }
 
 // TestDHCPHandlerNoMatchedPoolDiscoverDropped: a discover against a
@@ -1246,6 +1303,32 @@ func newLoopbackServer(t *testing.T) *server4.Server {
 	}
 
 	return server
+}
+
+// TestStopTreatsTheAlreadyClosedListenerAsConverged pins the p3 finding:
+// the library's Serve defers the socket close, so the conn of a listener
+// whose serve loop already exited is closed by the time a later teardown
+// reaches it. the close error of that window is the converged outcome -
+// surfacing it made the pool cleanup log a failed shutdown and bump the
+// error metric for a routine teardown.
+func TestStopTreatsTheAlreadyClosedListenerAsConverged(t *testing.T) {
+	a := NewDHCPAllocator()
+
+	server := newLoopbackServer(t)
+	a.servers["net-closed"] = server
+	a.serverNics["net-closed"] = "lo"
+	if err := server.Close(); err != nil {
+		t.Fatalf("closing the listener: %v", err)
+	}
+
+	// the registry entry is still live (the serve wrapper has not woken
+	// up yet), but the socket is already closed: the stop must converge
+	if err := a.Stop("net-closed"); err != nil {
+		t.Errorf("Stop of an already-closed listener = %v, want the converged nil", err)
+	}
+	if a.IsRunning("net-closed") {
+		t.Error("the stopped network must be deregistered")
+	}
 }
 
 // TestServeAndDeregisterKeepsTheReplacementRegistered pins the identity

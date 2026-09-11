@@ -81,6 +81,14 @@ type DHCPAllocator struct {
 	// a second Run on the same interface can surface the kernel-dependent
 	// delivery duplication instead of hiding it
 	serverNics map[string]string
+	// lastKnownServerIP records the server ip each network last served
+	// with, and it survives the pool deletion: a request which arrives
+	// after the deletion (the reload window, or a vm still running on a
+	// deleted pool) must be nak-ed in the name of THIS server - never
+	// with the request's own (attacker-supplied) identifier or another
+	// server's address, rfc 2131 section 4.3.2 - and only when the
+	// request is addressed to this server at all
+	lastKnownServerIP map[string]net.IP
 	// closed is set by StopAll: the shutdown paths stop the listeners
 	// before the era join, and the flag fences a draining controller
 	// worker which would otherwise re-open a listener behind the teardown
@@ -108,12 +116,14 @@ func NewDHCPAllocator() *DHCPAllocator {
 	leases := make(map[string]DHCPLease)
 	servers := make(map[string]*server4.Server)
 	serverNics := make(map[string]string)
+	lastKnownServerIP := make(map[string]net.IP)
 
 	return &DHCPAllocator{
-		pools:      pools,
-		leases:     leases,
-		servers:    servers,
-		serverNics: serverNics,
+		pools:             pools,
+		leases:            leases,
+		servers:           servers,
+		serverNics:        serverNics,
+		lastKnownServerIP: lastKnownServerIP,
 	}
 }
 
@@ -217,6 +227,10 @@ func (a *DHCPAllocator) AddPool(
 	pool.Nic = nic
 
 	a.pools[name] = pool
+	// the served identity of this network outlives the pool entry: the
+	// pool-gone nak path speaks in the name of the server which last
+	// served the network, never with the request's own identifier
+	a.lastKnownServerIP[name] = server
 
 	log.Debugf("(dhcp.AddPool) pool %s added", name)
 
@@ -230,6 +244,19 @@ func (a *DHCPAllocator) CheckPool(name string) bool {
 	_, exists := a.pools[name]
 
 	return exists
+}
+
+// lastServedServerIP reports the server ip this allocator last served
+// the named network with, also after the pool was deleted: the pool-gone
+// nak path needs the identity to speak in, and the registry entry
+// deliberately survives the pool deletion.
+func (a *DHCPAllocator) lastServedServerIP(networkName string) (net.IP, bool) {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	ip, known := a.lastKnownServerIP[networkName]
+
+	return ip, known
 }
 
 // NicClaimedByAnotherPool reports the network of the registered dhcp pool
@@ -645,19 +672,34 @@ func (a *DHCPAllocator) dhcpHandler(conn net.PacketConn, peer net.Addr, m *dhcpv
 
 	if !poolFound {
 		// the lease's pool is gone (deleted while the vm still runs, or the
-		// brief reload window): a request which asks for an address this
-		// server can no longer serve gets a nak so the client restarts the
-		// discovery instead of retransmitting indefinitely against a silent
-		// drop; other message types are dropped, there is nothing to offer
+		// brief reload window): a request which asks this server for an
+		// address it can no longer serve gets a nak so the client restarts
+		// the discovery instead of retransmitting indefinitely against a
+		// silent drop; other message types are dropped, there is nothing
+		// to offer
 		log.Warnf("(dhcp.dhcpHandler) NO MATCHED POOL FOUND FOR LEASE: hwaddr=%s", m.ClientHWAddr.String())
 
 		if m.MessageType() == dhcpv4.MessageTypeRequest {
-			serverIP := m.ServerIdentifier()
-			if len(serverIP) == 0 {
-				serverIP = net.IPv4zero
+			// the nak carries the identifier of the server which sends
+			// it (rfc 2131 section 4.3.2), never the attacker-supplied
+			// identifier of the request or another server's address:
+			// the identity is the ip this allocator last served the
+			// network with, which survives the pool deletion. a request
+			// which selected another server is not ours to answer - a
+			// nak in this server's name would tear down a binding this
+			// server never made
+			ourIP, known := a.lastServedServerIP(lease.PoolName)
+			serverID := m.ServerIdentifier()
+			if known && (len(serverID) == 0 || serverID.Equal(ourIP)) {
+				a.sendNak(conn, m, ourIP)
+
+				return
 			}
 
-			a.sendNak(conn, m, serverIP)
+			if len(serverID) > 0 {
+				log.Infof("(dhcp.dhcpHandler) [txid=%s] DHCPREQUEST from %s for the vanished pool %s ignored: the client selected the server %s",
+					m.TransactionID.String(), m.ClientHWAddr.String(), lease.PoolName, serverID.String())
+			}
 		}
 
 		return
@@ -998,7 +1040,15 @@ func (a *DHCPAllocator) Stop(networkName string) (err error) {
 		return
 	}
 
-	return server.Close()
+	// the library's Serve defers the socket close, so the conn of a
+	// listener whose serve loop already exited is closed by the time this
+	// teardown reaches it: the already-closed error is the converged
+	// outcome, not a failed shutdown
+	if err := server.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		return err
+	}
+
+	return nil
 }
 
 // StopAll stops and removes every running dhcp service: the shutdown path
