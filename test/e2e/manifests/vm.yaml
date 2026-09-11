@@ -1,0 +1,241 @@
+# Halted on creation: the helper reserves the address for the explicit MAC
+# before run.sh starts this VM. The guest exposes only the helper-served Multus
+# NIC; CirrOS starts and maintains its stock eth0 DHCP client.
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: e2e-vm
+  namespace: e2e
+  labels:
+    app: kubevirt-ip-helper-e2e
+spec:
+  runStrategy: Halted
+  template:
+    metadata:
+      labels:
+        app: kubevirt-ip-helper-e2e
+    spec:
+      domain:
+        cpu:
+          cores: 1
+        memory:
+          guest: 256Mi
+        devices:
+          disks:
+            - name: containerdisk
+              disk:
+                bus: virtio
+            - name: cloudinitdisk
+              disk:
+                bus: virtio
+          interfaces:
+            - name: kihnet0
+              bridge: {}
+              macAddress: 02:00:00:00:00:11
+      networks:
+        - name: kihnet0
+          multus:
+            networkName: kubevirt-ip-helper/kubevirt-ip-helper-e2e
+      volumes:
+        - name: containerdisk
+          containerDisk:
+            image: quay.io/kubevirt/cirros-container-disk-demo:v1.9.0@sha256:ebdb8d8b9b480f6ee7664ed3fdde8428767664f507d98f94090edeff04d7ebf2
+        - name: cloudinitdisk
+          cloudInitNoCloud:
+            userData: |
+              #!/bin/sh
+              EXPECTED_MAC="02:00:00:00:00:11"
+              SEQ=0
+              LOOKUP_FILE="/tmp/e2e-nslookup.$$"
+
+              csv_or_unset() {
+                awk 'NF {
+                       if (count++) printf ","
+                       printf "%s", $0
+                     }
+                     END {
+                       if (!count) printf "unset"
+                       printf "\n"
+                     }'
+              }
+
+              route_values_for() {
+                awk -v iface="$1" '
+                  {
+                    dev = ""
+                    via = ""
+                    for (i = 1; i <= NF; i++) {
+                      if ($i == "dev" && i < NF) dev = $(i + 1)
+                      if ($i == "via" && i < NF) via = $(i + 1)
+                    }
+                    if (dev == iface) print via == "" ? "unset" : via
+                  }'
+              }
+
+              client_matches_iface() {
+                [ -r "/proc/$1/cmdline" ] || return 1
+                tr '\000' '\n' < "/proc/$1/cmdline" 2>/dev/null |
+                  awk -v iface="$2" '
+                    NR == 1 {
+                      sub(/^.*\//, "", $0)
+                      is_udhcpc = ($0 == "udhcpc")
+                    }
+                    previous == "-i" && $0 == iface { owns_iface = 1 }
+                    { previous = $0 }
+                    END { exit !(is_udhcpc && owns_iface) }'
+              }
+
+              resolve_ipv4() {
+                if ! : > "${LOOKUP_FILE}"; then
+                  printf '%s\n' unset
+                  return
+                fi
+                nslookup "$1" > "${LOOKUP_FILE}" 2>&1 &
+                lookup_pid=$!
+                (
+                  sleep 2
+                  kill "${lookup_pid}" 2>/dev/null
+                ) &
+                watchdog_pid=$!
+                wait "${lookup_pid}"
+                lookup_rc=$?
+                kill "${watchdog_pid}" 2>/dev/null || true
+                wait "${watchdog_pid}" 2>/dev/null || true
+                if [ "${lookup_rc}" -ne 0 ]; then
+                  printf '%s\n' unset
+                  return
+                fi
+                awk '
+                  function ipv4(value, pieces, piece_count, i) {
+                    piece_count = split(value, pieces, ".")
+                    if (piece_count != 4) return 0
+                    for (i = 1; i <= 4; i++) {
+                      if (pieces[i] !~ /^[0-9][0-9]*$/ || pieces[i] > 255) return 0
+                    }
+                    return 1
+                  }
+                  $1 == "Name:" { answer = 1; next }
+                  answer && $1 == "Address" && ipv4($3) { print $3 }' \
+                  "${LOOKUP_FILE}" | csv_or_unset
+              }
+
+              while :; do
+                SEQ=$((SEQ + 1))
+                IFACE=missing
+                MAC=missing
+                ADDRESS=unset
+                ROUTER=unset
+                CLIENT_PID=unset
+                CLIENT_ALIVE=0
+                GATEWAY_OK=0
+                TARGET_IP=unset
+                TARGET_VIA=unset
+                TARGET_OK=0
+
+                MATCHING_IFACE=""
+                MATCH_COUNT=0
+                for path in /sys/class/net/*; do
+                  [ -r "${path}/address" ] || continue
+                  observed="$(cat "${path}/address" 2>/dev/null)"
+                  [ "${observed}" = "${EXPECTED_MAC}" ] || continue
+                  MATCHING_IFACE="${path##*/}"
+                  MATCH_COUNT=$((MATCH_COUNT + 1))
+                done
+                if [ "${MATCH_COUNT}" -eq 1 ]; then
+                  IFACE="${MATCHING_IFACE}"
+                  MAC="$(cat "/sys/class/net/${IFACE}/address" 2>/dev/null)"
+                  [ -n "${MAC}" ] || MAC=missing
+
+                  ADDRESS="$(
+                    ip -4 addr show dev "${IFACE}" 2>/dev/null |
+                      awk '$1 == "inet" { print $2 }' |
+                      csv_or_unset
+                  )"
+                  ROUTER="$(
+                    ip -4 route show default 2>/dev/null |
+                      route_values_for "${IFACE}" |
+                      csv_or_unset
+                  )"
+
+                  pidfile="/var/run/udhcpc.${IFACE}.pid"
+                  if [ -r "${pidfile}" ]; then
+                    CLIENT_PID="$(
+                      awk '{
+                             for (i = 1; i <= NF; i++) {
+                               values++
+                               value = $i
+                             }
+                           }
+                           END {
+                             if (values == 1 && value ~ /^[0-9][0-9]*$/) print value
+                           }' "${pidfile}" 2>/dev/null
+                    )"
+                    [ -n "${CLIENT_PID}" ] || CLIENT_PID=unset
+                  fi
+                  if [ "${CLIENT_PID}" != unset ] &&
+                     client_matches_iface "${CLIENT_PID}" "${IFACE}"; then
+                    CLIENT_ALIVE=1
+                  fi
+                fi
+
+                DNS="$(
+                  awk '$1 == "nameserver" && NF > 1 { print $2 }' \
+                    /etc/resolv.conf 2>/dev/null |
+                    csv_or_unset
+                )"
+                SEARCH="$(
+                  awk '($1 == "search" || $1 == "domain") {
+                         for (i = 2; i <= NF; i++) {
+                           if ($i ~ /^#/) break
+                           print $i
+                         }
+                       }' /etc/resolv.conf 2>/dev/null |
+                    csv_or_unset
+                )"
+                FIRST_SEARCH="$(
+                  awk '($1 == "search" || $1 == "domain") {
+                         for (i = 2; i <= NF; i++) {
+                           if ($i ~ /^#/) exit
+                           print $i
+                           exit
+                         }
+                       }' /etc/resolv.conf 2>/dev/null
+                )"
+
+                case "${ROUTER}" in
+                  unset|*,*) ;;
+                  *)
+                    ping -q -c 1 -W 1 -w 2 "${ROUTER}" >/dev/null 2>&1 &&
+                      GATEWAY_OK=1
+                    ;;
+                esac
+
+                if [ -n "${FIRST_SEARCH}" ]; then
+                  TARGET_IP="$(resolve_ipv4 "probe.${FIRST_SEARCH}")"
+                fi
+                rm -f "${LOOKUP_FILE}"
+
+                case "${TARGET_IP}" in
+                  unset|*,*) ;;
+                  *)
+                    if [ "${IFACE}" != missing ]; then
+                      TARGET_VIA="$(
+                        ip -4 route get "${TARGET_IP}" 2>/dev/null |
+                          route_values_for "${IFACE}" |
+                          csv_or_unset
+                      )"
+                      ping -q -c 1 -W 1 -w 2 "${TARGET_IP}" >/dev/null 2>&1 &&
+                        TARGET_OK=1
+                    fi
+                    ;;
+                esac
+
+                UPTIME="$(awk '{ print $1; exit }' /proc/uptime 2>/dev/null)"
+                [ -n "${UPTIME}" ] || UPTIME=unset
+                printf 'E2E_NET_SAMPLE seq=%s uptime=%s iface=%s mac=%s address=%s router=%s dns=%s search=%s client_pid=%s client_alive=%s gateway_ok=%s target_ip=%s target_via=%s target_ok=%s\n' \
+                  "${SEQ}" "${UPTIME}" "${IFACE}" "${MAC}" "${ADDRESS}" \
+                  "${ROUTER}" "${DNS}" "${SEARCH}" "${CLIENT_PID}" \
+                  "${CLIENT_ALIVE}" "${GATEWAY_OK}" "${TARGET_IP}" \
+                  "${TARGET_VIA}" "${TARGET_OK}" > /dev/ttyS0
+                sleep 2
+              done
