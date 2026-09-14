@@ -149,10 +149,19 @@ spec:
         # the health server starts only inside Run, after Init and the
         # startup network cleanup: without a startup probe the liveness
         # probe below (15s initial delay, 3 failures) would kill a pod
-        # whose startup legitimately exceeds ~45s - a slow apiserver -
-        # before the process ever listens. the startup probe tolerates
-        # the full startup budget (the 15-minute gate stall timeout of
-        # the application) before the liveness probe arms.
+        # whose startup legitimately exceeds ~45s - a slow apiserver - in
+        # the window before the process ever listens. the startup probe
+        # covers exactly that window (the process answers /healthz as soon
+        # as the server listens, so the budget is generous for a slow
+        # initialization), and it is deliberately not sized to the service
+        # era: the era startup (the pool registrations and the binding
+        # replays, up to the 15-minute gate stall timeout) runs with the
+        # health server listening and the liveness probe armed, which
+        # passes while this pod holds and renews its lease. a pod which
+        # does not finish its era reports not-ready through /ready, so the
+        # rollout waits for it, and the application's own fences
+        # (startupListTimeout, startupStallTimeout) plus the
+        # progressDeadlineSeconds above bound that startup
         startupProbe:
           httpGet:
             path: /healthz
