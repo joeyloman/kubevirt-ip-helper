@@ -97,13 +97,19 @@ spec:
   selector:
     matchLabels:
       app: kubevirt-ip-helper
-  # a surged pod of a RollingUpdate is a lease standby and can never pass
-  # the leadership-gated readiness probe while the old leader still holds
-  # the lease, so the rollout would wedge at the progress deadline;
-  # Recreate terminates the old pods first, which releases the lease
-  # (ReleaseOnCancel + the SIGTERM handler) for a new pod to acquire
+  # the replicas are lease peers: the standby is a ready pod which serves
+  # nothing (the readiness probe does not gate on the leadership - see the
+  # services check of the application), so the deployment reaches its
+  # desired availability and the rollout completes. maxUnavailable: 0 keeps
+  # the serving leader in place until the replacement replicas are
+  # available: the old pod is terminated last, its SIGTERM releases the
+  # leader lease (ReleaseOnCancel + the signal handler) and the new leader
+  # rebuilds its services from the still-live configuration
   strategy:
-    type: Recreate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+    type: RollingUpdate
   template:
     metadata:
       annotations:
@@ -162,6 +168,14 @@ spec:
           periodSeconds: 10
           timeoutSeconds: 3
           failureThreshold: 3
+        # the readiness probe reports a pod whose service era is being built
+        # (APP_INIT) or torn down (APP_RESTART) as not-ready. it must not
+        # gate on the leadership: a non-leader replica would stay not-ready
+        # forever, the deployment could never reach its desired
+        # availability, and every rollout would be reported as failed at the
+        # progress deadline although the leader serves. the metrics service
+        # selects the serving pod through the pod label, not through this
+        # endpoint
         readinessProbe:
           httpGet:
             path: /ready

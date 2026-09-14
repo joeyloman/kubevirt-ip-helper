@@ -233,8 +233,8 @@ func (m *MetricsAllocator) SetHealthCheck(name string, check func() error) {
 }
 
 // SetReadinessCheck registers a check evaluated by the /ready endpoint
-// only: a pod which has not started serving (or never acquired the
-// leadership) stays not-ready without failing its liveness probe.
+// only: a pod which has not started serving stays not-ready without failing
+// its liveness probe.
 func (m *MetricsAllocator) SetReadinessCheck(name string, check func() error) {
 	m.healthMutex.Lock()
 	defer m.healthMutex.Unlock()

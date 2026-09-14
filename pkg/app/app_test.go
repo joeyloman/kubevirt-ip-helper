@@ -1057,9 +1057,11 @@ func (h *captureHook) entriesText() string {
 }
 
 // The health endpoints are process-global, so a standby replica must stay
-// live (a non-leader never fails the leaderElection check) while only the
-// readiness reflects the serving state of the current era. This pins the
-// contract the pod's kubelet probes rely on, against the real HTTP server.
+// live (a non-leader never fails the leaderElection check) and ready (a
+// leadership-gated readiness would keep the deployment from ever reaching its
+// desired availability), while a pod whose era is being built or torn down
+// reports not-ready. This pins the contract the pod's kubelet probes and the
+// deployment rollout rely on, against the real HTTP server.
 func TestRegisterHealthChecksStandbyAndEraStates(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -1103,12 +1105,16 @@ func TestRegisterHealthChecksStandbyAndEraStates(t *testing.T) {
 	}
 
 	// a standby never acquires the leadership: liveness must pass (this is
-	// the check which used to kill every standby) while readiness fails
+	// the check which used to kill every standby) and readiness must pass as
+	// well - a non-leader replica which is never ready keeps the deployment
+	// from reaching its desired availability, so every rollout of a
+	// multi-replica deployment ends in ProgressDeadlineExceeded although the
+	// leader serves
 	if code := getStatusCode("/healthz"); code != http.StatusOK {
 		t.Errorf("standby /healthz = %d, want %d", code, http.StatusOK)
 	}
-	if code := getStatusCode("/ready"); code != http.StatusServiceUnavailable {
-		t.Errorf("standby /ready = %d, want %d", code, http.StatusServiceUnavailable)
+	if code := getStatusCode("/ready"); code != http.StatusOK {
+		t.Errorf("standby /ready = %d, want %d", code, http.StatusOK)
 	}
 
 	// an era which is still initializing serves no leases yet
@@ -1117,6 +1123,12 @@ func TestRegisterHealthChecksStandbyAndEraStates(t *testing.T) {
 	h.era.Store(era)
 	if code := getStatusCode("/ready"); code != http.StatusServiceUnavailable {
 		t.Errorf("initializing /ready = %d, want %d", code, http.StatusServiceUnavailable)
+	}
+
+	// an era which is reinitializing has torn its services down
+	era.appStatus.Store(APP_RESTART)
+	if code := getStatusCode("/ready"); code != http.StatusServiceUnavailable {
+		t.Errorf("restarting /ready = %d, want %d", code, http.StatusServiceUnavailable)
 	}
 
 	// once the era runs its services the pod becomes ready

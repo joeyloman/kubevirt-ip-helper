@@ -218,8 +218,22 @@ func (h *handler) Run(mainCtx context.Context) {
 // registerHealthChecks wires the process-global health endpoints: the
 // leaderElection check passes for a non-leader (client-go reports
 // unhealthy only for a lease owner which cannot renew), so a standby stays
-// live, and the services check keeps a not-serving pod out of the ready
-// endpoint without failing its liveness probe.
+// live, and the services check reports a pod whose service era is being
+// built or torn down as not-ready without failing its liveness probe.
+//
+// the readiness check deliberately does not gate on the leadership: the
+// replica count of the deployment is a number of *pods*, and a
+// leadership-gated readiness keeps every non-leader replica not-ready
+// forever, so the deployment can never reach its desired availability -
+// availableReplicas stays below replicas, the rollout reports
+// ProgressDeadlineExceeded at the progress deadline and every release
+// (kubectl rollout status, helm --wait, a gitops health gate) is reported
+// as failed although the leader serves. selecting the serving pod is the
+// job of the metrics service, which routes to the leader through the pod
+// label, not of the readiness endpoint. a standby which never ran a
+// service era is therefore a healthy, ready member of the deployment, and
+// only a pod which is mid-rebuild (APP_INIT) or mid-teardown (APP_RESTART)
+// reports not-ready.
 func (h *handler) registerHealthChecks() {
 	h.metrics.SetHealthCheck("leaderElection", func() error {
 		return h.leaderWatchdog.Check(nil)
@@ -227,7 +241,12 @@ func (h *handler) registerHealthChecks() {
 	h.metrics.SetHealthCheck("process", func() error { return nil })
 	h.metrics.SetReadinessCheck("services", func() error {
 		era := h.era.Load()
-		if era == nil || era.appStatus.Load() != APP_RUNNING {
+		if era == nil {
+			// this process never acquired the leadership: a healthy standby
+			return nil
+		}
+
+		if era.appStatus.Load() != APP_RUNNING {
 			return errors.New("application is not running its services")
 		}
 
