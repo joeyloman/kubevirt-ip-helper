@@ -549,11 +549,21 @@ func (c *Controller) cleanupIPPoolObjects(pool *kihv1.IPPool) (err error) {
 
 	c.stopDHCPListener(pool)
 	c.ipam.DeleteSubnet(pool.Spec.NetworkName)
+	// the pool entry is removed before the leases: an in-flight handler
+	// (the packet handler of the library runs in its own goroutine) which
+	// snapshots the pool-absent state while the lease is still registered
+	// is the deleted-pool case the nak path covers, so the ordering keeps
+	// that answer reachable for as long as the teardown runs
 	c.dhcp.DeletePool(pool.Spec.NetworkName)
-	// a deleted pool must not leave its leases behind: its server is gone,
-	// so the renewals of still-running vms would be blackholed against a
-	// pool which can never serve them again (unlike a reload, which keeps
-	// the leases of the live vms)
+	// a deleted pool must not leave its leases behind: its listener is
+	// already stopped, so nothing of the network is answered anymore, and a
+	// registration which is later re-created under the same networkname must
+	// not serve the pre-deletion addresses of its own bindings - their
+	// renewals would be acked with an address the new subnet may not
+	// contain. the bindings re-claim their recorded address through the new
+	// registration's claim protection instead, and an address which the new
+	// pool cannot serve surfaces as their error status (unlike a reload,
+	// which keeps the leases of the live vms and the same projection)
 	c.dhcp.RemoveLeasesForNetwork(pool.Spec.NetworkName)
 	c.metrics.DeleteIPPool(pool.Name, pool.Spec.IPv4Config.Subnet, pool.Spec.NetworkName)
 	c.cache.Delete("pool", pool.Spec.NetworkName)

@@ -878,6 +878,16 @@ func TestSyncDeleteRegisteredPoolFreesItsState(t *testing.T) {
 	if err := controller.dhcp.AddPool("net-dup", "192.168.1.1", "255.255.255.0", "192.168.1.1", nil, "", nil, nil, 60, "test-fake-iface"); err != nil {
 		t.Fatalf("registering the dhcp pool: %v", err)
 	}
+	// a lease of the deleted network, which the teardown must drop with
+	// the registration (its listener is stopped first, so the network is
+	// served by nobody afterwards)
+	if err := controller.dhcp.AddLease("02:00:00:00:00:01", "net-dup", "192.168.1.10", "ref-dup"); err != nil {
+		t.Fatalf("seeding the lease of the deleted network: %v", err)
+	}
+	// a lease of another network, which the teardown of this pool must not touch
+	if err := controller.dhcp.AddLease("02:00:00:00:00:99", "net-keep", "192.168.2.50", "ref-keep"); err != nil {
+		t.Fatalf("seeding the lease of another network: %v", err)
+	}
 	if err := cacheAllocator.Add(storedPool); err != nil {
 		t.Fatalf("caching the pool: %v", err)
 	}
@@ -893,6 +903,18 @@ func TestSyncDeleteRegisteredPoolFreesItsState(t *testing.T) {
 	}
 	if controller.dhcp.CheckPool("net-dup") {
 		t.Error("the deleted pool's dhcp pool survived the delete")
+	}
+	// the leases of the deleted network are dropped with the teardown
+	if controller.dhcp.CheckLease("02:00:00:00:00:01") {
+		t.Error("the deleted network's lease survived the delete")
+	}
+	// the sweep is scoped to the deleted network: the lease of another
+	// network survives the teardown
+	if !controller.dhcp.CheckLease("02:00:00:00:00:99") {
+		t.Error("a lease of another network must survive the delete")
+	}
+	if lease := controller.dhcp.GetLease("02:00:00:00:00:99"); lease.PoolName != "net-keep" {
+		t.Errorf("the surviving lease serves network %q, want net-keep", lease.PoolName)
 	}
 	if cacheAllocator.Check(storedPool) {
 		t.Error("the deleted pool's cache entry survived the delete")

@@ -83,11 +83,12 @@ type DHCPAllocator struct {
 	serverNics map[string]string
 	// lastKnownServerIP records the server ip each network last served
 	// with, and it survives the pool deletion: a request which arrives
-	// after the deletion (the reload window, or a vm still running on a
-	// deleted pool) must be nak-ed in the name of THIS server - never
-	// with the request's own (attacker-supplied) identifier or another
-	// server's address, rfc 2131 section 4.3.2 - and only when the
-	// request is addressed to this server at all
+	// while the network has no pool entry (the in-flight handlers of a
+	// deletion, or the brief reload window of a live registration) must be
+	// nak-ed in the name of THIS server - never with the request's own
+	// (attacker-supplied) identifier or another server's address, rfc 2131
+	// section 4.3.2 - and only when the request is addressed to this
+	// server at all
 	lastKnownServerIP map[string]net.IP
 	// closed is set by StopAll: the shutdown paths stop the listeners
 	// before the era join, and the flag fences a draining controller
@@ -739,12 +740,15 @@ func (a *DHCPAllocator) dhcpHandler(conn net.PacketConn, peer net.Addr, m *dhcpv
 		}
 
 		if !poolFound {
-			// the lease's pool is gone (deleted while the vm still runs, or the
-			// brief reload window): a request which asks this server for an
+			// the lease's pool entry is gone (the teardown of a deleted pool
+			// removes the pool entry before the leases, so an in-flight
+			// handler still holds the lease, or the brief reload window of a
+			// live registration): a request which asks this server for an
 			// address it can no longer serve gets a nak so the client restarts
 			// the discovery instead of retransmitting indefinitely against a
 			// silent drop; other message types are dropped, there is nothing
-			// to offer
+			// to offer. a completed deletion stops the listener first, so its
+			// packets are not received at all anymore
 			log.Warnf("(dhcp.dhcpHandler) NO MATCHED POOL FOUND FOR LEASE: hwaddr=%s", m.ClientHWAddr.String())
 
 			if m.MessageType() == dhcpv4.MessageTypeRequest {
