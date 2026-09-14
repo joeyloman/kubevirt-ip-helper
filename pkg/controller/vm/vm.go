@@ -30,6 +30,21 @@ func (c *Controller) handleVirtualMachineObjectChange(vm *kubevirtV1.VirtualMach
 		}
 	}
 
+	// an object which is already being deleted is not this vm's to
+	// configure: the vmnetcfg controller's finalizer cleanup iterates the
+	// spec of the doomed object and releases the leases, the ipam claims
+	// and the ledger records of the nics it finds there, so writing this
+	// vm's spec into it hands the reservations of the replacement to a
+	// cleanup which is about to delete the object (the replacement then
+	// serves without them until its own resync re-creates the vmnetcfg).
+	// the sync is deferred with a retriable error: the rate-limited retry
+	// and the resync converge once the object is gone, and the retried
+	// sync creates the replacement's own object
+	if vmnetcfg.ObjectMeta.DeletionTimestamp != nil {
+		return fmt.Errorf("(vm.handleVirtualMachineObjectChange) [%s/%s] the VirtualMachineNetworkConfig object is being deleted, deferring the sync until it is gone",
+			vm.Namespace, vm.Name)
+	}
+
 	return c.updateVirtualMachineNetworkConfigObject(vm, vmnetcfg)
 }
 

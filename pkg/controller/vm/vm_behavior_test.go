@@ -740,10 +740,75 @@ func TestHandleVirtualMachineObjectChangeUpdatesExisting(t *testing.T) {
 	}
 }
 
+// TestHandleVirtualMachineObjectChangeSkipsTerminatingObject pins the
+// replacement race of a deleted virtual machine: the vm controller deletes
+// the vmnetcfg object of a deleted vm, and a same-name replacement
+// created while that deletion is still running finds the doomed object on
+// its own create-or-update lookup. configuring the replacement through it
+// would write the replacement's spec into the object whose finalizer
+// cleanup is in flight, and that cleanup releases the leases, the ipam
+// claims and the ledger records of the nics it finds in the spec before
+// it deletes the object - the replacement then serves without its
+// reservations until its own resync re-creates the vmnetcfg. the sync is
+// deferred with a retriable error instead, and the retried sync creates
+// the replacement's own object once the doomed one is gone.
+func TestHandleVirtualMachineObjectChangeSkipsTerminatingObject(t *testing.T) {
+	c, f := vmBehaviorNewTestController(t)
+
+	// the object of a deleted virtual machine is still terminating: its
+	// finalizer cleanup has not completed yet
+	now := metav1.Now()
+	f.mu.Lock()
+	f.vmnetcfgs["ns1/vm1"] = &kihv1.VirtualMachineNetworkConfig{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "vm1",
+			Namespace:         "ns1",
+			DeletionTimestamp: &now,
+			Finalizers:        []string{vmnetcfgFinalizer},
+		},
+		Spec: kihv1.VirtualMachineNetworkConfigSpec{VMName: "vm1"},
+	}
+	f.mu.Unlock()
+
+	// the replacement advertises its own interface
+	vm := multusVM("ns1", "vm1", "net1", "default/net-a", "aa:bb:cc:00:00:02")
+
+	err := c.handleVirtualMachineObjectChange(vm)
+	if err == nil {
+		t.Fatal("expected the sync of a terminating vmnetcfg object to be deferred")
+	}
+
+	// the doomed object must not be configured: no spec update of it
+	if n := len(f.requestsFor(http.MethodPut, "/virtualmachinenetworkconfigs/vm1")); n != 0 {
+		t.Errorf("expected no update of the terminating object, got %d", n)
+	}
+
+	// the deferred sync converges once the object is gone: the retried
+	// sync creates the replacement's own object
+	f.mu.Lock()
+	delete(f.vmnetcfgs, "ns1/vm1")
+	f.mu.Unlock()
+
+	if err := c.handleVirtualMachineObjectChange(vm); err != nil {
+		t.Fatalf("the retried sync of the gone object must create the replacement's object: %v", err)
+	}
+
+	creates := f.requestsFor(http.MethodPost, "/virtualmachinenetworkconfigs")
+	if len(creates) != 1 {
+		t.Fatalf("expected 1 create after the doomed object is gone, got %d", len(creates))
+	}
+	var created kihv1.VirtualMachineNetworkConfig
+	if err := json.Unmarshal(creates[0].body, &created); err != nil {
+		t.Fatalf("decoding create body: %v", err)
+	}
+	if len(created.Spec.NetworkConfig) != 1 || created.Spec.NetworkConfig[0] != testNetCfg("aa:bb:cc:00:00:02", "default/net-a", "") {
+		t.Errorf("the replacement must get its own network config, got %+v", created.Spec.NetworkConfig)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // createVirtualMachineNetworkConfigObject
 // ---------------------------------------------------------------------------
-
 func TestCreateVirtualMachineNetworkConfigObjectSkipsWithoutNetworks(t *testing.T) {
 	c, f := vmBehaviorNewTestController(t)
 
