@@ -535,10 +535,21 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 
 				// set the old status; a binding whose verification and
 				// repair succeed without any previous entry synthesizes its
-				// success status below instead of serving silently
+				// success status below instead of serving silently. an
+				// ERROR entry is deliberately not carried over: this sync
+				// re-attempted the failed interface and verified its
+				// lease, claim and ownership record, so republishing the
+				// previous failure verbatim would leave the status and its
+				// metric stuck on ERROR for an interface which serves,
+				// while every resync re-attempts it again. the success
+				// status is synthesized below instead
 				statusRecorded := false
 				for _, nic := range vmnetcfg.Status.NetworkConfig {
 					if v.MACAddress == nic.MACAddress && v.NetworkName == nic.NetworkName {
+						if nic.Status == "ERROR" {
+							break
+						}
+
 						netcfgStatus.Status = nic.Status
 						netcfgStatus.Message = nic.Message
 						newNetCfgStatusList = append(newNetCfgStatusList, netcfgStatus)

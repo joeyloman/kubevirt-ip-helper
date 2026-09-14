@@ -956,6 +956,80 @@ func TestVMNetCfgErrorRetryRecordsFreshError(t *testing.T) {
 	}
 }
 
+// TestVMNetCfgErrorRetryHealsWithIntactLease pins the lease-idempotent
+// retry of a transient ERROR: the failed interface already holds its
+// lease, its claim and its pool ownership record (an earlier sync failed
+// after the allocation was applied), so the re-attempt verifies the
+// binding and repairs the record - and it must publish the success status
+// of this sync instead of carrying the previous ERROR entry over
+// verbatim, which left the status and its metric stuck on ERROR for an
+// interface which serves, while every resync re-attempted it again.
+func TestVMNetCfgErrorRetryHealsWithIntactLease(t *testing.T) {
+	e := newTestEnv(t)
+	e.appStatus.Store(APP_RUNNING)
+	e.addSubnet("10.0.0.1", "10.0.0.1")
+
+	// the binding is fully applied: the claim, the lease and the pool
+	// ownership record all exist
+	ownerRef := testNamespace + "/" + testVMName + " [" + testMAC + "]"
+	if _, err := e.ipam.ReclaimIP(testNetwork, "10.0.0.1", ownerRef); err != nil {
+		t.Fatalf("claiming the address: %s", err)
+	}
+	if err := e.dhcp.AddLease(testMAC, testNetwork, "10.0.0.1", testNamespace+"/"+testVMName); err != nil {
+		t.Fatalf("seeding the lease: %s", err)
+	}
+	e.seedPool(map[string]string{"10.0.0.1": ownerRef})
+
+	// only the published status still records the failure of the
+	// earlier sync
+	vmnetcfg := newVMNetCfg("10.0.0.1", testMAC)
+	vmnetcfg.Status.NetworkConfig = []kihv1.NetworkConfigStatus{
+		{MACAddress: testMAC, NetworkName: testNetwork, Status: "ERROR", Message: "the IPPool status could not be updated"},
+	}
+	e.seedVMNetCfg(vmnetcfg)
+
+	if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, vmnetcfg); err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	}
+
+	stored := e.getStoredVMNetCfg()
+	if len(stored.Status.NetworkConfig) != 1 {
+		t.Fatalf("status entries = %d, want 1", len(stored.Status.NetworkConfig))
+	}
+	if got := stored.Status.NetworkConfig[0]; got.Status != "OK" {
+		t.Errorf("status = %+v, want OK for the re-attempted interface which serves", got)
+	}
+	if n := e.countRequests(http.MethodPut, vmnetcfgStatusPath); n != 1 {
+		t.Errorf("status update requests = %d, want 1", n)
+	}
+
+	// the verified binding keeps its address, its lease and its record
+	if got := stored.Spec.NetworkConfig[0].IPAddress; got != "10.0.0.1" {
+		t.Errorf("spec ip = %q, want the verified 10.0.0.1", got)
+	}
+	if !e.dhcp.CheckLease(testMAC) {
+		t.Error("the verified lease must remain")
+	}
+	if got := e.getStoredPool().Status.IPv4.Allocated["10.0.0.1"]; got != ownerRef {
+		t.Errorf("pool status entry = %q, want the intact owner record", got)
+	}
+
+	// the metric follows the published status: the ERROR series is gone
+	wantLabel := map[string]string{
+		"vm":      testNamespace + "/" + testVMNetCfgName,
+		"network": testNetwork,
+		"mac":     testMAC,
+		"ip":      "10.0.0.1",
+		"status":  "OK",
+	}
+	if v, ok := e.metricValue(metricVMNetCfgStatus, wantLabel); !ok || v != 1 {
+		t.Errorf("metric for %v = %v (present %v), want 1", wantLabel, v, ok)
+	}
+	if n := e.countMetricsByLabel(metricVMNetCfgStatus, "status", "ERROR"); n != 0 {
+		t.Errorf("ERROR status metric series = %d, want 0 after the healed re-attempt", n)
+	}
+}
+
 // TestVMNetCfgErrorSkipHijackMarker pins that the terminal hijack rejection
 // is never re-attempted: an object which was created while the operator was
 // down must stay unrserved even though the steady-state retries re-run
