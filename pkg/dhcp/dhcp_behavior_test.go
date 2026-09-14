@@ -453,8 +453,10 @@ func TestDHCPHandlerInformAckWithoutLeaseTime(t *testing.T) {
 	conn := &recordingPacketConn{}
 
 	// rfc 2131 4.3.5: an inform is acked with the configuration options
-	// only - no yiaddr and no lease time
+	// only - no yiaddr and no lease time. the client which asks has
+	// configured its own address (section 4.4.3 puts it in ciaddr)
 	req := newBootRequest(t, mustHWAddr(t, "aa:bb:cc:dd:ee:01"), dhcpv4.MessageTypeInform)
+	req.ClientIPAddr = net.ParseIP("192.168.0.50")
 	a.dhcpHandler(conn, testPeer(), req)
 
 	if conn.len() != 1 {
@@ -475,6 +477,103 @@ func TestDHCPHandlerInformAckWithoutLeaseTime(t *testing.T) {
 	}
 	if resp.GetOneOption(dhcpv4.OptionSubnetMask) == nil {
 		t.Error("inform ack must carry the configuration options (subnet mask)")
+	}
+	// rfc 2131 section 3.4: the ack is unicast to the address of the
+	// 'ciaddr' field, not to the udp peer of the request
+	if got := conn.peers[0].String(); got != "192.168.0.50:68" {
+		t.Errorf("inform ack destination = %s, want the client address 192.168.0.50:68", got)
+	}
+}
+
+// TestDHCPHandlerInformWithoutLeaseIsAnswered pins the rfc 2131 section
+// 3.4 requirement that the server MUST NOT check for an existing lease: a
+// client which obtained its address by other means holds no lease of this
+// server at all, so its inform must still be acked with the
+// configuration parameters of the pool which serves its address.
+func TestDHCPHandlerInformWithoutLeaseIsAnswered(t *testing.T) {
+	a := newTestPooledAllocator(t)
+	conn := &recordingPacketConn{}
+
+	// no lease exists for this hardware address
+	req := newBootRequest(t, mustHWAddr(t, "00:11:22:33:44:55"), dhcpv4.MessageTypeInform)
+	req.ClientIPAddr = net.ParseIP("192.168.0.50")
+	a.dhcpHandler(conn, testPeer(), req)
+
+	if conn.len() != 1 {
+		t.Fatalf("expected 1 inform ack without a lease, got %d", conn.len())
+	}
+	resp, err := dhcpv4.FromBytes(conn.payloads[0])
+	if err != nil {
+		t.Fatalf("parsing reply: %v", err)
+	}
+	if mt := resp.MessageType(); mt != dhcpv4.MessageTypeAck {
+		t.Errorf("got message type %v, want Ack for an inform", mt)
+	}
+	if !resp.YourIPAddr.IsUnspecified() {
+		t.Errorf("YourIPAddr = %s, want 0.0.0.0 for an inform ack", resp.YourIPAddr)
+	}
+	if resp.GetOneOption(dhcpv4.OptionIPAddressLeaseTime) != nil {
+		t.Error("inform ack carries the lease time option, rfc 2131 4.3.5 forbids it")
+	}
+	if resp.GetOneOption(dhcpv4.OptionSubnetMask) == nil {
+		t.Error("inform ack must carry the configuration options (subnet mask)")
+	}
+	if got := conn.peers[0].String(); got != "192.168.0.50:68" {
+		t.Errorf("inform ack destination = %s, want the client address 192.168.0.50:68", got)
+	}
+	// rfc 2131 section 3.4: no address is allocated and no binding
+	// is checked, so the inform must not create a lease either
+	if a.CheckLease("00:11:22:33:44:55") {
+		t.Error("answering an inform must not create a lease")
+	}
+}
+
+// TestDHCPHandlerInformWithoutServedNetworkIsDropped pins the
+// consistency check of rfc 2131 section 3.4: the network address of the
+// inform is checked against the served subnets, so an address which no
+// registered pool serves is not answered (and nothing is created for it).
+func TestDHCPHandlerInformWithoutServedNetworkIsDropped(t *testing.T) {
+	a := newTestPooledAllocator(t)
+	conn := &recordingPacketConn{}
+
+	req := newBootRequest(t, mustHWAddr(t, "00:11:22:33:44:55"), dhcpv4.MessageTypeInform)
+	req.ClientIPAddr = net.ParseIP("10.99.0.9")
+	a.dhcpHandler(conn, testPeer(), req)
+
+	if conn.len() != 0 {
+		t.Errorf("expected no reply for an inform of an unserved network, got %d", conn.len())
+	}
+}
+
+// TestDHCPHandlerInformAmbiguousNetworkIsDropped pins the fail-closed
+// resolution of the inform pool: a server ip which lies outside its own
+// subnet puts two registered pools on the same subnet, and an address
+// claimed by both of them must not be answered with the configuration
+// of one of them.
+func TestDHCPHandlerInformAmbiguousNetworkIsDropped(t *testing.T) {
+	a := newTestPooledAllocator(t)
+	if err := a.AddPool(
+		"pool2",
+		"192.168.0.2",
+		"255.255.255.0",
+		"192.168.0.254",
+		nil,
+		"",
+		nil,
+		nil,
+		3600,
+		"eth1",
+	); err != nil {
+		t.Fatalf("AddPool: %v", err)
+	}
+	conn := &recordingPacketConn{}
+
+	req := newBootRequest(t, mustHWAddr(t, "00:11:22:33:44:55"), dhcpv4.MessageTypeInform)
+	req.ClientIPAddr = net.ParseIP("192.168.0.50")
+	a.dhcpHandler(conn, testPeer(), req)
+
+	if conn.len() != 0 {
+		t.Errorf("expected no reply for an ambiguous inform network, got %d", conn.len())
 	}
 }
 

@@ -584,6 +584,46 @@ func (a *DHCPAllocator) packetLeaseAndPool(hwAddr string) (lease DHCPLease, pool
 	return lease, pool, true, poolFound
 }
 
+// poolForClientAddress resolves the pool which serves the given client
+// address: the pool whose subnet - the server ip of the pool under its own
+// subnet mask - contains it. it backs the DHCPINFORM path, whose ack must be
+// constructed from the local configuration of the network the client address
+// belongs to (rfc 2131 section 3.4: the server checks the network address
+// of the request for consistency, but MUST NOT check for an existing lease).
+// an address which no registered pool serves is reported as not found, and so
+// is one which more than one pool serves (a server ip outside its own subnet
+// can put two pools on the same subnet): an ambiguous address must not be
+// answered with the configuration of the wrong network.
+func (a *DHCPAllocator) poolForClientAddress(clientIP net.IP) (pool DHCPPool, found bool) {
+	clientV4 := clientIP.To4()
+	if clientV4 == nil {
+		return pool, false
+	}
+
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	for _, candidate := range a.pools {
+		if candidate.ServerIP.To4() == nil || len(candidate.SubnetMask) == 0 {
+			continue
+		}
+
+		network := candidate.ServerIP.Mask(candidate.SubnetMask)
+		if !network.Equal(clientV4.Mask(candidate.SubnetMask)) {
+			continue
+		}
+
+		if found {
+			// more than one pool claims the address: fail closed
+			return DHCPPool{}, false
+		}
+
+		pool, found = candidate, true
+	}
+
+	return pool, found
+}
+
 // logUnknownHWAddr reports packets whose hardware address has no lease,
 // throttled to one aggregated line per window: an unrelated or abusive
 // broadcast flood on the served segment must not produce one log line per
@@ -659,72 +699,102 @@ func (a *DHCPAllocator) dhcpHandler(conn net.PacketConn, peer net.Addr, m *dhcpv
 		return
 	}
 
-	// lease and pool resolution under one lock acquisition (see
-	// packetLeaseAndPool): a flood on the shared interface must not stall
-	// the allocator behind three serialized lookups per packet
-	lease, pool, leaseFound, poolFound := a.packetLeaseAndPool(m.ClientHWAddr.String())
+	// a DHCPINFORM is answered from the local configuration of the network
+	// its client address belongs to, without any lease lookup: rfc 2131
+	// section 3.4 requires the server to construct the ack "without:
+	// allocating a new address, checking for an existing binding, filling in
+	// 'yiaddr' or including lease time parameters" (section 4.3.5 repeats
+	// that the ack carries no lease expiration time), and the client which
+	// asks for configuration parameters has obtained its address by some
+	// other means - it holds no lease of this server, so the lease gate
+	// below would silently drop every one of its requests. the network
+	// address of the request is checked for consistency instead: the pool
+	// which serves its subnet answers, and an address which no pool (or more
+	// than one pool) serves is not answered at all instead of being
+	// answered with the configuration of another network
+	informReply := m.MessageType() == dhcpv4.MessageTypeInform
 
-	if !leaseFound {
-		a.logUnknownHWAddr(m)
+	var lease DHCPLease
+	var pool DHCPPool
+	var leaseFound, poolFound bool
 
-		return
-	}
+	if informReply {
+		pool, poolFound = a.poolForClientAddress(m.ClientIPAddr)
+		if !poolFound {
+			log.Warnf("(dhcp.dhcpHandler) [txid=%s] DHCPINFORM from %s: no pool serves the address %s, not answering",
+				m.TransactionID.String(), m.ClientHWAddr.String(), m.ClientIPAddr.String())
 
-	if !poolFound {
-		// the lease's pool is gone (deleted while the vm still runs, or the
-		// brief reload window): a request which asks this server for an
-		// address it can no longer serve gets a nak so the client restarts
-		// the discovery instead of retransmitting indefinitely against a
-		// silent drop; other message types are dropped, there is nothing
-		// to offer
-		log.Warnf("(dhcp.dhcpHandler) NO MATCHED POOL FOUND FOR LEASE: hwaddr=%s", m.ClientHWAddr.String())
+			return
+		}
+	} else {
+		// lease and pool resolution under one lock acquisition (see
+		// packetLeaseAndPool): a flood on the shared interface must not
+		// stall the allocator behind three serialized lookups per packet
+		lease, pool, leaseFound, poolFound = a.packetLeaseAndPool(m.ClientHWAddr.String())
 
-		if m.MessageType() == dhcpv4.MessageTypeRequest {
-			// the nak carries the identifier of the server which sends
-			// it (rfc 2131 section 4.3.2), never the attacker-supplied
-			// identifier of the request or another server's address:
-			// the identity is the ip this allocator last served the
-			// network with, which survives the pool deletion. a request
-			// which selected another server is not ours to answer - a
-			// nak in this server's name would tear down a binding this
-			// server never made
-			ourIP, known := a.lastServedServerIP(lease.PoolName)
-			serverID := m.ServerIdentifier()
-			if known && (len(serverID) == 0 || serverID.Equal(ourIP)) {
-				a.sendNak(conn, m, ourIP)
+		if !leaseFound {
+			a.logUnknownHWAddr(m)
 
-				return
-			}
-
-			if len(serverID) > 0 {
-				log.Infof("(dhcp.dhcpHandler) [txid=%s] DHCPREQUEST from %s for the vanished pool %s ignored: the client selected the server %s",
-					m.TransactionID.String(), m.ClientHWAddr.String(), lease.PoolName, serverID.String())
-			}
+			return
 		}
 
-		return
-	}
+		if !poolFound {
+			// the lease's pool is gone (deleted while the vm still runs, or the
+			// brief reload window): a request which asks this server for an
+			// address it can no longer serve gets a nak so the client restarts
+			// the discovery instead of retransmitting indefinitely against a
+			// silent drop; other message types are dropped, there is nothing
+			// to offer
+			log.Warnf("(dhcp.dhcpHandler) NO MATCHED POOL FOUND FOR LEASE: hwaddr=%s", m.ClientHWAddr.String())
 
-	log.Debugf("(dhcp.dhcpHandler) LEASE FOUND: hwaddr=%s, serverip=%s, clientip=%s, mask=%s, router=%s, dns=%+v, domainname=%s, domainsearch=%+v, ntp=%+v, leasetime=%d, reference=%s, nic=%s",
-		m.ClientHWAddr.String(),
-		pool.ServerIP.String(),
-		lease.ClientIP.String(),
-		pool.SubnetMask.String(),
-		pool.Router.String(),
-		pool.DNS,
-		pool.DomainName,
-		pool.DomainSearch,
-		pool.NTP,
-		pool.LeaseTime,
-		lease.Reference,
-		pool.Nic,
-	)
+			if m.MessageType() == dhcpv4.MessageTypeRequest {
+				// the nak carries the identifier of the server which sends
+				// it (rfc 2131 section 4.3.2), never the attacker-supplied
+				// identifier of the request or another server's address:
+				// the identity is the ip this allocator last served the
+				// network with, which survives the pool deletion. a request
+				// which selected another server is not ours to answer - a
+				// nak in this server's name would tear down a binding this
+				// server never made
+				ourIP, known := a.lastServedServerIP(lease.PoolName)
+				serverID := m.ServerIdentifier()
+				if known && (len(serverID) == 0 || serverID.Equal(ourIP)) {
+					a.sendNak(conn, m, ourIP)
+
+					return
+				}
+
+				if len(serverID) > 0 {
+					log.Infof("(dhcp.dhcpHandler) [txid=%s] DHCPREQUEST from %s for the vanished pool %s ignored: the client selected the server %s",
+						m.TransactionID.String(), m.ClientHWAddr.String(), lease.PoolName, serverID.String())
+				}
+			}
+
+			return
+		}
+
+		log.Debugf("(dhcp.dhcpHandler) LEASE FOUND: hwaddr=%s, serverip=%s, clientip=%s, mask=%s, router=%s, dns=%+v, domainname=%s, domainsearch=%+v, ntp=%+v, leasetime=%d, reference=%s, nic=%s",
+			m.ClientHWAddr.String(),
+			pool.ServerIP.String(),
+			lease.ClientIP.String(),
+			pool.SubnetMask.String(),
+			pool.Router.String(),
+			pool.DNS,
+			pool.DomainName,
+			pool.DomainSearch,
+			pool.NTP,
+			pool.LeaseTime,
+			lease.Reference,
+			pool.Nic,
+		)
+	}
 
 	var replyType dhcpv4.MessageType
 	var sendReply bool
 	// informReply marks a DHCPINFORM ack: rfc 2131 4.3.5 says it carries
 	// the configuration options only - no yiaddr and no lease time
-	informReply := false
+	// (the pool of an inform was resolved from its client address, so the
+	// ack is unicast to it)
 
 	switch mt := m.MessageType(); mt {
 	case dhcpv4.MessageTypeDiscover:
@@ -762,14 +832,14 @@ func (a *DHCPAllocator) dhcpHandler(conn net.PacketConn, peer net.Addr, m *dhcpv
 		replyType = dhcpv4.MessageTypeAck
 		sendReply = true
 	case dhcpv4.MessageTypeInform:
-		// rfc 2131 4.3.5: a client which already has an address asks only
-		// for its configuration parameters; the ack carries the options
-		// without yiaddr and without a lease time
-		log.Infof("(dhcp.dhcpHandler) [txid=%s] DHCPINFORM from %s via %s", m.TransactionID.String(), m.ClientHWAddr.String(), pool.Nic)
+		// rfc 2131 4.3.5: a client which has an address by other means
+		// asks only for its configuration parameters; the ack carries the
+		// options of the pool which serves its network address, without
+		// yiaddr and without a lease time, and no lease is consulted
+		log.Infof("(dhcp.dhcpHandler) [txid=%s] DHCPINFORM from %s with address %s via %s", m.TransactionID.String(), m.ClientHWAddr.String(), m.ClientIPAddr.String(), pool.Nic)
 
 		replyType = dhcpv4.MessageTypeAck
 		sendReply = true
-		informReply = true
 	case dhcpv4.MessageTypeDecline:
 		// rfc 2131 4.3.3: the client reports an on-segment conflict for
 		// the offered address. the pre-allocated model keeps the lease:
@@ -870,10 +940,16 @@ func (a *DHCPAllocator) dhcpHandler(conn net.PacketConn, peer net.Addr, m *dhcpv
 	// (giaddr:67), which forwards it towards the client - never to the udp
 	// peer the relayed packet arrived from, and without the broadcast bit
 	// the nak path needs. a directly received request is answered at the
-	// peer address as before.
+	// peer address as before, except for an inform ack: rfc 2131 section
+	// 3.4 requires it to be unicast to the address of the 'ciaddr' field
+	// of the request, which is the address the client asks the
+	// configuration parameters for (the source address of the request is
+	// not necessarily the same one)
 	dst := peer
 	if relay := relayDestination(m); relay != nil {
 		dst = relay
+	} else if informReply {
+		dst = &net.UDPAddr{IP: m.ClientIPAddr.To4(), Port: dhcpv4.ClientPort}
 	}
 	if _, err := conn.WriteTo(reply.ToBytes(), dst); err != nil {
 		log.Errorf("(dhcp.dhcpHandler) Cannot reply to client: %v", err)
