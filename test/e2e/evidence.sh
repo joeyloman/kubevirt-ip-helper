@@ -312,6 +312,10 @@ _evidence_object_captures() { # <dir>
     -n "${KIH_HELPER_NAMESPACE}" get endpointslices -o json || rc=1
   _evidence_group "${dir}" workloads \
     -n "${KIH_WORKLOAD_NAMESPACE}" get pods -o json || rc=1
+  # The guest observer script is delivered through this Secret, so the checkpoint
+  # records the object the guest actually executed.
+  _evidence_group "${dir}" guest-userdata \
+    -n "${KIH_WORKLOAD_NAMESPACE}" get secrets -o json || rc=1
   if [ "${allow_custom_api}" -eq 1 ]; then
     # The helper CRDs are intentionally absent at the first bootstrap checkpoint.
     EVIDENCE_ALLOW_MISSING_API=1 _evidence_group "${dir}" ippools \
@@ -470,7 +474,16 @@ _evidence_observations() { # <dir>
         "cannot append helper pod ${pod} interface/route/UDP output" || true
     fi
   done
-  if ! output="$(helper_service_metrics)"; then
+  # A checkpoint taken while the leader rebuilds its services can catch the pod
+  # before its readiness probe flips, so the Service briefly has no ready endpoint.
+  # The scrape is retried inside the capture budget; a Service which never serves
+  # still fails the checkpoint.
+  metrics_deadline=$((SECONDS + E2E_CAPTURE_TIMEOUT))
+  while ! output="$(helper_service_metrics)"; do
+    [ "${SECONDS}" -lt "${metrics_deadline}" ] || break
+    sleep 1
+  done
+  if [ -z "${output}" ]; then
     rc=1
     _evidence_record_error "observations" "metrics Service scrape from the network client failed" || true
   elif ! printf '\n===== metrics Service =====\n%s\n' "${output}" >> "${observations}"; then

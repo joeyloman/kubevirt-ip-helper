@@ -260,7 +260,7 @@ ensure_kind() {
   chmod 755 "${E2E_BIN_DIR}/kind"
   require_checksum "${E2E_BIN_DIR}/kind" "${expected}"
   KIND="${E2E_BIN_DIR}/kind"
-  log "installed ${KIND} ($("${KIND}" version | head -n 1))"
+  log "installed ${KIND} ($("${KIND}" version | head -n 1 || true))"
 }
 
 verify_cluster_pin() {
@@ -595,9 +595,16 @@ ensure_bridge_plugin() {
     die "kind cannot enumerate exactly three nodes for ${E2E_CLUSTER_NAME}"
   while IFS= read -r node; do
     "${RUNTIME}" exec "${node}" mkdir -p /opt/cni/bin
-    tar -C "${stage}" -cf - . |
-      "${RUNTIME}" exec -i "${node}" tar -xf - -C /opt/cni/bin
-    out="$("${RUNTIME}" exec "${node}" /opt/cni/bin/bridge --version 2>&1 | head -n 1)"
+    # The reading tar stops at the archive's end-of-archive marker, so the writing
+    # tar can be killed by SIGPIPE after it has written everything. Feeding the
+    # stream through process substitution keeps the status on the extraction that
+    # matters, instead of failing the gate on a pipefail SIGPIPE.
+    "${RUNTIME}" exec -i "${node}" tar -xf - -C /opt/cni/bin \
+      < <(tar -C "${stage}" -cf - .) ||
+      die "node ${node}: cannot install the pinned bridge CNI plugin into /opt/cni/bin"
+    # `head` closes the pipe after the first line, so the writer can be killed by
+    # SIGPIPE; under `set -o pipefail` that would fail the gate.
+    out="$("${RUNTIME}" exec "${node}" /opt/cni/bin/bridge --version 2>&1 | head -n 1 || true)"
     case "${out}" in
       *"${CNI_PLUGINS_VERSION}"*)
         log "node ${node}: ${out}"
