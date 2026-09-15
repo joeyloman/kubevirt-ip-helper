@@ -374,6 +374,10 @@ capture 06-ipam-vm.txt "VirtualMachineNetworkConfigs" kubectl get vmnetcfg -A -o
 capture 06-ipam-vm.txt "VirtualMachines" kubectl -n "${KIH_WORKLOAD_NAMESPACE}" get vm -o yaml
 capture 06-ipam-vm.txt "VirtualMachineInstances" kubectl -n "${KIH_WORKLOAD_NAMESPACE}" get vmi -o yaml
 capture 06-ipam-vm.txt "workload pods" kubectl -n "${KIH_WORKLOAD_NAMESPACE}" get pods -o yaml
+# The guest executes the observer script from this Secret, so its content is part of
+# what the guest actually ran.
+capture 06-ipam-vm.txt "guest userdata Secret" \
+  kubectl -n "${KIH_WORKLOAD_NAMESPACE}" get secret "${KIH_GUEST_USERDATA_SECRET}" -o yaml
 capture 06-ipam-vm.txt "workload events" kubectl -n "${KIH_WORKLOAD_NAMESPACE}" get events --sort-by=.lastTimestamp
 for pod in $(collector_list "workload pod listing" kubectl -n "${KIH_WORKLOAD_NAMESPACE}" \
   get pods -o jsonpath='{.items[*].metadata.name}' || true); do

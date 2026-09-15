@@ -104,7 +104,7 @@ The preflight deliberately finishes before KubeVirt installation. A broken kindn
 kubectl kustomize --load-restrictor=LoadRestrictionsNone test/e2e/manifests
 ```
 
-The unrestricted loader imports the production deployment manifests; CRDs are applied separately before the overlay. The overlay deletes only the unsupported `ServiceMonitor`, pins the locally loaded content-ID image, and attaches both production-default helper replicas to the primary NAD as `kihnet0`; it does not override helper replicas, scheduling, readiness, resources, or environment. The ordinary first Deployment apply and normal rollout readiness are used—there is no forced restart or readiness bypass. `manifests/vm.yaml` is rendered into the profile artifact directory with the selected `KIH_GUEST_IMAGE`, and the render rejects an unreplaced template image.
+The unrestricted loader imports the production deployment manifests; CRDs are applied separately before the overlay. The overlay deletes only the unsupported `ServiceMonitor`, pins the locally loaded content-ID image, and attaches both production-default helper replicas to the primary NAD as `kihnet0`; it does not override helper replicas, scheduling, readiness, resources, or environment. The ordinary first Deployment apply and normal rollout readiness are used—there is no forced restart or readiness bypass. `manifests/vm.yaml` is rendered into the profile artifact directory with the selected `KIH_GUEST_IMAGE`, and the render rejects an unreplaced template image. KubeVirt caps an inline `cloudInitNoCloud` userData at 2048 bytes and the guest observer script is larger, so the script lives in `manifests/guest-userdata.sh` and travels as the `userdata` key of the `kih-guest-userdata` Secret: `run.sh` creates that Secret before the first VM applies, the guest manifest references it through `cloudInitNoCloud.secretRef`, and the applied bytes are compared with the pinned file because the guest executes the Secret.
 
 The primary IPPool is intentionally separate from the overlay and is applied only after both helper pod sandboxes prove that `kihnet0` exists. Its contract is:
 
@@ -113,7 +113,7 @@ The primary IPPool is intentionally separate from the overlay and is applied onl
 - allocation range: `10.77.0.100` through `10.77.0.110`
 - bind interface: `kihnet0`
 
-The guest has only the helper-served Multus bridge NIC with explicit MAC `02:00:00:00:00:11`. It uses stock persistent CirrOS DHCP on that NIC. Observation-only userdata finds the NIC by MAC and repeatedly writes a fresh `E2E_NET_SAMPLE` containing the native client, address, route, DNS, gateway, and routed-target observations; it neither configures networking nor invokes, replaces, signals, or restarts the DHCP client.
+The guest has only the helper-served Multus bridge NIC with explicit MAC `02:00:00:00:00:11`. It uses stock persistent CirrOS DHCP on that NIC. The observation-only script in `manifests/guest-userdata.sh`, delivered through the `kih-guest-userdata` Secret, reports the guest's single non-loopback interface with the MAC the kernel assigned it and repeatedly writes a fresh `E2E_NET_SAMPLE` containing the native client, address, route, DNS, gateway, and routed-target observations; the runner compares that MAC with the one the helper reserved. The script neither configures networking nor invokes, replaces, signals, or restarts the DHCP client.
 
 ## Assertions
 
@@ -148,7 +148,7 @@ When cluster state, the kind binary, and a kubeconfig are available, `collect.sh
 - Multus DaemonSet state and logs
 - KubeVirt CR, workloads, and component logs
 - helper Deployment, pods, Lease, Service, Endpoints, logs, and previous logs
-- IPPool, VMNetCfg, VM, VMI, workload events, and virt-launcher logs
+- IPPool, VMNetCfg, VM, VMI, workload events, the guest userdata Secret, and virt-launcher logs
 - leader interface, route, UDP socket, and labelled-leader metrics state
 - the per-bootstrap-gate `bootstrap-cases.jsonl` journal
 - kind-node CNI files, bridge state, runtime-network identities, and container-runtime information

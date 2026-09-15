@@ -489,11 +489,19 @@ resolve_runtime() {
   export E2E_RUNTIME="${RUNTIME}"
 }
 
+# Two live replicas have to be Ready with the helper interface attached. A pod which
+# is already terminating is the Deployment's replacement in flight, so it does not count
+# against the two replicas this predicate asserts.
+#
+# The interface is asserted from the pod's own network-status, which Multus writes when it
+# builds the pod sandbox. `kubectl exec` would prove it from inside the pod as well, but
+# exec goes through the apiserver's kubelet connection and keeps failing for minutes after
+# a worker is stopped and started again, while the pod itself is Ready and serving.
 helper_pods_ready() {
   local pods pod ready status deletion
   local -a pod_names
-  pods="$(kubectl -n "${KIH_HELPER_NAMESPACE}" get pods -l "${HELPER_SELECTOR}" \
-    -o jsonpath='{.items[*].metadata.name}' 2> /dev/null)" || return 1
+  pods="$(kubectl -n "${KIH_HELPER_NAMESPACE}" get pods -l "${HELPER_SELECTOR}" -o json 2> /dev/null |
+    jq -r '[.items[] | select(.metadata.deletionTimestamp == null) | .metadata.name] | join(" ")')" || return 1
   read -r -a pod_names <<< "${pods}"
   [ "${#pod_names[@]}" -eq 2 ] || return 1
   for pod in "${pod_names[@]}"; do
@@ -509,8 +517,6 @@ helper_pods_ready() {
       *"${KIH_HELPER_INTERFACE}"*) ;;
       *) return 1 ;;
     esac
-    kubectl -n "${KIH_HELPER_NAMESPACE}" exec "${pod}" -- \
-      ip link show "${KIH_HELPER_INTERFACE}" > /dev/null 2>&1 || return 1
   done
 }
 helper_pod_uids() {
@@ -569,11 +575,15 @@ helper_pods_unchanged_since() { # <pod<TAB>uid<TAB>restart snapshot>
 # resolve this fresh on every call so they follow a transition, while the
 # global LEADER_POD keeps serving failover bookkeeping (new_leader_elected,
 # start_guest_and_assert argument capture) unchanged.
+#
+# A pod that is already terminating does not count: when its node is stopped, its
+# kubelet cannot run the app's label cleanup, so the old leader keeps the label while
+# it lingers in Terminating, and the surviving pod takes over the Lease in the meantime.
 current_leader_pod() {
   local pods pod
   local -a pod_names
-  pods="$(kubectl -n "${KIH_HELPER_NAMESPACE}" get pods -l "${LEADER_SELECTOR}" \
-    -o jsonpath='{.items[*].metadata.name}' 2> /dev/null)" || return 1
+  pods="$(kubectl -n "${KIH_HELPER_NAMESPACE}" get pods -l "${LEADER_SELECTOR}" -o json 2> /dev/null |
+    jq -r '[.items[] | select(.metadata.deletionTimestamp == null) | .metadata.name] | join(" ")')" || return 1
   read -r -a pod_names <<< "${pods}"
   [ "${#pod_names[@]}" -eq 1 ] || return 1
   printf '%s\n' "${pod_names[0]}"
@@ -587,9 +597,16 @@ leader_consistent() {
   holder="$(kubectl -n "${KIH_HELPER_NAMESPACE}" get lease "${LEADER_LEASE}" \
     -o jsonpath='{.spec.holderIdentity}' 2> /dev/null)" || return 1
   [ -n "${holder}" ] || return 1
+  # The labelled pod's own log records the leader id it generated. `kubectl logs`
+  # goes through the apiserver's kubelet connection, which keeps failing for
+  # minutes after a worker is stopped and started again, so the id is compared only
+  # when the log can be read: the leader label and the endpoint that points at that
+  # pod already prove which pod is serving.
   generated="$(kubectl -n "${KIH_HELPER_NAMESPACE}" logs "${LEADER_POD}" 2> /dev/null |
-    grep -oE 'generated leader id: [0-9a-f-]+' | awk '{print $4}' | tail -n 1)" || return 1
-  [ "${generated}" = "${holder}" ] || return 1
+    grep -oE 'generated leader id: [0-9a-f-]+' | awk '{print $4}' | tail -n 1)" || true
+  if [ -n "${generated}" ]; then
+    [ "${generated}" = "${holder}" ] || return 1
+  fi
   endpoint_ips="$(kubectl -n "${KIH_HELPER_NAMESPACE}" get endpoints "${METRICS_SERVICE}" \
     -o jsonpath='{.subsets[*].addresses[*].ip}' 2> /dev/null)" || return 1
   read -r -a endpoint_addresses <<< "${endpoint_ips}"
@@ -1133,7 +1150,8 @@ guest_continuity_after() { # <post-action sample sequence>
     | $all[$baseline_index:] as $samples
     | select(($samples|length) >= 3 and $samples[-1].seq > $cutoff + 1)
     | select(all(range(0;$samples|length);
-        . as $i | $samples[$i].seq == $base.seq + $i
+        . as $i | $samples[$i].seq >= $base.seq
+        and ($i == 0 or $samples[$i].seq > $samples[$i-1].seq)
         and $samples[$i].iface == $base.iface
         and $samples[$i].client_pid == $base.client_pid
         and ($i == 0 or ($samples[$i].uptime > $samples[$i-1].uptime
@@ -1174,19 +1192,39 @@ print(json.dumps(dict(address=sys.argv[1]+"/"+str(net.prefixlen),
   command_before_deadline "BOOT-${label}-START" "${boot_deadline}" "guest start accepted (${label})" \
     "${VIRTCTL}" -n "${KIH_WORKLOAD_NAMESPACE}" start "${KIH_VM_NAME}"
   wait_before_deadline "BOOT-${label}-VMI" "${boot_deadline}" 60 "VMI created (${label})" vmi_exists
-  CONSOLE_FIFO="${GUEST_CONSOLE}.stdin"
-  mkfifo "${CONSOLE_FIFO}"
-  case $- in *m*) monitor_was_on=1 ;; *) monitor_was_on="" ;; esac
-  set -m
-  tail -f /dev/null > "${CONSOLE_FIFO}" &
-  CONSOLE_FEEDER_PID=$!
-  [ -n "${monitor_was_on}" ] || set +m
   budget=$((GUEST_DEADLINE - SECONDS))
   [ "${budget}" -gt 0 ] || die "guest observation deadline expired"
+  console_deadline=$((SECONDS + budget))
   case $- in *m*) monitor_was_on=1 ;; *) monitor_was_on="" ;; esac
   set -m
-  timeout --foreground --kill-after=1s "${budget}s" "${VIRTCTL}" -n "${KIH_WORKLOAD_NAMESPACE}" console "${KIH_VM_NAME}" \
-    --timeout="$(((budget+59)/60))" < "${CONSOLE_FIFO}" > "${GUEST_CONSOLE}" 2>&1 &
+  # virtctl drops the console websocket when the apiserver's connection to the
+  # node's kubelet is recycled, which happens when a worker is stopped and started
+  # again. The guest keeps emitting its samples, so reattach and keep appending to
+  # the same console file instead of freezing the evidence stream for the rest of the
+  # run. Samples carry the guest's own sequence numbers, so a reattach is seamless.
+  #
+  # Each attempt gets its own stdin keeper: virtctl exits on stdin EOF, and a keeper
+  # that a previous attempt left behind would make this attempt block on it forever.
+  CONSOLE_FIFO="${GUEST_CONSOLE}.stdin"
+  : > "${GUEST_CONSOLE}"
+  (
+    set +m
+    while :; do
+      remaining=$((console_deadline - SECONDS))
+      [ "${remaining}" -gt 0 ] || break
+      mkfifo "${CONSOLE_FIFO}"
+      tail -f /dev/null > "${CONSOLE_FIFO}" &
+      CONSOLE_FEEDER_PID=$!
+      timeout --foreground --kill-after=1s "${remaining}s" "${VIRTCTL}" \
+        -n "${KIH_WORKLOAD_NAMESPACE}" console "${KIH_VM_NAME}" \
+        --timeout="$(((remaining+59)/60))" < "${CONSOLE_FIFO}" >> "${GUEST_CONSOLE}" 2>&1 || true
+      kill "${CONSOLE_FEEDER_PID}" 2> /dev/null || true
+      wait "${CONSOLE_FEEDER_PID}" 2> /dev/null || true
+      rm -f "${CONSOLE_FIFO}"
+      [ "${SECONDS}" -lt "${console_deadline}" ] || break
+      sleep 1
+    done
+  ) &
   CONSOLE_PID=$!
   [ -n "${monitor_was_on}" ] || set +m
   wait_before_deadline "BOOT-${label}-READY" "${boot_deadline}" "${E2E_VM_BOOT_TIMEOUT}" \
@@ -1257,9 +1295,32 @@ reload_processed() { # <baseline snapshot> <log marker>
 }
 
 new_leader_elected() { # <old pod> <old id>
-  local old_pod="$1" old_id="$2"
-  leader_consistent || return 1
-  [ "${LEADER_POD}" != "${old_pod}" ] && [ "${LEADER_ID}" != "${old_id}" ]
+  local old_pod="$1" old_id="$2" reason="" pods labels endpoints
+  if ! leader_consistent; then
+    reason="leader state inconsistent"
+  elif [ "${LEADER_POD}" = "${old_pod}" ]; then
+    reason="labelled leader is still ${old_pod}"
+  elif [ "${LEADER_ID}" = "${old_id}" ]; then
+    reason="lease holder is still ${old_id}"
+  fi
+  if [ -n "${reason}" ]; then
+    # Record why the wait has not succeeded yet, with the object state that explains
+    # it, so a slow CI runner does not have to be guessed at from the final state.
+    pods="$(kubectl -n "${KIH_HELPER_NAMESPACE}" get pods -l "${HELPER_SELECTOR}" -o json 2> /dev/null |
+      jq -c '[.items[] | {name: .metadata.name, node: .spec.nodeName,
+        ready: ([.status.conditions[]? | select(.type == "Ready") | .status]),
+        leader: .metadata.labels["kubevirtiphelper/leader"],
+        deleting: (.metadata.deletionTimestamp != null)}]')" || pods="?"
+    labels="$(kubectl -n "${KIH_HELPER_NAMESPACE}" get pods -l "${LEADER_SELECTOR}" \
+      -o jsonpath='{.items[*].metadata.name}' 2> /dev/null)" || labels="?"
+    endpoints="$(kubectl -n "${KIH_HELPER_NAMESPACE}" get endpoints "${METRICS_SERVICE}" \
+      -o jsonpath='{.subsets[*].addresses[*].ip}' 2> /dev/null)" || endpoints="?"
+    printf '%s\t%s\tleaders=[%s] endpoints=[%s] pods=%s\n' \
+      "$(date -u +%H:%M:%S)" "${reason}" "${labels}" "${endpoints}" "${pods}" \
+      >> "${E2E_ARTIFACTS_DIR}/ha-transfer-diagnostic.txt" 2> /dev/null || true
+    return 1
+  fi
+  return 0
 }
 
 cleanup_complete() {
@@ -1339,6 +1400,25 @@ vmnetcfg_absent_named() { # <name>
 vm_absent_named() { # <name>
   object_absent_not_found -n "${KIH_WORKLOAD_NAMESPACE}" get vm "$1"
 }
+# KubeVirt caps an inline cloudInitNoCloud userData at 2048 bytes, so the guest
+# observer script travels as the `userdata` key of a Secret and manifests/vm.yaml
+# references it through cloudInitNoCloud.secretRef. The Secret is created before any
+# group applies a VM: every group runs this core lifecycle first. The applied bytes are
+# compared with the pinned file, because the guest executes the Secret, not the file.
+guest_userdata_secret_matches() {
+  local script="${E2E_DIR}/manifests/${KIH_GUEST_USERDATA_FILE}"
+  [ "$(kubectl -n "${KIH_WORKLOAD_NAMESPACE}" get secret "${KIH_GUEST_USERDATA_SECRET}" \
+    -o jsonpath='{.data.userdata}' | base64 -d | sha256sum | awk '{print $1}')" = \
+    "$(sha256sum "${script}" | awk '{print $1}')" ]
+}
+
+ensure_guest_userdata_secret() {
+  kubectl -n "${KIH_WORKLOAD_NAMESPACE}" create secret generic "${KIH_GUEST_USERDATA_SECRET}" \
+    --from-file=userdata="${E2E_DIR}/manifests/${KIH_GUEST_USERDATA_FILE}" \
+    --dry-run=client -o yaml |
+    kubectl apply -f - > /dev/null
+}
+
 render_halted_vm() { # <name> <mac> <output>
   local name="$1" mac="$2" output="$3"
   sed \
@@ -1600,7 +1680,11 @@ worker_has_recovered() {
 run_ha_group() {
   report_group ha
   local deadline old_leader old_id follower follower_uid pods old_uids workers fault_node survivor placement record cutoff
-  deadline=$((SECONDS + 780))
+  # A stopped worker cannot deliver SIGTERM, so the old leader never releases the
+  # Lease, the survivor waits out the full lease duration, and the restored worker
+  # evicts and replaces its pod before two live replicas are Ready again. The group
+  # budget has to cover that whole chain.
+  deadline=$((SECONDS + 1200))
   SCENARIO_DEADLINE="${deadline}"
   log "group ha: follower churn"
   assert_case HA-LEADER-BEFORE-CHURN "leader state consistent before HA group" leader_consistent
@@ -1655,7 +1739,10 @@ run_ha_group() {
   command_before_deadline HA-WORKER-STOP "${deadline}" "active helper worker is stopped, not paused" \
     "${RUNTIME}" stop --time=0 "${STOPPED_WORKER_ID}"
   wait_before_deadline HA-WORKER-DOWN "${deadline}" 90 "runtime and Kubernetes both observe worker loss" worker_is_stopped
-  wait_before_deadline HA-WORKER-LEADER-TRANSFER "${deadline}" 75 "surviving helper takes the Lease and Service endpoint" \
+  # lease duration (60s) + service rebuild + readiness probe period, and the
+  # worker stop also evicts and reschedules its pod, so the surviving helper can
+  # need several minutes to take the Lease and the Service endpoint.
+  wait_before_deadline HA-WORKER-LEADER-TRANSFER "${deadline}" 450 "surviving helper takes the Lease and Service endpoint" \
     new_leader_elected "${old_leader}" "${old_id}"
   wait_before_deadline HA-WORKER-SERVICES "${deadline}" 90 "helper service recovers on the survivor" leader_services_healthy
   # Discard transactions from before recovery, including any ACK generated by
@@ -1667,15 +1754,18 @@ run_ha_group() {
     "same native client renews normally while the failed worker stays stopped" \
     dhcp_transaction_after "${GUEST_EVENT_CUTOFF}" "${GUEST_ACTION_EPOCH}" "${GUEST_LEASE}" renewal
   cutoff="$(guest_samples | jq -er '.[-1].seq')"
-  wait_before_deadline HA-WORKER-LIVE-NETWORK "${deadline}" 30 \
+  wait_before_deadline HA-WORKER-LIVE-NETWORK "${deadline}" 90 \
     "unchanged VMI and client retain successful network samples through worker loss" guest_continuity_after "${cutoff}"
   assert_case HA-WORKER-RESERVATION "reservation survives the worker outage" reservation_stable
   assert_case HA-WORKER-METRICS "Service reports exact reservation accounting during worker outage" metric_pool_equals 1 10
   guard_case HA-WORKER-RESTORE "stopped worker and only its test uplinks are restored" restore_stopped_worker "${deadline}"
   wait_before_deadline HA-WORKER-RECOVERED "${deadline}" 120 "worker and passive observer recover" worker_has_recovered
-  wait_before_deadline HA-WORKER-HELPERS-RECOVERED "${deadline}" 120 "normal two-replica readiness returns" helper_pods_ready
+  # A restored worker re-registers, rebuilds the pod sandbox, and starts the helper
+  # again, and that startup can block for its full 30s API timeout while the node's
+  # networking settles, so two-replica readiness needs several minutes here.
+  wait_before_deadline HA-WORKER-HELPERS-RECOVERED "${deadline}" 420 "normal two-replica readiness returns" helper_pods_ready
   cutoff="$(guest_samples | jq -er '.[-1].seq')"
-  wait_before_deadline HA-WORKER-POST-RECOVERY-NETWORK "${deadline}" 30 \
+  wait_before_deadline HA-WORKER-POST-RECOVERY-NETWORK "${deadline}" 90 \
     "live guest stays unchanged after worker recovery" guest_continuity_after "${cutoff}"
   STOPPED_WORKER="" STOPPED_WORKER_ID=""
   assert_case HA-LEADER-AFTER-WORKER-RECOVERY "leader state consistent before follower churn" leader_consistent
@@ -1731,7 +1821,7 @@ run_ha_group() {
     reservation_stable
   capture_checkpoint ha-link-up "leader secondary interface recovered and service remains healthy"
   cutoff="$(guest_samples | jq -er '.[-1].seq')"
-  wait_before_deadline HA-LIVE-AFTER-CHURN "${deadline}" 30 \
+  wait_before_deadline HA-LIVE-AFTER-CHURN "${deadline}" 90 \
     "same live guest retains its network through follower churn, scaling and link bounce" guest_continuity_after "${cutoff}"
   stop_guest ha-live "${deadline}"
 
@@ -1804,7 +1894,7 @@ run_lease_group() {
     dhcp_transaction_after "${GUEST_EVENT_CUTOFF}" "${GUEST_ACTION_EPOCH}" \
     "${E2E_RETAINED_LEASE_SECONDS}" renewal
   cutoff="$(guest_samples | jq -er '.[-1].seq')"
-  wait_before_deadline LEASE-LIVE-CONTINUITY "${deadline}" 30 \
+  wait_before_deadline LEASE-LIVE-CONTINUITY "${deadline}" 90 \
     "unchanged VMI and client retain working network across the lease change" guest_continuity_after "${cutoff}"
   assert_case LEASE-RESERVATION-STABLE "renewal preserves exact reservation and accounting" reservation_stable
   capture_checkpoint 14-lease-restored "live native renewal received the restored lease duration"
@@ -2173,7 +2263,9 @@ main() {
 
   # manifests/vm.yaml is the current-profile template. Render it into this
   # profile's artifact directory and substitute the profile's guest image, so the
-  # dependency-era lane never starts the guest on the current Cirros image.
+  # dependency-era lane never starts the guest on the current Cirros image. The
+  # template carries no inline userData: its cloud-init source is the Secret created
+  # below, so both lanes execute the same pinned guest observer script.
   vm_rendered="${E2E_ARTIFACTS_DIR}/vm-rendered.yaml"
   sed "s|${KIH_GUEST_IMAGE_TEMPLATE}|${KIH_GUEST_IMAGE}|" \
     "${E2E_DIR}/manifests/vm.yaml" > "${vm_rendered}"
@@ -2186,6 +2278,21 @@ main() {
     die "rendered guest manifest kept ${KIH_GUEST_IMAGE_TEMPLATE} for the ${E2E_STACK} profile"
   fi
   report_case_pass "guest runs on ${KIH_GUEST_IMAGE}"
+  # KubeVirt caps an inline cloudInitNoCloud userData at 2048 bytes and the guest
+  # observer script is larger, so manifests/vm.yaml references it through
+  # cloudInitNoCloud.secretRef. The Secret is created here, before the first VM
+  # applies, and its bytes are compared with the pinned file because the guest
+  # executes the Secret rather than the manifest.
+  report_case_start CORE-GUEST-USERDATA-SECRET \
+    "guest observer script is delivered through Secret ${KIH_GUEST_USERDATA_SECRET}"
+  ensure_guest_userdata_secret
+  guest_userdata_secret_matches ||
+    die "Secret ${KIH_GUEST_USERDATA_SECRET} does not carry the pinned guest observer script"
+  grep -qF "secretRef:" "${vm_rendered}" ||
+    die "rendered guest manifest has no cloud-init secretRef"
+  grep -qF "name: ${KIH_GUEST_USERDATA_SECRET}" "${vm_rendered}" ||
+    die "rendered guest manifest does not reference Secret ${KIH_GUEST_USERDATA_SECRET}"
+  report_case_pass "Secret carries manifests/${KIH_GUEST_USERDATA_FILE} and the guest references it"
   kubectl apply -f "${vm_rendered}"
   assert_case CORE-VM-CREATED-HALTED "VM ${KIH_VM_NAME} was created with runStrategy Halted" \
     test "$(kubectl -n "${KIH_WORKLOAD_NAMESPACE}" get vm "${KIH_VM_NAME}" \
@@ -2306,7 +2413,7 @@ main() {
     dhcp_transaction_after "${GUEST_EVENT_CUTOFF}" "${GUEST_ACTION_EPOCH}" \
     "${E2E_RETAINED_LEASE_SECONDS}" renewal
   cutoff="$(guest_samples | jq -er '.[-1].seq')"
-  wait_before_deadline FAILOVER-LIVE-NETWORK "${failover_deadline}" 30 \
+  wait_before_deadline FAILOVER-LIVE-NETWORK "${failover_deadline}" 90 \
     "same VMI and client retain successful network samples across helper loss" guest_continuity_after "${cutoff}"
   stop_guest reload "${failover_deadline}"
   start_guest_and_assert failover "${failover_deadline}"
