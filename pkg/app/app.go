@@ -32,6 +32,7 @@ import (
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -50,6 +51,7 @@ type handler struct {
 	kubeConfigFile       string
 	kubeContext          string
 	namespace            string
+	networkScope         util.NetworkScope
 	metrics              *metrics.MetricsAllocator
 	ippoolEventHandler   *ippool.EventHandler
 	vmnetcfgEventHandler *vmnetcfg.EventHandler
@@ -88,6 +90,7 @@ type eraState struct {
 	ipam         *ipam.IPAllocator
 	dhcp         *dhcp.DHCPAllocator
 	cache        *cache.CacheAllocator
+	reconcileMu  *sync.Mutex
 }
 
 func Register() *handler {
@@ -124,6 +127,11 @@ func (h *handler) getKubeConfig() (config *rest.Config, err error) {
 }
 
 func (h *handler) Init() {
+	h.init("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+}
+
+// init keeps the namespace-file boundary explicit for isolated startup tests.
+func (h *handler) init(namespaceFile string) {
 	h.kubeConfigFile = os.Getenv("KUBECONFIG")
 	if h.kubeConfigFile == "" {
 		homedir := os.Getenv("HOME")
@@ -132,17 +140,22 @@ func (h *handler) Init() {
 
 	h.kubeContext = os.Getenv("KUBECONTEXT")
 
-	ns, nsErr := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+	ns, nsErr := os.ReadFile(namespaceFile)
 	if nsErr != nil {
-		log.Errorf("(app.Run) cannot determine current namespace (using the default): %s", nsErr.Error())
-
+		log.Errorf("(app.Init) cannot determine current namespace (using the default): %s", nsErr.Error())
 		h.namespace = "kubevirt-ip-helper"
 	} else {
 		h.namespace = strings.TrimSpace(string(ns))
 	}
-
-	// make sure the leader label is removed in case the pod crashed
-	h.RemoveLeaderPodLabel()
+	podName, err := os.Hostname()
+	if err != nil || podName == "" {
+		handleErr(fmt.Errorf("cannot determine current pod name: %v", err))
+	}
+	// Reject an invalid namespace before constructing an API path. The actual
+	// network name is read only from the own Pod, never from a fallback.
+	if problems := validation.IsDNS1123Label(h.namespace); len(problems) != 0 {
+		handleErr(fmt.Errorf("invalid own Pod namespace %q: %s", h.namespace, strings.Join(problems, "; ")))
+	}
 
 	config, err := h.getKubeConfig()
 	if err != nil {
@@ -154,12 +167,27 @@ func (h *handler) Init() {
 		handleErr(err)
 	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pod, err := k8s_clientset.CoreV1().Pods(h.namespace).Get(ctx, podName, metav1.GetOptions{})
+	if err != nil {
+		handleErr(fmt.Errorf("cannot read own Pod for network identity: %w", err))
+	}
+	h.networkScope, err = util.NewNetworkScope(h.namespace, pod.Labels[util.NetworkLabel])
+	if err != nil {
+		handleErr(fmt.Errorf("invalid own Pod network identity: %w", err))
+	}
+
+	// Only a validated identity may mutate the Pod or enter network cleanup
+	// and election. A live label edit never changes this process's scope.
+	h.RemoveLeaderPodLabel()
+
 	h.leaderId = uuid.NewString()
 	log.Infof("(app.Run) generated leader id: %s", h.leaderId)
 
 	h.lock = &resourcelock.LeaseLock{
 		LeaseMeta: metav1.ObjectMeta{
-			Name:      "kubevirt-ip-helper-lock",
+			Name:      h.networkScope.LeaseName(),
 			Namespace: h.namespace,
 		},
 		Client: k8s_clientset.CoordinationV1(),
@@ -450,6 +478,7 @@ func (h *handler) RunServices(ctx context.Context) error {
 		ipam:         ipam.New(),
 		dhcp:         dhcp.New(),
 		cache:        cache.New(),
+		reconcileMu:  &sync.Mutex{},
 	}
 	era.appStatus.Store(APP_INIT)
 	h.era.Store(era)
@@ -496,6 +525,7 @@ func (h *handler) RunServices(ctx context.Context) error {
 		nil,
 		era.appStatus,
 		era.ippoolGate,
+		h.networkScope,
 	)
 	if err := h.ippoolEventHandler.Init(); err != nil {
 		handleErr(err)
@@ -566,6 +596,8 @@ func (h *handler) RunServices(ctx context.Context) error {
 		nil,
 		era.appStatus,
 		era.vmnetcfgGate,
+		h.networkScope,
+		era.reconcileMu,
 	)
 	if err := h.vmnetcfgEventHandler.Init(); err != nil {
 		handleErr(err)
@@ -614,6 +646,8 @@ func (h *handler) RunServices(ctx context.Context) error {
 		nil,
 		nil,
 		nil,
+		h.networkScope,
+		era.reconcileMu,
 	)
 	if err := h.vmEventHandler.Init(); err != nil {
 		handleErr(err)
@@ -757,6 +791,9 @@ func retryList[T any](ctx context.Context, m *metrics.MetricsAllocator, what str
 }
 
 func (h *handler) getIPPools(ctx context.Context) (IPPools []v1.IPPool, err error) {
+	if h.networkScope.NetworkName() == "" {
+		return nil, fmt.Errorf("cannot discover IPPools without a network identity")
+	}
 	kubeRestConfig, err := h.getKubeConfig()
 	if err != nil {
 		return IPPools, fmt.Errorf("cannot get kubeRestConfig: %s", err.Error())
@@ -767,7 +804,7 @@ func (h *handler) getIPPools(ctx context.Context) (IPPools []v1.IPPool, err erro
 		return IPPools, fmt.Errorf("cannot get kihClientset: %s", err.Error())
 	}
 
-	IPPoolList, err := kihClientset.KubevirtiphelperV1().IPPools().List(ctx, metav1.ListOptions{})
+	IPPoolList, err := kihClientset.KubevirtiphelperV1().IPPools().List(ctx, metav1.ListOptions{LabelSelector: h.networkScope.Selector()})
 	if err != nil {
 		return IPPools, fmt.Errorf("cannot get the IPPoolList: %s", err.Error())
 	}
@@ -831,11 +868,9 @@ func (h *handler) NetworkCleanup() {
 	}
 }
 
-// StartupNetworkCleanup removes the server ips of all pools of the cluster
-// from the local interfaces at process start: it is the workaround for a
-// previously killed process which could not clean up after itself, so the
-// pools must be gathered from the api (a fresh process has no local pool
-// cache yet). an unreachable api only skips the workaround.
+// StartupNetworkCleanup removes only this network's server addresses after a
+// previously killed process. A fresh process gathers selected pools from the API;
+// an unreachable API skips the workaround, never widens discovery.
 func (h *handler) StartupNetworkCleanup() {
 	// bound the gather: the cleanup runs before the leader election starts
 	// where a hang must not block the startup
@@ -850,6 +885,11 @@ func (h *handler) StartupNetworkCleanup() {
 	}
 
 	for _, pool := range IPPoolList {
+		if !h.networkScope.MatchesPool(&pool) {
+			log.Errorf("(app.StartupNetworkCleanup) refusing pool [%s]: labels and spec.networkname must identify [%s]",
+				pool.Name, h.networkScope.NetworkName())
+			continue
+		}
 		// remove the IP address from the bind interface
 		ipnet, err := netip.ParsePrefix(pool.Spec.IPv4Config.Subnet)
 		if err != nil {

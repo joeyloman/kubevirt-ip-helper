@@ -628,6 +628,46 @@ func (a *IPAllocator) ReleaseIPOwnedBy(name string, givenIP string, owner string
 	return
 }
 
+// IPsOwnedBy snapshots the allocated addresses held by this owner in one
+// network. Anonymous protection pins are never treated as owned claims.
+// Callers must recheck ownership when releasing a returned address.
+func (a *IPAllocator) IPsOwnedBy(name string, owner string) (ips []string) {
+	if owner == "" {
+		return nil
+	}
+
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	subnet := a.ipam[name]
+	for ip, currentOwner := range subnet.owners {
+		if currentOwner == owner && subnet.ips[ip] {
+			ips = append(ips, ip)
+		}
+	}
+	return ips
+}
+
+// UsageCounts returns one consistent accounting snapshot and whether the
+// network is registered. A missing subnet is not an empty, available pool.
+func (a *IPAllocator) UsageCounts(name string) (used int, available int, exists bool) {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	subnet, exists := a.ipam[name]
+	if !exists {
+		return
+	}
+	for _, allocated := range subnet.ips {
+		if allocated {
+			used++
+		} else {
+			available++
+		}
+	}
+	return
+}
+
 func (a *IPAllocator) Used(name string) (i int) {
 	a.mutex.Lock()
 	defer a.mutex.Unlock()

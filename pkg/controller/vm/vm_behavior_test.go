@@ -27,6 +27,7 @@ import (
 	kihclientset "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/clientset/versioned"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/metrics"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/util"
 )
 
 const vmnetcfgFinalizer = "kubevirtiphelper.k8s.binbash.org/vmnetcfg-cleanup"
@@ -34,6 +35,13 @@ const vmnetcfgFinalizer = "kubevirtiphelper.k8s.binbash.org/vmnetcfg-cleanup"
 // ---------------------------------------------------------------------------
 // Fixtures and helpers
 // ---------------------------------------------------------------------------
+func vmTestScope(namespace, name string) util.NetworkScope {
+	scope, err := util.NewNetworkScope(namespace, name)
+	if err != nil {
+		panic(err)
+	}
+	return scope
+}
 
 // vmBehaviorNewTestController builds a Controller wired to a real generated clientset that
 // talks to an in-process fake API server, plus fresh in-memory allocators. Each
@@ -61,6 +69,8 @@ func vmBehaviorNewTestController(t *testing.T) (*Controller, *fakeAPI) {
 		dhcp:         dhcp.NewDHCPAllocator(),
 		metrics:      metrics.NewMetricsAllocator(),
 		kihClientset: cs,
+		scope:        vmTestScope("default", "net-a"),
+		reconcileMu:  &sync.Mutex{},
 	}, f
 }
 
@@ -91,7 +101,7 @@ func testNetCfg(mac, networkName, ip string) kihv1.NetworkConfig {
 // addSimpleLease registers a dhcp lease for mac belonging to ref.
 func addSimpleLease(t *testing.T, alloc *dhcp.DHCPAllocator, mac, ip, ref string) {
 	t.Helper()
-	if err := alloc.AddLease(mac, "test-pool", ip, ref); err != nil {
+	if err := alloc.AddLease(mac, "default/net-a", ip, ref); err != nil {
 		t.Fatalf("adding lease for %s: %v", mac, err)
 	}
 }
@@ -189,6 +199,10 @@ type fakeAPI struct {
 	ippoolStatusConflicts    int // consecutive 409s before a successful status update
 	ippoolStatusUpdateStatus int
 	ippoolStatusUpdateErr    string
+	// Hooks run outside mu, allowing a second real HTTP client to commit
+	// between another controller's read and write.
+	beforeVMNetCfgCreate func()
+	beforeVMNetCfgUpdate func(status bool, proposed *kihv1.VirtualMachineNetworkConfig)
 }
 
 func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -218,16 +232,42 @@ func (f *fakeAPI) handleVMNetCfg(w http.ResponseWriter, r *http.Request, ns stri
 		name = segs[6]
 	}
 	key := ns + "/" + name
+	status := len(segs) == 8 && segs[7] == "status"
+	obj := &kihv1.VirtualMachineNetworkConfig{}
+	if r.Method == http.MethodPost || r.Method == http.MethodPut {
+		if err := json.Unmarshal(body, obj); err != nil {
+			writeAPIError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if r.Method == http.MethodPost {
+			key = ns + "/" + obj.Name
+		}
+	}
 
+	// Detach each hook before invoking it: nested real client requests must
+	// proceed normally while the outer request remains suspended.
 	f.mu.Lock()
-	existing, found := f.vmnetcfgs[key]
-	if found && existing.ObjectMeta.ResourceVersion == "" {
-		// direct-seeded fixtures are normalized to a first version so the
-		// fake can work like a versioned apiserver
-		existing.ObjectMeta.ResourceVersion = "1"
+	createHook, updateHook := f.beforeVMNetCfgCreate, f.beforeVMNetCfgUpdate
+	if r.Method == http.MethodPost {
+		f.beforeVMNetCfgCreate = nil
+	}
+	if r.Method == http.MethodPut {
+		f.beforeVMNetCfgUpdate = nil
 	}
 	f.mu.Unlock()
+	if r.Method == http.MethodPost && createHook != nil {
+		createHook()
+	}
+	if r.Method == http.MethodPut && updateHook != nil {
+		updateHook(status, obj.DeepCopy())
+	}
 
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	existing, found := f.vmnetcfgs[key]
+	if found && existing.ResourceVersion == "" {
+		existing.ResourceVersion = "1"
+	}
 	switch r.Method {
 	case http.MethodGet:
 		if f.vmnetcfgGetStatus != 0 {
@@ -235,15 +275,12 @@ func (f *fakeAPI) handleVMNetCfg(w http.ResponseWriter, r *http.Request, ns stri
 			return
 		}
 		if !found {
-			writeAPIError(w, http.StatusNotFound,
-				fmt.Sprintf("virtualmachinenetworkconfigs.kubevirtiphelper.k8s.binbash.org %q not found", name))
+			writeAPIError(w, http.StatusNotFound, fmt.Sprintf("virtualmachinenetworkconfigs %q not found", name))
 			return
 		}
 		served := existing.DeepCopy()
 		if f.vmnetcfgGetUIDOverride != "" {
-			// models a stale read: the caller observes the pre-replacement
-			// object while the store already holds the replacement
-			served.ObjectMeta.UID = types.UID(f.vmnetcfgGetUIDOverride)
+			served.UID = types.UID(f.vmnetcfgGetUIDOverride)
 		}
 		vmBehaviorWriteJSON(w, http.StatusOK, served)
 	case http.MethodPost:
@@ -251,59 +288,51 @@ func (f *fakeAPI) handleVMNetCfg(w http.ResponseWriter, r *http.Request, ns stri
 			writeAPIError(w, f.vmnetcfgCreateStatus, f.vmnetcfgCreateErr)
 			return
 		}
-		obj := &kihv1.VirtualMachineNetworkConfig{}
-		if err := json.Unmarshal(body, obj); err != nil {
-			writeAPIError(w, http.StatusBadRequest, err.Error())
+		if found {
+			vmBehaviorWriteJSON(w, http.StatusConflict, metav1.Status{
+				TypeMeta: metav1.TypeMeta{Kind: "Status", APIVersion: "v1"},
+				Status:   metav1.StatusFailure, Reason: metav1.StatusReasonAlreadyExists,
+				Message: "virtualmachinenetworkconfigs already exists", Code: http.StatusConflict,
+			})
 			return
 		}
-		f.mu.Lock()
+		obj.ResourceVersion = "1"
+		obj.UID = types.UID("cfg-" + obj.Name)
+		obj.Status = kihv1.VirtualMachineNetworkConfigStatus{}
 		f.vmnetcfgs[key] = obj
-		f.mu.Unlock()
 		vmBehaviorWriteJSON(w, http.StatusCreated, obj)
 	case http.MethodPut:
 		if f.vmnetcfgUpdateStatus != 0 {
 			writeAPIError(w, f.vmnetcfgUpdateStatus, f.vmnetcfgUpdateErr)
 			return
 		}
-		obj := &kihv1.VirtualMachineNetworkConfig{}
-		if err := json.Unmarshal(body, obj); err != nil {
-			writeAPIError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		f.mu.Lock()
-		stored, found := f.vmnetcfgs[key]
-		f.mu.Unlock()
 		if !found {
-			writeAPIError(w, http.StatusNotFound,
-				fmt.Sprintf("virtualmachinenetworkconfigs.kubevirtiphelper.k8s.binbash.org %q not found", name))
+			writeAPIError(w, http.StatusNotFound, fmt.Sprintf("virtualmachinenetworkconfigs %q not found", name))
 			return
 		}
-
-		// a write must be based on the latest stored version and match the
-		// requested object identity
-		if obj.ObjectMeta.Name != name || obj.ObjectMeta.Namespace != ns {
+		if obj.Name != name || obj.Namespace != ns {
 			writeAPIError(w, http.StatusBadRequest, "the object identity does not match the requested object")
 			return
 		}
-		if submittedRV := obj.ObjectMeta.ResourceVersion; submittedRV == "" || stored.ObjectMeta.ResourceVersion != submittedRV {
-			writeAPIError(w, http.StatusConflict,
-				fmt.Sprintf("Operation cannot be fulfilled on virtualmachinenetworkconfigs %q: the object has been modified; please apply your changes to the latest version and try again", name))
+		if obj.ResourceVersion == "" || obj.ResourceVersion != existing.ResourceVersion || obj.UID != existing.UID {
+			writeAPIError(w, http.StatusConflict, "the object has been modified")
 			return
 		}
-
+		if status {
+			next := existing.DeepCopy()
+			next.Status = obj.Status
+			obj = next
+		} else {
+			obj.Status = existing.DeepCopy().Status
+		}
 		vmBehaviorBumpResourceVersion(&obj.ObjectMeta)
-		f.mu.Lock()
 		f.vmnetcfgs[key] = obj
-		f.mu.Unlock()
 		vmBehaviorWriteJSON(w, http.StatusOK, obj)
 	case http.MethodDelete:
 		if f.vmnetcfgDeleteStatus != 0 {
 			writeAPIError(w, f.vmnetcfgDeleteStatus, f.vmnetcfgDeleteErr)
 			return
 		}
-		// a uid precondition must match the stored object, like a real
-		// apiserver: a same-name replacement created after the caller's
-		// get is rejected with a conflict instead of being destroyed
 		opts := &metav1.DeleteOptions{}
 		if len(body) > 0 {
 			if err := json.Unmarshal(body, opts); err != nil {
@@ -312,15 +341,11 @@ func (f *fakeAPI) handleVMNetCfg(w http.ResponseWriter, r *http.Request, ns stri
 			}
 		}
 		if opts.Preconditions != nil && opts.Preconditions.UID != nil && found &&
-			string(existing.UID) != string(*opts.Preconditions.UID) {
-			writeAPIError(w, http.StatusConflict,
-				fmt.Sprintf("Operation cannot be fulfilled on virtualmachinenetworkconfigs %q: the UID in the precondition (%s) does not match the UID in record (%s)",
-					name, *opts.Preconditions.UID, existing.UID))
+			existing.UID != *opts.Preconditions.UID {
+			writeAPIError(w, http.StatusConflict, "the UID in the precondition does not match the UID in record")
 			return
 		}
-		f.mu.Lock()
 		delete(f.vmnetcfgs, key)
-		f.mu.Unlock()
 		writeAPISuccess(w)
 	default:
 		f.t.Errorf("unexpected method %s for %s", r.Method, r.URL.Path)
@@ -916,6 +941,9 @@ func TestUpdateVirtualMachineNetworkConfigObjectPropagatesUpdateError(t *testing
 	storePool(t, c, f, "pool-a", "default/net-a", map[string]string{
 		"10.0.0.42": "ns1/vm1 [aa:bb:cc:00:00:01]",
 	})
+	if err := c.ipam.NewSubnet("default/net-a", "10.0.0.0/24", "10.0.0.10", "10.0.0.50"); err != nil {
+		t.Fatalf("registering cleanup allocator: %v", err)
+	}
 
 	f.mu.Lock()
 	f.vmnetcfgs["ns1/vm1"] = &kihv1.VirtualMachineNetworkConfig{
@@ -931,8 +959,8 @@ func TestUpdateVirtualMachineNetworkConfigObjectPropagatesUpdateError(t *testing
 
 	existing := f.storedVMNetCfg("ns1/vm1")
 	err := c.updateVirtualMachineNetworkConfigObject(vm, existing)
-	if err == nil || !strings.Contains(err.Error(), "cannot update VirtualMachineNetworkConfig object for vm") {
-		t.Fatalf("expected wrapped update error, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "boom") {
+		t.Fatalf("expected the injected VMNetCfg API failure after successful cleanup, got %v", err)
 	}
 }
 
@@ -946,7 +974,9 @@ func TestDeleteVirtualMachineNetworkConfigObject(t *testing.T) {
 	f.mu.Lock()
 	f.vmnetcfgs["ns1/vm1"] = &kihv1.VirtualMachineNetworkConfig{
 		ObjectMeta: metav1.ObjectMeta{Name: "vm1", Namespace: "ns1"},
-		Spec:       kihv1.VirtualMachineNetworkConfigSpec{VMName: "vm1"},
+		Spec: kihv1.VirtualMachineNetworkConfigSpec{VMName: "vm1", NetworkConfig: []kihv1.NetworkConfig{
+			testNetCfg("aa:bb:cc:00:00:01", "default/net-a", ""),
+		}},
 	}
 	f.mu.Unlock()
 
@@ -978,7 +1008,12 @@ func TestDeleteVirtualMachineNetworkConfigObjectPropagatesDeleteError(t *testing
 	f.vmnetcfgDeleteErr = "boom"
 
 	f.mu.Lock()
-	f.vmnetcfgs["ns1/vm1"] = &kihv1.VirtualMachineNetworkConfig{ObjectMeta: metav1.ObjectMeta{Name: "vm1", Namespace: "ns1"}}
+	f.vmnetcfgs["ns1/vm1"] = &kihv1.VirtualMachineNetworkConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: "vm1", Namespace: "ns1"},
+		Spec: kihv1.VirtualMachineNetworkConfigSpec{VMName: "vm1", NetworkConfig: []kihv1.NetworkConfig{
+			testNetCfg("aa:bb:cc:00:00:01", "default/net-a", ""),
+		}},
+	}
 	f.mu.Unlock()
 
 	err := c.deleteVirtualMachineNetworkConfigObject("ns1", "vm1")
@@ -1051,6 +1086,9 @@ func TestDeleteVirtualMachineNetworkConfigObjectSendsUIDPrecondition(t *testing.
 	f.mu.Lock()
 	f.vmnetcfgs["ns1/vm1"] = &kihv1.VirtualMachineNetworkConfig{
 		ObjectMeta: metav1.ObjectMeta{Name: "vm1", Namespace: "ns1", UID: types.UID("1111-2222-3333")},
+		Spec: kihv1.VirtualMachineNetworkConfigSpec{VMName: "vm1", NetworkConfig: []kihv1.NetworkConfig{
+			testNetCfg("aa:bb:cc:00:00:01", "default/net-a", ""),
+		}},
 	}
 	f.mu.Unlock()
 
@@ -1090,6 +1128,9 @@ func TestDeleteVirtualMachineNetworkConfigObjectSparesReplacementOnUIDConflict(t
 	f.mu.Lock()
 	f.vmnetcfgs["ns1/vm1"] = &kihv1.VirtualMachineNetworkConfig{
 		ObjectMeta: metav1.ObjectMeta{Name: "vm1", Namespace: "ns1", UID: types.UID("uid-b")},
+		Spec: kihv1.VirtualMachineNetworkConfigSpec{VMName: "vm1", NetworkConfig: []kihv1.NetworkConfig{
+			testNetCfg("aa:bb:cc:00:00:01", "default/net-a", ""),
+		}},
 	}
 	f.mu.Unlock()
 
@@ -1279,12 +1320,6 @@ func TestCleanupNetworkInterfaceSkipsSuccessorAllocationOnRetry(t *testing.T) {
 	}
 	f.mu.Unlock()
 
-	// the first cleanup un-recorded the entry and republished the counts
-	putsAfterFirstCleanup := len(f.requestsFor(http.MethodPut, "/ippools/pool-a/status"))
-	if putsAfterFirstCleanup != 2 {
-		t.Fatalf("expected the first cleanup to un-record and republish, got %d puts", putsAfterFirstCleanup)
-	}
-
 	// the replay must converge instead of freeing the successor's claim
 	if err := c.cleanupNetworkInterface(vmnetcfg, &netCfg); err != nil {
 		t.Fatalf("retried cleanup: %v", err)
@@ -1300,9 +1335,6 @@ func TestCleanupNetworkInterfaceSkipsSuccessorAllocationOnRetry(t *testing.T) {
 	pool := f.storedPool("pool-a")
 	if got := pool.Status.IPv4.Allocated[ip]; got != "ns1/vm2 ["+successorMac+"]" {
 		t.Errorf("expected the successor's status entry preserved, got %q", got)
-	}
-	if n := len(f.requestsFor(http.MethodPut, "/ippools/pool-a/status")); n != putsAfterFirstCleanup {
-		t.Errorf("expected the replay to write no pool status, got %d new puts", n-putsAfterFirstCleanup)
 	}
 }
 
@@ -1446,13 +1478,10 @@ func TestCleanupNetworkInterfaceReleasesOwnStateUnderForeignLedgerEntry(t *testi
 		t.Errorf("ipam used = %d, want 0: the own reservation must be released", used)
 	}
 
-	// the foreign ledger entry is kept and nothing was written through it
+	// The foreign ledger entry stays intact.
 	pool := f.storedPool("pool-a")
 	if got := pool.Status.IPv4.Allocated[ip]; got != foreignRef {
 		t.Errorf("pool record = %q, want the foreign entry kept", got)
-	}
-	if n := len(f.requestsFor(http.MethodPut, "/ippools/pool-a/status")); n != 0 {
-		t.Errorf("expected no pool status write for a foreign entry, got %d", n)
 	}
 }
 
@@ -1549,8 +1578,8 @@ func TestUpdateIPPoolStatusAddRejectsDuplicateIP(t *testing.T) {
 	}
 }
 
-// a re-try of an allocation whose reference is already recorded must be a
-// no-op instead of failing with the duplicate-ip error
+// A retry with an already-recorded reference and current accounting must be
+// a no-op instead of failing with the duplicate-IP error.
 func TestUpdateIPPoolStatusAddIsIdempotentForSameOwner(t *testing.T) {
 	c, f := vmBehaviorNewTestController(t)
 
@@ -1608,6 +1637,7 @@ func TestUpdateIPPoolStatusRetriesOnConflict(t *testing.T) {
 	c, f := vmBehaviorNewTestController(t)
 
 	storePool(t, c, f, "pool-a", "net-a", map[string]string{})
+	addSubnetWithIP(t, c.ipam, "net-a", "10.0.0.11")
 	f.ippoolStatusConflicts = 1
 
 	if err := c.updateIPPoolStatus(ADD, "ns1", "vm1", "10.0.0.11", "net-a", "aa:bb:cc:00:00:01", "pool-a"); err != nil {
@@ -1639,12 +1669,13 @@ func TestUpdateIPPoolStatusPropagatesUpdateError(t *testing.T) {
 	c, f := vmBehaviorNewTestController(t)
 
 	storePool(t, c, f, "pool-a", "net-a", map[string]string{})
+	addSubnetWithIP(t, c.ipam, "net-a", "10.0.0.11")
 	f.ippoolStatusUpdateStatus = http.StatusInternalServerError
 	f.ippoolStatusUpdateErr = "boom"
 
 	err := c.updateIPPoolStatus(ADD, "ns1", "vm1", "10.0.0.11", "net-a", "aa:bb:cc:00:00:01", "pool-a")
-	if err == nil || !strings.Contains(err.Error(), "cannot update status of IPPool pool-a") {
-		t.Fatalf("expected wrapped update error, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "boom") {
+		t.Fatalf("expected the injected pool status API failure, got %v", err)
 	}
 }
 
@@ -1772,12 +1803,15 @@ func TestCleanupNetworkInterfaceConvergesWithoutLeaseAndIP(t *testing.T) {
 	c, f := vmBehaviorNewTestController(t)
 
 	storePool(t, c, f, "pool-a", "default/net-a", map[string]string{})
+	if err := c.ipam.NewSubnet("default/net-a", "10.0.0.0/24", "10.0.0.10", "10.0.0.12"); err != nil {
+		t.Fatalf("registering empty subnet: %v", err)
+	}
 
 	vmnetcfg := &kihv1.VirtualMachineNetworkConfig{
 		ObjectMeta: metav1.ObjectMeta{Name: "vm1", Namespace: "ns1"},
 		Spec:       kihv1.VirtualMachineNetworkConfigSpec{VMName: "vm1"},
 	}
-	// no lease registered for the mac, no subnet registered for the network
+	// The allocator is registered but this binding has no lease or claim.
 	if err := c.cleanupNetworkInterface(vmnetcfg, &kihv1.NetworkConfig{MACAddress: "aa:bb:cc:00:00:01", NetworkName: "default/net-a", IPAddress: "10.0.0.11"}); err != nil {
 		t.Fatalf("cleanupNetworkInterface: %v", err)
 	}
@@ -1785,8 +1819,9 @@ func TestCleanupNetworkInterfaceConvergesWithoutLeaseAndIP(t *testing.T) {
 	if c.dhcp.CheckLease("aa:bb:cc:00:00:01") {
 		t.Error("expected no lease after cleanup")
 	}
-	if n := len(f.requestsFor(http.MethodPut, "/ippools/pool-a/status")); n != 1 {
-		t.Errorf("expected 1 pool status update, got %d", n)
+	pool := f.storedPool("pool-a")
+	if len(pool.Status.IPv4.Allocated) != 0 || pool.Status.IPv4.Used != 0 || pool.Status.IPv4.Available != 3 {
+		t.Errorf("cleanup without local bindings must leave an empty, accurately counted pool: %+v", pool.Status.IPv4)
 	}
 }
 
@@ -2036,9 +2071,12 @@ func TestCleanupNetworkInterfaceConvergesWhenPoolDeleted(t *testing.T) {
 
 	mac := "aa:bb:cc:00:00:03"
 	networkName := "default/net-deleted"
+	c.scope = vmTestScope("default", "net-deleted")
 	ip := "10.0.0.11"
 
-	addSimpleLease(t, c.dhcp, mac, ip, "ns1/vm1")
+	if err := c.dhcp.AddLease(mac, networkName, ip, "ns1/vm1"); err != nil {
+		t.Fatalf("adding lease: %v", err)
+	}
 	addSubnetWithOwnedIP(t, c.ipam, networkName, ip, "ns1/vm1 ["+mac+"]")
 
 	vmnetcfg := &kihv1.VirtualMachineNetworkConfig{

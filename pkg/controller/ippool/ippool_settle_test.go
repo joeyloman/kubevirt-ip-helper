@@ -23,7 +23,7 @@ func TestSyncDeleteSettlesUnregisteredPoolStartup(t *testing.T) {
 	startupGate := newTestGate("ippool-x")
 	controller, _ := newTestController(t, newTestQueue(), newTestIndexer(), nil, &appStatus, startupGate)
 
-	if err := controller.sync(Event{key: "ippool-x", action: DELETE, poolName: "ippool-x", poolNetworkName: "net-x"}); err != nil {
+	if err := controller.sync(Event{key: "ippool-x", action: DELETE, poolName: "ippool-x", poolNetworkName: "infra/net-x"}); err != nil {
 		t.Fatalf("the delete sync failed: %s", err)
 	}
 	if startupGate.Settled() != 1 {

@@ -1,11 +1,20 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: kubevirt-ip-helper
+  name: helper-management
   namespace: kubevirt-ip-helper
+  labels:
+    kubevirtiphelper/network: kubevirt-ip-helper-e2e
 spec:
+  # Explicit HA fixture: production defaults to one replica per network.
+  replicas: 2
+  selector:
+    matchLabels:
+      kubevirtiphelper/network: kubevirt-ip-helper-e2e
   template:
     metadata:
+      labels:
+        kubevirtiphelper/network: kubevirt-ip-helper-e2e
       annotations:
         k8s.v1.cni.cncf.io/networks: '[{"name":"kubevirt-ip-helper-e2e","namespace":"kubevirt-ip-helper","interface":"kihnet0"}]'
     spec:

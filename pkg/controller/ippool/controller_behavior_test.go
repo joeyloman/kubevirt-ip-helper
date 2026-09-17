@@ -2,6 +2,7 @@ package ippool
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
@@ -26,7 +28,7 @@ import (
 	kihclientset "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/clientset/versioned"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/metrics"
-	"github.com/joeyloman/kubevirt-ip-helper/pkg/network"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/util"
 )
 
 // newTestGate builds a startup gate whose snapshot holds the given keys:
@@ -78,6 +80,30 @@ func (s *stubInformer) LastSyncResourceVersion() string { return "" }
 func newTestController(t *testing.T, queue workqueue.RateLimitingInterface, indexer cache.Indexer, informer cache.Controller, appStatus *atomic.Int32, startupGate *gate.Gate) (*Controller, *kihcache.CacheAllocator) {
 	t.Helper()
 
+	scope := testNetworkScope("infra/net-a")
+	for _, obj := range indexer.List() {
+		if pool, ok := obj.(*kihv1.IPPool); ok {
+			scope = testNetworkScope(pool.Spec.NetworkName)
+			break
+		}
+	}
+	// The fixture's API follows its selected objects unless a lifecycle test
+	// supplies an independent recovery server to model informer lag.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		name := strings.TrimPrefix(r.URL.Path, "/apis/kubevirtiphelper.k8s.binbash.org/v1/ippools/")
+		if obj, exists, err := indexer.GetByKey(name); err == nil && exists {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(obj)
+			return
+		}
+		ippoolBehaviorWriteKubeError(w, http.StatusNotFound)
+	}))
+	t.Cleanup(server.Close)
+	client, err := kihclientset.NewForConfig(&rest.Config{Host: server.URL})
+	if err != nil {
+		t.Fatalf("creating fixture client: %v", err)
+	}
+
 	cacheAllocator := kihcache.NewCacheAllocator()
 	controller := NewController(
 		queue,
@@ -88,10 +114,11 @@ func newTestController(t *testing.T, queue workqueue.RateLimitingInterface, inde
 		ipam.NewIPAllocator(),
 		dhcp.NewDHCPAllocator(),
 		metrics.NewMetricsAllocator(),
-		nil,
+		client,
 		appStatus,
 		startupGate,
 		nil,
+		scope,
 	)
 	t.Cleanup(queue.ShutDown)
 
@@ -117,9 +144,28 @@ func newUnavailableClientset(t *testing.T) *kihclientset.Clientset {
 	return client
 }
 
+func testNetworkScope(network string) util.NetworkScope {
+	namespace, name, ok := strings.Cut(network, "/")
+	if !ok {
+		panic("test network must be namespace-qualified: " + network)
+	}
+	scope, err := util.NewNetworkScope(namespace, name)
+	if err != nil {
+		panic(err)
+	}
+	return scope
+}
+
+func testPoolMetadata(name, network string) metav1.ObjectMeta {
+	scope := testNetworkScope(network)
+	return metav1.ObjectMeta{Name: name, Labels: map[string]string{
+		util.NetworkLabel: scope.Name(), util.NetworkNamespaceLabel: scope.Namespace(),
+	}}
+}
+
 func testPool(name, network string, leaseTime int) *kihv1.IPPool {
 	return &kihv1.IPPool{
-		ObjectMeta: metav1.ObjectMeta{Name: name},
+		ObjectMeta: testPoolMetadata(name, network),
 		Spec: kihv1.IPPoolSpec{
 			NetworkName:   network,
 			BindInterface: "test-fake-iface",
@@ -143,7 +189,7 @@ func testPool(name, network string, leaseTime int) *kihv1.IPPool {
 // requeue retries it, and the next era's resync re-delivers it in any
 // case.
 func TestSyncDefersAddDuringRestart(t *testing.T) {
-	pool := testPool("pool-defer", "net-defer", 60)
+	pool := testPool("pool-defer", "infra/net-defer", 60)
 	c, _, _ := recoveryNewController(t, pool)
 
 	// the sync-level event drives the object through the indexer, and
@@ -162,17 +208,17 @@ func TestSyncDefersAddDuringRestart(t *testing.T) {
 		key:             "pool-defer",
 		action:          ADD,
 		poolName:        "pool-defer",
-		poolNetworkName: "net-defer",
+		poolNetworkName: "infra/net-defer",
 	}
 
 	err := c.sync(event)
 	if err == nil || !strings.Contains(err.Error(), "deferring registration") {
 		t.Fatalf("sync of an add during the restart = %v, want the deferral", err)
 	}
-	if c.dhcp.CheckPool("net-defer") {
+	if c.dhcp.CheckPool("infra/net-defer") {
 		t.Error("a dying era must not register the pool's dhcp service")
 	}
-	if used := c.ipam.Used("net-defer"); used != 0 {
+	if used := c.ipam.Used("infra/net-defer"); used != 0 {
 		t.Errorf("ipam used = %d, want 0: the deferred add must not register a subnet", used)
 	}
 
@@ -181,7 +227,7 @@ func TestSyncDefersAddDuringRestart(t *testing.T) {
 	if err := c.sync(event); err != nil {
 		t.Fatalf("the retried add after the restart must register: %v", err)
 	}
-	if !c.dhcp.CheckPool("net-defer") {
+	if !c.dhcp.CheckPool("infra/net-defer") {
 		t.Error("the retried add must register the dhcp pool once the era runs")
 	}
 }
@@ -207,7 +253,7 @@ func TestProcessNextItemSucceedsForMissingIndexObject(t *testing.T) {
 	var appStatus atomic.Int32
 	controller, _ := newTestController(t, queue, newTestIndexer(), nil, &appStatus, nil)
 
-	event := testPoolEvent("pool-a", ADD, "net-a")
+	event := testPoolEvent("pool-a", ADD, "infra/net-a")
 	queue.Add(event)
 
 	if got := controller.processNextItem(); !got {
@@ -225,7 +271,7 @@ func TestProcessNextItemRequeuesOnIndexerError(t *testing.T) {
 	indexer := &failingIndexer{Indexer: newTestIndexer(), err: errors.New("store unavailable")}
 	controller, _ := newTestController(t, queue, indexer, nil, &appStatus, nil)
 
-	event := testPoolEvent("pool-b", ADD, "net-b")
+	event := testPoolEvent("pool-b", ADD, "infra/net-b")
 	queue.Add(event)
 
 	if got := controller.processNextItem(); !got {
@@ -328,7 +374,7 @@ func TestSyncReturnsNilForMissingIndexObject(t *testing.T) {
 	var appStatus atomic.Int32
 	controller, _ := newTestController(t, newTestQueue(), newTestIndexer(), nil, &appStatus, nil)
 
-	if err := controller.sync(testPoolEvent("pool-f", ADD, "net-f")); err != nil {
+	if err := controller.sync(testPoolEvent("pool-f", ADD, "infra/net-f")); err != nil {
 		t.Errorf("sync() for a missing index object returned error %v, want nil", err)
 	}
 }
@@ -338,7 +384,7 @@ func TestSyncReturnsIndexerError(t *testing.T) {
 	indexer := &failingIndexer{Indexer: newTestIndexer(), err: errors.New("store unavailable")}
 	controller, _ := newTestController(t, newTestQueue(), indexer, nil, &appStatus, nil)
 
-	if err := controller.sync(testPoolEvent("pool-g", ADD, "net-g")); err == nil {
+	if err := controller.sync(testPoolEvent("pool-g", ADD, "infra/net-g")); err == nil {
 		t.Fatalf("sync() returned nil, want the indexer error")
 	}
 }
@@ -349,7 +395,7 @@ func TestSyncDeleteSucceedsWhenPoolNotCached(t *testing.T) {
 	var appStatus atomic.Int32
 	controller, _ := newTestController(t, newTestQueue(), newTestIndexer(), nil, &appStatus, nil)
 
-	if err := controller.sync(testPoolEvent("pool-h", DELETE, "net-h")); err != nil {
+	if err := controller.sync(testPoolEvent("pool-h", DELETE, "infra/net-h")); err != nil {
 		t.Errorf("sync(DELETE) returned error %v, want nil", err)
 	}
 }
@@ -361,10 +407,10 @@ func TestSyncUpdateReturnsErrorWhenPoolNotCached(t *testing.T) {
 	// the queue retries instead of silently forgetting the event
 	var appStatus atomic.Int32
 	indexer := newTestIndexer()
-	indexer.Add(testPool("pool-i", "net-i", 60))
+	indexer.Add(testPool("pool-i", "infra/net-i", 60))
 	controller, _ := newTestController(t, newTestQueue(), indexer, nil, &appStatus, nil)
 
-	if err := controller.sync(testPoolEvent("pool-i", UPDATE, "net-i")); err == nil {
+	if err := controller.sync(testPoolEvent("pool-i", UPDATE, "infra/net-i")); err == nil {
 		t.Error("sync(UPDATE) returned nil, want a rate-limited requeue error for the missing cache entry")
 	}
 }
@@ -372,8 +418,8 @@ func TestSyncUpdateReturnsErrorWhenPoolNotCached(t *testing.T) {
 func TestSyncUpdateIgnoredWhileInitializing(t *testing.T) {
 	var appStatus atomic.Int32
 	appStatus.Store(APP_INIT)
-	oldPool := testPool("pool-j", "net-j", 60)
-	newPool := testPool("pool-j", "net-j", 120)
+	oldPool := testPool("pool-j", "infra/net-j", 60)
+	newPool := testPool("pool-j", "infra/net-j", 120)
 
 	indexer := newTestIndexer()
 	indexer.Add(newPool)
@@ -388,7 +434,7 @@ func TestSyncUpdateIgnoredWhileInitializing(t *testing.T) {
 		return nil
 	}
 
-	if err := controller.sync(testPoolEvent("pool-j", UPDATE, "net-j")); err != nil {
+	if err := controller.sync(testPoolEvent("pool-j", UPDATE, "infra/net-j")); err != nil {
 		t.Errorf("sync(UPDATE) returned error %v, want nil", err)
 	}
 
@@ -399,7 +445,7 @@ func TestSyncUpdateIgnoredWhileInitializing(t *testing.T) {
 	if listenerRepairs != 0 {
 		t.Errorf("listener repair attempts = %d, want 0 while the application initializes", listenerRepairs)
 	}
-	got, err := cacheAllocator.Get("pool", "net-j")
+	got, err := cacheAllocator.Get("pool", "infra/net-j")
 	if err != nil {
 		t.Fatalf("pool missing from cache: %v", err)
 	}
@@ -411,7 +457,7 @@ func TestSyncUpdateIgnoredWhileInitializing(t *testing.T) {
 func TestSyncUpdateSkipsIdenticalPoolWhenRunning(t *testing.T) {
 	var appStatus atomic.Int32
 	appStatus.Store(APP_RUNNING)
-	pool := testPool("pool-k", "net-k", 60)
+	pool := testPool("pool-k", "infra/net-k", 60)
 
 	indexer := newTestIndexer()
 	indexer.Add(pool)
@@ -426,20 +472,20 @@ func TestSyncUpdateSkipsIdenticalPoolWhenRunning(t *testing.T) {
 		return nil
 	}
 
-	if err := controller.sync(testPoolEvent("pool-k", UPDATE, "net-k")); err != nil {
+	if err := controller.sync(testPoolEvent("pool-k", UPDATE, "infra/net-k")); err != nil {
 		t.Errorf("sync(UPDATE) returned error %v, want nil", err)
 	}
 
 	// an identical object is a no-change: the cache keeps the original pool
 	// and no dhcp pool is (re)registered
-	got, err := cacheAllocator.Get("pool", "net-k")
+	got, err := cacheAllocator.Get("pool", "infra/net-k")
 	if err != nil {
 		t.Fatalf("pool missing from cache: %v", err)
 	}
 	if leaseTime := got.(kihv1.IPPool).Spec.IPv4Config.LeaseTime; leaseTime != 60 {
 		t.Errorf("cache lease time = %d after no-change update, want 60", leaseTime)
 	}
-	if controller.dhcp.CheckPool("net-k") {
+	if controller.dhcp.CheckPool("infra/net-k") {
 		t.Errorf("dhcp pool registered for an identical update")
 	}
 
@@ -457,7 +503,7 @@ func TestSyncUpdateSkipsIdenticalPoolWhenRunning(t *testing.T) {
 func TestSyncUpdateListenerRepairFailsLoudly(t *testing.T) {
 	var appStatus atomic.Int32
 	appStatus.Store(APP_RUNNING)
-	pool := testPool("pool-m2", "net-m2", 60)
+	pool := testPool("pool-m2", "infra/net-m2", 60)
 
 	indexer := newTestIndexer()
 	indexer.Add(pool)
@@ -470,7 +516,7 @@ func TestSyncUpdateListenerRepairFailsLoudly(t *testing.T) {
 		return errors.New("cannot bind to interface test-fake-iface: no such device")
 	}
 
-	if err := controller.sync(testPoolEvent("pool-m2", UPDATE, "net-m2")); err == nil {
+	if err := controller.sync(testPoolEvent("pool-m2", UPDATE, "infra/net-m2")); err == nil {
 		t.Error("sync(UPDATE) returned nil, want the listener repair failure surfaced for the rate-limited retry")
 	}
 }
@@ -478,8 +524,8 @@ func TestSyncUpdateListenerRepairFailsLoudly(t *testing.T) {
 func TestSyncUpdateReloadsPoolWhenRunning(t *testing.T) {
 	var appStatus atomic.Int32
 	appStatus.Store(APP_RUNNING)
-	oldPool := testPool("pool-l", "net-l", 60)
-	newPool := testPool("pool-l", "net-l", 120)
+	oldPool := testPool("pool-l", "infra/net-l", 60)
+	newPool := testPool("pool-l", "infra/net-l", 120)
 
 	indexer := newTestIndexer()
 	indexer.Add(newPool)
@@ -490,16 +536,16 @@ func TestSyncUpdateReloadsPoolWhenRunning(t *testing.T) {
 	}
 	controller.runListener = func(networkName string, nic string) error { return nil }
 
-	if err := controller.sync(testPoolEvent("pool-l", UPDATE, "net-l")); err != nil {
+	if err := controller.sync(testPoolEvent("pool-l", UPDATE, "infra/net-l")); err != nil {
 		t.Errorf("sync(UPDATE) returned error %v, want nil", err)
 	}
 
 	// a lease time change is reloadable: the dhcp pool is refreshed and the
 	// cache now carries the updated pool
-	if !controller.dhcp.CheckPool("net-l") {
+	if !controller.dhcp.CheckPool("infra/net-l") {
 		t.Errorf("dhcp pool was not registered after a reloadable update")
 	}
-	got, err := cacheAllocator.Get("pool", "net-l")
+	got, err := cacheAllocator.Get("pool", "infra/net-l")
 	if err != nil {
 		t.Fatalf("pool missing from cache: %v", err)
 	}
@@ -569,6 +615,7 @@ func TestEventListenerStopsWhenContextIsCancelled(t *testing.T) {
 		newUnavailableClientset(t),
 		new(atomic.Int32),
 		nil,
+		testNetworkScope("infra/net-a"),
 	)
 
 	done := make(chan error, 1)
@@ -583,6 +630,87 @@ func TestEventListenerStopsWhenContextIsCancelled(t *testing.T) {
 		}
 	case <-time.After(shutdownWait):
 		t.Fatal("EventListener did not return after context cancellation")
+	}
+}
+
+func TestEventListenerScopesInitialListAndWatchByBothLabels(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	type observation struct {
+		watch    bool
+		selector string
+	}
+	requests := make(chan observation, 4)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/apis/kubevirtiphelper.k8s.binbash.org/v1/ippools" {
+			ippoolBehaviorWriteKubeError(w, http.StatusNotFound)
+			return
+		}
+		watching := r.URL.Query().Get("watch") == "true"
+		select {
+		case requests <- observation{watch: watching, selector: r.URL.Query().Get("labelSelector")}:
+		case <-ctx.Done():
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if watching {
+			w.WriteHeader(http.StatusOK)
+			w.(http.Flusher).Flush()
+			<-ctx.Done()
+			return
+		}
+		_ = json.NewEncoder(w).Encode(&kihv1.IPPoolList{
+			TypeMeta: metav1.TypeMeta{APIVersion: kihv1.SchemeGroupVersion.String(), Kind: "IPPoolList"},
+			ListMeta: metav1.ListMeta{ResourceVersion: "1"},
+			Items:    []kihv1.IPPool{},
+		})
+	}))
+	t.Cleanup(server.Close)
+	t.Cleanup(cancel)
+	client, err := kihclientset.NewForConfig(&rest.Config{Host: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope := testNetworkScope("infra/net-a")
+	handler := NewEventHandler(
+		ctx, ipam.NewIPAllocator(), dhcp.NewDHCPAllocator(), metrics.NewMetricsAllocator(),
+		kihcache.NewCacheAllocator(), "", "", nil, client, new(atomic.Int32), newTestGate(), scope,
+	)
+	done := make(chan error, 1)
+	go func() { done <- handler.EventListener() }()
+	deadline := time.NewTimer(shutdownWait)
+	defer deadline.Stop()
+	seenList, seenWatch := false, false
+	for !seenList || !seenWatch {
+		select {
+		case request := <-requests:
+			if request.watch {
+				seenWatch = true
+			} else {
+				seenList = true
+			}
+			selector, err := labels.Parse(request.selector)
+			if err != nil {
+				t.Fatalf("invalid discovery selector: %v", err)
+			}
+			if !selector.Matches(labels.Set{util.NetworkLabel: "net-a", util.NetworkNamespaceLabel: "infra"}) ||
+				selector.Matches(labels.Set{util.NetworkLabel: "net-a", util.NetworkNamespaceLabel: "tenant"}) ||
+				selector.Matches(labels.Set{util.NetworkLabel: "net-b", util.NetworkNamespaceLabel: "infra"}) ||
+				selector.Matches(labels.Set{util.NetworkLabel: "net-a"}) {
+				t.Errorf("watch=%v selector does not isolate the NAD namespace: %q", request.watch, request.selector)
+			}
+		case <-deadline.C:
+			t.Fatalf("discovery did not reach both requests: list=%v watch=%v", seenList, seenWatch)
+		}
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(shutdownWait):
+		t.Fatal("scoped event listener did not stop after cancellation")
 	}
 }
 
@@ -634,6 +762,7 @@ func newTestEventHandler(kubeConfig, kubeContext string) *EventHandler {
 		nil,
 		new(atomic.Int32),
 		nil,
+		testNetworkScope("infra/net-a"),
 	)
 }
 
@@ -714,7 +843,7 @@ func TestSyncAddReturnsErrorWhenPoolFailsToRegister(t *testing.T) {
 	// queue applies a rate-limited requeue. A nil error would Forget the
 	// event and the successful-pool counter would never reach the target
 	// count, blocking initialization forever.
-	pool := testPool("pool-m", "net-m", 60)
+	pool := testPool("pool-m", "infra/net-m", 60)
 	pool.Spec.IPv4Config.Subnet = "not-a-cidr"
 
 	indexer := newTestIndexer()
@@ -725,11 +854,11 @@ func TestSyncAddReturnsErrorWhenPoolFailsToRegister(t *testing.T) {
 	var appStatus atomic.Int32
 	controller, _ := newTestController(t, newTestQueue(), indexer, nil, &appStatus, nil)
 
-	if err := controller.sync(testPoolEvent("pool-m", ADD, "net-m")); err == nil {
+	if err := controller.sync(testPoolEvent("pool-m", ADD, "infra/net-m")); err == nil {
 		t.Error("sync(ADD) returned nil, want a rate-limited requeue error from the registration failure")
 	}
 
-	if controller.dhcp.CheckPool("net-m") {
+	if controller.dhcp.CheckPool("infra/net-m") {
 		t.Errorf("dhcp pool registered although registerIPPool failed")
 	}
 	if v, ok := ippoolBehaviorMetricValue(t, controller.metrics, "kubevirtiphelper_app_logs", map[string]string{"loglevel": "error"}); !ok || v != 1 {
@@ -743,13 +872,13 @@ func TestSyncAddReturnsErrorWhenPoolFailsToRegister(t *testing.T) {
 // of the registration stays scoped to its own keys
 func TestSyncAddDuplicateNetworkNameDoesNotTouchForeignState(t *testing.T) {
 	var appStatus atomic.Int32
-	foreignPool := testPool("pool-a", "net-dup", 60)
+	foreignPool := testPool("pool-a", "infra/net-dup", 60)
 
 	indexer := newTestIndexer()
 	if err := indexer.Add(foreignPool); err != nil {
 		t.Fatalf("seeding indexer: %v", err)
 	}
-	if err := indexer.Add(testPool("pool-b", "net-dup", 60)); err != nil {
+	if err := indexer.Add(testPool("pool-b", "infra/net-dup", 60)); err != nil {
 		t.Fatalf("seeding indexer: %v", err)
 	}
 
@@ -757,13 +886,13 @@ func TestSyncAddDuplicateNetworkNameDoesNotTouchForeignState(t *testing.T) {
 
 	// a foreign pool registration already owns the net-dup keys and holds
 	// one live allocation
-	if err := controller.ipam.NewSubnet("net-dup", "192.168.1.0/24", "192.168.1.10", "192.168.1.100"); err != nil {
+	if err := controller.ipam.NewSubnet("infra/net-dup", "192.168.1.0/24", "192.168.1.10", "192.168.1.100"); err != nil {
 		t.Fatalf("registering the foreign ipam subnet: %v", err)
 	}
-	if _, err := controller.ipam.GetIP("net-dup", "192.168.1.10"); err != nil {
+	if _, err := controller.ipam.GetIP("infra/net-dup", "192.168.1.10"); err != nil {
 		t.Fatalf("allocating the foreign live ip: %v", err)
 	}
-	if err := controller.dhcp.AddPool("net-dup", "192.168.1.1", "255.255.255.0", "192.168.1.1", nil, "", nil, nil, 60, "test-fake-iface"); err != nil {
+	if err := controller.dhcp.AddPool("infra/net-dup", "192.168.1.1", "255.255.255.0", "192.168.1.1", nil, "", nil, nil, 60, "test-fake-iface"); err != nil {
 		t.Fatalf("registering the foreign dhcp pool: %v", err)
 	}
 	if err := cacheAllocator.Add(foreignPool); err != nil {
@@ -777,20 +906,20 @@ func TestSyncAddDuplicateNetworkNameDoesNotTouchForeignState(t *testing.T) {
 		t.Error("registerIPPool requested cleanup for an already-claimed networkname, want the foreign state untouched")
 	}
 
-	if err := controller.sync(testPoolEvent("pool-b", ADD, "net-dup")); err == nil {
+	if err := controller.sync(testPoolEvent("pool-b", ADD, "infra/net-dup")); err == nil {
 		t.Fatal("sync(ADD) for an already-claimed networkname returned nil, want a rejection error")
 	} else if !strings.Contains(err.Error(), "already registered") {
 		t.Errorf("error = %v, want a networkname-claim rejection", err)
 	}
 
 	// the foreign registration must survive both rejections untouched
-	if used := controller.ipam.Used("net-dup"); used < 1 {
+	if used := controller.ipam.Used("infra/net-dup"); used < 1 {
 		t.Errorf("foreign allocation state of net-dup wiped: used=%d, want >= 1", used)
 	}
-	if _, err := controller.ipam.GetIP("net-dup", ""); err != nil {
+	if _, err := controller.ipam.GetIP("infra/net-dup", ""); err != nil {
 		t.Errorf("GetIP on the foreign subnet failed: %v, want the subnet to stay live", err)
 	}
-	if !controller.dhcp.CheckPool("net-dup") {
+	if !controller.dhcp.CheckPool("infra/net-dup") {
 		t.Error("the foreign dhcp pool was removed by the rejected duplicate ADD")
 	}
 	if !cacheAllocator.Check(foreignPool) {
@@ -807,7 +936,7 @@ func TestSyncAddDuplicateNetworkNameDoesNotTouchForeignState(t *testing.T) {
 // that networkname, and free the live pool's state
 func TestSyncDeleteForeignCacheEntryKeepsLivePoolState(t *testing.T) {
 	var appStatus atomic.Int32
-	foreignPool := testPool("pool-a", "net-dup", 60)
+	foreignPool := testPool("pool-a", "infra/net-dup", 60)
 
 	indexer := newTestIndexer()
 	if err := indexer.Add(foreignPool); err != nil {
@@ -817,41 +946,38 @@ func TestSyncDeleteForeignCacheEntryKeepsLivePoolState(t *testing.T) {
 	controller, cacheAllocator := newTestController(t, newTestQueue(), indexer, nil, &appStatus, nil)
 
 	// a live registration owns the net-dup keys and holds one allocation
-	if err := controller.ipam.NewSubnet("net-dup", "192.168.1.0/24", "192.168.1.10", "192.168.1.100"); err != nil {
+	if err := controller.ipam.NewSubnet("infra/net-dup", "192.168.1.0/24", "192.168.1.10", "192.168.1.100"); err != nil {
 		t.Fatalf("registering the live pool's ipam subnet: %v", err)
 	}
-	if _, err := controller.ipam.GetIP("net-dup", "192.168.1.10"); err != nil {
+	if _, err := controller.ipam.GetIP("infra/net-dup", "192.168.1.10"); err != nil {
 		t.Fatalf("allocating the live pool's ip: %v", err)
 	}
-	if err := controller.dhcp.AddPool("net-dup", "192.168.1.1", "255.255.255.0", "192.168.1.1", nil, "", nil, nil, 60, "test-fake-iface"); err != nil {
+	if err := controller.dhcp.AddPool("infra/net-dup", "192.168.1.1", "255.255.255.0", "192.168.1.1", nil, "", nil, nil, 60, "test-fake-iface"); err != nil {
 		t.Fatalf("registering the live pool's dhcp pool: %v", err)
 	}
 	if err := cacheAllocator.Add(foreignPool); err != nil {
 		t.Fatalf("caching the live pool: %v", err)
 	}
-	controller.metrics.UpdateIPPoolUsed("pool-a", "192.168.1.0/24", "net-dup", 1)
-	controller.metrics.UpdateIPPoolAvailable("pool-a", "192.168.1.0/24", "net-dup", 90)
+	controller.metrics.UpdateIPPoolUsed("pool-a", "192.168.1.0/24", "infra/net-dup", 1)
+	controller.metrics.UpdateIPPoolAvailable("pool-a", "192.168.1.0/24", "infra/net-dup", 90)
 
 	// pool-b was rejected at registration time and shares networkname
 	// net-dup with the live pool-a; deleting it is a no-op
-	if err := controller.sync(testPoolEvent("pool-b", DELETE, "net-dup")); err != nil {
+	if err := controller.sync(testPoolEvent("pool-b", DELETE, "infra/net-dup")); err != nil {
 		t.Fatalf("sync(DELETE) for an unregistered pool returned error %v, want nil", err)
 	}
 
-	if used := controller.ipam.Used("net-dup"); used < 1 {
+	if used := controller.ipam.Used("infra/net-dup"); used < 1 {
 		t.Errorf("live allocation state of net-dup wiped by the unrelated delete: used=%d, want >= 1", used)
 	}
-	if !controller.dhcp.CheckPool("net-dup") {
+	if !controller.dhcp.CheckPool("infra/net-dup") {
 		t.Error("the live pool's dhcp pool was removed by the unrelated delete")
 	}
 	if !cacheAllocator.Check(foreignPool) {
 		t.Error("the live pool was dropped from the cache by the unrelated delete")
 	}
-	if v, ok := ippoolBehaviorMetricValue(t, controller.metrics, "kubevirtiphelper_ippool_used", map[string]string{"ippool": "pool-a", "subnet": "192.168.1.0/24", "network": "net-dup"}); !ok || v != 1 {
+	if v, ok := ippoolBehaviorMetricValue(t, controller.metrics, "kubevirtiphelper_ippool_used", map[string]string{"ippool": "pool-a", "subnet": "192.168.1.0/24", "network": "infra/net-dup"}); !ok || v != 1 {
 		t.Errorf("ippool_used metric after the unrelated delete: got value %v found %v, want 1", v, ok)
-	}
-	if v, ok := ippoolBehaviorMetricValue(t, controller.metrics, "kubevirtiphelper_app_logs", map[string]string{"loglevel": "warning"}); !ok || v != 1 {
-		t.Errorf("app log status gauge: got value %v found %v, want exactly 1 warning entry", v, ok)
 	}
 }
 
@@ -860,7 +986,7 @@ func TestSyncDeleteForeignCacheEntryKeepsLivePoolState(t *testing.T) {
 // and both pool gauges
 func TestSyncDeleteRegisteredPoolFreesItsState(t *testing.T) {
 	var appStatus atomic.Int32
-	storedPool := testPool("pool-a", "net-dup", 60)
+	storedPool := testPool("pool-a", "infra/net-dup", 60)
 
 	indexer := newTestIndexer()
 	if err := indexer.Add(storedPool); err != nil {
@@ -869,39 +995,42 @@ func TestSyncDeleteRegisteredPoolFreesItsState(t *testing.T) {
 
 	controller, cacheAllocator := newTestController(t, newTestQueue(), indexer, nil, &appStatus, nil)
 
-	if err := controller.ipam.NewSubnet("net-dup", "192.168.1.0/24", "192.168.1.10", "192.168.1.100"); err != nil {
+	if err := controller.ipam.NewSubnet("infra/net-dup", "192.168.1.0/24", "192.168.1.10", "192.168.1.100"); err != nil {
 		t.Fatalf("registering the ipam subnet: %v", err)
 	}
-	if _, err := controller.ipam.GetIP("net-dup", "192.168.1.10"); err != nil {
+	if _, err := controller.ipam.GetIP("infra/net-dup", "192.168.1.10"); err != nil {
 		t.Fatalf("allocating the live ip: %v", err)
 	}
-	if err := controller.dhcp.AddPool("net-dup", "192.168.1.1", "255.255.255.0", "192.168.1.1", nil, "", nil, nil, 60, "test-fake-iface"); err != nil {
+	if err := controller.dhcp.AddPool("infra/net-dup", "192.168.1.1", "255.255.255.0", "192.168.1.1", nil, "", nil, nil, 60, "test-fake-iface"); err != nil {
 		t.Fatalf("registering the dhcp pool: %v", err)
 	}
 	// a lease of the deleted network, which the teardown must drop with
 	// the registration (its listener is stopped first, so the network is
 	// served by nobody afterwards)
-	if err := controller.dhcp.AddLease("02:00:00:00:00:01", "net-dup", "192.168.1.10", "ref-dup"); err != nil {
+	if err := controller.dhcp.AddLease("02:00:00:00:00:01", "infra/net-dup", "192.168.1.10", "ref-dup"); err != nil {
 		t.Fatalf("seeding the lease of the deleted network: %v", err)
 	}
 	// a lease of another network, which the teardown of this pool must not touch
-	if err := controller.dhcp.AddLease("02:00:00:00:00:99", "net-keep", "192.168.2.50", "ref-keep"); err != nil {
+	if err := controller.dhcp.AddLease("02:00:00:00:00:99", "infra/net-keep", "192.168.2.50", "ref-keep"); err != nil {
 		t.Fatalf("seeding the lease of another network: %v", err)
 	}
 	if err := cacheAllocator.Add(storedPool); err != nil {
 		t.Fatalf("caching the pool: %v", err)
 	}
-	controller.metrics.UpdateIPPoolUsed("pool-a", "192.168.1.0/24", "net-dup", 1)
-	controller.metrics.UpdateIPPoolAvailable("pool-a", "192.168.1.0/24", "net-dup", 90)
+	controller.metrics.UpdateIPPoolUsed("pool-a", "192.168.1.0/24", "infra/net-dup", 1)
+	controller.metrics.UpdateIPPoolAvailable("pool-a", "192.168.1.0/24", "infra/net-dup", 90)
+	if err := indexer.Delete(storedPool); err != nil {
+		t.Fatal(err)
+	}
 
-	if err := controller.sync(testPoolEvent("pool-a", DELETE, "net-dup")); err != nil {
+	if err := controller.sync(testPoolEvent("pool-a", DELETE, "infra/net-dup")); err != nil {
 		t.Fatalf("sync(DELETE) for a registered pool returned error %v, want nil", err)
 	}
 
-	if used := controller.ipam.Used("net-dup"); used != 0 {
+	if used := controller.ipam.Used("infra/net-dup"); used != 0 {
 		t.Errorf("ipam allocation state after the own delete: used=%d, want 0", used)
 	}
-	if controller.dhcp.CheckPool("net-dup") {
+	if controller.dhcp.CheckPool("infra/net-dup") {
 		t.Error("the deleted pool's dhcp pool survived the delete")
 	}
 	// the leases of the deleted network are dropped with the teardown
@@ -913,27 +1042,23 @@ func TestSyncDeleteRegisteredPoolFreesItsState(t *testing.T) {
 	if !controller.dhcp.CheckLease("02:00:00:00:00:99") {
 		t.Error("a lease of another network must survive the delete")
 	}
-	if lease := controller.dhcp.GetLease("02:00:00:00:00:99"); lease.PoolName != "net-keep" {
+	if lease := controller.dhcp.GetLease("02:00:00:00:00:99"); lease.PoolName != "infra/net-keep" {
 		t.Errorf("the surviving lease serves network %q, want net-keep", lease.PoolName)
 	}
 	if cacheAllocator.Check(storedPool) {
 		t.Error("the deleted pool's cache entry survived the delete")
 	}
-	if _, found := ippoolBehaviorMetricValue(t, controller.metrics, "kubevirtiphelper_ippool_used", map[string]string{"ippool": "pool-a", "subnet": "192.168.1.0/24", "network": "net-dup"}); found {
+	if _, found := ippoolBehaviorMetricValue(t, controller.metrics, "kubevirtiphelper_ippool_used", map[string]string{"ippool": "pool-a", "subnet": "192.168.1.0/24", "network": "infra/net-dup"}); found {
 		t.Error("the deleted pool's ippool_used metric survived the delete")
 	}
-	if _, found := ippoolBehaviorMetricValue(t, controller.metrics, "kubevirtiphelper_ippool_available", map[string]string{"ippool": "pool-a", "subnet": "192.168.1.0/24", "network": "net-dup"}); found {
+	if _, found := ippoolBehaviorMetricValue(t, controller.metrics, "kubevirtiphelper_ippool_available", map[string]string{"ippool": "pool-a", "subnet": "192.168.1.0/24", "network": "infra/net-dup"}); found {
 		t.Error("the deleted pool's ippool_available metric survived the delete")
 	}
 }
 
-// deleting an IPPool object whose networkname resolves to no cache entry
-// at all (its registration was rejected, or failed and was torn back down)
-// is the converged outcome of a never-registered pool, not a failure: the
-// delete is a no-op which reports a warning like the name-mismatch case,
-// and the pool still counts for the startup gate so a startup-time
-// deletion cannot block the controller startup
-func TestSyncDeleteUncachedNetworkNameReportsWarning(t *testing.T) {
+// An authoritative NotFound for a never-registered pool is a converged
+// no-op and settles its startup snapshot key.
+func TestSyncDeleteUncachedPoolSettlesAfterNotFound(t *testing.T) {
 	var appStatus atomic.Int32
 	startupGate := newTestGate("pool-a")
 
@@ -942,88 +1067,49 @@ func TestSyncDeleteUncachedNetworkNameReportsWarning(t *testing.T) {
 	// no pool is registered under net-gone in this process era
 	controller, _ := newTestController(t, newTestQueue(), indexer, nil, &appStatus, startupGate)
 
-	if err := controller.sync(testPoolEvent("pool-a", DELETE, "net-gone")); err != nil {
+	if err := controller.sync(testPoolEvent("pool-a", DELETE, "infra/net-gone")); err != nil {
 		t.Fatalf("sync(DELETE) for an uncached networkname returned error %v, want nil", err)
 	}
 
 	if v, ok := ippoolBehaviorMetricValue(t, controller.metrics, "kubevirtiphelper_app_logs", map[string]string{"loglevel": "error"}); ok {
 		t.Errorf("app log status gauge: got error entry %v, want none for a converged no-op delete", v)
 	}
-	if v, ok := ippoolBehaviorMetricValue(t, controller.metrics, "kubevirtiphelper_app_logs", map[string]string{"loglevel": "warning"}); !ok || v != 1 {
-		t.Errorf("app log status gauge: got value %v found %v, want exactly 1 warning entry", v, ok)
-	}
 	if startupGate.Settled() != 1 {
 		t.Errorf("startup gate count = %d, want 1: a startup-time deletion must count for the gate even without a cache entry", startupGate.Settled())
 	}
 }
 
-// a pool whose networkname changed keeps its cache entry under the old key:
-// its update event must still reach the restart handling through it
-func TestSyncUpdateReachesRestartAfterNetworkNameChange(t *testing.T) {
-	var appStatus atomic.Int32
-	appStatus.Store(APP_RUNNING)
-	oldPool := testPool("pool-n", "net-old", 60)
-	newPool := testPool("pool-n", "net-new", 60)
-
-	indexer := newTestIndexer()
-	if err := indexer.Add(newPool); err != nil {
-		t.Fatalf("seeding indexer: %v", err)
+// An out-of-scope update stops local service instead of restarting the helper
+// under the foreign network, even if the informer held its old key, and foreign
+// allocator state is not mistaken for this helper's old registration.
+func TestSyncUpdateNetworkMismatchPreservesForeignState(t *testing.T) {
+	oldPool := recoveryNewPool("pool-n", "infra/net-a")
+	controller, rs, _ := recoveryNewController(t, oldPool)
+	if err := recoveryRegistrationSteps(t, controller, oldPool); err != nil {
+		t.Fatal(err)
 	}
-
-	controller, cacheAllocator := newTestController(t, newTestQueue(), indexer, nil, &appStatus, nil)
-	if err := cacheAllocator.Add(oldPool); err != nil {
-		t.Fatalf("seeding cache: %v", err)
+	const foreign = "other/net-a"
+	if err := controller.dhcp.AddPool(foreign, "192.168.2.1", "255.255.255.0", "192.168.2.1", nil, "", nil, nil, 60, "other-interface"); err != nil {
+		t.Fatal(err)
 	}
-
-	event := testPoolEvent("pool-n", UPDATE, "net-new")
-	event.oldPoolNetworkName = "net-old"
-
-	if err := controller.sync(event); err != nil {
-		t.Fatalf("unexpected error: %s", err)
+	newPool := oldPool.DeepCopy()
+	newPool.Spec.NetworkName = foreign
+	rs.pool = newPool
+	controller.indexer = newTestIndexer()
+	if err := controller.indexer.Add(newPool); err != nil {
+		t.Fatal(err)
 	}
-
-	if appStatus.Load() != APP_RESTART {
-		t.Errorf("app status = %d, want %d after a networkname change", appStatus.Load(), APP_RESTART)
+	if err := controller.sync(testPoolEvent("pool-n", UPDATE, foreign)); !errors.Is(err, ErrPoolUnregistrable) {
+		t.Fatalf("mismatched update = %v, want unregistrable", err)
 	}
-}
-
-// renaming a pool into a networkname which a live registration already
-// claims would tear the whole application down and then fail during the
-// re-registration: that update must be rejected before any teardown, so
-// the currently registered configuration keeps serving
-func TestSyncUpdateRejectsNetworkNameChangeToClaimedNetwork(t *testing.T) {
-	var appStatus atomic.Int32
-	appStatus.Store(APP_RUNNING)
-	oldPool := testPool("pool-n", "net-old", 60)
-	newPool := testPool("pool-n", "net-claimed", 60)
-
-	indexer := newTestIndexer()
-	if err := indexer.Add(newPool); err != nil {
-		t.Fatalf("seeding indexer: %v", err)
+	if controller.appStatus.Load() != APP_RUNNING {
+		t.Fatal("network mismatch must stop the old service without restarting into the foreign network")
 	}
-
-	controller, cacheAllocator := newTestController(t, newTestQueue(), indexer, nil, &appStatus, nil)
-	if err := cacheAllocator.Add(oldPool); err != nil {
-		t.Fatalf("seeding cache: %v", err)
+	if controller.cache.Check(oldPool) || controller.dhcp.CheckPool(oldPool.Spec.NetworkName) {
+		t.Fatal("the old local registration survived the scope mismatch")
 	}
-
-	// a live registration already owns the target networkname
-	if err := controller.dhcp.AddPool("net-claimed", "192.168.2.1", "255.255.255.0", "192.168.2.1", nil, "", nil, nil, 60, "test-fake-iface-2"); err != nil {
-		t.Fatalf("registering the claimant dhcp pool: %v", err)
-	}
-
-	event := testPoolEvent("pool-n", UPDATE, "net-claimed")
-	event.oldPoolNetworkName = "net-old"
-
-	if err := controller.sync(event); err == nil {
-		t.Fatal("sync(UPDATE) accepted a networkname change into an already claimed networkname")
-	}
-
-	if appStatus.Load() != APP_RUNNING {
-		t.Errorf("the rejected rename started an application restart: app status got %d, want %d", appStatus.Load(), APP_RUNNING)
-	}
-	if !cacheAllocator.Check(oldPool) {
-		t.Error("the rejected rename dropped the live registration from the cache")
+	if !controller.dhcp.CheckPool(foreign) {
+		t.Fatal("the mismatch removed foreign DHCP state")
 	}
 }
 
@@ -1036,33 +1122,33 @@ func TestSyncAddRejectedPoolCountsAsHandledDuringInit(t *testing.T) {
 	var appStatus atomic.Int32
 	appStatus.Store(APP_INIT)
 	startupGate := newTestGate("pool-b")
-	foreignPool := testPool("pool-a", "net-dup", 60)
+	foreignPool := testPool("pool-a", "infra/net-dup", 60)
 
 	indexer := newTestIndexer()
 	if err := indexer.Add(foreignPool); err != nil {
 		t.Fatalf("seeding indexer: %v", err)
 	}
-	if err := indexer.Add(testPool("pool-b", "net-dup", 60)); err != nil {
+	if err := indexer.Add(testPool("pool-b", "infra/net-dup", 60)); err != nil {
 		t.Fatalf("seeding indexer: %v", err)
 	}
 
 	controller, cacheAllocator := newTestController(t, newTestQueue(), indexer, nil, &appStatus, startupGate)
 
 	// a live registration owns the net-dup keys and holds one allocation
-	if err := controller.ipam.NewSubnet("net-dup", "192.168.1.0/24", "192.168.1.10", "192.168.1.100"); err != nil {
+	if err := controller.ipam.NewSubnet("infra/net-dup", "192.168.1.0/24", "192.168.1.10", "192.168.1.100"); err != nil {
 		t.Fatalf("registering the live pool's ipam subnet: %v", err)
 	}
-	if _, err := controller.ipam.GetIP("net-dup", "192.168.1.10"); err != nil {
+	if _, err := controller.ipam.GetIP("infra/net-dup", "192.168.1.10"); err != nil {
 		t.Fatalf("allocating the live pool's ip: %v", err)
 	}
-	if err := controller.dhcp.AddPool("net-dup", "192.168.1.1", "255.255.255.0", "192.168.1.1", nil, "", nil, nil, 60, "test-fake-iface"); err != nil {
+	if err := controller.dhcp.AddPool("infra/net-dup", "192.168.1.1", "255.255.255.0", "192.168.1.1", nil, "", nil, nil, 60, "test-fake-iface"); err != nil {
 		t.Fatalf("registering the live pool's dhcp pool: %v", err)
 	}
 	if err := cacheAllocator.Add(foreignPool); err != nil {
 		t.Fatalf("caching the live pool: %v", err)
 	}
 
-	if err := controller.sync(testPoolEvent("pool-b", ADD, "net-dup")); err == nil {
+	if err := controller.sync(testPoolEvent("pool-b", ADD, "infra/net-dup")); err == nil {
 		t.Fatal("sync(ADD) for an already-claimed networkname returned nil, want a rejection error")
 	}
 	if startupGate.Settled() != 1 {
@@ -1070,7 +1156,7 @@ func TestSyncAddRejectedPoolCountsAsHandledDuringInit(t *testing.T) {
 	}
 
 	// the rate-limited retries of the same event must not double count
-	if err := controller.sync(testPoolEvent("pool-b", ADD, "net-dup")); err == nil {
+	if err := controller.sync(testPoolEvent("pool-b", ADD, "infra/net-dup")); err == nil {
 		t.Fatal("the retried sync(ADD) returned nil, want a rejection error")
 	}
 	if startupGate.Settled() != 1 {
@@ -1087,7 +1173,7 @@ func TestSyncAddVanishedPoolCountsAsHandledDuringInit(t *testing.T) {
 	startupGate := newTestGate("pool-z")
 	controller, _ := newTestController(t, newTestQueue(), newTestIndexer(), nil, &appStatus, startupGate)
 
-	if err := controller.sync(testPoolEvent("pool-z", ADD, "net-z")); err != nil {
+	if err := controller.sync(testPoolEvent("pool-z", ADD, "infra/net-z")); err != nil {
 		t.Fatalf("sync(ADD) for a vanished pool returned error %v, want nil", err)
 	}
 	if startupGate.Settled() != 1 {
@@ -1124,13 +1210,13 @@ func TestSyncUpdateAttemptsRegistrationForUnregisteredPool(t *testing.T) {
 	appStatus.Store(APP_INIT)
 	startupGate := newTestGate("pool-r")
 	indexer := newTestIndexer()
-	if err := indexer.Add(testPool("pool-r", "net-fresh", 60)); err != nil {
+	if err := indexer.Add(testPool("pool-r", "infra/net-fresh", 60)); err != nil {
 		t.Fatalf("seeding indexer: %v", err)
 	}
 
 	controller, _ := newTestController(t, newTestQueue(), indexer, nil, &appStatus, startupGate)
 
-	event := testPoolEvent("pool-r", UPDATE, "net-fresh")
+	event := testPoolEvent("pool-r", UPDATE, "infra/net-fresh")
 
 	if err := controller.sync(event); err != nil {
 		if strings.Contains(err.Error(), "does not exists in cache") {
@@ -1161,33 +1247,33 @@ func TestSyncUpdateAttemptsRegistrationForUnregisteredPool(t *testing.T) {
 func TestSyncUpdateForeignCacheEntryDoesNotCascadeRestart(t *testing.T) {
 	var appStatus atomic.Int32
 	appStatus.Store(APP_RUNNING)
-	foreignPool := testPool("pool-a", "net-shared", 60)
+	foreignPool := testPool("pool-a", "infra/net-shared", 60)
 
 	indexer := newTestIndexer()
 	if err := indexer.Add(foreignPool); err != nil {
 		t.Fatalf("seeding indexer: %v", err)
 	}
-	if err := indexer.Add(testPool("pool-b", "net-shared", 60)); err != nil {
+	if err := indexer.Add(testPool("pool-b", "infra/net-shared", 60)); err != nil {
 		t.Fatalf("seeding indexer: %v", err)
 	}
 
 	controller, cacheAllocator := newTestController(t, newTestQueue(), indexer, nil, &appStatus, nil)
 
 	// a live registration owns the net-shared keys and holds one allocation
-	if err := controller.ipam.NewSubnet("net-shared", "192.168.1.0/24", "192.168.1.10", "192.168.1.100"); err != nil {
+	if err := controller.ipam.NewSubnet("infra/net-shared", "192.168.1.0/24", "192.168.1.10", "192.168.1.100"); err != nil {
 		t.Fatalf("registering the live pool's ipam subnet: %v", err)
 	}
-	if _, err := controller.ipam.GetIP("net-shared", "192.168.1.10"); err != nil {
+	if _, err := controller.ipam.GetIP("infra/net-shared", "192.168.1.10"); err != nil {
 		t.Fatalf("allocating the live pool's ip: %v", err)
 	}
-	if err := controller.dhcp.AddPool("net-shared", "192.168.1.1", "255.255.255.0", "192.168.1.1", nil, "", nil, nil, 60, "test-fake-iface"); err != nil {
+	if err := controller.dhcp.AddPool("infra/net-shared", "192.168.1.1", "255.255.255.0", "192.168.1.1", nil, "", nil, nil, 60, "test-fake-iface"); err != nil {
 		t.Fatalf("registering the live pool's dhcp pool: %v", err)
 	}
 	if err := cacheAllocator.Add(foreignPool); err != nil {
 		t.Fatalf("caching the live pool: %v", err)
 	}
 
-	if err := controller.sync(testPoolEvent("pool-b", UPDATE, "net-shared")); err == nil {
+	if err := controller.sync(testPoolEvent("pool-b", UPDATE, "infra/net-shared")); err == nil {
 		t.Fatal("sync(UPDATE) for a pool with a claimed networkname returned nil, want a rejection error")
 	} else if !strings.Contains(err.Error(), "already registered") {
 		t.Errorf("error = %v, want the duplicate networkname rejection", err)
@@ -1196,10 +1282,10 @@ func TestSyncUpdateForeignCacheEntryDoesNotCascadeRestart(t *testing.T) {
 	if appStatus.Load() != APP_RUNNING {
 		t.Errorf("app status = %d after the rejected update, want %d: the foreign registration must not start an application restart", appStatus.Load(), APP_RUNNING)
 	}
-	if used := controller.ipam.Used("net-shared"); used < 1 {
+	if used := controller.ipam.Used("infra/net-shared"); used < 1 {
 		t.Errorf("live allocation of net-shared wiped: used=%d, want >= 1", used)
 	}
-	if !controller.dhcp.CheckPool("net-shared") {
+	if !controller.dhcp.CheckPool("infra/net-shared") {
 		t.Error("the live pool's dhcp pool was removed by the unrelated update")
 	}
 	if !cacheAllocator.Check(foreignPool) {
@@ -1215,7 +1301,7 @@ func TestSyncUpdateForeignCacheEntryDoesNotCascadeRestart(t *testing.T) {
 func TestSyncUpdateListenerRepairAlreadyRunningConverges(t *testing.T) {
 	var appStatus atomic.Int32
 	appStatus.Store(APP_RUNNING)
-	pool := testPool("pool-n2", "net-n2", 60)
+	pool := testPool("pool-n2", "infra/net-n2", 60)
 
 	indexer := newTestIndexer()
 	indexer.Add(pool)
@@ -1228,235 +1314,57 @@ func TestSyncUpdateListenerRepairAlreadyRunningConverges(t *testing.T) {
 		return fmt.Errorf("%w: network %s", dhcp.ErrServerAlreadyRunning, networkName)
 	}
 
-	if err := controller.sync(testPoolEvent("pool-n2", UPDATE, "net-n2")); err != nil {
+	if err := controller.sync(testPoolEvent("pool-n2", UPDATE, "infra/net-n2")); err != nil {
 		t.Errorf("sync(UPDATE) returned error %v, want nil for the converged already-running repair", err)
 	}
 }
 
-// TestSyncUpdateResyncReroutesSwallowedNetworkNameChange pins the review
-// finding: a networkname change which arrives while the application is
-// initializing is ignored, but the registration keeps serving under the
-// old networkname. the resync update which follows (old==new networkname)
-// used to misread the pool as never-registered and re-register it a
-// second time under the new name, leaving two live registrations of the
-// same pool - the stale one under the old networkname could never be
-// cleaned by a later event again. the resync must route the rename
-// through the regular change handling instead, which tears the old
-// registration down through the restart flow.
-func TestSyncUpdateResyncReroutesSwallowedNetworkNameChange(t *testing.T) {
-	stubNicMutation(t)
-
-	// the pool status the registration consults survives at the api
-	stored := testPool("pool-n", "net-old", 60)
-	rs := ippoolBehaviorNewRestState(stored)
-	srv := httptest.NewServer(rs.ippoolBehaviorHandler())
-	t.Cleanup(srv.Close)
-
-	var appStatus atomic.Int32
-	appStatus.Store(APP_INIT)
-	startupGate := newTestGate("pool-n")
-
-	oldSpec := testPool("pool-n", "net-old", 60)
-	newSpec := testPool("pool-n", "net-new", 60)
-
-	indexer := newTestIndexer()
-	if err := indexer.Add(oldSpec); err != nil {
-		t.Fatalf("seeding indexer: %v", err)
+// Scope loss is actionable during startup, not a swallowed ordinary
+// configuration update. Repeated resyncs cannot publish a foreign pool.
+func TestSyncNetworkMismatchDuringInitCannotDoubleRegister(t *testing.T) {
+	oldPool := recoveryNewPool("pool-n", "infra/net-a")
+	controller, rs, _ := recoveryNewController(t, oldPool)
+	controller.appStatus.Store(APP_INIT)
+	controller.gate = newTestGate(oldPool.Name)
+	if err := recoveryRegistrationSteps(t, controller, oldPool); err != nil {
+		t.Fatal(err)
 	}
-
-	controller, cacheAllocator := newTestController(t, newTestQueue(), indexer, nil, &appStatus, startupGate)
-	cs, err := kihclientset.NewForConfig(&rest.Config{Host: srv.URL})
-	if err != nil {
-		t.Fatalf("creating clientset: %v", err)
+	renamed := oldPool.DeepCopy()
+	renamed.Spec.NetworkName = "infra/net-new"
+	rs.pool = renamed
+	controller.indexer = newTestIndexer()
+	if err := controller.indexer.Add(renamed); err != nil {
+		t.Fatal(err)
 	}
-	controller.kihClientset = cs
-	// the listener seam keeps the registration off the host network
-	controller.runListener = func(networkName string, nic string) error {
-		return nil
-	}
-
-	// the startup registration settles under the old networkname
-	if err := controller.sync(testPoolEvent("pool-n", ADD, "net-old")); err != nil {
-		t.Fatalf("the startup registration failed: %v", err)
-	}
-	if !cacheAllocator.Check(oldSpec) {
-		t.Fatal("the startup registration did not publish the pool under the old networkname")
-	}
-	if net, live := controller.registeredPools["pool-n"]; !live || net != "net-old" {
-		t.Fatalf("the settled registration was not recorded: registeredPools[pool-n] = %q, live=%v", net, live)
-	}
-
-	// the rename arrives while the application is initializing: the update
-	// is ignored, the registration keeps serving under the old networkname.
-	// the rename is persisted, so the api serves the new spec from now on
-	// (exactly like a cluster where the object was updated).
-	if err := indexer.Update(newSpec); err != nil {
-		t.Fatalf("applying the rename to the index: %v", err)
-	}
-	rs.pool = newSpec.DeepCopy()
-	renameEvent := testPoolEvent("pool-n", UPDATE, "net-new")
-	renameEvent.oldPoolNetworkName = "net-old"
-	if err := controller.sync(renameEvent); err != nil {
-		t.Fatalf("the initializing application must ignore the rename update: %v", err)
-	}
-	if appStatus.Load() != APP_INIT {
-		t.Fatalf("app status = %d, want %d: the swallowed rename must not restart the initializing application", appStatus.Load(), APP_INIT)
-	}
-
-	// a resync update (old==new networkname) must not double-register
-	// while the application is initializing either: it is routed through
-	// the change handling, which ignores it until the application runs
-	resyncEvent := testPoolEvent("pool-n", UPDATE, "net-new")
-	if err := controller.sync(resyncEvent); err != nil {
-		t.Fatalf("the resync during initialization returned an error: %v", err)
-	}
-	if controller.dhcp.CheckPool("net-new") || cacheAllocator.Check(newSpec) {
-		t.Fatal("the resync during initialization double-registered the pool")
-	}
-
-	// once the application runs, the resync routes the swallowed rename
-	// through the restart flow instead of registering a second time
-	appStatus.Store(APP_RUNNING)
-	if err := controller.sync(resyncEvent); err != nil {
-		t.Fatalf("the resync of the swallowed rename returned an error: %v", err)
-	}
-	if appStatus.Load() != APP_RESTART {
-		t.Errorf("app status = %d, want %d: the swallowed rename must take the restart flow", appStatus.Load(), APP_RESTART)
-	}
-
-	// no second registration exists: the new networkname has no live
-	// sub-resources, the old registration is the one the era restart
-	// tears down
-	if controller.dhcp.CheckPool("net-new") {
-		t.Error("the resync registered a second dhcp pool under the new networkname")
-	}
-	if cacheAllocator.Check(newSpec) {
-		t.Error("the resync published a second cache entry under the new networkname")
-	}
-	if controller.ipam.Used("net-new") != 0 {
-		t.Error("the resync registered a second ipam subnet under the new networkname")
-	}
-	if !controller.dhcp.CheckPool("net-old") {
-		t.Error("the old registration must stay live until the era restart tears it down")
-	}
-	if net, live := controller.registeredPools["pool-n"]; !live || net != "net-old" {
-		t.Errorf("the restart flow must keep the recorded registration untouched: registeredPools[pool-n] = %q, live=%v", net, live)
-	}
-	if startupGate.Settled() != 1 {
-		t.Errorf("ippool count = %d, want 1 (a single settled registration)", startupGate.Settled())
+	for _, phase := range []int32{APP_INIT, APP_RUNNING} {
+		controller.appStatus.Store(phase)
+		if err := controller.sync(testPoolEvent(oldPool.Name, UPDATE, renamed.Spec.NetworkName)); !errors.Is(err, ErrPoolUnregistrable) {
+			t.Fatalf("phase %d mismatch = %v, want unregistrable", phase, err)
+		}
+		if controller.dhcp.CheckPool(oldPool.Spec.NetworkName) || controller.dhcp.CheckPool(renamed.Spec.NetworkName) || controller.cache.Check(oldPool) || controller.cache.Check(renamed) {
+			t.Fatal("out-of-scope resync retained or double-registered the pool")
+		}
+		if controller.appStatus.Load() != phase {
+			t.Fatal("scope mismatch initiated an application restart")
+		}
 	}
 }
 
-// TestSyncDeleteOfRenamedPoolTearsDownTheRecordedRegistration pins the
-// review finding: a pool which was renamed while the application was
-// initializing keeps its live registration under the OLD networkname
-// (the rename is swallowed during APP_INIT). when the object is then
-// deleted, the event carries only the final networkname, so the delete
-// path used to report "never registered; skipping cleanup" and leak the
-// whole registration: the dhcp pool, the ipam subnet, the cache entry,
-// the nic address and the registeredPools record all stayed behind. the
-// deletion must resolve the recorded networkname (exactly like the
-// update path) and tear the live registration down.
-func TestSyncDeleteOfRenamedPoolTearsDownTheRecordedRegistration(t *testing.T) {
-	stubNicMutation(t)
-
-	// the cleanup releases the server ip from the bind interface: record
-	// the seam so the teardown of the old registration is observable
-	var removedNicIPs []string
-	origRemove := network.RemoveIpFromNic
-	network.RemoveIpFromNic = func(nic string, ip4 string) error {
-		removedNicIPs = append(removedNicIPs, nic+" "+ip4)
-
-		return nil
+// A deletion event carries the final, possibly foreign network name;
+// teardown must still find the local registration by object identity.
+func TestSyncDeleteOfRenamedPoolTearsDownRecordedRegistration(t *testing.T) {
+	oldPool := recoveryNewPool("pool-d", "infra/net-a")
+	controller, rs, _ := recoveryNewController(t, oldPool)
+	if err := recoveryRegistrationSteps(t, controller, oldPool); err != nil {
+		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		network.RemoveIpFromNic = origRemove
-	})
-
-	// the pool status the registration consults survives at the api
-	stored := testPool("pool-d", "net-old", 60)
-	rs := ippoolBehaviorNewRestState(stored)
-	srv := httptest.NewServer(rs.ippoolBehaviorHandler())
-	t.Cleanup(srv.Close)
-
-	var appStatus atomic.Int32
-	appStatus.Store(APP_INIT)
-	startupGate := newTestGate("pool-d")
-
-	oldSpec := testPool("pool-d", "net-old", 60)
-	newSpec := testPool("pool-d", "net-new", 60)
-
-	indexer := newTestIndexer()
-	if err := indexer.Add(oldSpec); err != nil {
-		t.Fatalf("seeding indexer: %v", err)
+	controller.indexer = newTestIndexer()
+	rs.pool = nil
+	if err := controller.sync(testPoolEvent(oldPool.Name, DELETE, "infra/net-new")); err != nil {
+		t.Fatal(err)
 	}
-
-	controller, cacheAllocator := newTestController(t, newTestQueue(), indexer, nil, &appStatus, startupGate)
-	cs, err := kihclientset.NewForConfig(&rest.Config{Host: srv.URL})
-	if err != nil {
-		t.Fatalf("creating clientset: %v", err)
-	}
-	controller.kihClientset = cs
-	// the listener seam keeps the registration off the host network
-	controller.runListener = func(networkName string, nic string) error {
-		return nil
-	}
-
-	// the startup registration settles under the old networkname
-	if err := controller.sync(testPoolEvent("pool-d", ADD, "net-old")); err != nil {
-		t.Fatalf("the startup registration failed: %v", err)
-	}
-	if net, live := controller.registeredPools["pool-d"]; !live || net != "net-old" {
-		t.Fatalf("the settled registration was not recorded: registeredPools[pool-d] = %q, live=%v", net, live)
-	}
-
-	// the rename arrives while the application is initializing and is
-	// swallowed; the rename is persisted, so the api serves the new spec
-	// from now on
-	if err := indexer.Update(newSpec); err != nil {
-		t.Fatalf("applying the rename to the index: %v", err)
-	}
-	rs.pool = newSpec.DeepCopy()
-	renameEvent := testPoolEvent("pool-d", UPDATE, "net-new")
-	renameEvent.oldPoolNetworkName = "net-old"
-	if err := controller.sync(renameEvent); err != nil {
-		t.Fatalf("the initializing application must ignore the rename update: %v", err)
-	}
-
-	// the renamed object is deleted: the event carries only the final
-	// networkname, and the handler must converge on it
-	if err := indexer.Delete(newSpec); err != nil {
-		t.Fatalf("removing the deleted object from the index: %v", err)
-	}
-	if err := controller.sync(testPoolEvent("pool-d", DELETE, "net-new")); err != nil {
-		t.Fatalf("the deletion of the renamed pool returned an error: %v", err)
-	}
-
-	// the registration under the old networkname is fully torn down
-	if controller.dhcp.CheckPool("net-old") {
-		t.Error("the dhcp pool of the old registration survived the deletion")
-	}
-	if used := controller.ipam.Used("net-old"); used != 0 {
-		t.Errorf("ipam used of net-old = %d, want 0 (the subnet must be deleted)", used)
-	}
-	if cacheAllocator.Check(oldSpec) {
-		t.Error("the cache entry of the old registration survived the deletion")
-	}
-	if _, live := controller.registeredPools["pool-d"]; live {
-		t.Error("the registeredPools record of the renamed pool survived the deletion")
-	}
-	if len(removedNicIPs) == 0 {
-		t.Error("the cleanup never removed the server ip from the bind interface")
-	} else if removedNicIPs[0] != "test-fake-iface 192.168.1.1/24" {
-		t.Errorf("removed nic ip = %q, want the server ip of the old registration", removedNicIPs[0])
-	}
-
-	// no registration ever existed under the new networkname
-	if controller.dhcp.CheckPool("net-new") {
-		t.Error("a dhcp pool exists under the new networkname")
-	}
-	if cacheAllocator.Check(newSpec) {
-		t.Error("a cache entry exists under the new networkname")
+	if controller.dhcp.CheckPool(oldPool.Spec.NetworkName) || controller.cache.Check(oldPool) {
+		t.Fatal("the deletion leaked the registration under the old network key")
 	}
 }
 
@@ -1486,7 +1394,7 @@ func TestRunJoinsTheInFlightSyncBeforeReturning(t *testing.T) {
 
 	queue := newTestQueue()
 	indexer := newTestIndexer()
-	if err := indexer.Add(testPool("pool-j", "net-j", 60)); err != nil {
+	if err := indexer.Add(testPool("pool-j", "infra/net-j", 60)); err != nil {
 		t.Fatalf("seeding indexer: %v", err)
 	}
 
@@ -1505,7 +1413,7 @@ func TestRunJoinsTheInFlightSyncBeforeReturning(t *testing.T) {
 		close(done)
 	}()
 
-	queue.Add(testPoolEvent("pool-j", ADD, "net-j"))
+	queue.Add(testPoolEvent("pool-j", ADD, "infra/net-j"))
 	<-started
 
 	close(stop)
@@ -1538,7 +1446,7 @@ func TestRunSettlesSnapshotKeysDeletedBeforeTheInformerStarted(t *testing.T) {
 	// the store holds another pool but not the snapshot's pool-gone: its
 	// deletion happened between the startup LIST and the informer start
 	indexer := newTestIndexer()
-	if err := indexer.Add(testPool("pool-live", "net-live", 60)); err != nil {
+	if err := indexer.Add(testPool("pool-live", "infra/net-live", 60)); err != nil {
 		t.Fatalf("seeding indexer: %v", err)
 	}
 
@@ -1552,6 +1460,19 @@ func TestRunSettlesSnapshotKeysDeletedBeforeTheInformerStarted(t *testing.T) {
 		close(done)
 	}()
 
+	deadline := time.NewTimer(shutdownWait)
+	defer deadline.Stop()
+	tick := time.NewTicker(time.Millisecond)
+	defer tick.Stop()
+	for startupGate.Settled() == 0 {
+		select {
+		case <-tick.C:
+		case <-deadline.C:
+			close(stop)
+			<-done
+			t.Fatal("the deleted snapshot key never settled after its API verification")
+		}
+	}
 	close(stop)
 
 	select {
@@ -1579,77 +1500,179 @@ func TestRunSettlesSnapshotKeysDeletedBeforeTheInformerStarted(t *testing.T) {
 // unregistrable (the startup gate counts the pool instead of retrying the
 // conflict forever), and the first registration stays untouched.
 func TestRegisterIPPoolRejectsDuplicateBindInterface(t *testing.T) {
-	stubNicMutation(t)
+	pool := recoveryNewPool("pool-b", "infra/net-b")
+	controller, _, _ := recoveryNewController(t, pool)
+	controller.appStatus.Store(APP_INIT)
+	controller.gate = newTestGate(pool.Name)
+	// Preserve the defensive allocator guard without making one scoped
+	// controller discover and register a second network.
+	if err := controller.dhcp.AddPool("infra/net-a", "192.168.1.1", "255.255.255.0", "192.168.1.1", nil, "", nil, nil, 60, pool.Spec.BindInterface); err != nil {
+		t.Fatal(err)
+	}
+	if cleanup, err := controller.registerIPPool(pool); !errors.Is(err, ErrPoolUnregistrable) || cleanup {
+		t.Fatalf("interface conflict = (%v, %v), want definitive rejection before mutation", cleanup, err)
+	}
+	if controller.dhcp.CheckPool(pool.Spec.NetworkName) || controller.cache.Check(pool) || controller.ipam.Used(pool.Spec.NetworkName) != 0 {
+		t.Fatal("the rejected pool published local state")
+	}
+	if !controller.dhcp.CheckPool("infra/net-a") || !controller.gate.Open() {
+		t.Fatal("interface conflict must preserve the incumbent and settle the rejected pool")
+	}
+}
 
-	// the live registration of pool-a on the shared nic
-	live := testPool("pool-a", "net-a", 60)
-	rs := ippoolBehaviorNewRestState(live)
-	srv := httptest.NewServer(rs.ippoolBehaviorHandler())
-	t.Cleanup(srv.Close)
+func TestSyncSelectorLossPreservesLedgerAndRestorationReplays(t *testing.T) {
+	for _, action := range []string{DELETE, UPDATE} {
+		t.Run(action, func(t *testing.T) {
+			pool := recoveryNewPool("pool1", "infra/net-a")
+			const mac = "02:aa:bb:cc:dd:01"
+			ref := util.AllocationRef("tenant", "vm", mac)
+			pool.Status.IPv4.Allocated = map[string]string{"10.0.0.2": ref}
+			c, rs, _ := recoveryNewController(t, pool)
+			rs.vmnetcfgs = []*kihv1.VirtualMachineNetworkConfig{
+				recoveryNewVMNetCfg("tenant", "vm", "10.0.0.2", mac, pool.Spec.NetworkName),
+			}
+			if err := recoveryRegistrationSteps(t, c, pool); err != nil {
+				t.Fatal(err)
+			}
+			if err := c.dhcp.AddLease(mac, pool.Spec.NetworkName, "10.0.0.2", "tenant/vm"); err != nil {
+				t.Fatal(err)
+			}
+			c.indexer = newTestIndexer()
+			before := rs.pool.DeepCopy()
+			writes := rs.putCount
+			delete(rs.pool.Labels, util.NetworkNamespaceLabel)
+			if err := c.sync(testPoolEvent(pool.Name, action, pool.Spec.NetworkName)); !errors.Is(err, ErrPoolUnregistrable) {
+				t.Fatalf("selector loss = %v, want unregistrable", err)
+			}
+			if rs.putCount != writes || rs.pool.Status.IPv4.Allocated["10.0.0.2"] != ref || !rs.pool.Status.LastUpdate.Equal(&before.Status.LastUpdate) {
+				t.Fatal("selector loss mutated the durable reservation ledger")
+			}
+			if c.cache.Check(pool) || c.dhcp.CheckPool(pool.Spec.NetworkName) || c.dhcp.CheckLease(mac) || c.ipam.Used(pool.Spec.NetworkName) != 0 {
+				t.Fatal("selector loss retained local serving state")
+			}
+			rs.pool.Labels[util.NetworkNamespaceLabel] = "infra"
+			if err := c.indexer.Add(rs.pool.DeepCopy()); err != nil {
+				t.Fatal(err)
+			}
+			if err := c.sync(testPoolEvent(pool.Name, ADD, pool.Spec.NetworkName)); err != nil {
+				t.Fatalf("restored selector replay: %v", err)
+			}
+			if !c.cache.Check(pool) || !c.dhcp.CheckPool(pool.Spec.NetworkName) {
+				t.Fatal("label restoration did not restore service")
+			}
+			if _, err := c.ipam.GetIP(pool.Spec.NetworkName, ""); err == nil {
+				t.Fatal("restoration offered the surviving owner's address to a new allocation")
+			}
+			if _, err := c.ipam.ReclaimIP(pool.Spec.NetworkName, "10.0.0.2", ref); err != nil {
+				t.Fatalf("surviving owner cannot reclaim its reservation: %v", err)
+			}
+		})
+	}
+}
 
-	var appStatus atomic.Int32
-	appStatus.Store(APP_INIT)
-	startupGate := newTestGate("pool-a", "pool-b")
+func TestSyncDisappearanceAPIErrorRetainsRegistrationAndRetries(t *testing.T) {
+	for _, action := range []string{DELETE, ADD} {
+		t.Run(action, func(t *testing.T) {
+			pool := recoveryNewPool("pool1", "infra/net-a")
+			c, rs, _ := recoveryNewController(t, pool)
+			if err := recoveryRegistrationSteps(t, c, pool); err != nil {
+				t.Fatal(err)
+			}
+			c.indexer = newTestIndexer()
+			c.queue = newTestQueue()
+			t.Cleanup(c.queue.ShutDown)
+			c.appStatus.Store(APP_INIT)
+			c.gate = newTestGate(pool.Name)
+			rs.getStatus = http.StatusInternalServerError
+			event := testPoolEvent(pool.Name, action, pool.Spec.NetworkName)
+			for range 6 {
+				err := c.sync(event)
+				if err == nil || errors.Is(err, ErrPoolUnregistrable) {
+					t.Fatalf("unverified disappearance = %v, want retryable", err)
+				}
+				c.handleErr(err, event)
+			}
+			if c.gate.Settled() != 0 || !c.cache.Check(pool) || !c.dhcp.CheckPool(pool.Spec.NetworkName) {
+				t.Fatal("exhausted API errors settled the gate or removed the live registration")
+			}
+			rs.getStatus = 0
+			rs.pool = nil
+			if err := c.sync(event); err != nil {
+				t.Fatalf("retry after authoritative deletion: %v", err)
+			}
+			if !c.gate.Open() || c.cache.Check(pool) || c.dhcp.CheckPool(pool.Spec.NetworkName) {
+				t.Fatal("NotFound did not settle and clean up the deleted registration")
+			}
+		})
+	}
+}
 
-	indexer := newTestIndexer()
-	if err := indexer.Add(live); err != nil {
-		t.Fatalf("seeding indexer: %v", err)
+func TestSyncVerificationDoesNotDiscoverLivePool(t *testing.T) {
+	pool := recoveryNewPool("pool1", "infra/net-a")
+	c, rs, _ := recoveryNewController(t, pool)
+	c.appStatus.Store(APP_INIT)
+	c.indexer = newTestIndexer()
+	for _, action := range []string{DELETE, ADD} {
+		if err := c.sync(testPoolEvent(pool.Name, action, pool.Spec.NetworkName)); err == nil || errors.Is(err, ErrPoolUnregistrable) {
+			t.Fatalf("live but unobserved pool = %v, want retryable informer wait", err)
+		}
 	}
-	if err := indexer.Add(testPool("pool-b", "net-b", 60)); err != nil {
-		t.Fatalf("seeding indexer: %v", err)
+	if c.cache.Check(pool) || c.dhcp.CheckPool(pool.Spec.NetworkName) || rs.putCount != 0 || c.gate.Settled() != 0 || len(c.indexer.List()) != 0 {
+		t.Fatal("unfiltered verification response entered discovery or durable state")
 	}
+	if err := c.indexer.Add(pool.DeepCopy()); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.sync(testPoolEvent(pool.Name, ADD, pool.Spec.NetworkName)); err != nil {
+		t.Fatal(err)
+	}
+	if !c.cache.Check(pool) || !c.gate.Open() {
+		t.Fatal("selected informer delivery did not register and settle the pool")
+	}
+}
 
-	controller, cacheAllocator := newTestController(t, newTestQueue(), indexer, nil, &appStatus, startupGate)
-	cs, err := kihclientset.NewForConfig(&rest.Config{Host: srv.URL})
-	if err != nil {
-		t.Fatalf("creating clientset: %v", err)
+func TestSyncDisappearanceUIDReplacementAndStaleDeleteKeepCurrentPool(t *testing.T) {
+	pool := recoveryNewPool("pool1", "infra/net-a")
+	pool.UID = "old"
+	c, rs, _ := recoveryNewController(t, pool)
+	if err := recoveryRegistrationSteps(t, c, pool); err != nil {
+		t.Fatal(err)
 	}
-	controller.kihClientset = cs
-	controller.runListener = func(networkName string, nic string) error {
-		return nil
+	const oldMAC = "02:00:00:00:00:01"
+	if err := c.dhcp.AddLease(oldMAC, pool.Spec.NetworkName, "10.0.0.2", "tenant/old"); err != nil {
+		t.Fatal(err)
 	}
-
-	// pool-a registers on the shared nic
-	if err := controller.sync(testPoolEvent("pool-a", ADD, "net-a")); err != nil {
-		t.Fatalf("the first registration failed: %v", err)
+	replacement := recoveryNewPool(pool.Name, pool.Spec.NetworkName)
+	replacement.UID = "new"
+	replacement.Spec.IPv4Config.Pool.Start = "10.0.0.3"
+	replacement.Spec.IPv4Config.Pool.End = "10.0.0.3"
+	rs.pool = replacement
+	c.indexer = newTestIndexer()
+	// The old DELETE arrives before the selected informer has the replacement.
+	if err := c.sync(testPoolEvent(pool.Name, DELETE, pool.Spec.NetworkName)); err == nil {
+		t.Fatal("replacement must wait for selected discovery")
 	}
-	if !controller.dhcp.CheckPool("net-a") {
-		t.Fatal("the first registration did not create its dhcp pool")
+	if c.cache.Check(pool) || c.dhcp.CheckLease(oldMAC) {
+		t.Fatal("the predecessor's allocator or lease survived its UID replacement")
 	}
-
-	// the api serves the second pool's object for its claim protection
-	rs.mu.Lock()
-	rs.pool = testPool("pool-b", "net-b", 60)
-	rs.mu.Unlock()
-
-	// pool-b claims the SAME bindinterface with another network: the
-	// registration must reject it definitively
-	err = controller.sync(testPoolEvent("pool-b", ADD, "net-b"))
-	if err == nil {
-		t.Fatal("the duplicate bindinterface registration returned nil, want a rejection")
+	if err := c.indexer.Add(replacement.DeepCopy()); err != nil {
+		t.Fatal(err)
 	}
-	if !errors.Is(err, ErrPoolUnregistrable) {
-		t.Errorf("error = %v, want the ErrPoolUnregistrable classification", err)
+	if err := c.sync(testPoolEvent(pool.Name, ADD, pool.Spec.NetworkName)); err != nil {
+		t.Fatal(err)
 	}
-
-	// none of pool-b's sub-resources exist
-	if controller.dhcp.CheckPool("net-b") {
-		t.Error("a dhcp pool was created for the rejected duplicate pool")
+	const newMAC = "02:00:00:00:00:02"
+	if ip, err := c.ipam.GetIP(pool.Spec.NetworkName, ""); err != nil || ip != "10.0.0.3" {
+		t.Fatalf("replacement range = %q, %v", ip, err)
 	}
-	if controller.ipam.Used("net-b") != 0 {
-		t.Error("an ipam subnet was created for the rejected duplicate pool")
+	if err := c.dhcp.AddLease(newMAC, pool.Spec.NetworkName, "10.0.0.3", "tenant/new"); err != nil {
+		t.Fatal(err)
 	}
-	if cacheAllocator.Check(testPool("pool-b", "net-b", 60)) {
-		t.Error("a cache entry was published for the rejected duplicate pool")
+	if err := c.sync(testPoolEvent(pool.Name, DELETE, pool.Spec.NetworkName)); err != nil {
+		t.Fatalf("stale DELETE against selected replacement: %v", err)
 	}
-
-	// the first registration is untouched and both pools settled the gate
-	// (the rejection is unregistrable, so it counts as handled)
-	if !controller.dhcp.CheckPool("net-a") {
-		t.Error("the live registration of the first pool must stay untouched")
-	}
-	if !startupGate.Open() {
-		t.Errorf("gate settled = %d out of %d, want the snapshot complete (the rejected pool counts as handled)",
-			startupGate.Settled(), startupGate.Target())
+	cached, err := c.cache.Get("pool", pool.Spec.NetworkName)
+	if err != nil || cached.(kihv1.IPPool).UID != replacement.UID || !c.dhcp.CheckLease(newMAC) || c.ipam.Used(pool.Spec.NetworkName) != 1 {
+		t.Fatal("stale deletion tore down the current replacement")
 	}
 }

@@ -2,6 +2,7 @@ package ippool
 
 import (
 	"context"
+	"fmt"
 	"sync/atomic"
 	"time"
 
@@ -9,7 +10,6 @@ import (
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
@@ -56,14 +56,14 @@ type EventHandler struct {
 	kcli           kubecli.KubevirtClient
 	appStatus      *atomic.Int32
 	startupGate    *gate.Gate
+	scope          util.NetworkScope
 }
 
 type Event struct {
-	key                string
-	action             string
-	poolName           string
-	poolNetworkName    string
-	oldPoolNetworkName string
+	key             string
+	action          string
+	poolName        string
+	poolNetworkName string
 }
 
 func NewEventHandler(
@@ -78,6 +78,7 @@ func NewEventHandler(
 	kihClientset *kihclientset.Clientset,
 	appStatus *atomic.Int32,
 	startupGate *gate.Gate,
+	scope util.NetworkScope,
 ) *EventHandler {
 	return &EventHandler{
 		ctx:            ctx,
@@ -91,6 +92,7 @@ func NewEventHandler(
 		kihClientset:   kihClientset,
 		appStatus:      appStatus,
 		startupGate:    startupGate,
+		scope:          scope,
 	}
 }
 
@@ -143,13 +145,18 @@ func (e *EventHandler) getKubeConfig() (config *rest.Config, err error) {
 }
 
 func (e *EventHandler) EventListener() (err error) {
+	if e.scope.NetworkName() == "" {
+		return fmt.Errorf("IPPool discovery requires a network scope")
+	}
 	log.Infof("(ippool.EventListener) starting the IPPool event listener")
 
-	vmWatcher := cache.NewListWatchFromClient(e.kihClientset.KubevirtiphelperV1().RESTClient(), "ippools", corev1.NamespaceAll, fields.Everything())
+	poolWatcher := cache.NewFilteredListWatchFromClient(e.kihClientset.KubevirtiphelperV1().RESTClient(), "ippools", corev1.NamespaceAll, func(options *metav1.ListOptions) {
+		options.LabelSelector = e.scope.Selector()
+	})
 
 	queue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
 
-	indexer, informer := cache.NewIndexerInformer(vmWatcher, &kihv1.IPPool{}, resyncPeriod, cache.ResourceEventHandlerFuncs{
+	indexer, informer := cache.NewIndexerInformer(poolWatcher, &kihv1.IPPool{}, resyncPeriod, cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			key, err := cache.MetaNamespaceKeyFunc(obj)
 			if err == nil {
@@ -165,27 +172,26 @@ func (e *EventHandler) EventListener() (err error) {
 			key, err := cache.MetaNamespaceKeyFunc(new)
 			if err == nil {
 				queue.Add(Event{
-					key:                key,
-					action:             UPDATE,
-					poolName:           new.(*kihv1.IPPool).ObjectMeta.Name,
-					poolNetworkName:    new.(*kihv1.IPPool).Spec.NetworkName,
-					oldPoolNetworkName: old.(*kihv1.IPPool).Spec.NetworkName,
+					key:             key,
+					action:          UPDATE,
+					poolName:        new.(*kihv1.IPPool).ObjectMeta.Name,
+					poolNetworkName: new.(*kihv1.IPPool).Spec.NetworkName,
 				})
 			}
 		},
 		DeleteFunc: func(obj interface{}) {
-			pool, isPool := util.UnwrapTombstone(obj).(*kihv1.IPPool)
-			if !isPool {
-				return
-			}
-
-			key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(pool)
+			// Tombstones need only their key: the fresh existence read in
+			// sync determines whether the object was deleted or deselected.
+			key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
 			if err == nil {
+				_, name, splitErr := cache.SplitMetaNamespaceKey(key)
+				if splitErr != nil {
+					return
+				}
 				queue.Add(Event{
-					key:             key,
-					action:          DELETE,
-					poolName:        pool.ObjectMeta.Name,
-					poolNetworkName: pool.Spec.NetworkName,
+					key:      key,
+					action:   DELETE,
+					poolName: name,
 				})
 			}
 		},
@@ -209,7 +215,7 @@ func (e *EventHandler) EventListener() (err error) {
 		return true, nil
 	}
 
-	controller := NewController(queue, indexer, informer, e.ctx, e.cache, e.ipam, e.dhcp, e.metrics, e.kihClientset, e.appStatus, e.startupGate, verifyVM)
+	controller := NewController(queue, indexer, informer, e.ctx, e.cache, e.ipam, e.dhcp, e.metrics, e.kihClientset, e.appStatus, e.startupGate, verifyVM, e.scope)
 	stop := make(chan struct{})
 
 	// join the controller on shutdown: EventListener only returns after

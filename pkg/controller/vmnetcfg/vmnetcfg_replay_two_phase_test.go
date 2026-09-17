@@ -251,7 +251,7 @@ func TestDeferredObjectSettlesTheStartupGate(t *testing.T) {
 		t.Fatalf("seeding the recorded object: %s", err)
 	}
 	startupGate := newTestGate(testNamespace+"/vm-a", testNamespace+"/vm-b")
-	controller := NewController(context.Background(), newTestQueue(), indexer, nil, e.cache, e.ipam, e.dhcp, e.metrics, e.client, e.appStatus, startupGate)
+	controller := NewController(context.Background(), newTestQueue(), indexer, nil, e.cache, e.ipam, e.dhcp, e.metrics, e.client, e.appStatus, startupGate, e.scope, e.reconcileMu)
 
 	// the deferred object is processed and counted during APP_INIT
 	if err := controller.sync(Event{key: testNamespace + "/vm-a", action: ADD}); err != nil {

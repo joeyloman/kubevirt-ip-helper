@@ -6,6 +6,8 @@ metadata:
   name: e2e-pool
   labels:
     app: kubevirt-ip-helper-e2e
+    kubevirtiphelper/network: kubevirt-ip-helper-e2e
+    kubevirtiphelper/network-namespace: kubevirt-ip-helper
 spec:
   ipv4config:
     serverip: 10.77.0.2

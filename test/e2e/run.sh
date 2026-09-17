@@ -67,11 +67,13 @@ E2E_CLUSTER_STATE_FILE="${E2E_ARTIFACTS_DIR}/cluster-state"
 export E2E_CLUSTER_STATE_FILE
 
 KIND="${E2E_BIN_DIR}/kind"
-HELPER_DEPLOYMENT="kubevirt-ip-helper"
-HELPER_SELECTOR="app=kubevirt-ip-helper"
-LEADER_SELECTOR="kubevirtiphelper/leader=active"
-LEADER_LEASE="kubevirt-ip-helper-lock"
-METRICS_SERVICE="kubevirt-ip-helper-metrics"
+HELPER_DEPLOYMENT="${KIH_HELPER_DEPLOYMENT}"
+HELPER_SELECTOR="${KIH_HELPER_SELECTOR}"
+LEADER_SELECTOR="${HELPER_SELECTOR},kubevirtiphelper/leader=active"
+LEADER_LEASE="${KIH_LEADER_LEASE}"
+METRICS_SERVICE="${KIH_METRICS_SERVICE}"
+HELPER_REPLICAS=2
+export E2E_SECOND_NETWORK_EXPECTED=0
 E2E_VM_BOOT_TIMEOUT="${E2E_VM_BOOT_TIMEOUT:-300}"
 E2E_PRED_SECONDS="${E2E_PRED_SECONDS:-20}"
 # Lease-loss fast-fail: repeated "NO LEASE FOUND" entries for the owner MAC
@@ -249,7 +251,7 @@ restore_stopped_worker() { # <absolute SECONDS deadline>
 }
 
 finish() {
-  local rc=$? collection_rc=0 report_rc=0 diagnostic_errors cleanup_rc=0 network
+  local rc="${1:-$?}" collection_rc=0 report_rc=0 diagnostic_errors cleanup_rc=0 network
   trap - EXIT
   trap '' INT TERM HUP
   set +e
@@ -486,7 +488,97 @@ resolve_runtime() {
   command -v timeout > /dev/null 2>&1 || die "GNU timeout is required"
   command -v jq > /dev/null 2>&1 || die "jq is required for reports and evidence"
   command -v python3 > /dev/null 2>&1 || die "Python 3 is required for passive DHCP evidence"
+  command -v openssl > /dev/null 2>&1 || die "OpenSSL is required for webhook TLS qualification"
   export E2E_RUNTIME="${RUNTIME}"
+}
+
+# A command failure alone is not admission proof: transport, schema and RBAC
+# failures must not masquerade as a webhook's explicit validation denial.
+admission_rejects() { # <manifest>
+  local response
+  if response="$(kubectl create --dry-run=server -f "$1" 2>&1)"; then
+    printf '%s\n' "${response}" >&2
+    return 1
+  fi
+  printf '%s\n' "${response}" > "${1}.admission.txt"
+  [[ "${response}" == *'admission webhook "'*'denied the request'* ]]
+}
+
+webhook_ready() {
+  local config service endpoints pods certificate csr ca dns
+  dns="${KIH_WEBHOOK_SERVICE}.${KIH_HELPER_NAMESPACE}.svc"
+  config="$(kubectl get validatingwebhookconfiguration "${KIH_WEBHOOK_CONFIGURATION}" -o json)" || return 1
+  service="$(kubectl -n "${KIH_HELPER_NAMESPACE}" get service "${KIH_WEBHOOK_SERVICE}" -o json)" || return 1
+  endpoints="$(kubectl -n "${KIH_HELPER_NAMESPACE}" get endpoints "${KIH_WEBHOOK_SERVICE}" -o json)" || return 1
+  pods="$(kubectl -n "${KIH_HELPER_NAMESPACE}" get pods -l app=kubevirt-ip-helper-webhook -o json)" || return 1
+  jq -e -n --argjson config "${config}" --argjson service "${service}" \
+    --argjson endpoints "${endpoints}" --argjson pods "${pods}" \
+    --arg name "${KIH_WEBHOOK_SERVICE}" --arg ns "${KIH_HELPER_NAMESPACE}" '
+      ($config.webhooks | length == 3)
+      and all($config.webhooks[]; .clientConfig.service.name == $name
+        and .clientConfig.service.namespace == $ns and .clientConfig.service.port == 8080
+        and (.clientConfig.caBundle | length > 0))
+      and $service.spec.selector.app == "kubevirt-ip-helper-webhook"
+      and ($service.spec.selector | has("kubevirtiphelper/network") | not)
+      and any($service.spec.ports[]; .port == 8080 and .targetPort == 8443)
+      and ([$pods.items[] | select(.metadata.deletionTimestamp == null)] | length == 1)
+      and ([$endpoints.subsets[]?.addresses[]?] | length == 1)
+      and all($endpoints.subsets[]?.addresses[]?;
+        .targetRef.uid as $uid | any($pods.items[];
+          .metadata.uid == $uid and .metadata.labels.app == "kubevirt-ip-helper-webhook"
+          and (.metadata.labels | has("kubevirtiphelper/network") | not)))
+    ' > /dev/null || return 1
+  certificate="$(kubectl -n "${KIH_HELPER_NAMESPACE}" get secret "${KIH_WEBHOOK_TLS_SECRET}" \
+    -o jsonpath='{.data.tls\.crt}')" || return 1
+  csr="$(kubectl get csr "${dns}" -o json)" || return 1
+  [ "$(jq -r '.status.certificate' <<< "${csr}")" = "${certificate}" ] || return 1
+  jq -e 'any(.status.conditions[]; .type == "Approved" and .status == "True")' \
+    <<< "${csr}" > /dev/null || return 1
+  ca="$(jq -er '.webhooks[0].clientConfig.caBundle' <<< "${config}")" || return 1
+  openssl verify -verify_hostname "${dns}" \
+    -CAfile <(printf '%s' "${ca}" | base64 -d) \
+    <(printf '%s' "${certificate}" | base64 -d) > /dev/null 2>&1 || return 1
+  # Exercise Service delivery and TLS from an ordinary cluster client as well
+  # as the apiserver admission requests below. Only the public CA is streamed.
+  printf '%s' "${ca}" | base64 -d |
+    kubectl -n "${KIH_WORKLOAD_NAMESPACE}" exec -i "${KIH_NETWORK_POD}" -c "${KIH_NETWORK_CONTAINER}" -- \
+      sh -ec '[ "$(curl --fail --silent --show-error --max-time 10 --cacert /dev/stdin "$1")" = ok ]' \
+      sh "https://${dns}:8080/readyz"
+}
+
+webhook_admission_qualified() {
+  local manifest="${E2E_ARTIFACTS_DIR}/webhook-invalid-pool.yaml"
+  # This valid CRD shape carries a semantically reversed range, so only the
+  # actual webhook (not OpenAPI validation) can reject it.
+  sed -e 's/name: e2e-pool/name: e2e-admission-probe/' \
+    -e 's/start: 10.77.0.100/start: 10.77.0.110/' \
+    -e 's/end: 10.77.0.110/end: 10.77.0.100/' \
+    "${E2E_DIR}/manifests/pool.yaml" > "${manifest}"
+  admission_rejects "${manifest}"
+}
+
+webhook_vmnetcfg_admission_qualified() {
+  local manifest="${E2E_ARTIFACTS_DIR}/webhook-invalid-vmnetcfg.json"
+  jq -n --arg ns "${KIH_WORKLOAD_NAMESPACE}" --arg network "${KIH_HELPER_NAMESPACE}/${KIH_NAD_NAME}" '
+    {apiVersion:"kubevirtiphelper.k8s.binbash.org/v1",kind:"VirtualMachineNetworkConfig",
+     metadata:{name:"e2e-admission-probe",namespace:$ns},
+     spec:{vmname:"e2e-admission-probe",networkconfig:[
+       {macaddress:"02:00:00:00:ff:01",networkname:$network,ipaddress:"10.77.0.99"}]}}
+    ' > "${manifest}"
+  admission_rejects "${manifest}"
+}
+
+# Bash dynamic scope keeps reused predicates network-local without mutating
+# the primary failover bookkeeping or watchdog leader-state handoff.
+on_secondary() {
+  local HELPER_DEPLOYMENT="${KIH_SECOND_HELPER_DEPLOYMENT}"
+  local HELPER_SELECTOR="${KIH_SECOND_HELPER_SELECTOR}"
+  local LEADER_SELECTOR="${KIH_SECOND_HELPER_SELECTOR},kubevirtiphelper/leader=active"
+  local LEADER_LEASE="${KIH_SECOND_LEADER_LEASE}" METRICS_SERVICE="${KIH_SECOND_METRICS_SERVICE}"
+  local KIH_NAD_NAME="${KIH_SECOND_NAD_NAME}" KIH_HELPER_INTERFACE="${KIH_SECOND_HELPER_INTERFACE}"
+  local KIH_IPPOOL_NAME="e2e-pool-second" KIH_IPPOOL_SERVER="10.78.0.2"
+  local HELPER_REPLICAS=1 LEADER_POD="" LEADER_ID="" PREDICATE_LEADER_STATE=""
+  "$@"
 }
 
 # Two live replicas have to be Ready with the helper interface attached. A pod which
@@ -503,7 +595,7 @@ helper_pods_ready() {
   pods="$(kubectl -n "${KIH_HELPER_NAMESPACE}" get pods -l "${HELPER_SELECTOR}" -o json 2> /dev/null |
     jq -r '[.items[] | select(.metadata.deletionTimestamp == null) | .metadata.name] | join(" ")')" || return 1
   read -r -a pod_names <<< "${pods}"
-  [ "${#pod_names[@]}" -eq 2 ] || return 1
+  [ "${#pod_names[@]}" -eq "${HELPER_REPLICAS}" ] || return 1
   for pod in "${pod_names[@]}"; do
     deletion="$(kubectl -n "${KIH_HELPER_NAMESPACE}" get pod "${pod}" \
       -o jsonpath='{.metadata.deletionTimestamp}' 2> /dev/null)" || return 1
@@ -667,7 +759,7 @@ pool_initialized() {
 # localhost observations in diagnostic captures are not this delivery check.
 metrics_text() {
   leader_consistent || return 1
-  helper_service_metrics
+  helper_service_metrics "${METRICS_SERVICE}"
 }
 
 # Extracts the value of exactly one exposition series: matching lines must
@@ -1436,8 +1528,8 @@ render_second_nad_vm() { # <name> <mac> <output>
   sed \
     -e "s|name: ${KIH_VM_NAME}|name: ${name}|" \
     -e "s|${KIH_VM_MAC}|${mac}|g" \
-    -e "s|networkName: ${KIH_HELPER_NAMESPACE}/${KIH_NAD_NAME}|networkName: ${KIH_HELPER_NAMESPACE}/${KIH_NAD_NAME}-second|" \
-    -e "s|${KIH_HELPER_INTERFACE}|kihnet1|g" \
+    -e "s|networkName: ${KIH_HELPER_NAMESPACE}/${KIH_NAD_NAME}|networkName: ${KIH_HELPER_NAMESPACE}/${KIH_SECOND_NAD_NAME}|" \
+    -e "s|${KIH_HELPER_INTERFACE}|${KIH_SECOND_HELPER_INTERFACE}|g" \
     -e "s|${KIH_GUEST_IMAGE_TEMPLATE}|${KIH_GUEST_IMAGE}|" \
     "${E2E_DIR}/manifests/vm.yaml" > "${output}"
 }
@@ -1473,13 +1565,17 @@ cleanup_pool_group() {
 cleanup_stale_expanded_resources() {
   cleanup_pool_group
   kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete vm \
-    multipool-vm multipool-guest --ignore-not-found --wait=true --timeout=120s > /dev/null
+    multipool-vm multipool-guest multipool-shared multipool-primary-guest --ignore-not-found --wait=true --timeout=120s > /dev/null
   kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete vmnetcfg \
-    multipool-vm multipool-guest --ignore-not-found --wait=true --timeout=120s > /dev/null
+    multipool-vm multipool-guest multipool-shared multipool-primary-guest --ignore-not-found --wait=true --timeout=120s > /dev/null
   kubectl delete ippool e2e-pool-second \
     --ignore-not-found --wait=true --timeout=120s > /dev/null
   kubectl -n "${KIH_HELPER_NAMESPACE}" delete network-attachment-definition \
-    "${KIH_NAD_NAME}-second" --ignore-not-found --wait=true --timeout=120s > /dev/null
+    "${KIH_SECOND_NAD_NAME}" --ignore-not-found --wait=true --timeout=120s > /dev/null
+  kubectl -n "${KIH_HELPER_NAMESPACE}" delete deployment "${KIH_SECOND_HELPER_DEPLOYMENT}" \
+    --ignore-not-found --wait=true --timeout=120s > /dev/null
+  kubectl -n "${KIH_HELPER_NAMESPACE}" delete service "${KIH_SECOND_METRICS_SERVICE}" \
+    --ignore-not-found > /dev/null
 }
 
 
@@ -1601,9 +1697,11 @@ spec:
       networkname: "${KIH_HELPER_NAMESPACE}/${KIH_NAD_NAME}"
       ipaddress: "${refused_ip}"
 EOF
-  kubectl apply -f "${E2E_ARTIFACTS_DIR}/15-out-of-range-vmnetcfg.yaml" > /dev/null
-  wait_before_deadline POOL-OUT-OF-RANGE-REFUSED "${deadline}" 90 \
-    "invalid raw record is rejected without allocating an address" vmnetcfg_status_is pool-vm-outside ERROR
+  assert_case POOL-OUT-OF-RANGE-REFUSED \
+    "admission rejects the out-of-range record explicitly" admission_rejects \
+    "${E2E_ARTIFACTS_DIR}/15-out-of-range-vmnetcfg.yaml"
+  assert_case POOL-OUT-OF-RANGE-ABSENT \
+    "denied out-of-range request leaves no VMNetCfg" vmnetcfg_absent_named pool-vm-outside
   wait_before_deadline POOL-OUT-OF-RANGE-ACCOUNTING "${deadline}" 60 \
     "out-of-range refusal leaves accounting unchanged" \
     pool_counts_equal "${KIH_IPPOOL_NAME}" 10 1
@@ -1944,10 +2042,7 @@ pool_initialized_named() { # <pool> <available>
 }
 
 second_pool_services_healthy() {
-  leader_consistent || return 1
-  kubectl -n "${KIH_HELPER_NAMESPACE}" exec "${LEADER_POD}" -- sh -c \
-    "ip -4 addr show dev 'kihnet1' | grep -q '10.78.0.2/24'" \
-    > /dev/null 2>&1
+  on_secondary leader_services_healthy
 }
 
 second_ippool_absent() {
@@ -1964,12 +2059,141 @@ second_server_ip_absent() {
 
 second_nad_absent() {
   object_absent_not_found -n "${KIH_HELPER_NAMESPACE}" \
-    get network-attachment-definition "${KIH_NAD_NAME}-second"
+    get network-attachment-definition "${KIH_SECOND_NAD_NAME}"
+}
+
+shared_reservation_ready() {
+  local config primary secondary
+  config="$(kubectl -n "${KIH_WORKLOAD_NAMESPACE}" get vmnetcfg multipool-shared -o json)" || return 1
+  primary="$(pool_snapshot "${KIH_IPPOOL_NAME}")" || return 1
+  secondary="$(pool_snapshot e2e-pool-second)" || return 1
+  jq -e --arg first "${KIH_HELPER_NAMESPACE}/${KIH_NAD_NAME}" \
+    --arg second "${KIH_HELPER_NAMESPACE}/${KIH_SECOND_NAD_NAME}" \
+    --arg owner "${KIH_WORKLOAD_NAMESPACE}/multipool-shared" \
+    --argjson primary "${primary}" --argjson secondary "${secondary}" '
+      . as $cfg
+      | .spec.vmname == "multipool-shared"
+      and (.spec.networkconfig | length == 2)
+      and (.status.networkconfig | length == 2)
+      and ((.metadata.finalizers // []) | index("kubevirtiphelper.k8s.binbash.org/vmnetcfg-cleanup") != null)
+      and all([{net:$first,mac:"02:00:00:00:02:10",pool:$primary},
+               {net:$second,mac:"02:00:00:00:02:11",pool:$secondary}][];
+        . as $nic
+        | any($cfg.spec.networkconfig[];
+            .networkname == $nic.net and .macaddress == $nic.mac
+            and $nic.pool.allocated[.ipaddress] == ($owner + " [" + $nic.mac + "]"))
+        and any($cfg.status.networkconfig[];
+            .networkname == $nic.net and .macaddress == $nic.mac and .status == "OK"))
+    ' <<< "${config}" > /dev/null
+}
+
+secondary_stability_snapshot() {
+  local lease endpoints pods metrics
+  on_secondary leader_consistent || return 1
+  lease="$(kubectl -n "${KIH_HELPER_NAMESPACE}" get lease "${KIH_SECOND_LEADER_LEASE}" -o json)" || return 1
+  endpoints="$(kubectl -n "${KIH_HELPER_NAMESPACE}" get endpoints "${KIH_SECOND_METRICS_SERVICE}" -o json)" || return 1
+  pods="$(on_secondary helper_pod_runtime_snapshot)" || return 1
+  metrics="$(helper_service_metrics "${KIH_SECOND_METRICS_SERVICE}" |
+    grep -E '^kubevirtiphelper_(ippool_|vmnetcfg_status)' | LC_ALL=C sort)" || return 1
+  # renewTime/resourceVersion are intentionally not stable: healthy leadership
+  # renews continuously. Holder, acquisition, transitions, UID and target are.
+  jq -Scn --argjson lease "${lease}" --argjson endpoints "${endpoints}" --arg pods "${pods}" --arg metrics "${metrics}" '
+    {lease:{uid:$lease.metadata.uid,holder:$lease.spec.holderIdentity,
+      acquired:$lease.spec.acquireTime,transitions:($lease.spec.leaseTransitions // 0)},
+     endpoints:[$endpoints.subsets[]?.addresses[]? | {ip,targetRef}],pods:$pods,metrics:$metrics}'
+}
+
+# The secondary recorder remains live while a second, single-NIC guest proves
+# primary DHCP. Keep the primary state local so both consoles/capture ownership
+# records coexist, and keep report writes in this shell (not a subshell).
+multipool_primary_live_failover() { # <label> <deadline> <secondary stability snapshot>
+  local label="$1" deadline="$2" secondary_before="$3" node old_leader old_id cutoff
+  local secondary_console_pid="${CONSOLE_PID}" secondary_console_feeder="${CONSOLE_FEEDER_PID}"
+  local secondary_console_fifo="${CONSOLE_FIFO}"
+  local secondary_guest_identity="${GUEST_IDENTITY}"
+  local -A secondary_pids=() secondary_pods=() secondary_files=() secondary_tokens=()
+  for node in "${!CAPTURE_PIDS[@]}"; do
+    secondary_pids["${node}"]="${CAPTURE_PIDS[$node]}"
+    secondary_pods["${node}"]="${CAPTURE_PODS[$node]}"
+    secondary_files["${node}"]="${CAPTURE_FILES[$node]}"
+    secondary_tokens["${node}"]="${CAPTURE_TOKENS[$node]}"
+  done
+  local KIH_VM_NAME="multipool-primary-guest" KIH_VM_MAC="02:00:00:00:02:20" RESERVED_IP
+  local CONSOLE_PID="" CONSOLE_FEEDER_PID="" CONSOLE_FIFO=""
+  local -A CAPTURE_PIDS=() CAPTURE_PODS=() CAPTURE_FILES=() CAPTURE_TOKENS=()
+  local GUEST_CONSOLE="" GUEST_EVENTS="" GUEST_EXPECTED="" GUEST_IDENTITY="" GUEST_BASELINE=""
+  local GUEST_BASELINE_INDEX=-1 GUEST_NODE="" GUEST_DEADLINE=0 GUEST_LEASE=""
+  local GUEST_EVENT_CUTOFF=0 GUEST_ACTION_EPOCH=0
+  trap 'finish_multipool_primary "$?"' EXIT
+  RESERVED_IP="$(kubectl -n "${KIH_WORKLOAD_NAMESPACE}" get vmnetcfg "${KIH_VM_NAME}" \
+    -o jsonpath='{.spec.networkconfig[0].ipaddress}')"
+  start_guest_and_assert "${label}" "${deadline}"
+  assert_case MULTI-BOTH-GUESTS-LIVE "primary DHCP completed while the unchanged secondary VMI remains Ready" \
+    test "$(kubectl -n "${KIH_WORKLOAD_NAMESPACE}" get vmi multipool-guest -o json |
+      jq -cer 'select(.metadata.deletionTimestamp == null and .status.phase == "Running")
+        | select(any(.status.conditions[]; .type == "Ready" and .status == "True"))
+        | [.metadata.uid,.status.nodeName]')" = "${secondary_guest_identity}"
+  assert_case MULTI-PRIMARY-LEADER-BEFORE-FAILOVER "primary leader is independently resolved" leader_consistent
+  old_leader="${LEADER_POD}" old_id="${LEADER_ID}"
+  snapshot_guest_continuity
+  primary_failover_epoch="$(date +%s.%N)"
+  command_before_deadline MULTI-PRIMARY-LEADER-DELETE "${deadline}" "only primary leader is deleted; both guests remain live" \
+    kubectl -n "${KIH_HELPER_NAMESPACE}" delete pod "${old_leader}" --wait=false
+  wait_before_deadline MULTI-PRIMARY-FAILOVER "${deadline}" 90 "primary transfers its own Lease and metrics endpoint" \
+    new_leader_elected "${old_leader}" "${old_id}"
+  wait_before_deadline MULTI-PRIMARY-RECOVERED "${deadline}" 90 "primary reconstructs only its own allocations" \
+    leader_services_healthy
+  assert_case MULTI-SECONDARY-UNCHANGED "secondary Lease, metrics and pod identity stay unchanged during primary failover" \
+    secondary_stable_since "${secondary_before}"
+  # Discard pre-recovery packets: require an actual native renewal answered
+  # after the replacement helper has taken leadership, without restarting VM
+  # or DHCP client. The primary and secondary observers both stay attached.
+  refresh_dhcp_events
+  GUEST_EVENT_CUTOFF="$(wc -l < "${GUEST_EVENTS}")"
+  GUEST_ACTION_EPOCH="$(date +%s.%N)"
+  wait_before_deadline MULTI-PRIMARY-LIVE-DHCP "${deadline}" "${E2E_FAILOVER_DHCP_TIMEOUT}" \
+    "same primary native client renews through the new helper while secondary stays up" \
+    dhcp_transaction_after "${GUEST_EVENT_CUTOFF}" "${GUEST_ACTION_EPOCH}" "${GUEST_LEASE}" renewal
+  cutoff="$(guest_samples | jq -er '.[-1].seq')"
+  wait_before_deadline MULTI-PRIMARY-LIVE-NETWORK "${deadline}" 60 \
+    "same primary VMI and client retain successful network samples through leader loss" \
+    guest_continuity_after "${cutoff}"
+  stop_guest "${label}" "${deadline}"
+  trap finish EXIT
+}
+
+# On any primary-guest failure, close its own recorders first, then let the
+# ordinary suite EXIT handler close the still-running secondary set. No
+# guessed process IDs, hidden capture failures, or extra scenario time.
+finish_multipool_primary() {
+  local rc="$1" node
+  trap - EXIT
+  set +e
+  SCENARIO_DEADLINE=0
+  if ! finish_guest_evidence "$((SECONDS + E2E_COLLECT_TOTAL_TIMEOUT))"; then
+    report_case_start MULTI-PRIMARY-GUEST-EVIDENCE "primary recorder teardown preserves complete evidence"
+    report_case_fail "primary recorder could not close cleanly"
+    rc=1
+  fi
+  CAPTURE_PIDS=() CAPTURE_PODS=() CAPTURE_FILES=() CAPTURE_TOKENS=()
+  for node in "${!secondary_pids[@]}"; do
+    CAPTURE_PIDS["${node}"]="${secondary_pids[$node]}"
+    CAPTURE_PODS["${node}"]="${secondary_pods[$node]}"
+    CAPTURE_FILES["${node}"]="${secondary_files[$node]}"
+    CAPTURE_TOKENS["${node}"]="${secondary_tokens[$node]}"
+  done
+  CONSOLE_PID="${secondary_console_pid}"
+  CONSOLE_FEEDER_PID="${secondary_console_feeder}"
+  CONSOLE_FIFO="${secondary_console_fifo}"
+  finish "${rc}"
+}
+secondary_stable_since() {
+  [ "$(secondary_stability_snapshot)" = "$1" ]
 }
 
 run_multipool_group() {
   report_group multipool
-  local deadline old_vm old_mac helper_snapshot
+  local deadline old_vm old_mac helper_snapshot second_snapshot secondary_identity primary_failover_epoch cutoff
   deadline=$((SECONDS + 900))
   SCENARIO_DEADLINE="${deadline}"
   log "group multipool: attaching an independent second bridge and pool"
@@ -1979,15 +2203,15 @@ run_multipool_group() {
     kubectl -n "${KIH_WORKLOAD_NAMESPACE}" get vmnetcfg multipool-vm > /dev/null 2>&1 ||
     kubectl -n "${KIH_WORKLOAD_NAMESPACE}" get vmnetcfg multipool-guest > /dev/null 2>&1 ||
     kubectl -n "${KIH_HELPER_NAMESPACE}" get network-attachment-definition \
-      kubevirt-ip-helper-e2e-second > /dev/null 2>&1; then
-    die "stale multipool resources exist; remove e2e-pool-second, multipool-vm, multipool-guest, and kubevirt-ip-helper-e2e-second before rerunning"
+      "${KIH_SECOND_NAD_NAME}" > /dev/null 2>&1; then
+    die "stale multipool resources exist; remove e2e-pool-second, multipool-vm, multipool-guest, and ${KIH_SECOND_NAD_NAME} before rerunning"
   fi
   report_case_pass "second-pool namespace is clean"
   cat > "${E2E_ARTIFACTS_DIR}/17-second-nad.yaml" <<EOF
 apiVersion: k8s.cni.cncf.io/v1
 kind: NetworkAttachmentDefinition
 metadata:
-  name: kubevirt-ip-helper-e2e-second
+  name: ${KIH_SECOND_NAD_NAME}
   namespace: ${KIH_HELPER_NAMESPACE}
 spec:
   config: '{"cniVersion":"0.3.1","type":"bridge","bridge":"${KIH_SECOND_BRIDGE_NAME}"}'
@@ -1998,6 +2222,9 @@ apiVersion: kubevirtiphelper.k8s.binbash.org/v1
 kind: IPPool
 metadata:
   name: e2e-pool-second
+  labels:
+    kubevirtiphelper/network: ${KIH_SECOND_NAD_NAME}
+    kubevirtiphelper/network-namespace: ${KIH_HELPER_NAMESPACE}
 spec:
   ipv4config:
     serverip: 10.78.0.2
@@ -2010,20 +2237,24 @@ spec:
       - ${KIH_SECOND_DNS_SERVER}
     domainname: ${KIH_SECOND_DNS_DOMAIN}
     leasetime: 300
-  networkname: ${KIH_HELPER_NAMESPACE}/kubevirt-ip-helper-e2e-second
-  bindinterface: kihnet1
+  networkname: ${KIH_HELPER_NAMESPACE}/${KIH_SECOND_NAD_NAME}
+  bindinterface: ${KIH_SECOND_HELPER_INTERFACE}
 EOF
-  kubectl -n "${KIH_HELPER_NAMESPACE}" patch deployment "${HELPER_DEPLOYMENT}" \
-    --type=merge \
-    -p '{"spec":{"template":{"metadata":{"annotations":{"k8s.v1.cni.cncf.io/networks":"[{\"name\":\"kubevirt-ip-helper-e2e\",\"namespace\":\"kubevirt-ip-helper\",\"interface\":\"kihnet0\"},{\"name\":\"kubevirt-ip-helper-e2e-second\",\"namespace\":\"kubevirt-ip-helper\",\"interface\":\"kihnet1\"}]"}}}}}'
-  command_before_deadline MULTI-ATTACHMENT-ROLLOUT "${deadline}" "second attachment rolls out normally" \
+  export E2E_SECOND_NETWORK_EXPECTED=1
+  kubectl kustomize --load-restrictor=LoadRestrictionsNone "${E2E_DIR}/manifests/secondary" \
+    > "${E2E_ARTIFACTS_DIR}/secondary-rendered.yaml"
+  sed -i "s|image: kubevirt-ip-helper:e2e|image: ${E2E_IMAGE}|" \
+    "${E2E_ARTIFACTS_DIR}/secondary-rendered.yaml"
+  kubectl apply -f "${E2E_ARTIFACTS_DIR}/secondary-rendered.yaml"
+  command_before_deadline MULTI-ATTACHMENT-ROLLOUT "${deadline}" "independent secondary helper rolls out normally" \
     kubectl -n "${KIH_HELPER_NAMESPACE}" rollout status \
-    "deployment/${HELPER_DEPLOYMENT}" --timeout="${E2E_WAIT_TIMEOUT}s"
-  wait_before_deadline MULTI-PODS-RETURN "${deadline}" 180 "two helper pods return after second attachment" \
-    helper_pods_ready
-  wait_before_deadline MULTI-BOTH-KIHNET1 "${deadline}" 120 "both helper pods contain kihnet1" \
-    helper_pods_have_interface kihnet1
-  wait_before_deadline MULTI-PRIMARY-RECONSTRUCTS "${deadline}" 120 "primary pool reconstructs after attachment rollout" \
+    "deployment/${KIH_SECOND_HELPER_DEPLOYMENT}" --timeout="${E2E_WAIT_TIMEOUT}s"
+  wait_before_deadline MULTI-PODS-RETURN "${deadline}" 180 "primary replicas remain Ready" helper_pods_ready
+  wait_before_deadline MULTI-BOTH-KIHNET1 "${deadline}" 120 "secondary helper alone has its contracted interface" \
+    on_secondary helper_pods_have_interface "${KIH_SECOND_HELPER_INTERFACE}"
+  assert_case MULTI-PRIMARY-ONE-NAD "primary has no secondary interface" \
+    helper_pods_lack_interface "${KIH_SECOND_HELPER_INTERFACE}"
+  wait_before_deadline MULTI-PRIMARY-RECONSTRUCTS "${deadline}" 120 "primary serves during independent secondary rollout" \
     leader_services_healthy
   command_before_deadline MULTI-SECOND-POOL-CREATED "${deadline}" "second pool created after its interface exists" \
     kubectl apply -f "${E2E_ARTIFACTS_DIR}/18-second-pool.yaml"
@@ -2048,6 +2279,20 @@ EOF
     --wait=true --timeout=120s
   wait_before_deadline MULTI-SECOND-RELEASED "${deadline}" 120 "second pool reservation is released" \
     pool_counts_equal e2e-pool-second 0 3
+  # A single shared VMNetCfg must retain both helpers' concurrent projections.
+  render_halted_vm multipool-shared 02:00:00:00:02:10 "${E2E_ARTIFACTS_DIR}/shared-vm.yaml"
+  kubectl create --dry-run=client -f "${E2E_ARTIFACTS_DIR}/shared-vm.yaml" -o json |
+    jq --arg network "${KIH_HELPER_NAMESPACE}/${KIH_SECOND_NAD_NAME}" '
+      .spec.template.spec.domain.devices.interfaces +=
+        [{name:"secondary",bridge:{},macAddress:"02:00:00:00:02:11"}]
+      | .spec.template.spec.networks += [{name:"secondary",multus:{networkName:$network}}]
+    ' > "${E2E_ARTIFACTS_DIR}/shared-vm.json"
+  kubectl apply -f "${E2E_ARTIFACTS_DIR}/shared-vm.json"
+  wait_before_deadline MULTI-SHARED-RESERVATION "${deadline}" 120 \
+    "both helpers project one shared VMNetCfg without losing either NIC" shared_reservation_ready
+  assert_case MULTI-SIMULTANEOUS-PRIMARY "primary simultaneously serves its shared allocation" metric_pool_equals 1 10
+  assert_case MULTI-SIMULTANEOUS-SECONDARY "secondary simultaneously serves its shared allocation" \
+    on_secondary metric_pool_equals 1 2
 
   log "group multipool: real guest on the second bridge"
   render_second_nad_vm multipool-guest 02:00:00:00:02:02 \
@@ -2055,6 +2300,12 @@ EOF
   kubectl apply -f "${E2E_ARTIFACTS_DIR}/20-second-nad-vm.yaml" > /dev/null
   wait_before_deadline MULTI-GUEST-RESERVATION "${deadline}" 120 \
     "second bridge reserves the guest address" vm_managed_reservation multipool-guest OK
+  render_halted_vm multipool-primary-guest 02:00:00:00:02:20 \
+    "${E2E_ARTIFACTS_DIR}/multipool-primary-guest.yaml"
+  kubectl apply -f "${E2E_ARTIFACTS_DIR}/multipool-primary-guest.yaml"
+  wait_before_deadline MULTI-PRIMARY-GUEST-RESERVATION "${deadline}" 120 \
+    "primary guest holds its own reservation beside the shared VM" \
+    vm_managed_reservation multipool-primary-guest OK
   old_vm="${KIH_VM_NAME}"
   old_mac="${KIH_VM_MAC}"
   KIH_VM_NAME="multipool-guest"
@@ -2070,25 +2321,52 @@ EOF
       ;;
   esac
   wait_before_deadline MULTI-GUEST-ACCOUNTING "${deadline}" 60 \
-    "second pool counts only the guest reservation" pool_counts_equal e2e-pool-second 1 2
+    "second pool counts guest and shared reservation" pool_counts_equal e2e-pool-second 2 1
   wait_before_deadline MULTI-GUEST-PRIMARY-ISOLATED "${deadline}" 60 \
-    "guest on the second bridge leaves the primary pool empty" \
-    pool_counts_equal "${KIH_IPPOOL_NAME}" 0 11
+    "second bridge guest leaves primary shared and guest allocations intact" \
+    pool_counts_equal "${KIH_IPPOOL_NAME}" 2 9
   capture_checkpoint 25-second-nad-guest "second bridge holds ${RESERVED_IP} for multipool-guest"
   start_guest_and_assert second-nad "${deadline}"
+  secondary_identity="$(secondary_stability_snapshot)"
+  snapshot_guest_continuity
+  multipool_primary_live_failover primary-beside-secondary "${deadline}" "${secondary_identity}"
+  wait_before_deadline MULTI-SECONDARY-LIVE-DHCP "${deadline}" 240 \
+    "secondary guest naturally renews across primary failover" dhcp_transaction_after \
+    "${GUEST_EVENT_CUTOFF}" "${primary_failover_epoch}" "${GUEST_LEASE}" renewal
+  cutoff="$(guest_samples | jq -er '.[-1].seq')"
+  wait_before_deadline MULTI-SECONDARY-LIVE-NETWORK "${deadline}" 60 \
+    "secondary VMI, native client and successful network samples persist through primary loss" \
+    guest_continuity_after "${cutoff}"
+  assert_case MULTI-SECONDARY-STILL-UNCHANGED "secondary leadership and metrics target remain unchanged after renewal" \
+    secondary_stable_since "${secondary_identity}"
+  assert_case MULTI-SHARED-AFTER-FAILOVER "both shared NICs and allocations survive primary failover" shared_reservation_ready
+  assert_case MULTI-PRIMARY-METRICS-AFTER-FAILOVER "primary metrics retain only its shared and guest allocations" metric_pool_equals 2 9
+  assert_case MULTI-SECONDARY-METRICS-AFTER-FAILOVER "secondary metrics are unchanged by primary failover" \
+    on_secondary metric_pool_equals 2 1
   stop_guest second-nad "${deadline}"
   wait_before_deadline MULTI-GUEST-RESERVATION-HELD "${deadline}" 60 \
-    "halted second-NAD guest keeps its address" pool_counts_equal e2e-pool-second 1 2
+    "halted second-NAD guest keeps its address" pool_counts_equal e2e-pool-second 2 1
   kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete vm "${KIH_VM_NAME}" --wait=true --timeout=120s
   wait_before_deadline MULTI-GUEST-OBJECTS-GONE "${deadline}" 120 \
     "second-NAD guest releases its VMNetCfg" vmnetcfg_absent_named multipool-guest
   wait_before_deadline MULTI-GUEST-RELEASED "${deadline}" 60 \
-    "second pool empties after the guest is deleted" pool_counts_equal e2e-pool-second 0 3
+    "second pool retains only shared NIC after guest deletion" pool_counts_equal e2e-pool-second 1 2
   KIH_VM_NAME="${old_vm}"
   KIH_VM_MAC="${old_mac}"
+  kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete vm multipool-primary-guest --wait=true --timeout=120s
+  wait_before_deadline MULTI-PRIMARY-GUEST-CLEANED "${deadline}" 120 \
+    "primary guest releases its retained reservation" vmnetcfg_absent_named multipool-primary-guest
+  kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete vm multipool-shared --wait=true --timeout=120s
+  wait_before_deadline MULTI-SHARED-CLEANED "${deadline}" 120 \
+    "both helpers acknowledge shared finalizer cleanup" vmnetcfg_absent_named multipool-shared
+  wait_before_deadline MULTI-SHARED-PRIMARY-RELEASED "${deadline}" 60 "primary shared allocation released" \
+    pool_counts_equal "${KIH_IPPOOL_NAME}" 0 11
+  wait_before_deadline MULTI-SHARED-SECONDARY-RELEASED "${deadline}" 60 "secondary shared allocation released" \
+    pool_counts_equal e2e-pool-second 0 3
 
   log "group multipool: deleting the second IPPool while both helpers keep serving"
   helper_snapshot="$(helper_pod_runtime_snapshot || true)"
+  second_snapshot="$(on_secondary helper_pod_runtime_snapshot)"
   guard_case MULTI-HELPER-SNAPSHOT \
     "both helper UIDs and restart counts captured before second-pool deletion" \
     test "$(printf '%s\n' "${helper_snapshot}" | sed '/^$/d' | wc -l)" -eq 2
@@ -2098,33 +2376,34 @@ EOF
   wait_before_deadline MULTI-SECOND-POOL-GONE "${deadline}" 90 \
     "second IPPool object is removed while helpers stay live" second_ippool_absent
   wait_before_deadline MULTI-SECOND-SERVER-REMOVED "${deadline}" 90 \
-    "leader drops the second pool server address" second_server_ip_absent
+    "secondary leader drops its pool server address" on_secondary second_server_ip_absent
   wait_before_deadline MULTI-SECOND-METRICS-GONE "${deadline}" 90 \
-    "second pool metrics disappear with its IPPool" metric_ippool_absent e2e-pool-second
+    "second pool metrics disappear from secondary service" on_secondary metric_ippool_absent e2e-pool-second
   wait_before_deadline MULTI-PRIMARY-HEALTH-WITH-SECOND-REMOVED "${deadline}" 120 \
     "primary DHCP service stays healthy beside the detached second bridge" \
     leader_services_healthy
   wait_before_deadline MULTI-HELPERS-UNCHANGED "${deadline}" 90 \
     "both helper pods stay live with unchanged UIDs and restart counts" \
     helper_pods_unchanged_since "${helper_snapshot}"
+  assert_case MULTI-SECONDARY-POD-UNCHANGED "secondary pod does not restart during pool removal" \
+    on_secondary helper_pods_unchanged_since "${second_snapshot}"
   assert_case MULTI-PRIMARY-METRICS-WITH-SECOND-REMOVED \
     "primary pool accounting stays exact after the second pool is removed" \
     metric_pool_equals 0 11
   capture_checkpoint 18-second-pool-removed \
     "second pool objects and metrics are gone while the primary pool keeps serving"
 
-  log "group multipool: restoring the primary-only attachment"
-  kubectl -n "${KIH_HELPER_NAMESPACE}" patch deployment "${HELPER_DEPLOYMENT}" \
-    --type=merge \
-    -p '{"spec":{"template":{"metadata":{"annotations":{"k8s.v1.cni.cncf.io/networks":"[{\"name\":\"kubevirt-ip-helper-e2e\",\"namespace\":\"kubevirt-ip-helper\",\"interface\":\"kihnet0\"}]"}}}}}'
-  kubectl -n "${KIH_HELPER_NAMESPACE}" rollout status \
-    "deployment/${HELPER_DEPLOYMENT}" --timeout="${E2E_WAIT_TIMEOUT}s"
+  log "group multipool: removing only the secondary helper pair"
+  kubectl -n "${KIH_HELPER_NAMESPACE}" delete deployment "${KIH_SECOND_HELPER_DEPLOYMENT}" \
+    --wait=true --timeout=120s
+  kubectl -n "${KIH_HELPER_NAMESPACE}" delete service "${KIH_SECOND_METRICS_SERVICE}"
+  export E2E_SECOND_NETWORK_EXPECTED=0
   wait_before_deadline MULTI-PRIMARY-ONLY-TOPOLOGY "${deadline}" 180 \
     "primary-only helper topology returns" helper_pods_ready
   wait_before_deadline MULTI-KIHNET1-REMOVED "${deadline}" 120 \
     "second interface is gone from both helper pods" helper_pods_lack_interface kihnet1
   kubectl -n "${KIH_HELPER_NAMESPACE}" delete network-attachment-definition \
-    kubevirt-ip-helper-e2e-second --ignore-not-found > /dev/null
+    "${KIH_SECOND_NAD_NAME}" --ignore-not-found > /dev/null
   wait_before_deadline MULTI-NAD-REMOVED "${deadline}" 90 \
     "second NetworkAttachmentDefinition is removed" second_nad_absent
   wait_before_deadline MULTI-SECOND-METRICS-STAY-GONE "${deadline}" 90 \
@@ -2143,7 +2422,7 @@ EOF
 
 main() {
   local rendered vm_rendered default_image old_leader old_id octet failover_deadline failover_budget retained_lease_deadline router_original reinit_before
-  local image_id repository image_record nodes node loaded before_deployment install_mode reload_before cutoff
+  local image_id webhook_image_id repository image_record nodes node loaded before_deployment install_mode reload_before cutoff
   local -a kind_nodes=()
   # versions.env composes E2E_ARTIFACTS_DIR as ${root}/runs/${E2E_RUN_ID},
   # and report/evidence derive the artifact root by stripping that exact
@@ -2162,7 +2441,7 @@ main() {
   resolve_runtime
   report_case_pass "runtime ${RUNTIME}, kubectl, GNU timeout, and jq available"
   report_case_start CORE-IMAGE-BUILT "helper image ${E2E_IMAGE} built from ${ROOT_DIR}"
-  "${RUNTIME}" build -t "${E2E_IMAGE}" "${ROOT_DIR}"
+  "${RUNTIME}" build -f "${ROOT_DIR}/build/Dockerfile" -t "${E2E_IMAGE}" "${ROOT_DIR}"
   image_record="$("${RUNTIME}" image inspect "${E2E_IMAGE}")"
   image_id="$(jq -er '.[0] | (.Id // .ID) | sub("^sha256:";"")
     | select(test("^[0-9a-f]{64}$"))' <<< "${image_record}")"
@@ -2173,6 +2452,18 @@ main() {
   export E2E_IMAGE
   printf '%s\n' "${image_record}" > "${E2E_ARTIFACTS_DIR}/built-image.json"
   report_case_pass "image ${E2E_IMAGE} present in ${RUNTIME}"
+  report_case_start CORE-WEBHOOK-IMAGE-BUILT "singleton admission image built from repository root"
+  "${RUNTIME}" build -f "${ROOT_DIR}/build/Dockerfile.webhook" -t "${E2E_WEBHOOK_IMAGE}" "${ROOT_DIR}"
+  image_record="$("${RUNTIME}" image inspect "${E2E_WEBHOOK_IMAGE}")"
+  webhook_image_id="$(jq -er '.[0] | (.Id // .ID) | sub("^sha256:";"")
+    | select(test("^[0-9a-f]{64}$"))' <<< "${image_record}")"
+  repository="${E2E_WEBHOOK_IMAGE%@*}"
+  case "${repository##*/}" in *:*) repository="${repository%:*}" ;; esac
+  "${RUNTIME}" tag "${E2E_WEBHOOK_IMAGE}" "${repository}:e2e-${webhook_image_id}"
+  E2E_WEBHOOK_IMAGE="${repository}:e2e-${webhook_image_id}"
+  export E2E_WEBHOOK_IMAGE
+  printf '%s\n' "${image_record}" > "${E2E_ARTIFACTS_DIR}/built-webhook-image.json"
+  report_case_pass "webhook image ${E2E_WEBHOOK_IMAGE} present in ${RUNTIME}"
   report_case_start CORE-BOOTSTRAP \
     "disposable cluster bootstrapped with bridge CNI, Multus and KubeVirt"
   REPORT_BOOTSTRAP_STARTED=1
@@ -2187,11 +2478,16 @@ main() {
   done <<< "${nodes}"
   guard_case CORE-KIND-NODE-COUNT "kind cluster has exactly three nodes for image verification" \
     test "${#kind_nodes[@]}" -eq 3
+  "${KIND}" load docker-image --name "${E2E_CLUSTER_NAME}" "${E2E_WEBHOOK_IMAGE}"
   for node in "${kind_nodes[@]}"; do
     loaded="$("${RUNTIME}" exec "${node}" crictl inspecti "${E2E_IMAGE}")"
     assert_case "CORE-IMAGE-${node}" "node ${node} loaded the exact built image content" \
       test "$(jq -er '.status.id | sub("^sha256:";"")' <<< "${loaded}")" = "${image_id}"
     printf '%s\n' "${loaded}" > "${E2E_ARTIFACTS_DIR}/loaded-image-${node}.json"
+    loaded="$("${RUNTIME}" exec "${node}" crictl inspecti "${E2E_WEBHOOK_IMAGE}")"
+    assert_case "CORE-WEBHOOK-IMAGE-${node}" "node ${node} loaded exact webhook image content" \
+      test "$(jq -er '.status.id | sub("^sha256:";"")' <<< "${loaded}")" = "${webhook_image_id}"
+    printf '%s\n' "${loaded}" > "${E2E_ARTIFACTS_DIR}/loaded-webhook-image-${node}.json"
   done
   report_case_start CORE-BOOTSTRAP-JOURNAL \
     "bootstrap gate journal is parseable and imported into the suite report"
@@ -2213,8 +2509,6 @@ main() {
     --ignore-not-found --wait=true --timeout=120s
     kubectl -n "${KIH_WORKLOAD_NAMESPACE}" delete vmnetcfg "${KIH_VM_NAME}" \
       --ignore-not-found --wait=true --timeout=120s
-    kubectl delete ippool "${KIH_IPPOOL_NAME}" \
-      --ignore-not-found --wait=true --timeout=120s
 
 
   rendered="${E2E_ARTIFACTS_DIR}/helper-rendered.yaml"
@@ -2224,8 +2518,13 @@ main() {
     case "${E2E_IMAGE}" in *'|'* | *'&'*) die "E2E_IMAGE may not contain | or &: ${E2E_IMAGE}" ;; esac
     sed -i "s|image: ${default_image}|image: ${E2E_IMAGE}|" "${rendered}"
   fi
+  case "${E2E_WEBHOOK_IMAGE}" in *'|'* | *'&'*) die "invalid E2E_WEBHOOK_IMAGE" ;; esac
+  sed -i "s|image: kubevirt-ip-helper-webhook:e2e|image: ${E2E_WEBHOOK_IMAGE}|" "${rendered}"
   assert_case CORE-RENDERED-IMAGE "rendered helper image equals ${E2E_IMAGE}" \
     grep -q "image: ${E2E_IMAGE}" "${rendered}"
+  assert_case CORE-NO-LEGACY-HELPER \
+    "obsolete unscoped helper is absent; Lease cutover requires explicit stop-old migration" \
+    object_absent_not_found -n "${KIH_HELPER_NAMESPACE}" get deployment kubevirt-ip-helper
   before_deployment="$(kubectl -n "${KIH_HELPER_NAMESPACE}" get deployment "${HELPER_DEPLOYMENT}" \
     --ignore-not-found -o json)"
   printf '%s\n' "${before_deployment}" > "${E2E_ARTIFACTS_DIR}/deployment-before-apply.json"
@@ -2238,6 +2537,12 @@ main() {
     install_mode="ordinary changed-image rollout"
   fi
   kubectl apply -f "${rendered}"
+  kubectl -n "${KIH_HELPER_NAMESPACE}" rollout status \
+    "deployment/${KIH_WEBHOOK_DEPLOYMENT}" --timeout="${E2E_WAIT_TIMEOUT}s"
+  wait_for CORE-WEBHOOK-ROUTING-TLS 120 \
+    "canonical singleton webhook routes only to admission pods with valid serving TLS" webhook_ready
+  assert_case CORE-WEBHOOK-ADMISSION \
+    "live API admission rejects invalid input rather than failing open" webhook_admission_qualified
   report_case_start CORE-HELPER-ROLLED-OUT "${install_mode} reaches normal production readiness"
   kubectl -n "${KIH_HELPER_NAMESPACE}" rollout status \
     "deployment/${HELPER_DEPLOYMENT}" --timeout="${E2E_WAIT_TIMEOUT}s"
@@ -2251,12 +2556,17 @@ main() {
   report_case_start CORE-STALE-RESOURCES-CLEARED \
     "expanded-group resources from an interrupted run are removed before core setup"
   cleanup_stale_expanded_resources
+  # Admission deliberately prevents deleting a referenced pool. Drain all
+  # primary and shared VMNetCfgs above before replacing its configuration.
+  kubectl delete ippool "${KIH_IPPOOL_NAME}" --ignore-not-found --wait=true --timeout=120s
   report_case_pass "pool, multipool, and second-NAD resources are absent before core setup"
   capture_checkpoint 02-start-clean \
     "expanded-group resources cleared after helper CRDs and serving objects are ready"
 
   kubectl apply -f "${E2E_DIR}/manifests/pool.yaml"
   wait_for CORE-POOL-INITIALIZED 120 "IPPool initialized with 11 available addresses" pool_initialized
+  assert_case CORE-WEBHOOK-VMNETCFG-ADMISSION \
+    "VMNetCfg range validation uses live admission and the configured pool" webhook_vmnetcfg_admission_qualified
   wait_for CORE-LEADER-SERVICES 120 "leader owns ${KIH_IPPOOL_SERVER}/24 and UDP/67" leader_services_healthy
   wait_for CORE-METRICS-EMPTY 60 "initial IPPool metrics" metric_pool_equals 0 11
   capture_checkpoint 03-pool-initialized "${KIH_IPPOOL_NAME} initialized with 11 free addresses"
@@ -2313,6 +2623,12 @@ main() {
     die "reservation ${RESERVED_IP} is outside 10.77.0.100-10.77.0.110"
   fi
   wait_for CORE-ALLOCATION-MATCHES 60 "IPPool allocation matches VMNetCfg" pool_allocation_matches
+  kubectl -n "${KIH_WORKLOAD_NAMESPACE}" get vmnetcfg "${KIH_VM_NAME}" -o json |
+    jq '.metadata = {name:"e2e-duplicate-admission-probe",namespace:.metadata.namespace}
+      | del(.status)' > "${E2E_ARTIFACTS_DIR}/webhook-duplicate-vmnetcfg.json"
+  assert_case CORE-WEBHOOK-DUPLICATE-ADMISSION \
+    "a distinct object cannot duplicate the same VM and MAC owner" admission_rejects \
+    "${E2E_ARTIFACTS_DIR}/webhook-duplicate-vmnetcfg.json"
   wait_for CORE-METRICS-RESERVED 60 "IPPool used/available metrics after reservation" metric_pool_equals 1 10
   wait_for CORE-METRICS-VMNETCFG-OK 60 "VMNetCfg OK metric" metric_vm_ok
   capture_checkpoint 04-halted-reservation "halted VM holds ${RESERVED_IP} with IPPool accounting"

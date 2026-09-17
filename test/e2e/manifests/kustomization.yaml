@@ -9,20 +9,48 @@ kind: Kustomization
 # The production resources live above this kustomization root.
 resources:
   - ../../../deployments/deployment.yaml
+  - ../../../deployments/webhook-deployment.yaml
   - namespaces.yaml
   - nad.yaml
   - network-services.yaml
 
 patches:
-  # Helper deployment: locally built image, IfNotPresent, and the contracted
-  # Multus attachment. Replicas, probes, resources, and env stay as deployed.
+  # Primary HA fixture has two replicas; all other runtime defaults remain.
   - path: helper-overlay.yaml
-  # kind clusters have no monitoring.coreos.com CRD, so the ServiceMonitor from
-  # the production manifest must not reach the API server.
+  - target:
+      kind: Service
+      name: metrics-management
+    patch: |-
+      - op: replace
+        path: /metadata/labels/kubevirtiphelper~1network
+        value: kubevirt-ip-helper-e2e
+      - op: replace
+        path: /spec/selector/kubevirtiphelper~1network
+        value: kubevirt-ip-helper-e2e
   - patch: |-
-      apiVersion: monitoring.coreos.com/v1
-      kind: ServiceMonitor
+      apiVersion: apps/v1
+      kind: Deployment
       metadata:
-        name: kubevirt-ip-helper
+        name: helper-storage
         namespace: kubevirt-ip-helper
       $patch: delete
+  - patch: |-
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: metrics-storage
+        namespace: kubevirt-ip-helper
+      $patch: delete
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: kubevirt-ip-helper-webhook
+        namespace: kubevirt-ip-helper
+      spec:
+        template:
+          spec:
+            containers:
+              - name: kubevirt-ip-helper-webhook
+                image: kubevirt-ip-helper-webhook:e2e
+                imagePullPolicy: IfNotPresent

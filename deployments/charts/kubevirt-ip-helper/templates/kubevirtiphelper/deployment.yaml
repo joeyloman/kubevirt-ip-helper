@@ -1,64 +1,100 @@
+{{- include "kubevirt-ip-helper.validate" . -}}
+{{- range .Values.kubevirtiphelper.networks }}
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "kubevirt-ip-helper.fullname" . }}
-  namespace: {{ .Release.Namespace | default "kube-system" }}
+  name: {{ .deploymentName | quote }}
+  namespace: {{ $.Release.Namespace | default "kube-system" }}
   labels:
-    {{- include "kubevirt-ip-helper.labels" . | nindent 4 }}
+    {{- include "kubevirt-ip-helper.labels" $ | nindent 4 }}
+    kubevirtiphelper/network: {{ .name | quote }}
 spec:
-  {{- if not .Values.kubevirtiphelper.autoscaling.enabled }}
-  replicas: {{ .Values.kubevirtiphelper.replicaCount }}
+  {{- if hasKey . "replicaCount" }}
+  replicas: {{ .replicaCount }}
+  {{- else }}
+  replicas: 1
   {{- end }}
   selector:
     matchLabels:
-      {{- include "kubevirt-ip-helper.selectorLabels" . | nindent 6 }}
-  progressDeadlineSeconds: 600
+      {{- include "kubevirt-ip-helper.selectorLabels" $ | nindent 6 }}
+      kubevirtiphelper/network: {{ .name | quote }}
+  progressDeadlineSeconds: 1800
   revisionHistoryLimit: 10
+  # A healthy standby is ready; only the active-leader label routes metrics.
   strategy:
     rollingUpdate:
-      maxSurge: 25%
-      maxUnavailable: 25%
+      maxSurge: 1
+      maxUnavailable: 0
     type: RollingUpdate
   template:
     metadata:
-      {{- with .Values.kubevirtiphelper.podAnnotations }}
       annotations:
+        {{- with omit $.Values.kubevirtiphelper.podAnnotations "k8s.v1.cni.cncf.io/networks" }}
         {{- toYaml . | nindent 8 }}
-      {{- end }}
+        {{- end }}
+        k8s.v1.cni.cncf.io/networks: {{ list (dict "name" .name "namespace" $.Release.Namespace "interface" .interface) | toJson | quote }}
       labels:
-        {{- include "kubevirt-ip-helper.selectorLabels" . | nindent 8 }}
+        {{- include "kubevirt-ip-helper.selectorLabels" $ | nindent 8 }}
+        kubevirtiphelper/network: {{ .name | quote }}
     spec:
-      {{- with .Values.kubevirtiphelper.nodeSelector }}
+      {{- with $.Values.kubevirtiphelper.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.kubevirtiphelper.affinity }}
+      {{- with $.Values.kubevirtiphelper.affinity }}
       affinity:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.kubevirtiphelper.tolerations }}
+      {{- with $.Values.kubevirtiphelper.tolerations }}
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       dnsPolicy: ClusterFirst
-      {{- with .Values.kubevirtiphelper.imagePullSecrets }}
+      terminationGracePeriodSeconds: 30
+      {{- with $.Values.kubevirtiphelper.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      serviceAccountName: {{ include "kubevirt-ip-helper.serviceAccountName" . }}
+      serviceAccountName: {{ include "kubevirt-ip-helper.serviceAccountName" $ }}
       securityContext:
-        {{- toYaml .Values.kubevirtiphelper.podSecurityContext | nindent 8 }}
+        {{- toYaml $.Values.kubevirtiphelper.podSecurityContext | nindent 8 }}
       containers:
-        - name: {{ .Chart.Name }}
+        - name: {{ $.Chart.Name }}
           securityContext:
-            {{- toYaml .Values.kubevirtiphelper.securityContext | nindent 12 }}
-          image: "{{ .Values.kubevirtiphelper.image.repository }}:{{ .Values.kubevirtiphelper.image.tag | default .Chart.AppVersion }}"
-          {{- with .Values.kubevirtiphelper.env }}
+            {{- toYaml $.Values.kubevirtiphelper.securityContext | nindent 12 }}
+          image: "{{ $.Values.kubevirtiphelper.image.repository }}:{{ $.Values.kubevirtiphelper.image.tag | default $.Chart.AppVersion }}"
+          {{- with $.Values.kubevirtiphelper.env }}
           env:
             {{- toYaml . | nindent 12 }}
           {{- end }}
-          imagePullPolicy: {{ .Values.kubevirtiphelper.image.pullPolicy }}
+          imagePullPolicy: {{ $.Values.kubevirtiphelper.image.pullPolicy }}
           resources:
-            {{- toYaml .Values.kubevirtiphelper.resources | nindent 12 }}
+            {{- toYaml $.Values.kubevirtiphelper.resources | nindent 12 }}
           terminationMessagePath: /dev/termination-log
           terminationMessagePolicy: File
+          # Covers Init before the health listener starts, not service-era replay.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            periodSeconds: 10
+            failureThreshold: 90
+          # A stale leader must stop answering DHCP instead of diverging.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+{{- end }}

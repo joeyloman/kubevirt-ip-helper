@@ -1,0 +1,52 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../../../deployments/deployment.yaml
+patches:
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: helper-management
+        namespace: kubevirt-ip-helper
+      $patch: delete
+  - patch: |-
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: metrics-management
+        namespace: kubevirt-ip-helper
+      $patch: delete
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: helper-storage
+        namespace: kubevirt-ip-helper
+        labels:
+          kubevirtiphelper/network: kubevirt-ip-helper-e2e2
+      spec:
+        selector:
+          matchLabels:
+            kubevirtiphelper/network: kubevirt-ip-helper-e2e2
+        template:
+          metadata:
+            labels:
+              kubevirtiphelper/network: kubevirt-ip-helper-e2e2
+            annotations:
+              k8s.v1.cni.cncf.io/networks: '[{"name":"kubevirt-ip-helper-e2e2","namespace":"kubevirt-ip-helper","interface":"kihnet1"}]'
+          spec:
+            containers:
+              - name: kubevirt-ip-helper
+                image: kubevirt-ip-helper:e2e
+                imagePullPolicy: IfNotPresent
+  - target:
+      kind: Service
+      name: metrics-storage
+    patch: |-
+      - op: replace
+        path: /metadata/labels/kubevirtiphelper~1network
+        value: kubevirt-ip-helper-e2e2
+      - op: replace
+        path: /spec/selector/kubevirtiphelper~1network
+        value: kubevirt-ip-helper-e2e2

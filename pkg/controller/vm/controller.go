@@ -19,6 +19,7 @@ import (
 	kihclientset "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/clientset/versioned"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/metrics"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/util"
 )
 
 type Controller struct {
@@ -31,6 +32,8 @@ type Controller struct {
 	dhcp         *dhcp.DHCPAllocator
 	metrics      *metrics.MetricsAllocator
 	kihClientset *kihclientset.Clientset
+	scope        util.NetworkScope
+	reconcileMu  *sync.Mutex
 }
 
 func NewController(
@@ -43,6 +46,8 @@ func NewController(
 	dhcp *dhcp.DHCPAllocator,
 	metrics *metrics.MetricsAllocator,
 	kihClientset *kihclientset.Clientset,
+	scope util.NetworkScope,
+	reconcileMu *sync.Mutex,
 ) *Controller {
 	// the API calls of a reconciliation run under the era context: a
 	// canceled era (application reinit or shutdown) aborts in-flight
@@ -61,6 +66,8 @@ func NewController(
 		dhcp:         dhcp,
 		metrics:      metrics,
 		kihClientset: kihClientset,
+		scope:        scope,
+		reconcileMu:  reconcileMu,
 	}
 }
 
@@ -79,6 +86,12 @@ func (c *Controller) processNextItem() bool {
 }
 
 func (c *Controller) sync(event Event) (err error) {
+	c.reconcileMu.Lock()
+	defer c.reconcileMu.Unlock()
+	if err := c.ctx.Err(); err != nil {
+		return err
+	}
+
 	obj, exists, err := c.indexer.GetByKey(event.key)
 	if err != nil {
 		log.Errorf("(vm.sync) fetching object with key %s from store failed with %v", event.key, err)

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	log "github.com/sirupsen/logrus"
 
@@ -44,6 +45,8 @@ type Controller struct {
 	metrics      *metrics.MetricsAllocator
 	kihClientset *kihclientset.Clientset
 	appStatus    *atomic.Int32
+	scope        util.NetworkScope
+	reconcileMu  *sync.Mutex
 
 	// gate is the startup membership gate of this era: its snapshot holds
 	// the exact keys of the startup LIST, and markInitAttempt settles a
@@ -88,6 +91,8 @@ func NewController(
 	kihClientset *kihclientset.Clientset,
 	appStatus *atomic.Int32,
 	startupGate *gate.Gate,
+	scope util.NetworkScope,
+	reconcileMu *sync.Mutex,
 ) *Controller {
 	// the API calls of a reconciliation run under the era context: a
 	// canceled era (application reinit or shutdown) aborts in-flight
@@ -108,6 +113,8 @@ func NewController(
 		kihClientset: kihClientset,
 		appStatus:    appStatus,
 		gate:         startupGate,
+		scope:        scope,
+		reconcileMu:  reconcileMu,
 	}
 }
 
@@ -196,6 +203,9 @@ func (c *Controller) releaseDeferredInitAllocations() (keys []string) {
 // is durable by then), so this record is the only thing which keeps the
 // owner-validated deletion reachable.
 func (c *Controller) rememberPendingUnwind(key string, entry pendingLedgerDelete) {
+	if !c.scope.Owns(entry.namespace, entry.networkName) {
+		return
+	}
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
@@ -212,10 +222,8 @@ func (c *Controller) rememberPendingUnwind(key string, entry pendingLedgerDelete
 // still recorded, and no reconciliation of it will ever arrive again -
 // the resident entries would keep the map bound and the ledger records
 // stranded until the next process era. each entry gets one final
-// owner-validated attempt; whatever still fails is dropped with a
-// warning, because the next era's pool registration revalidates the
-// persisted ledger and drops the orphaned record of a positively
-// removed binding.
+// owner-validated attempt; whatever still fails is dropped with a warning.
+// The next era's pool registration revalidates the persisted ledger.
 func (c *Controller) drainPendingUnwinds(key string) {
 	c.mutex.Lock()
 	pending := c.pendingUnwinds[key]
@@ -223,6 +231,9 @@ func (c *Controller) drainPendingUnwinds(key string) {
 	c.mutex.Unlock()
 
 	for _, entry := range pending {
+		if !c.scope.Owns(entry.namespace, entry.networkName) {
+			continue
+		}
 		err := c.updateIPPoolStatus(
 			DELETE,
 			entry.namespace,
@@ -278,6 +289,9 @@ func (c *Controller) retryPendingUnwinds(vmnetcfg *kihv1.VirtualMachineNetworkCo
 	var retryErr error
 
 	for _, entry := range pending {
+		if !c.scope.Owns(entry.namespace, entry.networkName) {
+			continue
+		}
 		err := c.updateIPPoolStatus(
 			DELETE,
 			entry.namespace,
@@ -418,12 +432,24 @@ func (c *Controller) sync(event Event) (err error) {
 		// controller startup forever
 		c.markInitAttempt(event.key)
 
-		// the object is gone for good (a regular deletion converged its
-		// own cleanup, a force-delete stripped the finalizers externally):
-		// replay its recorded ledger deletions one last time and drop
-		// them, so a stranded record cannot keep the entry resident for
-		// the rest of the era
+		// A queued deletion can outlive a same-name replacement. Verify
+		// absence under the era mutex before draining the old pending work.
+		namespace, name, splitErr := cache.SplitMetaNamespaceKey(event.key)
+		if splitErr != nil {
+			return splitErr
+		}
+		c.reconcileMu.Lock()
+		live, readErr := c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs(namespace).Get(c.ctx, name, metav1.GetOptions{})
+		if readErr == nil {
+			c.reconcileMu.Unlock()
+			return c.updateVirtualMachineNetworkConfig(UPDATE, live)
+		}
+		if !apierrors.IsNotFound(readErr) {
+			c.reconcileMu.Unlock()
+			return readErr
+		}
 		c.drainPendingUnwinds(event.key)
+		c.reconcileMu.Unlock()
 	}
 
 	return

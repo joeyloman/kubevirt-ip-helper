@@ -115,6 +115,7 @@ func TestVMNetCfgDeletionReleasesThePreMoveTuple(t *testing.T) {
 	vmnetcfg := newDeletingVMNetCfg([]kihv1.NetworkConfig{
 		{IPAddress: "10.0.1.5", MACAddress: testMAC, NetworkName: "net-moved"},
 	})
+	vmnetcfg.Status.NetworkConfig = []kihv1.NetworkConfigStatus{{NetworkName: testNetwork, MACAddress: testMAC, Status: "OK"}}
 	e.seedVMNetCfg(vmnetcfg)
 
 	if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, vmnetcfg); err != nil {
@@ -131,8 +132,8 @@ func TestVMNetCfgDeletionReleasesThePreMoveTuple(t *testing.T) {
 	if got, still := pool.Status.IPv4.Allocated["10.0.0.2"]; still {
 		t.Errorf("the ledger record of the old network survived the deletion: %q", got)
 	}
-	if final := e.getStoredVMNetCfg(); len(final.Finalizers) != 0 {
-		t.Errorf("finalizers = %v, want removed so the object can be deleted", final.Finalizers)
+	if final := e.getStoredVMNetCfg(); len(final.Finalizers) != 1 || len(final.Spec.NetworkConfig) != 1 || len(final.Status.NetworkConfig) != 0 {
+		t.Errorf("foreign post-move spec must block finalization while the old status acknowledges: %#v", final)
 	}
 }
 

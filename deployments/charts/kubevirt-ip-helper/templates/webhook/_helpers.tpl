@@ -46,7 +46,7 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 Selector labels
 */}}
 {{- define "kubevirt-ip-helper-webhook.selectorLabels" -}}
-app.kubernetes.io/name: {{ include "kubevirt-ip-helper-webhook.name" . }}
+app.kubernetes.io/name: {{ include "kubevirt-ip-helper-webhook.name" . | quote }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
@@ -57,6 +57,6 @@ Create the name of the service account to use
 {{- if .Values.webhook.serviceAccount.create }}
 {{- default (include "kubevirt-ip-helper-webhook.fullname" .) .Values.webhook.serviceAccount.name }}
 {{- else }}
-{{- default "default" .Values.webhook.serviceAccount.name }}
+{{- required "webhook.serviceAccount.name is required when create is false" .Values.webhook.serviceAccount.name }}
 {{- end }}
 {{- end }}

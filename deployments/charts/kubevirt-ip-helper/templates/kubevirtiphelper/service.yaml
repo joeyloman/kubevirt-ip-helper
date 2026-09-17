@@ -1,18 +1,23 @@
+{{- range .Values.kubevirtiphelper.networks }}
+---
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "kubevirt-ip-helper.fullname" . }}-metrics
-  namespace: {{ .Release.Namespace | default "kube-system" }}
+  name: {{ .metricsServiceName | quote }}
+  namespace: {{ $.Release.Namespace | default "kube-system" }}
   labels:
-    {{- include "kubevirt-ip-helper.labels" . | nindent 4 }}
+    {{- include "kubevirt-ip-helper.labels" $ | nindent 4 }}
+    kubevirtiphelper/network: {{ .name | quote }}
 spec:
   selector:
-    {{- include "kubevirt-ip-helper.selectorLabels" . | nindent 4 }}
+    {{- include "kubevirt-ip-helper.selectorLabels" $ | nindent 4 }}
+    kubevirtiphelper/network: {{ .name | quote }}
     kubevirtiphelper/leader: active
   ports:
     - name: metrics
-      port: {{ .Values.kubevirtiphelper.service.metricsPort | default 8080 }}
+      port: {{ $.Values.kubevirtiphelper.service.metricsPort }}
       protocol: TCP
-      targetPort: {{ .Values.kubevirtiphelper.service.metricsPort | default 8080 }}
+      targetPort: 8080
   sessionAffinity: None
   type: ClusterIP
+{{- end }}

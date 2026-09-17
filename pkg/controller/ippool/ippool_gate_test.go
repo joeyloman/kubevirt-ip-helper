@@ -21,7 +21,11 @@ func TestRegisterIPPoolTransientFailureStaysUncountedDuringInit(t *testing.T) {
 	startupGate := newTestGate("pool-t")
 	controller, _ := newTestController(t, newTestQueue(), newTestIndexer(), nil, &appStatus, startupGate)
 
-	pool := testPool("pool-t", "net-t", 60)
+	pool := testPool("pool-t", "infra/net-t", 60)
+	controller.scope = testNetworkScope(pool.Spec.NetworkName)
+	if err := controller.indexer.Add(pool); err != nil {
+		t.Fatal(err)
+	}
 
 	if _, err := controller.registerIPPool(pool); err == nil {
 		t.Fatal("the registration of a pool with a missing bindinterface returned nil, want a transient error")
@@ -48,7 +52,8 @@ func TestRegisterIPPoolUnparseableSubnetCountsAsHandledDuringInit(t *testing.T) 
 	startupGate := newTestGate("pool-u")
 	controller, _ := newTestController(t, newTestQueue(), newTestIndexer(), nil, &appStatus, startupGate)
 
-	pool := testPool("pool-u", "net-u", 60)
+	pool := testPool("pool-u", "infra/net-u", 60)
+	controller.scope = testNetworkScope(pool.Spec.NetworkName)
 	pool.Spec.IPv4Config.Subnet = "192.168.1.0/33"
 
 	_, err := controller.registerIPPool(pool)
@@ -71,7 +76,8 @@ func TestRegisterIPPoolSettledCountIsIdempotent(t *testing.T) {
 	startupGate := newTestGate("pool-v")
 	controller, _ := newTestController(t, newTestQueue(), newTestIndexer(), nil, &appStatus, startupGate)
 
-	pool := testPool("pool-v", "net-v", 60)
+	pool := testPool("pool-v", "infra/net-v", 60)
+	controller.scope = testNetworkScope(pool.Spec.NetworkName)
 	pool.Spec.IPv4Config.Subnet = "192.168.1.0/33"
 
 	if _, err := controller.registerIPPool(pool); err == nil {

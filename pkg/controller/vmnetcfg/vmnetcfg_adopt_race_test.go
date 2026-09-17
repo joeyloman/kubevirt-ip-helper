@@ -109,8 +109,8 @@ func TestAdoptionDoesNotRecreateTheClaimAfterConcurrentCleanup(t *testing.T) {
 		e.api.mu.Unlock()
 	})
 
-	if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, vmnetcfg); err != nil {
-		t.Fatalf("the raced reconciliation must converge: %s", err)
+	if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, vmnetcfg); err == nil {
+		t.Fatal("the stale owned decision must requeue after guarded cleanup")
 	}
 
 	// nothing of the removed nic survives

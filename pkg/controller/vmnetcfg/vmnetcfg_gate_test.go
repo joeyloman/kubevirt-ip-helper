@@ -42,6 +42,8 @@ func newGateTestEnv(t *testing.T) (*testEnv, *Controller, *gate.Gate) {
 		e.client,
 		&appStatus,
 		startupGate,
+		e.scope,
+		e.reconcileMu,
 	)
 
 	return e, controller, startupGate
@@ -60,6 +62,7 @@ func TestSyncAddTransientFailureStaysUncountedUntilTheRestoreSucceeds(t *testing
 	// (a pending nic without a recorded address defers instead and is
 	// covered by the finding-4 replay tests)
 	vmnetcfg := newVMNetCfg("10.0.0.1", testMAC)
+	e.seedVMNetCfg(vmnetcfg)
 	if err := controller.indexer.Add(vmnetcfg); err != nil {
 		t.Fatalf("seeding indexer: %s", err)
 	}
@@ -161,11 +164,11 @@ func TestSyncAddMixedFailureClassifiesOnTheRecordedFailure(t *testing.T) {
 	e.seedPool(nil)
 
 	// the first interface fails transiently (its pool status write), the
-	// second interface sits on a network without a registered pool
+	// second has an invalid MAC on the same owned network
 	vmnetcfg := newVMNetCfg("", testMAC)
 	vmnetcfg.Spec.NetworkConfig = []kihv1.NetworkConfig{
 		{IPAddress: "10.0.0.1", MACAddress: testMAC, NetworkName: testNetwork},
-		{MACAddress: testMAC2, NetworkName: "net-missing"},
+		{MACAddress: "not-a-mac-address", NetworkName: testNetwork},
 	}
 	e.seedVMNetCfg(vmnetcfg)
 	if err := controller.indexer.Add(vmnetcfg); err != nil {
@@ -190,10 +193,12 @@ func TestSyncAddMixedFailureClassifiesOnTheRecordedFailure(t *testing.T) {
 	// settles the object for the gate
 	e.api.poolStatusPutCode = 0
 	if err := controller.sync(Event{key: key, action: ADD}); err == nil {
-		t.Fatal("want the pool-less interface to keep failing the sync")
+		t.Fatal("want the invalid-MAC interface to keep failing the sync")
+	} else if !errors.Is(err, errNicMacInvalid) {
+		t.Fatalf("error = %v, want the remaining permanent invalid-MAC failure", err)
 	}
 	if startupGate.Settled() != 1 {
-		t.Fatalf("gate count = %d, want 1: the pool-less interface settles the gate", startupGate.Settled())
+		t.Fatalf("gate count = %d, want 1: the invalid-MAC interface settles the gate", startupGate.Settled())
 	}
 }
 

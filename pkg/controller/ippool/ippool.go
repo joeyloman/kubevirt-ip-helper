@@ -110,6 +110,26 @@ func validateExcludeEntries(pool *kihv1.IPPool) error {
 	return nil
 }
 
+func (c *Controller) selectedPool(pool *kihv1.IPPool) bool {
+	return c.scope.NetworkName() != "" &&
+		pool.Labels[util.NetworkLabel] == c.scope.Name() &&
+		pool.Labels[util.NetworkNamespaceLabel] == c.scope.Namespace()
+}
+
+func (c *Controller) poolIdentityError(pool *kihv1.IPPool) error {
+	return fmt.Errorf("IPPool %s labels and spec.networkname %q must match helper network %s: %w",
+		pool.Name, pool.Spec.NetworkName, c.scope.NetworkName(), ErrPoolUnregistrable)
+}
+
+// Every fresh pool read used for registration must still belong to the
+// selected network before its claims or status are used.
+func (c *Controller) verifyPoolIdentity(current *kihv1.IPPool) error {
+	if !c.scope.MatchesPool(current) {
+		return c.poolIdentityError(current)
+	}
+	return nil
+}
+
 func (c *Controller) registerIPPool(pool *kihv1.IPPool) (cleanup bool, err error) {
 
 	// the startup gate counts this pool as handled once its registration
@@ -180,11 +200,14 @@ func (c *Controller) registerIPPool(pool *kihv1.IPPool) (cleanup bool, err error
 	// claim protection keeps the registration honest
 	if c.kihClientset != nil {
 		cPool, getErr := c.kihClientset.KubevirtiphelperV1().IPPools().Get(c.ctx, pool.Name, metav1.GetOptions{})
-		if getErr != nil && !apierrors.IsNotFound(getErr) {
+		if getErr != nil {
 			return cleanup, fmt.Errorf("error while checking the exclude entries of pool [%s] against its persisted claims for network [%s]: %s",
 				pool.Name, pool.Spec.NetworkName, getErr.Error())
 		}
 		if getErr == nil {
+			if identityErr := c.verifyPoolIdentity(cPool); identityErr != nil {
+				return cleanup, identityErr
+			}
 			for _, ex := range pool.Spec.IPv4Config.Pool.Exclude {
 				if ref, claimed := cPool.Status.IPv4.Allocated[ex]; claimed && ref != ipam.ExcludedOwner {
 					conflict, verifyErr := c.excludeEntryConflicts(pool, ex, ref)
@@ -312,17 +335,6 @@ func (c *Controller) registerIPPool(pool *kihv1.IPPool) (cleanup bool, err error
 		return cleanup, fmt.Errorf("error while caching the IPPool for network [%s]: %s", pool.Spec.NetworkName, err.Error())
 	}
 
-	// record the live registration of this era: the pool NAME owns the
-	// networkname key it registered under, so a later update which does
-	// not carry that networkname anymore (a rename swallowed while the
-	// application was initializing, re-delivered by a resync with
-	// old==new) can still find and tear the old registration down instead
-	// of registering the pool a second time
-	if c.registeredPools == nil {
-		c.registeredPools = make(map[string]string)
-	}
-	c.registeredPools[pool.Name] = pool.Spec.NetworkName
-
 	log.Infof("(ippool.registerIPPool) [%s] new IPPool registered", pool.Name)
 
 	return
@@ -426,6 +438,9 @@ func (c *Controller) handleIPPoolObjectChange(oldPool kihv1.IPPool, newPool *kih
 				newPool.Name, newPool.Spec.NetworkName, getErr.Error())
 		}
 		if getErr == nil {
+			if identityErr := c.verifyPoolIdentity(cPool); identityErr != nil {
+				return identityErr
+			}
 			for _, ex := range newPool.Spec.IPv4Config.Pool.Exclude {
 				if ref, claimed := cPool.Status.IPv4.Allocated[ex]; claimed && ref != ipam.ExcludedOwner {
 					conflict, verifyErr := c.excludeEntryConflicts(newPool, ex, ref)
@@ -567,9 +582,6 @@ func (c *Controller) cleanupIPPoolObjects(pool *kihv1.IPPool) (err error) {
 	c.dhcp.RemoveLeasesForNetwork(pool.Spec.NetworkName)
 	c.metrics.DeleteIPPool(pool.Name, pool.Spec.IPv4Config.Subnet, pool.Spec.NetworkName)
 	c.cache.Delete("pool", pool.Spec.NetworkName)
-	// the pool name holds no live registration anymore (delete on the nil
-	// map of a never-registered pool is a no-op)
-	delete(c.registeredPools, pool.Name)
 
 	ipnet, err := netip.ParsePrefix(pool.Spec.IPv4Config.Subnet)
 	if err != nil {
@@ -722,6 +734,9 @@ func (c *Controller) protectPersistedClaims(pool *kihv1.IPPool) (map[string]stri
 		// the registration instead of publishing an unprotected allocator
 		return nil, fmt.Errorf("error while getting IPPool %s: %w", pool.Name, err)
 	}
+	if err := c.verifyPoolIdentity(cPool); err != nil {
+		return nil, err
+	}
 	claims := make(map[string]string)
 	// pinnedIPs records the addresses this protection actually reserved:
 	// the spec sweep skips them (the ledger already decided those
@@ -858,7 +873,14 @@ func (c *Controller) protectPersistedClaims(pool *kihv1.IPPool) (map[string]stri
 			continue
 		}
 
-		if len(vmnetcfg.Status.NetworkConfig) == 0 &&
+		hasOwnedStatus := false
+		for _, nic := range vmnetcfg.Status.NetworkConfig {
+			if util.QualifyNetworkName(vmnetcfg.Namespace, nic.NetworkName) == pool.Spec.NetworkName {
+				hasOwnedStatus = true
+				break
+			}
+		}
+		if !hasOwnedStatus &&
 			!cPool.Status.LastUpdate.IsZero() &&
 			vmnetcfg.CreationTimestamp.After(cPool.Status.LastUpdate.Time) {
 			// the binding replay rejects this object as a manually created
@@ -871,13 +893,14 @@ func (c *Controller) protectPersistedClaims(pool *kihv1.IPPool) (map[string]stri
 		}
 
 		for _, v := range vmnetcfg.Spec.NetworkConfig {
-			if v.IPAddress == "" || v.NetworkName != pool.Spec.NetworkName {
+			if v.IPAddress == "" || util.QualifyNetworkName(vmnetcfg.Namespace, v.NetworkName) != pool.Spec.NetworkName {
 				continue
 			}
 
 			nicStatus, hasStatus := "", false
 			for _, nic := range vmnetcfg.Status.NetworkConfig {
-				if v.MACAddress == nic.MACAddress && v.NetworkName == nic.NetworkName {
+				if util.CanonicalHWAddr(v.MACAddress) == util.CanonicalHWAddr(nic.MACAddress) &&
+					util.QualifyNetworkName(vmnetcfg.Namespace, nic.NetworkName) == pool.Spec.NetworkName {
 					nicStatus, hasStatus = nic.Status, true
 
 					break
@@ -1009,7 +1032,7 @@ func (c *Controller) protectPersistedClaims(pool *kihv1.IPPool) (map[string]stri
 	specStillRecordsClaim := func(vmnetcfg *kihv1.VirtualMachineNetworkConfig, claim specClaim) bool {
 		for _, v := range vmnetcfg.Spec.NetworkConfig {
 			if util.CanonicalHWAddr(v.MACAddress) == claim.mac &&
-				v.NetworkName == pool.Spec.NetworkName && v.IPAddress == claim.ip {
+				util.QualifyNetworkName(vmnetcfg.Namespace, v.NetworkName) == pool.Spec.NetworkName && v.IPAddress == claim.ip {
 				return true
 			}
 		}
@@ -1155,7 +1178,7 @@ func (c *Controller) verifyLedgerOwner(pool *kihv1.IPPool, namespace string, vmN
 	if getErr == nil {
 		for _, v := range vmnetcfg.Spec.NetworkConfig {
 			if util.CanonicalHWAddr(v.MACAddress) == util.CanonicalHWAddr(hwAddr) &&
-				v.NetworkName == pool.Spec.NetworkName && v.IPAddress == ip {
+				util.QualifyNetworkName(vmnetcfg.Namespace, v.NetworkName) == pool.Spec.NetworkName && v.IPAddress == ip {
 				return ownerLive
 			}
 		}
@@ -1301,6 +1324,9 @@ func (c *Controller) resetIPPoolStatus(pool *kihv1.IPPool, protectedClaims map[s
 	if err != nil {
 		return uPool, err
 	}
+	if err := c.verifyPoolIdentity(cPool); err != nil {
+		return nil, err
+	}
 
 	// if the timestamp is not set, set it to the current local time
 	if cPool.Status.LastUpdate.IsZero() {
@@ -1335,6 +1361,9 @@ func (c *Controller) resetIPPoolMetrics(pool *kihv1.IPPool) (err error) {
 	cPool, err := c.kihClientset.KubevirtiphelperV1().IPPools().Get(c.ctx, pool.Name, metav1.GetOptions{})
 	if err != nil {
 		return
+	}
+	if err := c.verifyPoolIdentity(cPool); err != nil {
+		return err
 	}
 
 	c.metrics.UpdateIPPoolUsed(cPool.Name, cPool.Spec.IPv4Config.Subnet, cPool.Spec.NetworkName, cPool.Status.IPv4.Used)

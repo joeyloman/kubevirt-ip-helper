@@ -1,13 +1,20 @@
 package service
 
 import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"sort"
 	"strings"
 	"testing"
 
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
+	admissionv1 "k8s.io/api/admission/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 )
 
 func vmnetcfg(namespace string, name string, vmName string, nics ...kihv1.NetworkConfig) *kihv1.VirtualMachineNetworkConfig {
@@ -20,6 +27,228 @@ func vmnetcfg(namespace string, name string, vmName string, nics ...kihv1.Networ
 			VMName:        vmName,
 			NetworkConfig: nics,
 		},
+	}
+}
+
+// Exercise admission against its real REST list path, without a live API.
+func admissionTestHandler(t *testing.T, pools *kihv1.IPPoolList, configs *kihv1.VirtualMachineNetworkConfigList, lookupFailure bool) *Handler {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.RawQuery != "" {
+			t.Errorf("admission discovery must remain an unfiltered GET: %s %s", r.Method, r.URL)
+		}
+		if lookupFailure {
+			http.Error(w, "API unavailable", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case vmNetCfgAPIPath + "/ippools":
+			_ = json.NewEncoder(w).Encode(pools)
+		case vmNetCfgAPIPath + "/virtualmachinenetworkconfigs":
+			_ = json.NewEncoder(w).Encode(configs)
+		case vmNetCfgAPIPath + "/namespaces/tenant/virtualmachinenetworkconfigs":
+			list := &kihv1.VirtualMachineNetworkConfigList{}
+			for _, obj := range configs.Items {
+				if obj.Namespace == "tenant" {
+					list.Items = append(list.Items, obj)
+				}
+			}
+			_ = json.NewEncoder(w).Encode(list)
+		default:
+			t.Errorf("unexpected admission lookup %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	clientset, err := kubernetes.NewForConfig(&rest.Config{Host: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &Handler{clientset: clientset}
+}
+
+func vmNetCfgReview(t *testing.T, operation admissionv1.Operation, obj, old *kihv1.VirtualMachineNetworkConfig) *admissionv1.AdmissionReview {
+	t.Helper()
+	raw, err := json.Marshal(obj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := &admissionv1.AdmissionRequest{
+		UID:       "admission-test",
+		Operation: operation,
+		Namespace: obj.Namespace,
+		Name:      obj.Name,
+		Object:    runtime.RawExtension{Raw: raw},
+	}
+	if old != nil {
+		request.OldObject.Raw, err = json.Marshal(old)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	return &admissionv1.AdmissionReview{Request: request}
+}
+
+func TestValidateVmNetCfgDelta(t *testing.T) {
+	own := kihv1.NetworkConfig{NetworkName: "infra/net-a", MACAddress: "02:00:00:00:00:01", IPAddress: "192.168.11.110"}
+	badMAC := kihv1.NetworkConfig{NetworkName: "infra/net-b", MACAddress: "01:00:5e:00:00:01"}
+	badIP := kihv1.NetworkConfig{NetworkName: "infra/net-b", MACAddress: "02:00:00:00:00:02", IPAddress: "192.168.11.250"}
+	duplicate := kihv1.NetworkConfig{NetworkName: "infra/net-b", MACAddress: "02:00:00:00:00:03"}
+	cfg := func(rows ...kihv1.NetworkConfig) *kihv1.VirtualMachineNetworkConfig {
+		return vmnetcfg("tenant", "shared", "vm", rows...)
+	}
+	old := cfg(own, badMAC, badIP, duplicate)
+	updatedOwn := own
+	updatedOwn.IPAddress = "192.168.11.120"
+	invalidOwn := own
+	invalidOwn.IPAddress = "192.168.11.250"
+	changedForeign := badIP
+	changedForeign.IPAddress = "192.168.11.251"
+	changedNetwork := badIP
+	changedNetwork.NetworkName = "infra/net-a"
+	changedMAC := badIP
+	changedMAC.MACAddress = "02:00:00:00:00:04"
+	metadataOnly := old.DeepCopy()
+	metadataOnly.Labels = map[string]string{"kept": "value"}
+	metadataOnly.Finalizers = []string{"cleanup"}
+	ownerMAC := cfg(badMAC)
+	ownerMAC.Spec.VMName = "new-owner"
+	ownerIP := cfg(badIP)
+	ownerIP.Spec.VMName = "new-owner"
+	ownerDuplicate := cfg(duplicate)
+	ownerDuplicate.Spec.VMName = "new-owner"
+	emptyOwner := cfg(badMAC)
+	emptyOwner.Spec.VMName = ""
+	sharedMAC := own
+	sharedMAC.NetworkName = "infra/net-b"
+
+	pools := &kihv1.IPPoolList{Items: []kihv1.IPPool{
+		*testPool("pool-a", "infra/net-a", "192.168.11.100", "192.168.11.166"),
+		*testPool("pool-b", "infra/net-b", "192.168.11.100", "192.168.11.166"),
+	}}
+	conflict := duplicate
+	conflict.NetworkName = "infra/net-c"
+	configs := &kihv1.VirtualMachineNetworkConfigList{Items: []kihv1.VirtualMachineNetworkConfig{
+		*vmnetcfg("other-tenant", "distinct-tenant", "vm", own),
+		*old,
+		*vmnetcfg("tenant", "distinct", "vm", conflict),
+		*vmnetcfg("tenant", "distinct-new-owner", "new-owner", conflict),
+	}}
+	h := admissionTestHandler(t, pools, configs, false)
+	tests := []struct {
+		name      string
+		operation admissionv1.Operation
+		old       *kihv1.VirtualMachineNetworkConfig
+		obj       *kihv1.VirtualMachineNetworkConfig
+		allowed   bool
+	}{
+		{"valid own allocation despite all unchanged foreign violations", admissionv1.Update, old, cfg(updatedOwn, badMAC, badIP, duplicate), true},
+		{"own row removal despite unchanged foreign violations", admissionv1.Update, old, cfg(badMAC, badIP, duplicate), true},
+		{"invalid row removal", admissionv1.Update, old, cfg(own, badIP, duplicate), true},
+		{"metadata acknowledgement despite unchanged foreign violations", admissionv1.Update, old, metadataOnly, true},
+		{"reorder uses complete rows not positions", admissionv1.Update, old, cfg(duplicate, badIP, own, badMAC), true},
+		{"removing one existing invalid duplicate", admissionv1.Update, cfg(badMAC, badMAC), cfg(badMAC), true},
+		{"extra duplicate invalid MAC is new", admissionv1.Update, old, cfg(own, badMAC, badIP, duplicate, badMAC), false},
+		{"extra duplicate invalid IP is new", admissionv1.Update, old, cfg(own, badMAC, badIP, duplicate, badIP), false},
+		{"extra duplicate cross-object claim is new", admissionv1.Update, old, cfg(own, badMAC, badIP, duplicate, duplicate), false},
+		{"modified own invalid IP is checked", admissionv1.Update, old, cfg(invalidOwn, badMAC, badIP, duplicate), false},
+		{"modified foreign IP is checked", admissionv1.Update, old, cfg(own, badMAC, changedForeign, duplicate), false},
+		{"network-only edit is a changed row", admissionv1.Update, cfg(badIP), cfg(changedNetwork), false},
+		{"MAC-only edit is a changed row", admissionv1.Update, cfg(badIP), cfg(changedMAC), false},
+		{"owner change revalidates MAC", admissionv1.Update, cfg(badMAC), ownerMAC, false},
+		{"owner change revalidates IP", admissionv1.Update, cfg(badIP), ownerIP, false},
+		{"owner change revalidates cross-object identity", admissionv1.Update, cfg(duplicate), ownerDuplicate, false},
+		{"clearing owner is exempt as before", admissionv1.Update, cfg(badMAC), emptyOwner, true},
+		{"CREATE validates rows even with OldObject", admissionv1.Create, old, old, false},
+		{"CREATE without owner is exempt as before", admissionv1.Create, nil, emptyOwner, true},
+		{"missing OldObject cannot exempt invalid rows", admissionv1.Update, nil, cfg(badMAC), false},
+		{"same MAC across networks inside shared object is valid", admissionv1.Create, nil, cfg(own, sharedMAC), true},
+		{"valid duplicate insertion does not invent an intra-object guard", admissionv1.Update, cfg(own), cfg(own, own), true},
+		{"last row removal needs no revalidation", admissionv1.Update, cfg(badMAC), cfg(), true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			response := h.validateVmNetCfg(vmNetCfgReview(t, tt.operation, tt.obj, tt.old))
+			if response.Allowed != tt.allowed {
+				t.Fatalf("allowed=%v, want %v: %+v", response.Allowed, tt.allowed, response.Result)
+			}
+		})
+	}
+}
+
+func TestValidateVmNetCfgQualifiedNetworks(t *testing.T) {
+	pools := &kihv1.IPPoolList{Items: []kihv1.IPPool{
+		*testPool("pool", "tenant/net-a", "192.168.11.100", "192.168.11.166"),
+		*testPool("shared-pool", "infra/net-b", "192.168.11.100", "192.168.11.166"),
+	}}
+	h := admissionTestHandler(t, pools, &kihv1.VirtualMachineNetworkConfigList{}, false)
+	tests := []struct {
+		name      string
+		namespace string
+		network   string
+		ip        string
+		allowed   bool
+	}{
+		{"qualified range enforced", "tenant", "tenant/net-a", "192.168.11.250", false},
+		{"bare equivalent range enforced", "tenant", "net-a", "192.168.11.250", false},
+		{"shared NAD range enforced from tenant", "tenant", "infra/net-b", "192.168.11.250", false},
+		{"bare network is not implicitly infrastructure scoped", "tenant", "net-b", "192.168.11.250", true},
+		{"valid bare range", "tenant", "net-a", "192.168.11.110", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			obj := vmnetcfg(tt.namespace, "shared", "vm", kihv1.NetworkConfig{
+				NetworkName: tt.network, MACAddress: "02:00:00:00:00:01", IPAddress: tt.ip,
+			})
+			response := h.validateVmNetCfg(vmNetCfgReview(t, admissionv1.Create, obj, nil))
+			if response.Allowed != tt.allowed {
+				t.Fatalf("allowed=%v, want %v: %+v", response.Allowed, tt.allowed, response.Result)
+			}
+		})
+	}
+}
+
+func TestValidateIPPoolGlobalDeletionGate(t *testing.T) {
+	tests := []struct {
+		name          string
+		network       string
+		statusOnly    bool
+		lookupFailure bool
+		allowed       bool
+	}{
+		{"same network tenant reference blocks", "infra/net-a", false, false, false},
+		{"other network same owner MAC does not block", "infra/net-b", false, false, true},
+		{"ambiguous tenant reference blocks", "", false, false, false},
+		{"lookup failure cannot prove orphan", "infra/net-b", false, true, false},
+		{"status rows and finalizers are not spec references", "infra/net-a", true, false, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pool := testPool("pool", "infra/net-a", "192.168.11.100", "192.168.11.166")
+			pool.Status.IPv4.Allocated = map[string]string{"192.168.11.110": "tenant/vm [02:00:00:00:00:01]"}
+			obj := vmnetcfg("tenant", "shared", "vm", kihv1.NetworkConfig{
+				NetworkName: tt.network, MACAddress: "02:00:00:00:00:01",
+			})
+			now := metav1.Now()
+			obj.DeletionTimestamp = &now
+			obj.Finalizers = []string{"cleanup"}
+			if tt.statusOnly {
+				obj.Spec.NetworkConfig = nil
+				obj.Status.NetworkConfig = []kihv1.NetworkConfigStatus{{
+					NetworkName: tt.network, MACAddress: "02:00:00:00:00:01",
+				}}
+			}
+			h := admissionTestHandler(t, &kihv1.IPPoolList{}, &kihv1.VirtualMachineNetworkConfigList{
+				Items: []kihv1.VirtualMachineNetworkConfig{*obj},
+			}, tt.lookupFailure)
+			response := h.validateIPPool(&admissionv1.AdmissionReview{
+				Request: &admissionv1.AdmissionRequest{UID: "delete-test", Operation: admissionv1.Delete},
+			}, pool)
+			if response.Allowed != tt.allowed {
+				t.Fatalf("allowed=%v, want %v: %+v", response.Allowed, tt.allowed, response.Result)
+			}
+		})
 	}
 }
 
@@ -55,38 +284,55 @@ func TestParseAllocationRef(t *testing.T) {
 	}
 }
 
-func TestBuildAllocationOwnerIndex(t *testing.T) {
-	list := &kihv1.VirtualMachineNetworkConfigList{
-		Items: []kihv1.VirtualMachineNetworkConfig{
-			*vmnetcfg("default", "cirros-vm1", "cirros-vm1",
-				kihv1.NetworkConfig{MACAddress: "02:7b:d9:84:8f:e5", NetworkName: "net-a"},
-				kihv1.NetworkConfig{MACAddress: "02:7b:d9:84:8f:e6", NetworkName: "net-b"}),
-			*vmnetcfg("default", "other", "vm-2",
-				kihv1.NetworkConfig{MACAddress: "02-00-00-00-00-11", NetworkName: "net-a"}),
-			*vmnetcfg("default", "broken", "vm-3",
-				kihv1.NetworkConfig{MACAddress: "not-a-mac", NetworkName: "net-a"}),
-			*vmnetcfg("default", "anonymous", "",
-				kihv1.NetworkConfig{MACAddress: "02:00:00:00:00:22", NetworkName: "net-a"}),
-		},
+func TestIPPoolRecordsNetworkOwnership(t *testing.T) {
+	const mac = "02:7b:d9:84:8f:e5"
+	tests := []struct {
+		name        string
+		poolNetwork string
+		namespace   string
+		vmName      string
+		network     string
+		mac         string
+		deleting    bool
+		blocked     bool
+	}{
+		{"same network bare row", "tenant/net-a", "tenant", "vm", "net-a", mac, false, true},
+		{"same network qualified row", "infra/net-a", "tenant", "vm", "infra/net-a", mac, false, true},
+		{"canonical mac spelling", "tenant/net-a", "tenant", "vm", "net-a", "02-7B-D9-84-8F-E5", false, true},
+		{"different network same owner mac", "tenant/net-a", "tenant", "vm", "net-b", mac, false, false},
+		{"bare row resolves in tenant namespace", "infra/net-a", "tenant", "vm", "net-a", mac, false, false},
+		{"different namespace", "infra/net-a", "other", "vm", "infra/net-a", mac, false, false},
+		{"different vm", "tenant/net-a", "tenant", "other-vm", "net-a", mac, false, false},
+		{"different mac", "tenant/net-a", "tenant", "vm", "net-a", "02:00:00:00:00:01", false, false},
+		{"deleting object still blocks", "tenant/net-a", "tenant", "vm", "net-a", mac, true, true},
+		{"empty pool network", "", "tenant", "vm", "net-b", mac, false, true},
+		{"bare cluster scoped pool network", "net-a", "tenant", "vm", "net-b", mac, false, true},
+		{"malformed pool network", "tenant/net-a/extra", "tenant", "vm", "net-b", mac, false, true},
+		{"empty row network", "tenant/net-a", "tenant", "vm", "", mac, false, true},
+		{"malformed row network", "tenant/net-a", "tenant", "vm", "tenant/net-a/extra", mac, false, true},
 	}
-
-	index := buildAllocationOwnerIndex(list)
-
-	if objName, live := index["default/cirros-vm1"]["02:7b:d9:84:8f:e5"]; !live || objName != "cirros-vm1" {
-		t.Fatalf("the canonical tuple of cirros-vm1 is not indexed: live=%v objName=%q", live, objName)
-	}
-
-	// the dash spelling of the live object must canonicalize to the same key
-	if objName, live := index["default/vm-2"]["02:00:00:00:00:11"]; !live || objName != "other" {
-		t.Fatalf("the dash-spelled tuple of vm-2 is not indexed canonically: live=%v objName=%q", live, objName)
-	}
-
-	if _, live := index["default/vm-3"]["not-a-mac"]; live {
-		t.Fatal("an unparseable macaddress must not be indexed")
-	}
-
-	if len(index["default/"]) != 0 {
-		t.Fatal("an object without a vmname must not be indexed")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			obj := vmnetcfg(tt.namespace, "config", tt.vmName,
+				kihv1.NetworkConfig{NetworkName: tt.network, MACAddress: tt.mac})
+			if tt.deleting {
+				now := metav1.Now()
+				obj.DeletionTimestamp = &now
+			}
+			index := buildAllocationOwnerIndex(&kihv1.VirtualMachineNetworkConfigList{
+				Items: []kihv1.VirtualMachineNetworkConfig{*obj},
+			})
+			blocking, orphaned := evaluateIPPoolRecords(
+				map[string]string{"192.168.10.63": "tenant/vm [" + mac + "]"},
+				tt.poolNetwork, index, true)
+			if tt.blocked {
+				if len(blocking) != 1 || len(orphaned) != 0 {
+					t.Fatalf("live or ambiguous record must block: blocking=%v orphaned=%v", blocking, orphaned)
+				}
+			} else if len(blocking) != 0 || len(orphaned) != 1 {
+				t.Fatalf("another binding must not keep this allocation live: blocking=%v orphaned=%v", blocking, orphaned)
+			}
+		})
 	}
 }
 
@@ -109,17 +355,17 @@ func TestEvaluateIPPoolRecords(t *testing.T) {
 		"192.168.10.101": "unparseable",
 	}
 
-	blocking, orphaned := evaluateIPPoolRecords(allocated, index, true)
+	blocking, orphaned := evaluateIPPoolRecords(allocated, "default/net-a", index, true)
 
 	if len(blocking) != 2 {
 		t.Fatalf("blocking = %v, want exactly the live and the unparseable records", blocking)
 	}
 
-	if !strings.Contains(blocking[0], "192.168.10.101") || !strings.Contains(blocking[0], "unparseable reference") {
+	if !strings.Contains(blocking[0], "192.168.10.101") {
 		t.Fatalf("the unparseable record must block and be reported first (sorted by ip): %v", blocking)
 	}
 
-	if !strings.Contains(blocking[1], "192.168.10.63") || !strings.Contains(blocking[1], "VirtualMachineNetworkConfig default/cirros-vm1") {
+	if !strings.Contains(blocking[1], "192.168.10.63") || !strings.Contains(blocking[1], "default/cirros-vm1") {
 		t.Fatalf("the live record must block and name its recording object: %v", blocking)
 	}
 
@@ -128,7 +374,7 @@ func TestEvaluateIPPoolRecords(t *testing.T) {
 	}
 
 	// an unavailable index keeps every non-EXCLUDED record blocking
-	blocking, orphaned = evaluateIPPoolRecords(allocated, index, false)
+	blocking, orphaned = evaluateIPPoolRecords(allocated, "default/net-a", index, false)
 
 	if len(blocking) != 3 || len(orphaned) != 0 {
 		t.Fatalf("with an unavailable index every record must block: blocking=%v orphaned=%v", blocking, orphaned)
@@ -148,7 +394,7 @@ func TestFindRecordedTuple(t *testing.T) {
 	list := &kihv1.VirtualMachineNetworkConfigList{
 		Items: []kihv1.VirtualMachineNetworkConfig{
 			*vmnetcfg("default", "cirros-vm1", "cirros-vm1",
-				kihv1.NetworkConfig{MACAddress: "02:7b:d9:84:8f:e5", NetworkName: "kubevirt-public/public-vlan-1"}),
+				kihv1.NetworkConfig{MACAddress: "02:7b:d9:84:8f:e5", NetworkName: "kubevirt-public/management"}),
 		},
 	}
 
@@ -161,28 +407,28 @@ func TestFindRecordedTuple(t *testing.T) {
 		{
 			"the same vm and mac in another object",
 			vmnetcfg("default", "dup-cfg", "cirros-vm1",
-				kihv1.NetworkConfig{IPAddress: "192.168.10.150", MACAddress: "02:7b:d9:84:8f:e5", NetworkName: "kubevirt-public/public-vlan-1"}),
+				kihv1.NetworkConfig{IPAddress: "192.168.10.150", MACAddress: "02:7b:d9:84:8f:e5", NetworkName: "kubevirt-public/management"}),
 			true,
-			"already recorded with macaddress 02:7b:d9:84:8f:e5 by VirtualMachineNetworkConfig default/cirros-vm1",
+			"default/cirros-vm1",
 		},
 		{
 			"the same vm and mac on a different network",
 			vmnetcfg("default", "dup-cfg", "cirros-vm1",
-				kihv1.NetworkConfig{IPAddress: "192.168.11.140", MACAddress: "02:7b:d9:84:8f:e5", NetworkName: "kubevirt-public/public-vlan-2"}),
+				kihv1.NetworkConfig{IPAddress: "192.168.11.140", MACAddress: "02:7b:d9:84:8f:e5", NetworkName: "kubevirt-public/storage"}),
 			true,
-			"(network kubevirt-public/public-vlan-1)",
+			"kubevirt-public/management",
 		},
 		{
 			"a different vmname claiming the same mac stays admissible",
 			vmnetcfg("default", "foreign-cfg", "other-vm",
-				kihv1.NetworkConfig{MACAddress: "02:7b:d9:84:8f:e5", NetworkName: "kubevirt-public/public-vlan-1"}),
+				kihv1.NetworkConfig{MACAddress: "02:7b:d9:84:8f:e5", NetworkName: "kubevirt-public/management"}),
 			false,
 			"",
 		},
 		{
 			"the object never conflicts with itself",
 			vmnetcfg("default", "cirros-vm1", "cirros-vm1",
-				kihv1.NetworkConfig{MACAddress: "02:7b:d9:84:8f:e5", NetworkName: "kubevirt-public/public-vlan-1"}),
+				kihv1.NetworkConfig{MACAddress: "02:7b:d9:84:8f:e5", NetworkName: "kubevirt-public/management"}),
 			false,
 			"",
 		},
@@ -229,8 +475,8 @@ func testPool(name string, networkName string, start string, end string) *kihv1.
 // without a pool (the vm-before-pool ordering) and a pool whose range does
 // not parse (the ippool controller's own rejection).
 func TestCheckNICIPAddress(t *testing.T) {
-	pool := testPool("public-vlan-2", "kubevirt-public/public-vlan-2", "192.168.11.100", "192.168.11.166")
-	brokenRange := testPool("broken-pool", "kubevirt-public/public-vlan-2", "192.168.11.abc", "192.168.11.166")
+	pool := testPool("storage", "kubevirt-public/storage", "192.168.11.100", "192.168.11.166")
+	brokenRange := testPool("broken-pool", "kubevirt-public/storage", "192.168.11.abc", "192.168.11.166")
 
 	tests := []struct {
 		name   string
@@ -238,15 +484,15 @@ func TestCheckNICIPAddress(t *testing.T) {
 		pool   *kihv1.IPPool
 		denied bool
 	}{
-		{"an ip inside the range", kihv1.NetworkConfig{IPAddress: "192.168.11.120", MACAddress: "02:00:00:00:00:01", NetworkName: "kubevirt-public/public-vlan-2"}, pool, false},
-		{"the range start itself", kihv1.NetworkConfig{IPAddress: "192.168.11.100", MACAddress: "02:00:00:00:00:01", NetworkName: "kubevirt-public/public-vlan-2"}, pool, false},
-		{"the range end itself", kihv1.NetworkConfig{IPAddress: "192.168.11.166", MACAddress: "02:00:00:00:00:01", NetworkName: "kubevirt-public/public-vlan-2"}, pool, false},
-		{"an ip above the range", kihv1.NetworkConfig{IPAddress: "192.168.11.200", MACAddress: "02:00:00:00:00:01", NetworkName: "kubevirt-public/public-vlan-2"}, pool, true},
-		{"an ip below the range", kihv1.NetworkConfig{IPAddress: "192.168.11.99", MACAddress: "02:00:00:00:00:01", NetworkName: "kubevirt-public/public-vlan-2"}, pool, true},
-		{"an ip outside the subnet", kihv1.NetworkConfig{IPAddress: "10.0.0.5", MACAddress: "02:00:00:00:00:01", NetworkName: "kubevirt-public/public-vlan-2"}, pool, true},
+		{"an ip inside the range", kihv1.NetworkConfig{IPAddress: "192.168.11.120", MACAddress: "02:00:00:00:00:01", NetworkName: "kubevirt-public/storage"}, pool, false},
+		{"the range start itself", kihv1.NetworkConfig{IPAddress: "192.168.11.100", MACAddress: "02:00:00:00:00:01", NetworkName: "kubevirt-public/storage"}, pool, false},
+		{"the range end itself", kihv1.NetworkConfig{IPAddress: "192.168.11.166", MACAddress: "02:00:00:00:00:01", NetworkName: "kubevirt-public/storage"}, pool, false},
+		{"an ip above the range", kihv1.NetworkConfig{IPAddress: "192.168.11.200", MACAddress: "02:00:00:00:00:01", NetworkName: "kubevirt-public/storage"}, pool, true},
+		{"an ip below the range", kihv1.NetworkConfig{IPAddress: "192.168.11.99", MACAddress: "02:00:00:00:00:01", NetworkName: "kubevirt-public/storage"}, pool, true},
+		{"an ip outside the subnet", kihv1.NetworkConfig{IPAddress: "10.0.0.5", MACAddress: "02:00:00:00:00:01", NetworkName: "kubevirt-public/storage"}, pool, true},
 		{"a network without a pool", kihv1.NetworkConfig{IPAddress: "10.99.0.10", MACAddress: "02:00:00:00:00:01", NetworkName: "kubevirt-public/nonexistent"}, nil, false},
-		{"a pool whose range does not parse", kihv1.NetworkConfig{IPAddress: "192.168.11.120", MACAddress: "02:00:00:00:00:01", NetworkName: "kubevirt-public/public-vlan-2"}, brokenRange, false},
-		{"an empty ipaddress is skipped", kihv1.NetworkConfig{MACAddress: "02:00:00:00:00:01", NetworkName: "kubevirt-public/public-vlan-2"}, pool, false},
+		{"a pool whose range does not parse", kihv1.NetworkConfig{IPAddress: "192.168.11.120", MACAddress: "02:00:00:00:00:01", NetworkName: "kubevirt-public/storage"}, brokenRange, false},
+		{"an empty ipaddress is skipped", kihv1.NetworkConfig{MACAddress: "02:00:00:00:00:01", NetworkName: "kubevirt-public/storage"}, pool, false},
 	}
 
 	for _, tt := range tests {

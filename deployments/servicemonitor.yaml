@@ -1,0 +1,16 @@
+# Optional: apply only when the monitoring.coreos.com ServiceMonitor CRD exists.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  labels:
+    app: kubevirt-ip-helper
+  name: kubevirt-ip-helper
+  namespace: kubevirt-ip-helper
+spec:
+  endpoints:
+    - port: metrics
+      scheme: http
+  jobLabel: jobLabel
+  selector:
+    matchLabels:
+      app: kubevirt-ip-helper

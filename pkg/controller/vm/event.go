@@ -2,6 +2,7 @@ package vm
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -51,6 +52,8 @@ type EventHandler struct {
 	kubeRestConfig *rest.Config
 	kihClientset   *kihclientset.Clientset
 	kcli           kubecli.KubevirtClient
+	scope          util.NetworkScope
+	reconcileMu    *sync.Mutex
 }
 
 type Event struct {
@@ -71,6 +74,8 @@ func NewEventHandler(
 	kubeRestConfig *rest.Config,
 	kihClientset *kihclientset.Clientset,
 	kcli kubecli.KubevirtClient,
+	scope util.NetworkScope,
+	reconcileMu *sync.Mutex,
 ) *EventHandler {
 	return &EventHandler{
 		ctx:            ctx,
@@ -83,6 +88,8 @@ func NewEventHandler(
 		kubeRestConfig: kubeRestConfig,
 		kihClientset:   kihClientset,
 		kcli:           kcli,
+		scope:          scope,
+		reconcileMu:    reconcileMu,
 	}
 }
 
@@ -179,7 +186,7 @@ func (e *EventHandler) EventListener() (err error) {
 		},
 	}, cache.Indexers{})
 
-	controller := NewController(e.ctx, queue, indexer, informer, e.cache, e.ipam, e.dhcp, e.metrics, e.kihClientset)
+	controller := NewController(e.ctx, queue, indexer, informer, e.cache, e.ipam, e.dhcp, e.metrics, e.kihClientset, e.scope, e.reconcileMu)
 	stop := make(chan struct{})
 
 	// join the controller on shutdown: EventListener only returns after

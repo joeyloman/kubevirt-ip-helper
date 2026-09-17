@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"sync"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -20,7 +21,7 @@ func TestEnqueueVirtualMachineDeleteDerivesTombstoneCleanup(t *testing.T) {
 	queue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
 	defer queue.ShutDown()
 
-	handler := &EventHandler{}
+	handler := &EventHandler{scope: vmTestScope("default", "net-a"), reconcileMu: &sync.Mutex{}}
 
 	// a tombstone with a live payload names the object from the object
 	handler.enqueueVirtualMachineDelete(queue, cache.DeletedFinalStateUnknown{

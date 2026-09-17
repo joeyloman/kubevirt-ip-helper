@@ -2,6 +2,7 @@ package vmnetcfg
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -58,6 +59,8 @@ type EventHandler struct {
 	kcli        kubecli.KubevirtClient
 	appStatus   *atomic.Int32
 	startupGate *gate.Gate
+	scope       util.NetworkScope
+	reconcileMu *sync.Mutex
 }
 
 type Event struct {
@@ -77,6 +80,8 @@ func NewEventHandler(
 	kihClientset *kihclientset.Clientset,
 	appStatus *atomic.Int32,
 	startupGate *gate.Gate,
+	scope util.NetworkScope,
+	reconcileMu *sync.Mutex,
 ) *EventHandler {
 	return &EventHandler{
 		ctx:            ctx,
@@ -90,6 +95,8 @@ func NewEventHandler(
 		kihClientset:   kihClientset,
 		appStatus:      appStatus,
 		startupGate:    startupGate,
+		scope:          scope,
+		reconcileMu:    reconcileMu,
 	}
 }
 
@@ -183,7 +190,7 @@ func (e *EventHandler) EventListener() (err error) {
 		},
 	}, cache.Indexers{})
 
-	controller := NewController(e.ctx, queue, indexer, informer, e.cache, e.ipam, e.dhcp, e.metrics, e.kihClientset, e.appStatus, e.startupGate)
+	controller := NewController(e.ctx, queue, indexer, informer, e.cache, e.ipam, e.dhcp, e.metrics, e.kihClientset, e.appStatus, e.startupGate, e.scope, e.reconcileMu)
 
 	// the orphan sweep verifies the vm of a controller-managed binding
 	// through the kubevirt api: only a vm which answers NotFound on the

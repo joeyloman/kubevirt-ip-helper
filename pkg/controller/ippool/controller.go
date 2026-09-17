@@ -10,6 +10,8 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/tools/cache"
@@ -22,6 +24,7 @@ import (
 	kihclientset "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/clientset/versioned"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/metrics"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/util"
 )
 
 const (
@@ -29,6 +32,10 @@ const (
 	APP_RUNNING = 1
 	APP_RESTART = 2
 )
+
+// A disappeared selected object has no informer resync to retry it. Keep
+// verification failures queued until the API can distinguish loss from deletion.
+var errPoolDisappearanceUnverified = errors.New("IPPool disappearance remains unverified")
 
 type Controller struct {
 	indexer      cache.Indexer
@@ -41,6 +48,7 @@ type Controller struct {
 	metrics      *metrics.MetricsAllocator
 	kihClientset *kihclientset.Clientset
 	appStatus    *atomic.Int32
+	scope        util.NetworkScope
 
 	// gate is the startup membership gate of this era: its snapshot holds
 	// the exact keys of the startup LIST, and markInitAttempt settles a
@@ -65,15 +73,6 @@ type Controller struct {
 	// controllers default to dhcp.Run, tests substitute a nil-returning
 	// stub
 	runListener func(networkName string, nic string) error
-
-	// registeredPools records the networkname each pool NAME holds its
-	// live registration of this era under. the cache is keyed by the
-	// networkname alone, so this record is the only way an update event
-	// which no longer carries the registered networkname (a rename
-	// swallowed while the application was initializing, re-delivered by a
-	// resync with old==new) can find the live registration it must tear
-	// down instead of registering the pool a second time
-	registeredPools map[string]string
 }
 
 func NewController(
@@ -89,6 +88,7 @@ func NewController(
 	appStatus *atomic.Int32,
 	startupGate *gate.Gate,
 	verifyVM func(namespace string, name string) (bool, error),
+	scope util.NetworkScope,
 ) *Controller {
 	return &Controller{
 		informer:     informer,
@@ -103,6 +103,7 @@ func NewController(
 		appStatus:    appStatus,
 		gate:         startupGate,
 		verifyVM:     verifyVM,
+		scope:        scope,
 	}
 }
 
@@ -143,14 +144,63 @@ func (c *Controller) sync(event Event) (err error) {
 		return
 	}
 
-	if !exists && event.action != DELETE {
-		log.Warnf("(ippool.sync) IPPool %s does not exist anymore", event.key)
-		c.metrics.UpdateLogStatus("warning")
-		c.markInitAttempt(event.poolName)
-
-		return
+	// A filtered watch DELETE (including a tombstone), or an absent cache
+	// entry, is not proof of deletion. Verify existence without the selector;
+	// an unavailable API must retain the registration for a later retry.
+	if event.action == DELETE || !exists {
+		if c.kihClientset == nil {
+			return fmt.Errorf("%w: no API client for IPPool %s", errPoolDisappearanceUnverified, event.poolName)
+		}
+		current, getErr := c.kihClientset.KubevirtiphelperV1().IPPools().Get(c.ctx, event.poolName, metav1.GetOptions{})
+		if apierrors.IsNotFound(getErr) {
+			if err := c.removeLocalRegistration(event.poolName); err != nil {
+				return err
+			}
+			c.markInitAttempt(event.poolName)
+			return nil
+		}
+		if getErr != nil {
+			return fmt.Errorf("%w: IPPool %s: %v", errPoolDisappearanceUnverified, event.poolName, getErr)
+		}
+		if !c.scope.MatchesPool(current) {
+			if err := c.removeLocalRegistration(event.poolName); err != nil {
+				return err
+			}
+			// Only a key already present in the selected startup snapshot
+			// can settle here. The verification response is never discovered.
+			c.markInitAttempt(event.poolName)
+			return fmt.Errorf("live IPPool %s no longer matches network %s; local registration removed, durable claims retained: %w",
+				current.Name, c.scope.NetworkName(), ErrPoolUnregistrable)
+		}
+		// Retire a predecessor seen during disappearance verification, but
+		// never discover its replacement through this unfiltered GET.
+		if installed, cacheErr := c.cache.Get("pool", c.scope.NetworkName()); cacheErr == nil {
+			pool := installed.(kihv1.IPPool)
+			if pool.Name == current.Name && pool.UID != current.UID {
+				if err := c.cleanupIPPoolObjects(&pool); err != nil {
+					return err
+				}
+			}
+		}
+		if !exists || obj.(*kihv1.IPPool).UID != current.UID || !c.scope.MatchesPool(obj.(*kihv1.IPPool)) {
+			return fmt.Errorf("%w: waiting for selected informer observation of live IPPool %s",
+				errPoolDisappearanceUnverified, current.Name)
+		}
+		event.action = UPDATE
 	}
 
+	current := obj.(*kihv1.IPPool)
+	if !c.scope.MatchesPool(current) {
+		if err := c.removeLocalRegistration(current.Name); err != nil {
+			return err
+		}
+		if c.selectedPool(current) {
+			c.markInitAttempt(current.Name)
+		}
+		return c.poolIdentityError(current)
+	}
+	event.poolName = current.Name
+	event.poolNetworkName = current.Spec.NetworkName
 	switch event.action {
 	case ADD:
 		// a dying era must not register a pool it is about to tear down
@@ -166,16 +216,9 @@ func (c *Controller) sync(event Event) (err error) {
 		err = c.registerPoolWithTeardown(obj.(*kihv1.IPPool), "failed to allocate new pool for")
 	case UPDATE:
 		pool, poolErr := c.cache.Get("pool", event.poolNetworkName)
-		if poolErr != nil && event.oldPoolNetworkName != "" && event.oldPoolNetworkName != event.poolNetworkName {
-			// the networkname changed: the cache still holds the pool under
-			// the old key, so the restart handling sees the old configuration
-			pool, poolErr = c.cache.Get("pool", event.oldPoolNetworkName)
-		}
-
 		if poolErr != nil || pool.(kihv1.IPPool).Name != event.poolName {
-			// neither cache key resolves to THIS pool: the pool has no live
-			// registration (its first attempt was dropped, or the lookup
-			// resolved a different pool which shares the networkname). the
+			// The cache does not resolve to THIS pool: it has no live
+			// registration, or another pool already claims the network. The
 			// update becomes a re-registration attempt instead, so a fixed
 			// projection comes to life with the next event without a pod
 			// restart. a still-unregistrable projection keeps failing and a
@@ -192,36 +235,6 @@ func (c *Controller) sync(event Event) (err error) {
 			if c.appStatus.Load() == APP_RESTART {
 				log.Warnf("(ippool.sync) deferring re-registration of pool %s while the application is reinitializing", event.poolName)
 				return fmt.Errorf("deferring re-registration of pool %s while the application is reinitializing", event.poolName)
-			}
-
-			// the pool can nevertheless own a live registration under a
-			// networkname which this event does not carry: its rename
-			// arrived while the application was initializing (updates are
-			// ignored then), so the registration kept serving under the
-			// old networkname while the object - and every resync update
-			// with it - already carries the new one. re-registering would
-			// create a SECOND live registration of the same pool (two dhcp
-			// listeners on the same segment, and a stale registration
-			// under the old networkname whose state no later event can
-			// clean anymore), so the rename is routed through the regular
-			// change handling, which tears the old registration down
-			// through the restart flow instead
-			if registeredNet, live := c.registeredPools[event.poolName]; live && registeredNet != event.poolNetworkName {
-				if oldPool, oldErr := c.cache.Get("pool", registeredNet); oldErr == nil && oldPool.(kihv1.IPPool).Name == event.poolName {
-					err = c.handleIPPoolObjectChange(oldPool.(kihv1.IPPool), obj.(*kihv1.IPPool))
-					if err != nil {
-						log.Errorf("(ippool.sync) failed to handle the deferred networkname change of pool %s: %s", event.poolName, err.Error())
-						c.metrics.UpdateLogStatus("error")
-					}
-
-					return err
-				}
-
-				// the recorded registration is not live anymore (its cache
-				// entry was released with it): fall through to the
-				// re-registration attempt
-				log.Warnf("(ippool.sync) the recorded registration of pool %s under networkname %s is not live anymore, re-registering it",
-					event.poolName, registeredNet)
 			}
 
 			err = c.registerPoolWithTeardown(obj.(*kihv1.IPPool), "failed to register unregistered pool")
@@ -272,87 +285,23 @@ func (c *Controller) sync(event Event) (err error) {
 				c.metrics.UpdateLogStatus("warning")
 			}
 		}
-	case DELETE:
-		// a pool which is deleted can never settle a registration for the
-		// gate anymore (it may have failed its attempts during startup):
-		// count it so a startup-time deletion does not block the controller
-		// startup forever. counted pools are deduplicated by name.
-		c.markInitAttempt(event.poolName)
-
-		// the deleted object carries only its final networkname, but a
-		// pool which was renamed while the application was initializing
-		// keeps its live registration under the OLD one: the rename was
-		// swallowed (updates are ignored during the initialization), so
-		// no registration under the new networkname exists and the
-		// lookup below cannot find the registration this deletion must
-		// tear down. resolve the recorded networkname exactly like the
-		// update path does and run the regular cleanup on the installed
-		// entry: the cleanup releases by the pool's own spec networkname
-		// (the old name), so it tears down exactly the leaked
-		// registration and drops the record itself
-		if registeredNet, live := c.registeredPools[event.poolName]; live && registeredNet != event.poolNetworkName {
-			if oldPool, oldErr := c.cache.Get("pool", registeredNet); oldErr == nil && oldPool.(kihv1.IPPool).Name == event.poolName {
-				p := oldPool.(kihv1.IPPool)
-				if err = c.cleanupIPPoolObjects(&p); err != nil {
-					log.Errorf("(ippool.sync) failed to cleanup the renamed pool %s under networkname %s: %s", event.poolName, registeredNet, err.Error())
-					c.metrics.UpdateLogStatus("error")
-				}
-
-				return
-			}
-
-			// the recorded registration is not live anymore (its cache
-			// entry was released with it, or another pool owns the
-			// networkname by now): drop the stale record and fall through
-			// to the regular handling of the event's networkname
-			log.Warnf("(ippool.sync) the recorded registration of pool %s under networkname %s is not live anymore, dropping the stale record",
-				event.poolName, registeredNet)
-			delete(c.registeredPools, event.poolName)
-		}
-
-		pool, poolErr := c.cache.Get("pool", event.poolNetworkName)
-		if poolErr != nil {
-			// no live registration exists under this networkname: the pool
-			// was never registered in this process era (its ADD was
-			// rejected, or its attempts failed and a partial registration
-			// was torn back down), so the deletion has no live state to
-			// clean up. this is the converged outcome of a never-registered
-			// pool, not a failure, so it is reported like the name-mismatch
-			// case below instead of counting as an error.
-			log.Warnf("(ippool.sync) IPPool %s [networkname %s] was never registered; skipping cleanup of the live state",
-				event.poolName, event.poolNetworkName)
-			c.metrics.UpdateLogStatus("warning")
-
-			return
-		}
-
-		p := pool.(kihv1.IPPool)
-		if p.Name != event.poolName {
-			// the cache is keyed by the networkname, so this lookup returns
-			// the pool which lives under the deleted object's networkname.
-			// a pool which was never registered under its own networkname
-			// (for example one whose ADD was rejected because a live pool
-			// already claims it) therefore resolves to that live pool.
-			// freeing the live pool's registration because an unrelated
-			// object was deleted is incorrect, so this delete stays a no-op.
-			log.Warnf("(ippool.sync) IPPool %s [networkname %s] was never registered; skipping cleanup of the live state",
-				event.poolName, event.poolNetworkName)
-			c.metrics.UpdateLogStatus("warning")
-
-			return
-		}
-		if err = c.cleanupIPPoolObjects(&p); err != nil {
-			log.Errorf("(ippool.sync) failed to cleanup pool %s: %s", event.poolName, err.Error())
-			c.metrics.UpdateLogStatus("error")
-		}
-
-		// the settled pool stays settled: the startup gate keys are the
-		// exact objects of the startup snapshot, so nothing has to be
-		// un-settled when a pool object disappears during the
-		// initialization
 	}
 
 	return
+}
+
+// removeLocalRegistration deliberately has no API writes: selector loss must
+// leave the still-live pool's reservation ledger available for label restoration.
+func (c *Controller) removeLocalRegistration(name string) error {
+	cached, err := c.cache.Get("pool", c.scope.NetworkName())
+	if err != nil {
+		return nil
+	}
+	pool := cached.(kihv1.IPPool)
+	if pool.Name != name {
+		return nil
+	}
+	return c.cleanupIPPoolObjects(&pool)
 }
 
 func (c *Controller) handleErr(err error, key interface{}) {
@@ -371,6 +320,10 @@ func (c *Controller) handleErr(err error, key interface{}) {
 	}
 
 	c.queue.Forget(key)
+	if errors.Is(err, errPoolDisappearanceUnverified) {
+		c.queue.AddAfter(key, resyncPeriod)
+		return
+	}
 
 	log.Errorf("(ippool.handleErr) dropping IPPool %q out of the queue: %v", key, err)
 	c.metrics.UpdateLogStatus("error")
@@ -396,22 +349,13 @@ func (c *Controller) Run(workers int, stopCh chan struct{}) {
 		return
 	}
 
-	// settle the snapshot keys whose object the informer never observed:
-	// a pool deleted between the startup LIST and the informer start
-	// generates no event at all, so without this reconciliation the
-	// membership gate would wait for it forever (a count-based gate
-	// hid this case by letting unrelated objects substitute). the cache
-	// sync guarantees the store holds the complete initial list, so a
-	// snapshot key which is absent from it was deleted before the
-	// informer started and can never settle otherwise
+	// The selected initial LIST may omit a startup key after deletion OR
+	// selector loss. Queue the same fresh-read disappearance reconciliation
+	// as a watch DELETE; a missing index entry cannot settle it by itself.
 	if c.gate != nil {
 		for _, key := range c.gate.Unsettled() {
 			if _, exists, getErr := c.indexer.GetByKey(key); getErr == nil && !exists {
-				log.Warnf("(ippool.Run) IPPool %s of the startup snapshot was deleted before the informer started, settling it for the startup gate",
-					key)
-				c.metrics.UpdateLogStatus("warning")
-
-				c.markInitAttempt(key)
+				c.queue.Add(Event{key: key, action: DELETE, poolName: key})
 			}
 		}
 	}

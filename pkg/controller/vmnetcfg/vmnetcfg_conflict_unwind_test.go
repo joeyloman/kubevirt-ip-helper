@@ -84,6 +84,7 @@ func TestCommitConflictUnwindsVanishedClaimedNic(t *testing.T) {
 // record blocks a later binding of the address for the whole era.
 func TestDeletionKeepsFinalizersWhilePendingUnwindFails(t *testing.T) {
 	e := newTestEnv(t)
+	e.addSubnet("10.0.0.1", "10.0.0.2")
 	e.seedPool(nil)
 
 	now := metav1.Now()

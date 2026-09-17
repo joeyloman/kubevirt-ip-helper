@@ -14,7 +14,7 @@ import (
 // take an address whose binding still exists.
 
 func TestProtectPersistedClaimsPinsThePersistedOwner(t *testing.T) {
-	stored := ippoolBehaviorNewTestPool("pool1", "net-a")
+	stored := ippoolBehaviorNewTestPool("pool1", "infra/net-a")
 	stored.Status.IPv4.Allocated = map[string]string{
 		"10.10.10.10": "default/vm-a [02:00:00:00:00:01]",
 		"10.10.10.99": "EXCLUDED",
@@ -25,8 +25,8 @@ func TestProtectPersistedClaimsPinsThePersistedOwner(t *testing.T) {
 	defer srv.Close()
 
 	c, _, _, _, _ := ippoolBehaviorNewTestController(t, srv)
-	pool := ippoolBehaviorNewTestPool("pool1", "net-a")
-	if err := c.ipam.NewSubnet("net-a", "10.10.10.0/24", "10.10.10.10", "10.10.10.50"); err != nil {
+	pool := ippoolBehaviorNewTestPool("pool1", "infra/net-a")
+	if err := c.ipam.NewSubnet("infra/net-a", "10.10.10.0/24", "10.10.10.10", "10.10.10.50"); err != nil {
 		t.Fatalf("registering the subnet: %s", err.Error())
 	}
 
@@ -45,28 +45,28 @@ func TestProtectPersistedClaimsPinsThePersistedOwner(t *testing.T) {
 	// sweep of the pool range drains everything but the pin (the range
 	// holds 41 addresses and one is pinned)
 	for i := 0; i < 40; i++ {
-		if _, err := c.ipam.GetIP("net-a", ""); err != nil {
+		if _, err := c.ipam.GetIP("infra/net-a", ""); err != nil {
 			t.Fatalf("allocation %d of the fresh range failed: %s", i+1, err.Error())
 		}
 	}
-	if _, err := c.ipam.GetIP("net-a", ""); err == nil {
+	if _, err := c.ipam.GetIP("infra/net-a", ""); err == nil {
 		t.Error("the pool must be exhausted after the fresh allocations plus the pin")
 	}
-	if used := c.ipam.Used("net-a"); used != 41 {
+	if used := c.ipam.Used("infra/net-a"); used != 41 {
 		t.Errorf("used = %d, want 41 (40 fresh allocations and the pinned claim)", used)
 	}
-	if _, err := c.ipam.ReclaimIP("net-a", "10.10.10.10", "default/vm-b [02:00:00:00:00:09]"); err == nil {
+	if _, err := c.ipam.ReclaimIP("infra/net-a", "10.10.10.10", "default/vm-b [02:00:00:00:00:09]"); err == nil {
 		t.Error("the foreign reclaim of the pinned address must fail")
 	}
 
 	// the restoring binding of the recorded owner reclaims idempotently
-	if _, err := c.ipam.ReclaimIP("net-a", "10.10.10.10", "default/vm-a [02:00:00:00:00:01]"); err != nil {
+	if _, err := c.ipam.ReclaimIP("infra/net-a", "10.10.10.10", "default/vm-a [02:00:00:00:00:01]"); err != nil {
 		t.Errorf("the own reclaim of the pinned address: %s", err.Error())
 	}
 }
 
 func TestProtectPersistedClaimsUnparseableRecordProtectsUnconditionally(t *testing.T) {
-	stored := ippoolBehaviorNewTestPool("pool1", "net-a")
+	stored := ippoolBehaviorNewTestPool("pool1", "infra/net-a")
 	stored.Status.IPv4.Allocated = map[string]string{
 		"10.10.10.10": "USED",
 	}
@@ -76,8 +76,8 @@ func TestProtectPersistedClaimsUnparseableRecordProtectsUnconditionally(t *testi
 	defer srv.Close()
 
 	c, _, _, _, _ := ippoolBehaviorNewTestController(t, srv)
-	pool := ippoolBehaviorNewTestPool("pool1", "net-a")
-	if err := c.ipam.NewSubnet("net-a", "10.10.10.0/24", "10.10.10.10", "10.10.10.50"); err != nil {
+	pool := ippoolBehaviorNewTestPool("pool1", "infra/net-a")
+	if err := c.ipam.NewSubnet("infra/net-a", "10.10.10.0/24", "10.10.10.10", "10.10.10.50"); err != nil {
 		t.Fatalf("registering the subnet: %s", err.Error())
 	}
 
@@ -90,13 +90,13 @@ func TestProtectPersistedClaimsUnparseableRecordProtectsUnconditionally(t *testi
 	}
 
 	// the protected address must not be handed out to a fresh allocation
-	if _, err := c.ipam.GetIP("net-a", "10.10.10.10"); err == nil {
+	if _, err := c.ipam.GetIP("infra/net-a", "10.10.10.10"); err == nil {
 		t.Error("the unconditionally protected address must not be reissuable")
 	}
 }
 
 func TestProtectPersistedClaimsFailsOnForeignRecording(t *testing.T) {
-	stored := ippoolBehaviorNewTestPool("pool1", "net-a")
+	stored := ippoolBehaviorNewTestPool("pool1", "infra/net-a")
 	stored.Status.IPv4.Allocated = map[string]string{
 		// a live conflict recorded by another owner: publishing the
 		// allocator would silently drop or offer a claimed address
@@ -108,14 +108,14 @@ func TestProtectPersistedClaimsFailsOnForeignRecording(t *testing.T) {
 	defer srv.Close()
 
 	c, _, _, _, _ := ippoolBehaviorNewTestController(t, srv)
-	pool := ippoolBehaviorNewTestPool("pool1", "net-a")
-	if err := c.ipam.NewSubnet("net-a", "10.10.10.0/24", "10.10.10.10", "10.10.10.50"); err != nil {
+	pool := ippoolBehaviorNewTestPool("pool1", "infra/net-a")
+	if err := c.ipam.NewSubnet("infra/net-a", "10.10.10.0/24", "10.10.10.10", "10.10.10.50"); err != nil {
 		t.Fatalf("registering the subnet: %s", err.Error())
 	}
 
 	// a competing plain allocation holds the address first: the pinned
 	// claim cannot be honored and the registration must fail loudly
-	if _, err := c.ipam.GetIP("net-a", "10.10.10.10"); err != nil {
+	if _, err := c.ipam.GetIP("infra/net-a", "10.10.10.10"); err != nil {
 		t.Fatalf("seeding the competing allocation: %s", err.Error())
 	}
 
@@ -125,7 +125,7 @@ func TestProtectPersistedClaimsFailsOnForeignRecording(t *testing.T) {
 }
 
 func TestProtectPersistedClaimsGettingTheStatusFailsTheRegistration(t *testing.T) {
-	stored := ippoolBehaviorNewTestPool("pool1", "net-a")
+	stored := ippoolBehaviorNewTestPool("pool1", "infra/net-a")
 
 	rs := ippoolBehaviorNewRestState(stored)
 	rs.failGet = true
@@ -133,8 +133,8 @@ func TestProtectPersistedClaimsGettingTheStatusFailsTheRegistration(t *testing.T
 	defer srv.Close()
 
 	c, _, _, _, _ := ippoolBehaviorNewTestController(t, srv)
-	pool := ippoolBehaviorNewTestPool("pool1", "net-a")
-	if err := c.ipam.NewSubnet("net-a", "10.10.10.0/24", "10.10.10.10", "10.10.10.50"); err != nil {
+	pool := ippoolBehaviorNewTestPool("pool1", "infra/net-a")
+	if err := c.ipam.NewSubnet("infra/net-a", "10.10.10.0/24", "10.10.10.10", "10.10.10.50"); err != nil {
 		t.Fatalf("registering the subnet: %s", err.Error())
 	}
 
@@ -144,7 +144,7 @@ func TestProtectPersistedClaimsGettingTheStatusFailsTheRegistration(t *testing.T
 }
 
 func TestProtectPersistedClaimsRepublishesTheDurableRecords(t *testing.T) {
-	stored := ippoolBehaviorNewTestPool("pool1", "net-a")
+	stored := ippoolBehaviorNewTestPool("pool1", "infra/net-a")
 	stored.Status.LastUpdate = metav1.Now()
 	stored.Status.IPv4.Allocated = map[string]string{
 		"10.10.10.10": "default/vm-a [02:00:00:00:00:01]",
@@ -153,7 +153,7 @@ func TestProtectPersistedClaimsRepublishesTheDurableRecords(t *testing.T) {
 	}
 	// 10.10.10.60 lies outside the pool range (start .10, end .50): its pin
 	// is skipped and its durable record is republished
-	pool := ippoolBehaviorNewTestPool("pool1", "net-a")
+	pool := ippoolBehaviorNewTestPool("pool1", "infra/net-a")
 	pool.Spec.IPv4Config.Pool.Exclude = []string{"10.10.10.20"}
 
 	rs := ippoolBehaviorNewRestState(stored)
@@ -161,7 +161,7 @@ func TestProtectPersistedClaimsRepublishesTheDurableRecords(t *testing.T) {
 	defer srv.Close()
 
 	c, _, _, _, _ := ippoolBehaviorNewTestController(t, srv)
-	if err := c.ipam.NewSubnet("net-a", "10.10.10.0/24", "10.10.10.10", "10.10.10.50"); err != nil {
+	if err := c.ipam.NewSubnet("infra/net-a", "10.10.10.0/24", "10.10.10.10", "10.10.10.50"); err != nil {
 		t.Fatalf("registering the subnet: %s", err.Error())
 	}
 

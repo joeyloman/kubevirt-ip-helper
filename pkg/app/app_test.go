@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,12 +21,15 @@ import (
 	log "github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/tools/leaderelection"
 
 	v1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/cache"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/dhcp"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/metrics"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/network"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/util"
 )
 
 // The tests in this file cover the app handler's configuration, listing,
@@ -230,35 +234,27 @@ func (r *requestRecorder) got() string {
 	return r.path
 }
 
-const ipPoolListJSON = `{
-  "kind": "IPPoolList",
-  "apiVersion": "kubevirtiphelper.k8s.binbash.org/v1",
-  "metadata": {},
-  "items": [
-    {
-      "metadata": {"name": "pool-a"},
-      "spec": {
-        "networkname": "net-a",
-        "bindinterface": "eth0",
-        "ipv4config": {
-          "serverip": "192.168.1.1",
-          "subnet": "192.168.1.0/24"
-        }
-      }
-    },
-    {
-      "metadata": {"name": "pool-b"},
-      "spec": {
-        "networkname": "net-b",
-        "bindinterface": "eth1",
-        "ipv4config": {
-          "serverip": "10.0.0.1",
-          "subnet": "10.0.0.0/24"
-        }
-      }
-    }
-  ]
-}`
+func testNetworkScope(t *testing.T) util.NetworkScope {
+	t.Helper()
+	scope, err := util.NewNetworkScope("kubevirt-ip-helper", "management")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return scope
+}
+
+func testNetworkPool(name, namespace, networkName string) v1.IPPool {
+	return v1.IPPool{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Labels: map[string]string{
+			util.NetworkLabel: networkName, util.NetworkNamespaceLabel: namespace,
+		}},
+		Spec: v1.IPPoolSpec{
+			NetworkName:   namespace + "/" + networkName,
+			BindInterface: "net1",
+			IPv4Config:    v1.IPv4Config{ServerIP: "192.168.1.1", Subnet: "192.168.1.0/24"},
+		},
+	}
+}
 
 const vmnetcfgListJSON = `{
   "kind": "VirtualMachineNetworkConfigList",
@@ -280,35 +276,60 @@ const vmnetcfgListJSON = `{
 func TestHandler_getIPPools(t *testing.T) {
 	const path = "/apis/kubevirtiphelper.k8s.binbash.org/v1/ippools"
 
-	t.Run("lists ippools from the API", func(t *testing.T) {
-		rec := &requestRecorder{}
+	t.Run("discovers only this network including selected invalid pools", func(t *testing.T) {
+		scope := testNetworkScope(t)
+		own := testNetworkPool("own", scope.Namespace(), scope.Name())
+		invalid := testNetworkPool("invalid", scope.Namespace(), scope.Name())
+		invalid.Spec.NetworkName = scope.Name()
+		otherName := testNetworkPool("other-name", scope.Namespace(), "storage")
+		otherNamespace := testNetworkPool("other-namespace", "tenant", scope.Name())
+		unlabelled := testNetworkPool("unlabelled", scope.Namespace(), scope.Name())
+		unlabelled.Labels = nil
+		all := []v1.IPPool{own, invalid, otherName, otherNamespace, unlabelled}
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			rec.record(r.URL.Path)
 			if r.URL.Path != path {
 				w.WriteHeader(http.StatusNotFound)
 				return
 			}
+			selector, err := labels.Parse(r.URL.Query().Get("labelSelector"))
+			if err != nil {
+				t.Error(err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			list := v1.IPPoolList{}
+			for _, pool := range all {
+				if selector.Matches(labels.Set(pool.Labels)) {
+					list.Items = append(list.Items, pool)
+				}
+			}
 			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprint(w, ipPoolListJSON)
+			_ = json.NewEncoder(w).Encode(list)
 		}))
 		defer srv.Close()
-
-		h := &handler{kubeConfigFile: writeTestKubeconfig(t, srv.URL)}
+		h := &handler{kubeConfigFile: writeTestKubeconfig(t, srv.URL), networkScope: scope}
 		pools, err := h.getIPPools(context.Background())
 		if err != nil {
-			t.Fatalf("getIPPools() unexpected error: %s", err)
+			t.Fatal(err)
 		}
-		if rec.got() != path {
-			t.Errorf("request path = %q, want %q", rec.got(), path)
+		if !reflect.DeepEqual(pools, []v1.IPPool{own, invalid}) {
+			t.Fatalf("startup discovery = %+v; want own and selected invalid pools only", pools)
 		}
-		if len(pools) != 2 {
-			t.Fatalf("got %d pools, want 2", len(pools))
+	})
+
+	t.Run("unresolved identity never discovers pools", func(t *testing.T) {
+		var requests atomic.Int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			requests.Add(1)
+			w.WriteHeader(http.StatusInternalServerError)
+		}))
+		defer srv.Close()
+		h := &handler{kubeConfigFile: writeTestKubeconfig(t, srv.URL)}
+		if _, err := h.getIPPools(context.Background()); err == nil {
+			t.Fatal("unresolved identity accepted")
 		}
-		if pools[0].Spec.NetworkName != "net-a" || pools[0].Spec.IPv4Config.Subnet != "192.168.1.0/24" {
-			t.Errorf("unexpected first pool: %+v", pools[0].Spec)
-		}
-		if pools[1].Spec.NetworkName != "net-b" || pools[1].Spec.IPv4Config.ServerIP != "10.0.0.1" {
-			t.Errorf("unexpected second pool: %+v", pools[1].Spec)
+		if requests.Load() != 0 {
+			t.Fatal("unresolved identity reached discovery API")
 		}
 	})
 
@@ -320,7 +341,7 @@ func TestHandler_getIPPools(t *testing.T) {
 		}))
 		defer srv.Close()
 
-		h := &handler{kubeConfigFile: writeTestKubeconfig(t, srv.URL)}
+		h := &handler{kubeConfigFile: writeTestKubeconfig(t, srv.URL), networkScope: testNetworkScope(t)}
 		_, err := h.getIPPools(context.Background())
 		if err == nil {
 			t.Fatal("getIPPools() expected an error for an API failure")
@@ -332,7 +353,7 @@ func TestHandler_getIPPools(t *testing.T) {
 
 	t.Run("missing kubeconfig is wrapped", func(t *testing.T) {
 		clearInClusterEnv(t)
-		h := &handler{kubeConfigFile: filepath.Join(t.TempDir(), "does-not-exist")}
+		h := &handler{kubeConfigFile: filepath.Join(t.TempDir(), "does-not-exist"), networkScope: testNetworkScope(t)}
 		_, err := h.getIPPools(context.Background())
 		if err == nil {
 			t.Fatal("getIPPools() expected an error without a kubeconfig")
@@ -352,6 +373,11 @@ func TestHandler_getVmNetCfgs(t *testing.T) {
 			rec.record(r.URL.Path)
 			if r.URL.Path != path {
 				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			if r.URL.Query().Get("labelSelector") != "" {
+				t.Error("VMNetCfg startup discovery must remain unfiltered")
+				w.WriteHeader(http.StatusBadRequest)
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
@@ -466,97 +492,50 @@ func TestHandler_NetworkCleanup(t *testing.T) {
 }
 
 func TestHandler_StartupNetworkCleanup(t *testing.T) {
-	const cleanupPoolsJSON = `{
-  "kind": "IPPoolList",
-  "apiVersion": "kubevirtiphelper.k8s.binbash.org/v1",
-  "metadata": {},
-  "items": [
-    {
-      "metadata": {"name": "pool-bad"},
-      "spec": {
-        "networkname": "net-bad",
-        "bindinterface": "eth0",
-        "ipv4config": {
-          "serverip": "not-an-ip",
-          "subnet": "not-a-subnet"
-        }
-      }
-    },
-    {
-      "metadata": {"name": "pool-ok"},
-      "spec": {
-        "networkname": "net-ok",
-        "bindinterface": "",
-        "ipv4config": {
-          "serverip": "192.168.1.1",
-          "subnet": "192.168.1.0/24"
-        }
-      }
-    }
-  ]
-}`
-
-	t.Run("tolerates unparsable subnets and skips missing interfaces", func(t *testing.T) {
+	scope := testNetworkScope(t)
+	removeIP := network.RemoveIpFromNic
+	t.Cleanup(func() { network.RemoveIpFromNic = removeIP })
+	t.Run("refuses invalid identity before network mutation and continues own cleanup", func(t *testing.T) {
+		own := testNetworkPool("own", scope.Namespace(), scope.Name())
+		foreign := testNetworkPool("foreign", scope.Namespace(), "storage")
+		wrongNamespace := testNetworkPool("other-namespace", "tenant", scope.Name())
+		unqualified := testNetworkPool("bare", scope.Namespace(), scope.Name())
+		unqualified.Spec.NetworkName = scope.Name()
+		mismatch := testNetworkPool("mismatch", scope.Namespace(), scope.Name())
+		mismatch.Spec.NetworkName = foreign.Spec.NetworkName
+		unlabelled := testNetworkPool("unlabelled", scope.Namespace(), scope.Name())
+		unlabelled.Labels = nil
+		badSubnet := testNetworkPool("bad-subnet", scope.Namespace(), scope.Name())
+		badSubnet.Spec.IPv4Config.Subnet = "invalid"
+		pools := []v1.IPPool{foreign, wrongNamespace, unqualified, mismatch, unlabelled, badSubnet, own}
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Deliberately return foreign rows too: cleanup must still validate
+			// each row before touching host addresses.
 			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprint(w, cleanupPoolsJSON)
+			_ = json.NewEncoder(w).Encode(v1.IPPoolList{Items: pools})
 		}))
 		defer srv.Close()
-
-		hook := attachLogCapture(t)
-		h := &handler{
-			kubeConfigFile: writeTestKubeconfig(t, srv.URL),
-			namespace:      "testns",
+		h := &handler{kubeConfigFile: writeTestKubeconfig(t, srv.URL), networkScope: scope}
+		var removals []string
+		network.RemoveIpFromNic = func(nic, address string) error {
+			removals = append(removals, nic+" "+address)
+			return nil
 		}
 		h.StartupNetworkCleanup()
-
-		if !hook.contains("error while parsing subnet [not-a-subnet]") {
-			t.Errorf("expected a log entry about the unparsable subnet, got:\n%s", hook.entriesText())
-		}
-		// The IPC removal for the next pool must still run: the first pool's
-		// subnet error must not abort the loop.
-		if !hook.contains("removing the IP4 address [192.168.1.1/24] on nic [] for network [net-ok]") {
-			t.Errorf("expected the valid pool to be processed after the bad one, got:\n%s", hook.entriesText())
-		}
-		// No interface named "" can exist, so removal fails without touching
-		// any host interface; that failure is expected and logged at debug.
-		if !hook.contains("error while removing IP4 address [192.168.1.1/24] from bind interface []") {
-			t.Errorf("expected the debug log for the missing interface, got:\n%s", hook.entriesText())
+		if !reflect.DeepEqual(removals, []string{"net1 192.168.1.1/24"}) {
+			t.Fatalf("host address mutations = %v, want only the valid own pool", removals)
 		}
 	})
 
-	t.Run("proceeds when the API is unreachable", func(t *testing.T) {
+	t.Run("failed discovery never mutates host addresses", func(t *testing.T) {
 		srv := httptest.NewServer(http.NotFoundHandler())
-		url := srv.URL
-		srv.Close()
-
-		hook := attachLogCapture(t)
-		h := &handler{
-			kubeConfigFile: writeTestKubeconfig(t, url),
-			namespace:      "testns",
+		defer srv.Close()
+		h := &handler{kubeConfigFile: writeTestKubeconfig(t, srv.URL), networkScope: scope}
+		network.RemoveIpFromNic = func(nic, address string) error {
+			t.Error("failed discovery reached host mutation")
+			return nil
 		}
-		h.StartupNetworkCleanup() // must not panic
-
-		if !hook.contains("app.StartupNetworkCleanup") {
-			t.Errorf("expected an error logged for the unreachable API, got:\n%s", hook.entriesText())
-		}
-	})
-
-	t.Run("proceeds on an invalid kubeconfig", func(t *testing.T) {
-		hook := attachLogCapture(t)
-		h := &handler{
-			kubeConfigFile: filepath.Join(t.TempDir(), "kubeconfig"),
-			namespace:      "testns",
-		}
-		badFile := h.kubeConfigFile
-		if err := os.WriteFile(badFile, []byte("not: [valid"), 0600); err != nil {
-			t.Fatalf("writing malformed kubeconfig: %s", err)
-		}
-		h.StartupNetworkCleanup() // must not panic
-
-		if !hook.contains("app.StartupNetworkCleanup") {
-			t.Errorf("expected an error logged for the invalid kubeconfig, got:\n%s", hook.entriesText())
-		}
+		h.StartupNetworkCleanup()
 	})
 }
 
@@ -992,49 +971,141 @@ func TestOnStoppedLeadingNeverLedStaysQuiet(t *testing.T) {
 }
 
 func TestHandler_Init(t *testing.T) {
-	t.Run("initializes with a valid kubeconfig", func(t *testing.T) {
-		srv := httptest.NewServer(http.NotFoundHandler()) // pod lookup inside Init returns 404, logged only
+	podName, err := os.Hostname()
+	if err != nil {
+		t.Fatal(err)
+	}
+	namespaceFile := func(t *testing.T, namespace string) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "namespace")
+		if err := os.WriteFile(path, []byte(namespace), 0600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	t.Run("resolves identity before cleanup and retains it after a label edit", func(t *testing.T) {
+		scope := testNetworkScope(t)
+		store := newPodStore(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Name: podName, Namespace: scope.Namespace(),
+			Labels: map[string]string{util.NetworkLabel: scope.Name(), leaderLabel: "active"},
+		}})
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/apis/kubevirtiphelper.k8s.binbash.org/v1/ippools" {
+				store.handler().ServeHTTP(w, r)
+				return
+			}
+			selector, err := labels.Parse(r.URL.Query().Get("labelSelector"))
+			if err != nil {
+				t.Error(err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			list := v1.IPPoolList{}
+			for _, pool := range []v1.IPPool{
+				testNetworkPool("original", scope.Namespace(), scope.Name()),
+				testNetworkPool("relabeled", scope.Namespace(), "storage"),
+			} {
+				if selector.Matches(labels.Set(pool.Labels)) {
+					list.Items = append(list.Items, pool)
+				}
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(list)
+		}))
 		defer srv.Close()
-		cfg := writeTestKubeconfig(t, srv.URL)
-		t.Setenv("KUBECONFIG", cfg)
-		clearInClusterEnv(t)
-		// select the fixture's own context so the override does not break Init
+		t.Setenv("KUBECONFIG", writeTestKubeconfig(t, srv.URL))
 		t.Setenv("KUBECONTEXT", "test")
-
 		h := Register()
-		h.Init()
-
-		if h.kubeConfigFile != cfg {
-			t.Errorf("kubeConfigFile = %q, want %q", h.kubeConfigFile, cfg)
+		h.init(namespaceFile(t, scope.Namespace()+"\n"))
+		if h.lock == nil || h.lock.LeaseMeta.Name != scope.LeaseName() || h.lock.LeaseMeta.Namespace != scope.Namespace() {
+			t.Fatalf("wrong election destination: %+v", h.lock)
 		}
-		if h.kubeContext != "test" {
-			t.Errorf("kubeContext = %q, want %q", h.kubeContext, "test")
+		if _, found := store.pod(podName).Labels[leaderLabel]; found {
+			t.Fatal("stale leader label retained")
 		}
-		if h.era.Load() != nil {
-			t.Error("era is set after Init, want no era before the leadership is acquired")
+		store.mu.Lock()
+		store.pods[podName].Labels[util.NetworkLabel] = "storage"
+		store.mu.Unlock()
+		pools, err := h.getIPPools(context.Background())
+		if err != nil {
+			t.Fatal(err)
 		}
-		if h.leaderId == "" {
-			t.Error("leaderId is empty after Init")
-		}
-		if h.lock == nil {
-			t.Fatal("lock is nil after Init")
-		}
-		if h.lock.LeaseMeta.Name != "kubevirt-ip-helper-lock" {
-			t.Errorf("lock name = %q, want %q", h.lock.LeaseMeta.Name, "kubevirt-ip-helper-lock")
-		}
-		if h.lock.LockConfig.Identity != h.leaderId {
-			t.Errorf("lock identity = %q, want leader id %q", h.lock.LockConfig.Identity, h.leaderId)
+		if len(pools) != 1 || pools[0].Name != "original" {
+			t.Fatalf("Pod relabel changed the running process's discovery: %+v", pools)
 		}
 	})
 
-	t.Run("panics when no kubeconfig is available", func(t *testing.T) {
+	t.Run("missing namespace file retains canonical namespace lookup", func(t *testing.T) {
+		scope := testNetworkScope(t)
+		store := newPodStore(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Name: podName, Namespace: scope.Namespace(), Labels: map[string]string{util.NetworkLabel: scope.Name()},
+		}})
+		srv := httptest.NewServer(store.handler())
+		defer srv.Close()
+		t.Setenv("KUBECONFIG", writeTestKubeconfig(t, srv.URL))
+		t.Setenv("KUBECONTEXT", "test")
+		h := Register()
+		h.init(filepath.Join(t.TempDir(), "absent"))
+		if h.networkScope != scope {
+			t.Fatalf("network identity = %+v, want %+v", h.networkScope, scope)
+		}
+	})
+
+	for _, tc := range []struct {
+		name      string
+		namespace string
+		label     string
+		apiError  bool
+	}{
+		{name: "missing label", namespace: "kubevirt-ip-helper"},
+		{name: "invalid label", namespace: "kubevirt-ip-helper", label: "MANAGEMENT"},
+		{name: "oversize label", namespace: "kubevirt-ip-helper", label: strings.Repeat("a", 64)},
+		{name: "own Pod unavailable", namespace: "kubevirt-ip-helper", label: "management", apiError: true},
+		{name: "empty namespace", label: "management"},
+		{name: "invalid namespace", namespace: "INVALID", label: "management"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var requests, forbidden atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests.Add(1)
+				if r.Method != http.MethodGet || r.URL.Path != "/api/v1/namespaces/"+tc.namespace+"/pods/"+podName {
+					forbidden.Add(1)
+					w.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+				if tc.apiError {
+					w.WriteHeader(http.StatusForbidden)
+					return
+				}
+				writePodJSON(w, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+					Name: podName, Namespace: tc.namespace, Labels: map[string]string{util.NetworkLabel: tc.label},
+				}})
+			}))
+			defer srv.Close()
+			t.Setenv("KUBECONFIG", writeTestKubeconfig(t, srv.URL))
+			t.Setenv("KUBECONTEXT", "test")
+			path := namespaceFile(t, tc.namespace)
+			h := Register()
+			assertPanics(t, func() { h.init(path) })
+			if forbidden.Load() != 0 {
+				t.Fatal("invalid identity caused mutation, pool discovery or election access")
+			}
+			if h.lock != nil || h.era.Load() != nil {
+				t.Fatal("invalid identity initialized election or services")
+			}
+			if (tc.namespace == "" || tc.namespace == "INVALID") && requests.Load() != 0 {
+				t.Fatal("invalid namespace reached API")
+			}
+		})
+	}
+
+	t.Run("missing kubeconfig stops startup", func(t *testing.T) {
 		t.Setenv("KUBECONFIG", filepath.Join(t.TempDir(), "does-not-exist"))
 		clearInClusterEnv(t)
-
 		h := Register()
-		recovered := assertPanics(t, func() { h.Init() })
-		if !strings.Contains(fmt.Sprint(recovered), "app.handleErr") {
-			t.Errorf("panic = %v, want it to contain the handleErr context", recovered)
+		assertPanics(t, func() { h.init(namespaceFile(t, "kubevirt-ip-helper")) })
+		if h.lock != nil {
+			t.Fatal("missing kubeconfig initialized election")
 		}
 	})
 }

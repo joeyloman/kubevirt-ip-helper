@@ -278,6 +278,22 @@ collector_list() { # <subject> <command> <arguments...>
   return 0
 }
 
+collector_metrics() { # <service>
+  local service="$1" output rc=0
+  output="$(helper_service_metrics "${service}" 2>&1)" || rc=$?
+  [ -n "${output}" ] || rc=1
+  {
+    printf '\n===== Service-delivered metrics %s/%s =====\n' "${KIH_HELPER_NAMESPACE}" "${service}"
+    printf '%s\n' "${output}"
+    [ "${rc}" -eq 0 ] || printf '[capture failed: exit %s]\n' "${rc}"
+  } >> "${E2E_ARTIFACTS_DIR}/08-netns.txt" || {
+    _evidence_record_error "diagnostics" "cannot write metrics Service ${service} output" || true
+  }
+  if [ "${rc}" -ne 0 ]; then
+    _evidence_record_error "diagnostics" "metrics Service ${service} scrape exited ${rc}" || true
+  fi
+}
+
 {
   printf 'collected: %s\n' "$(date -Is 2> /dev/null || date)"
   printf 'cluster: %s\n' "${E2E_CLUSTER_NAME}"
@@ -355,18 +371,44 @@ for pod in $(collector_list "virt-handler pod listing" kubectl -n kubevirt \
   capture 03-kubevirt.txt "${pod} logs" kubectl -n kubevirt logs "${pod}" --all-containers --tail=-1 --prefix
 done
 
-capture 04-helper.txt "helper deployment" kubectl -n "${KIH_HELPER_NAMESPACE}" get deployment/kubevirt-ip-helper -o yaml
-capture 04-helper.txt "helper pods" kubectl -n "${KIH_HELPER_NAMESPACE}" get pods -l app=kubevirt-ip-helper -o yaml
-capture 04-helper.txt "leader Lease" kubectl -n "${KIH_HELPER_NAMESPACE}" get lease/kubevirt-ip-helper-lock -o yaml
-capture 04-helper.txt "metrics Service" kubectl -n "${KIH_HELPER_NAMESPACE}" get service/kubevirt-ip-helper-metrics -o yaml
-capture 04-helper.txt "metrics Endpoints" kubectl -n "${KIH_HELPER_NAMESPACE}" get endpoints/kubevirt-ip-helper-metrics -o yaml
-capture 04-helper.txt "metrics EndpointSlices" kubectl -n "${KIH_HELPER_NAMESPACE}" get endpointslices -l kubernetes.io/service-name=kubevirt-ip-helper-metrics -o yaml
+capture 04-helper.txt "helper pods with network identity" kubectl -n "${KIH_HELPER_NAMESPACE}" get pods -l app=kubevirt-ip-helper -o yaml
+capture 04-helper.txt "required primary Deployment" kubectl -n "${KIH_HELPER_NAMESPACE}" get deployment "${KIH_HELPER_DEPLOYMENT}" -o yaml
+capture 04-helper.txt "required primary Lease" kubectl -n "${KIH_HELPER_NAMESPACE}" get lease "${KIH_LEADER_LEASE}" -o yaml
+capture 04-helper.txt "required primary Service" kubectl -n "${KIH_HELPER_NAMESPACE}" get service "${KIH_METRICS_SERVICE}" -o yaml
+capture 04-helper.txt "required primary Endpoints" kubectl -n "${KIH_HELPER_NAMESPACE}" get endpoints "${KIH_METRICS_SERVICE}" -o yaml
+capture 04-helper.txt "required primary EndpointSlices" kubectl -n "${KIH_HELPER_NAMESPACE}" get endpointslices -l "kubernetes.io/service-name=${KIH_METRICS_SERVICE}" -o yaml
+collector_metrics "${KIH_METRICS_SERVICE}"
+if [ "${E2E_SECOND_NETWORK_EXPECTED:-0}" = 1 ]; then
+  capture 04-helper.txt "required secondary Deployment" kubectl -n "${KIH_HELPER_NAMESPACE}" get deployment "${KIH_SECOND_HELPER_DEPLOYMENT}" -o yaml
+  capture 04-helper.txt "required secondary Lease" kubectl -n "${KIH_HELPER_NAMESPACE}" get lease "${KIH_SECOND_LEADER_LEASE}" -o yaml
+  capture 04-helper.txt "required secondary Service" kubectl -n "${KIH_HELPER_NAMESPACE}" get service "${KIH_SECOND_METRICS_SERVICE}" -o yaml
+  capture 04-helper.txt "required secondary Endpoints" kubectl -n "${KIH_HELPER_NAMESPACE}" get endpoints "${KIH_SECOND_METRICS_SERVICE}" -o yaml
+  capture 04-helper.txt "required secondary EndpointSlices" kubectl -n "${KIH_HELPER_NAMESPACE}" get endpointslices -l "kubernetes.io/service-name=${KIH_SECOND_METRICS_SERVICE}" -o yaml
+  collector_metrics "${KIH_SECOND_METRICS_SERVICE}"
+fi
+capture 04-helper.txt "canonical standalone webhook Deployment" kubectl -n kubevirt-ip-helper get deployment kubevirt-ip-helper-webhook -o yaml
+capture 04-helper.txt "canonical webhook Service 8080 to 8443" kubectl -n kubevirt-ip-helper get service kubevirt-ip-helper-webhook -o yaml
+capture 04-helper.txt "canonical webhook Endpoints" kubectl -n kubevirt-ip-helper get endpoints kubevirt-ip-helper-webhook -o yaml
+capture 04-helper.txt "canonical webhook EndpointSlices" kubectl -n kubevirt-ip-helper get endpointslices -l kubernetes.io/service-name=kubevirt-ip-helper-webhook -o yaml
+capture 04-helper.txt "canonical admission registration and CA bundle" kubectl get validatingwebhookconfiguration kubevirt-ip-helper-validator -o yaml
+capture 04-helper.txt "canonical public CSR and signed certificate" kubectl get certificatesigningrequest kubevirt-ip-helper-webhook.kubevirt-ip-helper.svc -o yaml
+# Do not request Secret YAML: it contains tls.key and may carry a last-applied
+# annotation with the same private material. This projection never outputs either.
+capture 04-helper.txt "webhook TLS Secret public certificate only (base64)" \
+  kubectl -n kubevirt-ip-helper get secret kubevirt-ip-helper-webhook-tls \
+  -o go-template='name={{.metadata.name}}{{"\n"}}namespace={{.metadata.namespace}}{{"\n"}}uid={{.metadata.uid}}{{"\n"}}type={{.type}}{{"\n"}}tls.crt={{index .data "tls.crt"}}{{"\n"}}'
 capture 04-helper.txt "helper events" kubectl -n "${KIH_HELPER_NAMESPACE}" get events --sort-by=.lastTimestamp
 for pod in $(collector_list "helper pod listing" kubectl -n "${KIH_HELPER_NAMESPACE}" \
   get pods -l app=kubevirt-ip-helper \
   -o jsonpath='{.items[*].metadata.name}' || true); do
   capture 05-helper-logs.txt "${pod} logs" kubectl -n "${KIH_HELPER_NAMESPACE}" logs "${pod}" --tail=-1 --prefix
   capture 05-helper-logs.txt "${pod} previous logs" kubectl -n "${KIH_HELPER_NAMESPACE}" logs "${pod}" --previous --tail=-1 --prefix
+done
+for pod in $(collector_list "webhook pod listing" kubectl -n kubevirt-ip-helper \
+  get pods -l app=kubevirt-ip-helper-webhook -o jsonpath='{.items[*].metadata.name}' || true); do
+  capture 04-helper.txt "${pod} webhook pod routing identity" kubectl -n kubevirt-ip-helper get pod "${pod}" -o yaml
+  capture 05-helper-logs.txt "${pod} webhook logs" kubectl -n kubevirt-ip-helper logs "${pod}" --tail=-1 --prefix
+  capture 05-helper-logs.txt "${pod} webhook previous logs" kubectl -n kubevirt-ip-helper logs "${pod}" --previous --tail=-1 --prefix
 done
 
 capture 06-ipam-vm.txt "IPPools" kubectl get ippools -o yaml
@@ -386,14 +428,14 @@ for pod in $(collector_list "workload pod listing" kubectl -n "${KIH_WORKLOAD_NA
   esac
 done
 
-for pod in $(collector_list "leader pod listing" kubectl -n "${KIH_HELPER_NAMESPACE}" \
-  get pods -l kubevirtiphelper/leader=active \
+for pod in $(collector_list "network leader pod listing" kubectl -n "${KIH_HELPER_NAMESPACE}" \
+  get pods -l app=kubevirt-ip-helper,kubevirtiphelper/leader=active \
   -o jsonpath='{.items[*].metadata.name}' || true); do
+  capture 08-netns.txt "${pod} network identity and role" kubectl -n "${KIH_HELPER_NAMESPACE}" get pod "${pod}" \
+    -o go-template='network={{index .metadata.labels "kubevirtiphelper/network"}}{{"\n"}}leader={{index .metadata.labels "kubevirtiphelper/leader"}}{{"\n"}}multus={{index .metadata.annotations "k8s.v1.cni.cncf.io/network-status"}}{{"\n"}}'
   capture 08-netns.txt "${pod} addresses" kubectl -n "${KIH_HELPER_NAMESPACE}" exec "${pod}" -- ip addr
   capture 08-netns.txt "${pod} routes" kubectl -n "${KIH_HELPER_NAMESPACE}" exec "${pod}" -- ip route
   capture 08-netns.txt "${pod} UDP sockets" kubectl -n "${KIH_HELPER_NAMESPACE}" exec "${pod}" -- cat /proc/net/udp
-  capture 08-netns.txt "${pod} localhost metrics (diagnostic only, not Service delivery proof)" \
-    kubectl -n "${KIH_HELPER_NAMESPACE}" exec "${pod}" -- wget -qO- http://127.0.0.1:8080/metrics
 done
 
 if [ -n "${RUNTIME}" ]; then

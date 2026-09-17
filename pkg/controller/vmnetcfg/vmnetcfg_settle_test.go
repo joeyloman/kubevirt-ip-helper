@@ -114,7 +114,8 @@ func TestHandleErrDropSettlesStartupCount(t *testing.T) {
 // no recorded address becomes reissuable.
 func TestGateDropSettleKeepsInterfacesProtected(t *testing.T) {
 	e, controller, startupGate := newGateTestEnv(t)
-	seedHealthyPool(e)
+	b := networkPeer(t, e, "net-test-2")
+	seedHealthyPool(b)
 	e.addSubnet("10.0.0.1", "10.0.0.2")
 	e.seedPool(nil)
 
@@ -129,13 +130,15 @@ func TestGateDropSettleKeepsInterfacesProtected(t *testing.T) {
 		},
 	}
 	e.seedVMNetCfg(vmnetcfg)
+	if err := b.controller.updateVirtualMachineNetworkConfig(ADD, vmnetcfg); err != nil {
+		t.Fatal(err)
+	}
 	if err := controller.indexer.Add(vmnetcfg); err != nil {
 		t.Fatalf("seeding indexer: %s", err)
 	}
 	key := testNamespace + "/" + testVMNetCfgName
 
-	// only the first pool's status path conflicts persistently: the second
-	// interface (its own pool) must complete its restore fully
+	// The owned pool fails while the other helper's completed restore remains.
 	e.api.conflictPath = ippoolStatusPath
 	e.api.conflictCount = 100
 
@@ -145,10 +148,10 @@ func TestGateDropSettleKeepsInterfacesProtected(t *testing.T) {
 	if startupGate.Settled() != 0 {
 		t.Fatalf("gate count = %d after the failed sync, want 0 (transient, uncounted)", startupGate.Settled())
 	}
-	if !e.dhcp.CheckLease("02:00:00:00:00:02") {
+	if !b.dhcp.CheckLease("02:00:00:00:00:02") {
 		t.Fatal("the second interface must be fully restored")
 	}
-	if used := e.ipam.Used(healthyNet2); used != 1 {
+	if used := b.ipam.Used(healthyNet2); used != 1 {
 		t.Fatalf("healthy network used = %d, want 1", used)
 	}
 	pool2 := e.api.ippools["ippool-test-2"].DeepCopy()
@@ -165,7 +168,7 @@ func TestGateDropSettleKeepsInterfacesProtected(t *testing.T) {
 	if _, err := e.ipam.GetIP(testNetwork, "10.0.0.1"); err == nil {
 		t.Error("the conflicting interface's recorded address must not be reissuable")
 	}
-	if _, err := e.ipam.GetIP(healthyNet2, "10.0.1.2"); err == nil {
+	if _, err := b.ipam.GetIP(healthyNet2, "10.0.1.2"); err == nil {
 		t.Fatal("the recorded address must not be reissuable")
 	}
 
@@ -192,13 +195,13 @@ func TestGateDropSettleKeepsInterfacesProtected(t *testing.T) {
 	if startupGate.Settled() != 1 {
 		t.Fatalf("gate count = %d after the drop, want 1", startupGate.Settled())
 	}
-	if !e.dhcp.CheckLease("02:00:00:00:00:02") {
+	if !b.dhcp.CheckLease("02:00:00:00:00:02") {
 		t.Error("the second interface's lease must survive the gate settle")
 	}
-	if used := e.ipam.Used(healthyNet2); used != 1 {
+	if used := b.ipam.Used(healthyNet2); used != 1 {
 		t.Errorf("healthy network used = %d after the gate settle, want 1", used)
 	}
-	if _, err := e.ipam.GetIP(healthyNet2, "10.0.1.2"); err == nil {
+	if _, err := b.ipam.GetIP(healthyNet2, "10.0.1.2"); err == nil {
 		t.Error("the recorded address must not become reissuable after the gate settle")
 	}
 	if !e.dhcp.CheckLease("02:00:00:00:00:01") {

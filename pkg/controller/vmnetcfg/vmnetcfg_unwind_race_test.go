@@ -17,10 +17,8 @@ import (
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
 )
 
-// TestVerifyClaimedNicsUnwindsVanishedNic: the sync's snapshot still lists
-// the nic while the live object already dropped it (the vm cleanup won the
-// race). The sync must not commit the nic back and must unwind everything
-// it recreated for it.
+// The fresh read sees an owned NIC, then a competing writer removes it
+// after allocation. The post-bind fence must unwind the newly served tuple.
 func TestVerifyClaimedNicsUnwindsVanishedNic(t *testing.T) {
 	e := newTestEnv(t)
 	e.appStatus.Store(APP_RUNNING)
@@ -31,13 +29,17 @@ func TestVerifyClaimedNicsUnwindsVanishedNic(t *testing.T) {
 	vmnetcfg := newVMNetCfg("", testMAC)
 	e.seedVMNetCfg(vmnetcfg)
 
-	// the live object: the vm controller already removed the nic durably
-	live := vmnetcfg.DeepCopy()
-	live.Spec.NetworkConfig = nil
-	e.api.seedVMNetCfg(live)
+	e.api.poolPutHook = func() {
+		e.api.mu.Lock()
+		defer e.api.mu.Unlock()
+		e.api.poolPutHook = nil
+		stored := e.api.vmnetcfgs[testNamespace+"/"+testVMNetCfgName]
+		stored.Spec.NetworkConfig = nil
+		bumpResourceVersion(stored)
+	}
 
-	if err := e.controller.updateVirtualMachineNetworkConfig(ADD, vmnetcfg); err != nil {
-		t.Fatalf("unexpected error: %s", err)
+	if err := e.controller.updateVirtualMachineNetworkConfig(ADD, vmnetcfg); err == nil {
+		t.Fatal("the stale owned decision must requeue after unwinding")
 	}
 
 	// the recreated state was unwound: nothing served, nothing recorded
@@ -138,8 +140,13 @@ func TestVerifyFailureStillUnwindsContestedClaims(t *testing.T) {
 	}
 	e.seedVMNetCfg(vmnetcfg)
 
-	// the pre-commit verification cannot re-read the live object
-	e.api.vmnetcfgGetCode = http.StatusInternalServerError
+	// Initial fresh read succeeds; verification fails only after binding.
+	e.api.poolPutHook = func() {
+		e.api.mu.Lock()
+		defer e.api.mu.Unlock()
+		e.api.poolPutHook = nil
+		e.api.vmnetcfgGetCode = http.StatusInternalServerError
+	}
 
 	if err := e.controller.updateVirtualMachineNetworkConfig(ADD, vmnetcfg); err == nil {
 		t.Fatal("want the failed verification to fail the sync")

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"time"
 
 	log "github.com/sirupsen/logrus"
 
@@ -21,6 +22,9 @@ import (
 )
 
 func (c *Controller) handleVirtualMachineObjectChange(vm *kubevirtV1.VirtualMachine) (err error) {
+	if vm.DeletionTimestamp != nil {
+		return nil
+	}
 	vmnetcfg, err := c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs(vm.Namespace).Get(c.ctx, vm.Name, metav1.GetOptions{})
 	if err != nil {
 		if apierrors.IsNotFound(err) {
@@ -49,6 +53,9 @@ func (c *Controller) handleVirtualMachineObjectChange(vm *kubevirtV1.VirtualMach
 }
 
 func (c *Controller) createVirtualMachineNetworkConfigObject(vm *kubevirtV1.VirtualMachine) (err error) {
+	if vm.DeletionTimestamp != nil {
+		return nil
+	}
 	log.Tracef("(vm.createVirtualMachineNetworkConfigObject) [%s/%s] processing new VirtualMachine [%+v]",
 		vm.Namespace, vm.Name, vm)
 
@@ -73,6 +80,13 @@ func (c *Controller) createVirtualMachineNetworkConfigObject(vm *kubevirtV1.Virt
 	newVmNetCfg.Spec.NetworkConfig = netCfgs
 
 	vmNetCfgObj, err := c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs(newVmNetCfg.Namespace).Create(c.ctx, &newVmNetCfg, metav1.CreateOptions{})
+	if apierrors.IsAlreadyExists(err) {
+		current, getErr := c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs(vm.Namespace).Get(c.ctx, vm.Name, metav1.GetOptions{})
+		if getErr != nil {
+			return getErr
+		}
+		return c.updateVirtualMachineNetworkConfigObject(vm, current)
+	}
 	if err != nil {
 		return fmt.Errorf("(vm.createVirtualMachineNetworkConfig) [%s/%s] cannot create VirtualMachineNetworkConfig object for vm: %s",
 			vm.Namespace, vm.Name, err.Error())
@@ -84,55 +98,233 @@ func (c *Controller) createVirtualMachineNetworkConfigObject(vm *kubevirtV1.Virt
 	return
 }
 
-func (c *Controller) updateVirtualMachineNetworkConfigObject(vm *kubevirtV1.VirtualMachine, vmnetcfg *kihv1.VirtualMachineNetworkConfig) (err error) {
-	log.Tracef("(vm.updateVirtualMachineNetworkConfigObject) [%s/%s] processing updated VirtualMachine  [%+v]",
-		vm.Namespace, vm.Name, vm)
-
-	newVmNetCfg := vmnetcfg.DeepCopy()
-
-	netCfgs, err := c.getNetworkConfigs(vm, vmnetcfg.Spec.NetworkConfig)
+func (c *Controller) updateVirtualMachineNetworkConfigObject(vm *kubevirtV1.VirtualMachine, vmnetcfg *kihv1.VirtualMachineNetworkConfig) error {
+	if vmnetcfg.DeletionTimestamp != nil || vm.DeletionTimestamp != nil {
+		return fmt.Errorf("cannot project NICs onto deleting VM or VMNetCfg %s/%s", vm.Namespace, vm.Name)
+	}
+	if vmnetcfg.Spec.VMName != vm.Name {
+		return fmt.Errorf("VMNetCfg %s/%s belongs to VM %q", vmnetcfg.Namespace, vmnetcfg.Name, vmnetcfg.Spec.VMName)
+	}
+	desired, err := c.getNetworkConfigs(vm, nil)
 	if err != nil {
-		return
+		return err
 	}
-
-	if reflect.DeepEqual(vmnetcfg.Spec.NetworkConfig, netCfgs) {
-		log.Debugf("(vm.updateVirtualMachineNetworkConfigObject) [%s/%s] no network updates needed", vm.Namespace, vm.Name)
-		return
+	wanted := make(map[networkConfigIdentity]bool, len(desired))
+	for _, nic := range desired {
+		wanted[networkConfigKey(vm.Namespace, nic.NetworkName, nic.MACAddress)] = true
 	}
-
-	newVmNetCfg.Spec.NetworkConfig = netCfgs
-
-	log.Tracef("(vm.updateVirtualMachineNetworkConfigObject) [%s/%s] new vmnetcfg networkconfig: [%+v]",
-		vm.Namespace, vm.Name, newVmNetCfg.Spec.NetworkConfig)
-
-	// when the nics in the vm differs from the vmnetcfg the mismatches should be cleaned up first
-	var nicCleanup bool
-	for _, curNetCfg := range vmnetcfg.Spec.NetworkConfig {
-		nicCleanup = true
-		for _, newNetCfg := range netCfgs {
-			if curNetCfg.MACAddress == newNetCfg.MACAddress && curNetCfg.NetworkName == newNetCfg.NetworkName && curNetCfg.IPAddress == newNetCfg.IPAddress {
-				nicCleanup = false
-			}
-		}
-		if nicCleanup {
-			// a failed cleanup aborts the sync: the durable update must not
-			// proceed on half-freed interface state
-			if err := c.cleanupNetworkInterface(vmnetcfg, &curNetCfg); err != nil {
-				return err
-			}
+	// Cleanup is performed once, outside the API conflict loops. Retain all
+	// durable acknowledgements until every removed owned binding is clean.
+	removed := make(map[networkConfigIdentity]kihv1.NetworkConfig)
+	for _, nic := range c.scope.FilterSpec(vmnetcfg.Namespace, vmnetcfg.Spec.NetworkConfig) {
+		key := networkConfigKey(vmnetcfg.Namespace, nic.NetworkName, nic.MACAddress)
+		if !wanted[key] {
+			removed[key] = nic
 		}
 	}
-
-	vmNetCfgObj, err := c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs(newVmNetCfg.Namespace).Update(c.ctx, newVmNetCfg, metav1.UpdateOptions{})
-	if err != nil {
-		return fmt.Errorf("(vm.updateVirtualMachineNetworkConfigObject) [%s/%s] cannot update VirtualMachineNetworkConfig object for vm: %s",
-			vm.Namespace, vm.Name, err.Error())
+	for _, nic := range c.scope.FilterStatus(vmnetcfg.Namespace, vmnetcfg.Status.NetworkConfig) {
+		key := networkConfigKey(vmnetcfg.Namespace, nic.NetworkName, nic.MACAddress)
+		if _, found := removed[key]; !wanted[key] && !found {
+			removed[key] = kihv1.NetworkConfig{NetworkName: nic.NetworkName, MACAddress: nic.MACAddress}
+		}
 	}
+	for _, nic := range removed {
+		if err := c.cleanupRemovedInterface(vmnetcfg, nic); err != nil {
+			return err
+		}
+	}
+	if len(desired) == 0 && len(removed) == 0 {
+		return nil
+	}
+	if err := c.commitProjection(vmnetcfg, false, func(current *kihv1.VirtualMachineNetworkConfig) error {
+		if err := c.verifyProjectionRows(vmnetcfg, current, wanted, removed); err != nil {
+			return err
+		}
+		// Preserve the latest allocated IP, including an allocation committed
+		// by the NIC controller after the projection's original read.
+		for i := range desired {
+			desired[i].IPAddress = ""
+			for _, nic := range current.Spec.NetworkConfig {
+				if networkConfigKey(current.Namespace, nic.NetworkName, nic.MACAddress) == networkConfigKey(current.Namespace, desired[i].NetworkName, desired[i].MACAddress) {
+					desired[i].IPAddress = nic.IPAddress
+					break
+				}
+			}
+		}
+		current.Spec.NetworkConfig = c.scope.MergeSpec(current.Namespace, current.Spec.NetworkConfig, desired)
+		return nil
+	}); err != nil {
+		return err
+	}
+	if len(removed) == 0 {
+		return nil
+	}
+	return c.commitProjection(vmnetcfg, true, func(current *kihv1.VirtualMachineNetworkConfig) error {
+		if err := c.verifyProjectionRows(vmnetcfg, current, wanted, removed); err != nil {
+			return err
+		}
+		var remaining []kihv1.NetworkConfigStatus
+		for _, nic := range c.scope.FilterStatus(current.Namespace, current.Status.NetworkConfig) {
+			if _, cleaned := removed[networkConfigKey(current.Namespace, nic.NetworkName, nic.MACAddress)]; !cleaned {
+				remaining = append(remaining, nic)
+			}
+		}
+		current.Status.NetworkConfig = c.scope.MergeStatus(current.Namespace, current.Status.NetworkConfig, remaining)
+		return nil
+	})
+}
 
-	log.Infof("(vm.updateVirtualMachineNetworkConfigObject) [%s/%s] successfully updated vmnetcfg object [%s/%s]",
-		vm.Namespace, vm.Name, vmNetCfgObj.ObjectMeta.Namespace, vmNetCfgObj.ObjectMeta.Name)
+type networkConfigIdentity struct {
+	network string
+	mac     string
+}
 
-	return
+func networkConfigKey(namespace, network, mac string) networkConfigIdentity {
+	return networkConfigIdentity{network: util.QualifyNetworkName(namespace, network), mac: util.CanonicalHWAddr(mac)}
+}
+
+// verifyProjectionRows fences cleanup acknowledgements against changed owned
+// bindings. Foreign changes and newer IPs on still-desired NICs are mergeable.
+func (c *Controller) verifyProjectionRows(base, current *kihv1.VirtualMachineNetworkConfig, wanted map[networkConfigIdentity]bool, removed map[networkConfigIdentity]kihv1.NetworkConfig) error {
+	for _, old := range c.scope.FilterSpec(base.Namespace, base.Spec.NetworkConfig) {
+		key := networkConfigKey(base.Namespace, old.NetworkName, old.MACAddress)
+		if !wanted[key] {
+			continue
+		}
+		found := false
+		for _, nic := range current.Spec.NetworkConfig {
+			if networkConfigKey(current.Namespace, nic.NetworkName, nic.MACAddress) == key {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("owned NIC disappeared during projection of %s/%s", current.Namespace, current.Name)
+		}
+	}
+	for _, nic := range c.scope.FilterSpec(current.Namespace, current.Spec.NetworkConfig) {
+		key := networkConfigKey(current.Namespace, nic.NetworkName, nic.MACAddress)
+		if wanted[key] {
+			continue
+		}
+		cleaned, ok := removed[key]
+		if !ok || cleaned.IPAddress != nic.IPAddress {
+			return fmt.Errorf("owned NIC changed during projection of %s/%s", current.Namespace, current.Name)
+		}
+	}
+	for _, nic := range c.scope.FilterStatus(current.Namespace, current.Status.NetworkConfig) {
+		key := networkConfigKey(current.Namespace, nic.NetworkName, nic.MACAddress)
+		if wanted[key] {
+			continue
+		}
+		// An exact base row already proves the unwanted row was acknowledged.
+		found := false
+		for _, old := range base.Status.NetworkConfig {
+			if networkConfigKey(base.Namespace, old.NetworkName, old.MACAddress) == key && reflect.DeepEqual(old, nic) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("owned status NIC changed during projection of %s/%s", current.Namespace, current.Name)
+		}
+	}
+	return nil
+}
+
+// commitProjection retries only the API intent, never lease/ledger cleanup.
+func (c *Controller) commitProjection(base *kihv1.VirtualMachineNetworkConfig, status bool, merge func(*kihv1.VirtualMachineNetworkConfig) error) error {
+	client := c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs(base.Namespace)
+	for attempt := range 10 {
+		if err := c.ctx.Err(); err != nil {
+			return err
+		}
+		current, err := client.Get(c.ctx, base.Name, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+		if current.UID != base.UID || current.Spec.VMName != base.Spec.VMName || current.DeletionTimestamp != nil {
+			return fmt.Errorf("VMNetCfg %s/%s replaced, deleting or owner changed during projection", base.Namespace, base.Name)
+		}
+		next := current.DeepCopy()
+		if err := merge(next); err != nil {
+			return err
+		}
+		if status {
+			if reflect.DeepEqual(current.Status.NetworkConfig, next.Status.NetworkConfig) {
+				return nil
+			}
+			_, err = client.UpdateStatus(c.ctx, next, metav1.UpdateOptions{})
+		} else {
+			if reflect.DeepEqual(current.Spec.NetworkConfig, next.Spec.NetworkConfig) {
+				return nil
+			}
+			_, err = client.Update(c.ctx, next, metav1.UpdateOptions{})
+		}
+		if err == nil {
+			return nil
+		}
+		if !apierrors.IsConflict(err) || attempt == 9 {
+			return err
+		}
+		select {
+		case <-c.ctx.Done():
+			return c.ctx.Err()
+		case <-time.After(time.Duration(attempt) * 100 * time.Millisecond):
+		}
+	}
+	return fmt.Errorf("projection retries exhausted for %s/%s", base.Namespace, base.Name)
+}
+
+// A status-only or not-yet-assigned spec row does not prove cleanup completed.
+// Resolve its binding from the owner-checked durable ledger and local lease.
+func (c *Controller) cleanupRemovedInterface(cfg *kihv1.VirtualMachineNetworkConfig, nic kihv1.NetworkConfig) error {
+	if !c.scope.Owns(cfg.Namespace, nic.NetworkName) {
+		return nil
+	}
+	nic.NetworkName = c.scope.NetworkName()
+	nic.MACAddress = util.CanonicalHWAddr(nic.MACAddress)
+	if nic.IPAddress != "" {
+		return c.cleanupNetworkInterface(cfg, &nic)
+	}
+	pools, err := c.kihClientset.KubevirtiphelperV1().IPPools().List(c.ctx, metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("cannot resolve removed NIC reservation: %w", err)
+	}
+	addresses := make(map[string]bool)
+	for _, ip := range c.ipam.IPsOwnedBy(nic.NetworkName, util.AllocationRef(cfg.Namespace, cfg.Spec.VMName, nic.MACAddress)) {
+		addresses[ip] = true
+	}
+	for _, pool := range pools.Items {
+		if pool.Spec.NetworkName != nic.NetworkName {
+			continue
+		}
+		if _, err := c.cache.Get("pool", nic.NetworkName); err != nil {
+			return fmt.Errorf("cannot resolve removed NIC while pool %s is unavailable: %w", pool.Name, err)
+		}
+		for ip, ref := range pool.Status.IPv4.Allocated {
+			ns, vm, mac, valid := util.ParseAllocationRef(ref)
+			if valid && ns == cfg.Namespace && vm == cfg.Spec.VMName && mac == nic.MACAddress {
+				addresses[ip] = true
+			}
+		}
+	}
+	lease := c.dhcp.GetLease(nic.MACAddress)
+	if lease.Reference == cfg.Namespace+"/"+cfg.Spec.VMName && lease.PoolName == nic.NetworkName && lease.ClientIP != nil {
+		addresses[lease.ClientIP.String()] = true
+	}
+	for ip := range addresses {
+		nic.IPAddress = ip
+		if err := c.cleanupNetworkInterface(cfg, &nic); err != nil {
+			return err
+		}
+	}
+	if len(addresses) == 0 {
+		if err := c.cleanupNetworkInterface(cfg, &nic); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (c *Controller) deleteVirtualMachineNetworkConfigObject(vmNamespace string, vmName string) (err error) {
@@ -150,6 +342,24 @@ func (c *Controller) deleteVirtualMachineNetworkConfigObject(vmNamespace string,
 			vmNamespace, vmName, vmNamespace, vmName)
 
 		return
+	}
+	if len(c.scope.FilterSpec(obj.Namespace, obj.Spec.NetworkConfig)) == 0 && len(c.scope.FilterStatus(obj.Namespace, obj.Status.NetworkConfig)) == 0 {
+		if len(obj.Spec.NetworkConfig) != 0 || len(obj.Status.NetworkConfig) != 0 {
+			return nil
+		}
+		managed := false
+		for _, finalizer := range obj.Finalizers {
+			if finalizer == "kubevirtiphelper.k8s.binbash.org/vmnetcfg-cleanup" {
+				managed = true
+				break
+			}
+		}
+		if !managed {
+			return nil
+		}
+	}
+	if obj.Spec.VMName != vmName {
+		return fmt.Errorf("VMNetCfg %s/%s belongs to VM %q", obj.Namespace, obj.Name, obj.Spec.VMName)
 	}
 
 	// the delete is conditioned on the uid the preflight get observed: a
@@ -197,6 +407,9 @@ func (c *Controller) checkVirtualMachineNetworkConfigObject(vmNamespace string, 
 }
 
 func (c *Controller) getNetworkConfigs(vm *kubevirtV1.VirtualMachine, curNetCfg []kihv1.NetworkConfig) (netCfgs []kihv1.NetworkConfig, err error) {
+	if vm.Spec.Template == nil {
+		return nil, nil
+	}
 	// make sure it also stays compatible with Harvester
 	var harvesterMacs map[string]string
 	if vm.ObjectMeta.Annotations != nil {
@@ -216,6 +429,9 @@ func (c *Controller) getNetworkConfigs(vm *kubevirtV1.VirtualMachine, curNetCfg 
 					log.Warnf("(vm.getNetworkConfigs) [%s/%s] unsupported network type found!",
 						vm.Namespace, vm.Name)
 				} else {
+					if !c.scope.Owns(vm.Namespace, net.Multus.NetworkName) {
+						continue
+					}
 					if nic.MacAddress == "" {
 						// when a new vm is created the macaddress doesn't exists immediately
 						// it takes a couple of object updates before the macaddress is assigned
@@ -243,6 +459,7 @@ func (c *Controller) getNetworkConfigs(vm *kubevirtV1.VirtualMachine, curNetCfg 
 							vm.Namespace, vm.Name)
 						c.metrics.UpdateLogStatus("error")
 					} else {
+						nic.MacAddress = util.CanonicalHWAddr(nic.MacAddress)
 						if c.dhcp.CheckLease(nic.MacAddress) {
 							lease := c.dhcp.GetLease(nic.MacAddress)
 							if lease.Reference != fmt.Sprintf("%s/%s", vm.Namespace, vm.Name) {
@@ -253,10 +470,10 @@ func (c *Controller) getNetworkConfigs(vm *kubevirtV1.VirtualMachine, curNetCfg 
 
 						netCfg := kihv1.NetworkConfig{}
 						netCfg.MACAddress = nic.MacAddress
-						netCfg.NetworkName = net.Multus.NetworkName
+						netCfg.NetworkName = c.scope.NetworkName()
 
 						for _, oldnet := range curNetCfg {
-							if oldnet.MACAddress == nic.MacAddress && oldnet.NetworkName == net.Multus.NetworkName {
+							if networkConfigKey(vm.Namespace, oldnet.NetworkName, oldnet.MACAddress) == networkConfigKey(vm.Namespace, netCfg.NetworkName, nic.MacAddress) {
 								netCfg.IPAddress = oldnet.IPAddress
 							}
 						}
@@ -283,6 +500,13 @@ func (c *Controller) getNetworkConfigs(vm *kubevirtV1.VirtualMachine, curNetCfg 
 // successor's named allocation and a registration protection pin both
 // stay untouched.
 func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetworkConfig, netCfg *kihv1.NetworkConfig) (err error) {
+	if !c.scope.Owns(vmnetcfg.Namespace, netCfg.NetworkName) {
+		return nil
+	}
+	canonical := *netCfg
+	canonical.NetworkName = c.scope.NetworkName()
+	canonical.MACAddress = util.CanonicalHWAddr(canonical.MACAddress)
+	netCfg = &canonical
 	log.Debugf("(vm.cleanupNetworkInterface) [%s/%s] cleaning interface with hwaddr=%s, networkname=%s, ipaddress=%s",
 		vmnetcfg.Namespace, vmnetcfg.Name, netCfg.MACAddress, netCfg.NetworkName, netCfg.IPAddress)
 
@@ -326,7 +550,7 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 	// its ownership record is still written, otherwise a crash between the
 	// release and the status write leaves an orphan ledger entry which the
 	// next registration re-pins to the ghost owner
-	var unrecordedPoolName string
+	var cleanupPoolName string
 	if netCfg.IPAddress != "" {
 		pool, poolErr := c.cache.Get("pool", netCfg.NetworkName)
 		if poolErr != nil {
@@ -388,7 +612,7 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 					vmnetcfg.Namespace, vmnetcfg.Name, netCfg.IPAddress, pool.(kihv1.IPPool).Name)
 				c.metrics.UpdateLogStatus("warning")
 			} else {
-				unrecordedPoolName = pool.(kihv1.IPPool).Name
+				cleanupPoolName = pool.(kihv1.IPPool).Name
 			}
 		}
 	}
@@ -405,27 +629,32 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 	// the owner check and the deletion run under one lock acquisition, so
 	// a delayed cleanup cannot delete a lease which a concurrent writer
 	// reassigned to another vm
-	if err := c.dhcp.DeleteLeaseOwnedBy(netCfg.MACAddress, ref); err != nil {
-		switch {
-		case errors.Is(err, dhcp.ErrLeaseNotFound):
-			// no lease left for this interface: the cleanup already
-			// converged, nothing to replay
+	lease := c.dhcp.GetLease(netCfg.MACAddress)
+	// A same-MAC binding on another network is never ours to delete.
+	// The owner-checked IPAM release below remains network-scoped.
+	if lease.Reference != ref || lease.PoolName == netCfg.NetworkName {
+		if err := c.dhcp.DeleteLeaseOwnedBy(netCfg.MACAddress, ref); err != nil {
+			switch {
+			case errors.Is(err, dhcp.ErrLeaseNotFound):
+				// no lease left for this interface: the cleanup already
+				// converged, nothing to replay
 
-		case errors.Is(err, dhcp.ErrLeaseInvalidHwAddr):
-			// an unparseable mac can never own a lease: the dhcp side of
-			// this cleanup has converged, the ipam release of an
-			// unparseable ip is classified the same way below
+			case errors.Is(err, dhcp.ErrLeaseInvalidHwAddr):
+				// an unparseable mac can never own a lease: the dhcp side of
+				// this cleanup has converged, the ipam release of an
+				// unparseable ip is classified the same way below
 
-		case errors.Is(err, dhcp.ErrLeaseForeignOwner):
-			// the mac was reassigned to another vm which owns the whole
-			// interface state by now
-			log.Warnf("(vm.cleanupNetworkInterface) [%s/%s] %s",
-				vmnetcfg.Namespace, vmnetcfg.Name, err.Error())
-			c.metrics.UpdateLogStatus("warning")
+			case errors.Is(err, dhcp.ErrLeaseForeignOwner):
+				// the mac was reassigned to another vm which owns the whole
+				// interface state by now
+				log.Warnf("(vm.cleanupNetworkInterface) [%s/%s] %s",
+					vmnetcfg.Namespace, vmnetcfg.Name, err.Error())
+				c.metrics.UpdateLogStatus("warning")
 
-		default:
-			return fmt.Errorf("(vm.cleanupNetworkInterface) [%s/%s] error deleting lease from dhcp: %s",
-				vmnetcfg.Namespace, vmnetcfg.Name, err.Error())
+			default:
+				return fmt.Errorf("(vm.cleanupNetworkInterface) [%s/%s] error deleting lease from dhcp: %s",
+					vmnetcfg.Namespace, vmnetcfg.Name, err.Error())
+			}
 		}
 	}
 
@@ -457,27 +686,11 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 				return fmt.Errorf("(vm.cleanupNetworkInterface) [%s/%s] error releasing ip from ipam: %s",
 					vmnetcfg.Namespace, vmnetcfg.Name, err.Error())
 			}
-		} else if unrecordedPoolName != "" {
-			// the release above changed the pool accounting after the
-			// un-record already persisted the pre-release counts: the
-			// persisted status must match the live allocator even when no
-			// follow-up write of the vmnetcfg controller ever lands, so
-			// the counts are republished through the same computation
-			// ippoolstatus.UpdateStatus performs (a converged no-op
-			// DELETE whose entry is already gone). the republish is
-			// best-effort: a foreign re-entry or a failed write is
-			// reported, not retried - the cleanup itself has converged
-			if republishErr := c.updateIPPoolStatus(
-				DELETE,
-				vmnetcfg.Namespace,
-				vmnetcfg.Spec.VMName,
-				netCfg.IPAddress,
-				netCfg.NetworkName,
-				netCfg.MACAddress,
-				unrecordedPoolName,
-			); republishErr != nil {
-				log.Warnf("(vm.cleanupNetworkInterface) [%s/%s] cannot republish the pool status counts of network %s: %s",
-					vmnetcfg.Namespace, vmnetcfg.Name, netCfg.NetworkName, republishErr.Error())
+		} else if cleanupPoolName != "" {
+			// Republish only after our successful un-record and local release.
+			// As before, a failed refresh is logged rather than retried.
+			if err := c.updateIPPoolStatus(DELETE, vmnetcfg.Namespace, vmnetcfg.Spec.VMName, netCfg.IPAddress, netCfg.NetworkName, netCfg.MACAddress, cleanupPoolName); err != nil {
+				log.Warnf("(vm.cleanupNetworkInterface) [%s/%s] cannot refresh pool accounting: %s", vmnetcfg.Namespace, vmnetcfg.Name, err)
 				c.metrics.UpdateLogStatus("warning")
 			}
 		}

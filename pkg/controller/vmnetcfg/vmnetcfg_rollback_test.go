@@ -5,8 +5,6 @@ import (
 	"strings"
 	"testing"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
 )
 
@@ -15,8 +13,7 @@ import (
 // address, so releasing its lease and ipam reservation would hand it to
 // another vm while the durable object still claims it.
 
-// a later nic whose pool is not in the cache must fail the sync without
-// freeing the restored durable address of an earlier nic
+// A later invalid owned MAC must not free an earlier durable binding.
 func TestVMNetCfgFailedSyncKeepsRestoredDurableAllocation(t *testing.T) {
 	e := newTestEnv(t)
 
@@ -24,20 +21,17 @@ func TestVMNetCfgFailedSyncKeepsRestoredDurableAllocation(t *testing.T) {
 	e.seedPool(nil)
 
 	// restart scenario: the lease map is empty and both nics carry already
-	// persisted addresses; the pool of the second nic is not registered
+	// persisted addresses; the second MAC is malformed
 	vmnetcfg := newVMNetCfg("", testMAC)
 	vmnetcfg.Spec.NetworkConfig = []kihv1.NetworkConfig{
 		{MACAddress: testMAC, NetworkName: testNetwork, IPAddress: "10.0.0.1"},
-		{MACAddress: testMAC2, NetworkName: "net-missing", IPAddress: "10.0.0.2"},
+		{MACAddress: "not-a-mac", NetworkName: testNetwork, IPAddress: "10.0.0.2"},
 	}
 	e.seedVMNetCfg(vmnetcfg)
 
 	err := e.controller.updateVirtualMachineNetworkConfig(ADD, vmnetcfg)
 	if err == nil {
-		t.Fatal("want the missing pool of the second nic to fail the sync")
-	}
-	if !strings.Contains(err.Error(), "does not exists in cache") {
-		t.Errorf("error = %q, want the cache miss message", err)
+		t.Fatal("want the invalid second MAC to fail the sync")
 	}
 
 	// the restored assignment of the first nic must stay fully applied
@@ -119,37 +113,21 @@ func TestVMNetCfgFailedSyncQuarantinesFreshAllocations(t *testing.T) {
 	// steady state: a running application's sync failure quarantines only
 	// the fresh allocations of this sync
 	e.appStatus.Store(APP_RUNNING)
-	secondNetwork := "net-b"
-	const secondPoolName = "ippool-b"
-
-	e.addSubnet("10.0.0.1", "10.0.0.1")
+	e.addSubnet("10.0.0.1", "10.0.0.2")
 	e.seedPool(nil)
 
-	poolB := &kihv1.IPPool{
-		ObjectMeta: metav1.ObjectMeta{Name: secondPoolName},
-		Spec: kihv1.IPPoolSpec{
-			NetworkName: secondNetwork,
-			IPv4Config:  kihv1.IPv4Config{Subnet: testSubnet, ServerIP: "10.0.0.1"},
-		},
-	}
-	e.seedPoolWith(poolB)
-	if err := e.ipam.NewSubnet(secondNetwork, testSubnet, "10.0.0.1", "10.0.0.1"); err != nil {
-		t.Fatalf("adding second subnet: %s", err)
-	}
-
-	// the first nic restores a durable address, the second nic asks for a
-	// fresh one and the third nic fails on its missing pool
+	// The first NIC restores, the second allocates, and the third fails.
 	vmnetcfg := newVMNetCfg("", testMAC)
 	vmnetcfg.Spec.NetworkConfig = []kihv1.NetworkConfig{
 		{MACAddress: testMAC, NetworkName: testNetwork, IPAddress: "10.0.0.1"},
-		{MACAddress: testMAC2, NetworkName: secondNetwork},
-		{MACAddress: "02:00:00:00:00:03", NetworkName: "net-missing"},
+		{MACAddress: testMAC2, NetworkName: testNetwork},
+		{MACAddress: "not-a-mac", NetworkName: testNetwork},
 	}
 	e.seedVMNetCfg(vmnetcfg)
 
 	err := e.controller.updateVirtualMachineNetworkConfig(ADD, vmnetcfg)
 	if err == nil {
-		t.Fatal("want the missing pool of the third nic to fail the sync")
+		t.Fatal("want the invalid third MAC to fail the sync")
 	}
 
 	// the durable restore stays applied
@@ -157,24 +135,21 @@ func TestVMNetCfgFailedSyncQuarantinesFreshAllocations(t *testing.T) {
 	if lease.ClientIP == nil || lease.ClientIP.String() != "10.0.0.1" {
 		t.Errorf("restored lease = %v, want 10.0.0.1 kept by the failed sync", lease.ClientIP)
 	}
-	if used := e.ipam.Used(testNetwork); used != 1 {
-		t.Errorf("durable ipam used = %d, want 1", used)
+	if used := e.ipam.Used(testNetwork); used != 2 {
+		t.Errorf("ipam used = %d, want durable and quarantined claims", used)
 	}
 
 	// the fresh allocation of the second nic stays quarantined: its lease
 	// may already have been served, so it is kept (lease, claim and record)
 	// until the retried sync adopts it
-	if freshLease := e.dhcp.GetLease(testMAC2); freshLease.ClientIP == nil || freshLease.ClientIP.String() != "10.0.0.1" {
+	if freshLease := e.dhcp.GetLease(testMAC2); freshLease.ClientIP == nil || freshLease.ClientIP.String() != "10.0.0.2" {
 		t.Errorf("fresh lease = %v, want the quarantined lease kept", freshLease.ClientIP)
-	}
-	if used := e.ipam.Used(secondNetwork); used != 1 {
-		t.Errorf("fresh ipam used = %d, want the quarantined claim kept", used)
 	}
 
 	e.api.mu.Lock()
-	poolBStored := e.api.ippools[secondPoolName].DeepCopy()
+	poolBStored := e.api.ippools[testPoolName].DeepCopy()
 	e.api.mu.Unlock()
-	if got := poolBStored.Status.IPv4.Allocated["10.0.0.1"]; got == "" {
+	if got := poolBStored.Status.IPv4.Allocated["10.0.0.2"]; got == "" {
 		t.Error("the quarantined status record of the second nic must be kept")
 	}
 }
@@ -232,6 +207,7 @@ func TestContestedRollbackClassifiesForeignOwnerOutcomesAsConverged(t *testing.T
 func TestUndeliveredClaimIsReleasedNotQuarantined(t *testing.T) {
 	e := newTestEnv(t)
 	e.addSubnet("10.0.0.1", "10.0.0.2")
+	e.seedPool(nil)
 
 	ownRef := testNamespace + "/" + testVMName + " [" + testMAC + "]"
 	if _, err := e.ipam.ReclaimIP(testNetwork, "10.0.0.1", ownRef); err != nil {

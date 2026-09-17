@@ -1,12 +1,27 @@
 # Default values for kubevirt-ip-helper.
 # This is a YAML-formatted file.
 # Declare variables to be passed into your templates.
+# Install one release in namespace kubevirt-ip-helper.
+# NADs and IPPools are operator-managed; this chart only references them.
 
 #
 # kubevirt-ip-helper options
 #
 kubevirtiphelper:
-  replicaCount: 2
+  networks:
+    - name: management
+      interface: net1
+      deploymentName: helper-management
+      metricsServiceName: metrics-management
+      replicaCount: 1
+    - name: storage
+      interface: net1
+      deploymentName: helper-storage
+      metricsServiceName: metrics-storage
+      replicaCount: 1
+  # Each entry defaults to one replica when omitted; zero stages a safe cutover.
+  serviceMonitor:
+    enabled: true
   
   image:
     repository: ghcr.io/joeyloman/kubevirt-ip-helper
@@ -24,11 +39,11 @@ kubevirtiphelper:
     annotations: {}
     # The name of the service account to use.
     # If not set and create is true, a name is generated using the fullname template
+    # With create: false, supply an existing account; bindings are still created.
     name: ""
   
-  podAnnotations:
-    k8s.v1.cni.cncf.io/networks: '[{ "interface":"eth1","name":"public-network1","namespace":"kubevirt-public" }]'
-    #k8s.v1.cni.cncf.io/networks: '[{ "interface":"eth1","name":"public-network1","namespace":"kubevirt-public" },{ "interface":"eth2","name":"public-network2","namespace":"kubevirt-public" }]'
+  # The network annotation is derived from each entry, not overridable.
+  podAnnotations: {}
   
   podSecurityContext: {}
     # fsGroup: 2000
@@ -48,13 +63,6 @@ kubevirtiphelper:
       cpu: 200m
       memory: 128Mi
   
-  autoscaling:
-    enabled: false
-    minReplicas: 1
-    maxReplicas: 100
-    targetCPUUtilizationPercentage: 80
-    # targetMemoryUtilizationPercentage: 80
-  
   nodeSelector: {}
   
   tolerations: []
@@ -73,6 +81,7 @@ kubevirtiphelper:
 
 #
 # kubevirt-ip-helper-webhook options
+# One shared webhook; its Service identity and ports are pinned by the runtime.
 #
 webhook:
   replicaCount: 1
@@ -84,7 +93,7 @@ webhook:
   
   imagePullSecrets: []
   nameOverride: ""
-  fullnameOverride: ""
+  fullnameOverride: kubevirt-ip-helper-webhook
   
   serviceAccount:
     # Specifies whether a service account should be created
@@ -93,6 +102,7 @@ webhook:
     annotations: {}
     # The name of the service account to use.
     # If not set and create is true, a name is generated using the fullname template
+    # With create: false, supply an existing account; bindings are still created.
     name: ""
   
   podAnnotations: {}

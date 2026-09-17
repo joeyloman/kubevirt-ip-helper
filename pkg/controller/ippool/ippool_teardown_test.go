@@ -42,13 +42,13 @@ func TestSyncUpdateFailedRegistrationTearsDownPartialState(t *testing.T) {
 	appStatus.Store(APP_INIT)
 	startupGate := newTestGate("pool-r2")
 	indexer := newTestIndexer()
-	if err := indexer.Add(testPool("pool-r2", "net-fresh2", 60)); err != nil {
+	if err := indexer.Add(testPool("pool-r2", "infra/net-fresh2", 60)); err != nil {
 		t.Fatalf("seeding indexer: %v", err)
 	}
 
 	controller, _ := newTestController(t, newTestQueue(), indexer, nil, &appStatus, startupGate)
 
-	event := testPoolEvent("pool-r2", UPDATE, "net-fresh2")
+	event := testPoolEvent("pool-r2", UPDATE, "infra/net-fresh2")
 
 	err := controller.sync(event)
 	if err == nil {
@@ -59,7 +59,7 @@ func TestSyncUpdateFailedRegistrationTearsDownPartialState(t *testing.T) {
 	}
 
 	// the partial registration must not claim the networkname
-	if controller.dhcp.CheckPool("net-fresh2") {
+	if controller.dhcp.CheckPool("infra/net-fresh2") {
 		t.Error("the partially applied dhcp pool must be torn down with the failed attempt")
 	}
 
@@ -88,20 +88,20 @@ func TestSyncAddFailedRegistrationTearsDownPartialState(t *testing.T) {
 	appStatus.Store(APP_INIT)
 	startupGate := newTestGate("pool-a2")
 	indexer := newTestIndexer()
-	if err := indexer.Add(testPool("pool-a2", "net-a2", 60)); err != nil {
+	if err := indexer.Add(testPool("pool-a2", "infra/net-a2", 60)); err != nil {
 		t.Fatalf("seeding indexer: %v", err)
 	}
 
 	controller, _ := newTestController(t, newTestQueue(), indexer, nil, &appStatus, startupGate)
 
-	err := controller.sync(testPoolEvent("pool-a2", ADD, "net-a2"))
+	err := controller.sync(testPoolEvent("pool-a2", ADD, "infra/net-a2"))
 	if err == nil {
 		t.Fatal("the registration attempt returned nil, want the dhcp listener failure of the missing bindinterface")
 	}
 	if strings.Contains(err.Error(), "already registered by another IPPool") {
 		t.Fatalf("the attempt was rejected by the duplicate check, want the environmental failure: %v", err)
 	}
-	if controller.dhcp.CheckPool("net-a2") {
+	if controller.dhcp.CheckPool("infra/net-a2") {
 		t.Error("the partially applied dhcp pool must be torn down with the failed attempt")
 	}
 }

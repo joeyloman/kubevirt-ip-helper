@@ -72,6 +72,13 @@ func (s *stubInformer) LastSyncResourceVersion() string { return "" }
 
 func newTestController(t *testing.T, queue workqueue.RateLimitingInterface, indexer cache.Indexer, informer cache.Controller, appStatus *atomic.Int32, startupGate *gate.Gate, kihClientset *kihclientset.Clientset) *Controller {
 	t.Helper()
+	if kihClientset == nil {
+		e := newTestEnv(t)
+		for _, obj := range indexer.List() {
+			e.seedVMNetCfg(obj.(*kihv1.VirtualMachineNetworkConfig))
+		}
+		kihClientset = e.client
+	}
 
 	controller := NewController(
 		context.Background(),
@@ -85,6 +92,8 @@ func newTestController(t *testing.T, queue workqueue.RateLimitingInterface, inde
 		kihClientset,
 		appStatus,
 		startupGate,
+		testNetworkScope(t, testNamespace, "net-test"),
+		&sync.Mutex{},
 	)
 	t.Cleanup(queue.ShutDown)
 
@@ -390,7 +399,7 @@ func TestSyncAddFailureCountsAsHandledForStartupGate(t *testing.T) {
 	appStatus.Store(APP_INIT)
 	indexer := newTestIndexer()
 	indexer.Add(testVMNetCfg([]kihv1.NetworkConfig{
-		{MACAddress: "02:00:00:00:00:01", NetworkName: "missing-net"},
+		{MACAddress: "02:00:00:00:00:01", NetworkName: testNetwork},
 	}))
 	controller := newTestController(t, newTestQueue(), indexer, nil, &appStatus, startupGate, nil)
 
@@ -477,6 +486,8 @@ func TestRunJoinsTheInFlightSyncBeforeReturning(t *testing.T) {
 		e.client,
 		e.appStatus,
 		nil,
+		e.scope,
+		e.reconcileMu,
 	)
 	queue.Add(Event{key: testNamespace + "/" + testVMNetCfgName, action: ADD})
 
@@ -560,6 +571,8 @@ func TestEventListenerStopsWhenContextIsCancelled(t *testing.T) {
 		newUnavailableClientset(t),
 		new(atomic.Int32),
 		nil,
+		testNetworkScope(t, testNamespace, "net-test"),
+		&sync.Mutex{},
 	)
 
 	done := make(chan error, 1)

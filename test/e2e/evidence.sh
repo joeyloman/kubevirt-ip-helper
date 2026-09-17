@@ -308,8 +308,26 @@ _evidence_object_captures() { # <dir>
     -n "${KIH_HELPER_NAMESPACE}" get leases -o json || rc=1
   _evidence_group "${dir}" helper-services \
     -n "${KIH_HELPER_NAMESPACE}" get services -o json || rc=1
+  _evidence_group "${dir}" helper-endpoints \
+    -n "${KIH_HELPER_NAMESPACE}" get endpoints -o json || rc=1
   _evidence_group "${dir}" helper-endpointslices \
     -n "${KIH_HELPER_NAMESPACE}" get endpointslices -o json || rc=1
+  _evidence_group "${dir}" webhook-registration get validatingwebhookconfigurations \
+    --field-selector metadata.name=kubevirt-ip-helper-validator -o json || rc=1
+  _evidence_group "${dir}" webhook-csr get certificatesigningrequests \
+    --field-selector metadata.name=kubevirt-ip-helper-webhook.kubevirt-ip-helper.svc -o json || rc=1
+  if [ "${allow_custom_api}" -eq 0 ]; then
+    # Project at kubectl output time: no private key or last-applied Secret
+    # annotation ever reaches a file, stderr, or the checksum-covered artifacts.
+    if ! _evidence_kubectl -n kubevirt-ip-helper get secret kubevirt-ip-helper-webhook-tls \
+      -o go-template='{"apiVersion":"v1","kind":"Secret","metadata":{"name":{{printf "%q" .metadata.name}},"namespace":{{printf "%q" .metadata.namespace}},"uid":{{printf "%q" .metadata.uid}}},"type":{{printf "%q" .type}},"data":{"tls.crt":{{printf "%q" (index .data "tls.crt")}}}}' \
+      > "${dir}/parts/webhook-public-certificate.json" 2> "${dir}/.webhook-cert.err"; then
+      _evidence_fail "webhook-public-certificate" "$(tr '\n' ' ' < "${dir}/.webhook-cert.err")" || true
+      rm -f "${dir}/parts/webhook-public-certificate.json"
+      rc=1
+    fi
+    rm -f "${dir}/.webhook-cert.err"
+  fi
   _evidence_group "${dir}" workloads \
     -n "${KIH_WORKLOAD_NAMESPACE}" get pods -o json || rc=1
   # The guest observer script is delivered through this Secret, so the checkpoint
@@ -372,11 +390,33 @@ _evidence_kubectl() {
 
 # Shared by runner assertions and checkpoint capture. The Service is the
 # externally consumed interface; a localhost listener is not delivery proof.
-helper_service_metrics() {
-  local service port dns
+helper_service_metrics() { # [service-name], defaults to the primary network
+  local service_name="${1:-${KIH_METRICS_SERVICE}}" service port dns selector leader endpoints
   local EVIDENCE_REQUEST_DEADLINE=$((SECONDS + E2E_CAPTURE_TIMEOUT))
   service="$(_evidence_kubectl \
-    -n "${KIH_HELPER_NAMESPACE}" get service "${METRICS_SERVICE:-kubevirt-ip-helper-metrics}" -o json)" || return 1
+    -n "${KIH_HELPER_NAMESPACE}" get service "${service_name}" -o json)" || return 1
+  selector="$(jq -er '
+    .spec.selector
+    | select(.app == "kubevirt-ip-helper"
+      and .["kubevirtiphelper/leader"] == "active"
+      and (.["kubevirtiphelper/network"] | type == "string" and length > 0))
+    | to_entries | sort_by(.key) | map(.key + "=" + .value) | join(",")
+  ' <<< "${service}")" || return 1
+  # Resolve the selected network's current leader on EVERY scrape, independently
+  # of the runner's failover bookkeeping or dynamically scoped primary globals.
+  leader="$(_evidence_kubectl -n "${KIH_HELPER_NAMESPACE}" get pods -l "${selector}" -o json |
+    jq -cer '[.items[] | select(.metadata.deletionTimestamp == null)]
+      | select(length == 1) | .[0]
+      | select(any(.status.conditions[]?; .type == "Ready" and .status == "True"))
+      | {name: .metadata.name, uid: .metadata.uid, ip: .status.podIP}')" || return 1
+  endpoints="$(_evidence_kubectl -n "${KIH_HELPER_NAMESPACE}" get endpointslices \
+    -l "kubernetes.io/service-name=${service_name}" -o json)" || return 1
+  jq -e --argjson leader "${leader}" '
+    [.items[].endpoints[]? | select(.conditions.ready == true)]
+    | length > 0 and all(.[];
+      .targetRef.kind == "Pod" and .targetRef.name == $leader.name
+      and .targetRef.uid == $leader.uid and (.addresses | index($leader.ip)) != null)
+  ' <<< "${endpoints}" > /dev/null || return 1
   port="$(jq -er '[.spec.ports[] | select(.name == "metrics") | .port]
     | select(length == 1) | .[0]
     | select(type == "number" and . >= 1 and . <= 65535 and . == floor)' <<< "${service}")" || return 1
@@ -386,12 +426,88 @@ helper_service_metrics() {
     curl -fsS --max-time 5 "http://${dns}:${port}/metrics"
 }
 
+# Inventory discovery must not turn an unexpectedly deleted resource into an
+# optional network. The runner marks the secondary's intentional lifetime;
+# otherwise its absence in primary-only lanes and after cleanup is normal.
+_evidence_topology_required() { # <raw-json> [bootstrap]
+  local raw="$1" bootstrap="${2:-0}" errors
+  errors="$(jq -er --arg primary "${KIH_HELPER_DEPLOYMENT}" \
+    --arg primaryService "${KIH_METRICS_SERVICE}" --arg primaryNetwork "${KIH_NAD_NAME}" \
+    --arg secondary "${KIH_SECOND_HELPER_DEPLOYMENT}" \
+    --arg secondaryService "${KIH_SECOND_METRICS_SERVICE}" \
+    --arg secondaryNetwork "${KIH_SECOND_NAD_NAME}" \
+    --arg namespace "${KIH_HELPER_NAMESPACE}" --arg bootstrap "${bootstrap}" \
+    --arg secondaryExpected "${E2E_SECOND_NETWORK_EXPECTED:-0}" '
+    . as $raw
+    | .["helper-deployment"].items as $deployments
+    | .["helper-services"].items as $services
+    | .["helper-pods"].items as $pods
+    | .["helper-leases"].items as $leases
+    | .["helper-endpoints"].items as $endpoints
+    | .["helper-endpointslices"].items as $slices
+    | [if $bootstrap != "1" then
+         {deployment:$primary, service:$primaryService, network:$primaryNetwork}
+       else empty end,
+       if $secondaryExpected == "1" then
+         {deployment:$secondary, service:$secondaryService, network:$secondaryNetwork}
+       else empty end] as $expected
+    | [
+      $expected[] as $e
+      | (if $e.network == "" then "helper \($e.deployment) lacks network identity" else empty end),
+        (if any($deployments[]; .metadata.name == $e.deployment
+             and .spec.template.metadata.labels["kubevirtiphelper/network"] == $e.network)
+         then empty else "missing or mislabelled helper Deployment \($e.deployment)" end),
+        (if any($pods[]; .metadata.labels.app == "kubevirt-ip-helper"
+             and .metadata.labels["kubevirtiphelper/network"] == $e.network)
+         then empty else "missing helper pods for \($e.network)" end),
+        (if any($leases[]; .metadata.name == ("kubevirt-ip-helper-lock-" + $e.network)
+             and (.spec.holderIdentity // "") != "")
+         then empty else "missing held Lease for \($e.network)" end),
+        (if any($raw.networkattachmentdefinitions.items[];
+             .metadata.namespace == $namespace and .metadata.name == $e.network)
+         then empty else "missing NAD for \($e.network)" end),
+        ([$services[] | select(.spec.selector.app == "kubevirt-ip-helper"
+            and .spec.selector["kubevirtiphelper/network"] == $e.network
+            and .spec.selector["kubevirtiphelper/leader"] == "active"
+            and .metadata.name == $e.service)] as $metrics
+         | if ($metrics | length) != 1 then "missing or ambiguous metrics Service for \($e.network)"
+           else $metrics[0].metadata.name as $name
+           | (if any($endpoints[]; .metadata.name == $name) then empty
+              else "missing Endpoints for \($name)" end),
+             (if any($slices[]; .metadata.labels["kubernetes.io/service-name"] == $name)
+              then empty else "missing EndpointSlices for \($name)" end)
+           end)
+      ] + [if $bootstrap != "1" then
+        (if any($deployments[]; .metadata.name == "kubevirt-ip-helper-webhook")
+         then empty else "missing standalone webhook Deployment" end),
+        (if any($services[]; .metadata.name == "kubevirt-ip-helper-webhook")
+         then empty else "missing canonical webhook Service" end),
+        (if any($endpoints[]; .metadata.name == "kubevirt-ip-helper-webhook")
+         then empty else "missing webhook Endpoints" end),
+        (if any($slices[]; .metadata.labels["kubernetes.io/service-name"] == "kubevirt-ip-helper-webhook")
+         then empty else "missing webhook EndpointSlices" end),
+        (if ($raw["webhook-registration"].items | length) == 1
+         then empty else "missing canonical ValidatingWebhookConfiguration" end),
+        (if ($raw["webhook-csr"].items | length) == 1
+         then empty else "missing canonical webhook CSR" end)
+        else empty end]
+      | unique | join("; ")
+  ' "${raw}")" || {
+    _evidence_fail "topology" "cannot inspect captured network resource inventory"
+    return 1
+  }
+  [ -z "${errors}" ] || {
+    _evidence_fail "topology" "${errors}"
+    return 1
+  }
+}
+
 # _evidence_observations keeps the non-object proof that belongs to a checkpoint:
 # guest network samples, artifact layout, and every helper pod's interface,
 # route, and UDP observations. Checkpoint metrics use the published Service.
 _evidence_observations() { # <dir>
-  local dir="$1" rc=0 leaders pods pod artifact output
-  local leader_err pod_err write_error=0
+  local dir="$1" rc=0 pods pod artifact output service network role services
+  local write_error=0 metrics_deadline
   local observations="${dir}/observations.txt"
   {
     printf '# observations for checkpoint %s at %s\n' \
@@ -413,46 +529,28 @@ _evidence_observations() { # <dir>
     return 1
   fi
 
-  leaders="$(_evidence_kubectl \
-    -n "${KIH_HELPER_NAMESPACE}" get pods -l "${LEADER_SELECTOR:-kubevirtiphelper/leader=active}" \
-    -o jsonpath='{.items[*].metadata.name}' 2> "${dir}/.leader.err")" || rc=1
-  leader_err="$(cat "${dir}/.leader.err" 2> /dev/null || true)"
-  rm -f "${dir}/.leader.err" || rc=1
-  pods="$(_evidence_kubectl \
-    -n "${KIH_HELPER_NAMESPACE}" get pods \
-    -o jsonpath='{.items[*].metadata.name}' 2> "${dir}/.pods.err")" || rc=1
-  pod_err="$(cat "${dir}/.pods.err" 2> /dev/null || true)"
-  rm -f "${dir}/.pods.err" || rc=1
+  # Use the captured inventory, not a single primary selector or every pod in the
+  # namespace (which now also contains the standalone admission service).
+  pods="$(jq -er '.["helper-pods"].items
+    | [.[] | select(.metadata.labels.app == "kubevirt-ip-helper")
+      | [.metadata.name, (.metadata.labels["kubevirtiphelper/network"] // "MISSING"),
+         (.metadata.labels["kubevirtiphelper/leader"] // "standby")] | @tsv]
+    | join("\n")' "${dir}/raw.json")" || {
+    _evidence_fail "observations" "cannot read captured helper pod inventory"
+    return 1
+  }
   if [ -z "${pods}" ]; then
-    if ! printf '\n===== helper pods: none =====\n' >> "${observations}"; then
-      _evidence_fail "observations" "cannot append helper pod listing to ${observations}"
-      return 1
-    fi
-    if [ "${rc}" -ne 0 ]; then
-      _evidence_fail "observations" \
-        "cannot list helper pods: ${pod_err:-${leader_err}}"
+    printf '\n===== helper pods: none =====\n' >> "${observations}" || return 1
+    if [ "$(basename "${dir}")" != "01-bootstrap" ]; then
+      _evidence_fail "observations" "expected helper pods are missing"
       return 1
     fi
     return 0
   fi
-  if [ -z "${leaders}" ]; then
-    rc=1
-    if ! printf '\n===== labelled leader: none =====\n' >> "${observations}"; then
-      _evidence_record_error "observations" "cannot append missing-leader marker" || true
-    fi
-    _evidence_record_error "observations" \
-      "helper pod list has no labelled leader${leader_err:+: ${leader_err}}" || true
-  else
-    if ! printf '\n===== labelled leader: %s =====\n' "${leaders}" >> "${observations}"; then
-      rc=1
-      _evidence_record_error "observations" "cannot append leader marker" || true
-    fi
-  fi
-  for pod in ${pods}; do
-    case " ${leaders} " in
-      *" ${pod} "*) printf '\n===== helper pod %s (leader) =====\n' "${pod}" ;;
-      *) printf '\n===== helper pod %s =====\n' "${pod}" ;;
-    esac >> "${observations}" || {
+  while IFS=$'\t' read -r pod network role; do
+    [ -n "${pod}" ] || continue
+    printf '\n===== helper pod %s network %s/%s (%s) =====\n' \
+      "${pod}" "${KIH_HELPER_NAMESPACE}" "${network}" "${role}" >> "${observations}" || {
       rc=1
       _evidence_record_error "observations" "cannot append helper pod ${pod} header" || true
     }
@@ -473,23 +571,39 @@ _evidence_observations() { # <dir>
       _evidence_record_error "observations" \
         "cannot append helper pod ${pod} interface/route/UDP output" || true
     fi
-  done
+  done <<< "${pods}"
   # A checkpoint taken while the leader rebuilds its services can catch the pod
   # before its readiness probe flips, so the Service briefly has no ready endpoint.
   # The scrape is retried inside the capture budget; a Service which never serves
   # still fails the checkpoint.
-  metrics_deadline=$((SECONDS + E2E_CAPTURE_TIMEOUT))
-  while ! output="$(helper_service_metrics)"; do
-    [ "${SECONDS}" -lt "${metrics_deadline}" ] || break
-    sleep 1
-  done
-  if [ -z "${output}" ]; then
-    rc=1
-    _evidence_record_error "observations" "metrics Service scrape from the network client failed" || true
-  elif ! printf '\n===== metrics Service =====\n%s\n' "${output}" >> "${observations}"; then
-    rc=1
-    _evidence_record_error "observations" "cannot append metrics Service output" || true
-  fi
+  services="$(jq -er '.["helper-services"].items
+    | [.[] | select(.spec.selector.app == "kubevirt-ip-helper")
+      | [.metadata.name, (.spec.selector["kubevirtiphelper/network"] // "MISSING")] | @tsv]
+    | sort | join("\n")' "${dir}/raw.json")" || {
+    _evidence_fail "observations" "cannot read captured metrics Service inventory"
+    return 1
+  }
+  [ -n "${services}" ] || {
+    _evidence_fail "observations" "expected metrics Services are missing"
+    return 1
+  }
+  while IFS=$'\t' read -r service network; do
+    metrics_deadline=$((SECONDS + E2E_CAPTURE_TIMEOUT))
+    output=""
+    while ! output="$(helper_service_metrics "${service}")"; do
+      [ "${SECONDS}" -lt "${metrics_deadline}" ] || break
+      sleep 1
+    done
+    if [ -z "${output}" ]; then
+      rc=1
+      _evidence_record_error "observations" \
+        "metrics Service ${service} network ${network} scrape from the network client failed" || true
+    elif ! printf '\n===== metrics Service %s network %s/%s =====\n%s\n' \
+      "${service}" "${KIH_HELPER_NAMESPACE}" "${network}" "${output}" >> "${observations}"; then
+      rc=1
+      _evidence_record_error "observations" "cannot append metrics Service ${service} output" || true
+    fi
+  done <<< "${services}"
   if [ "${rc}" -ne 0 ]; then
     _evidence_fail "observations" \
       "at least one helper pod observation or observation-file write failed"
@@ -737,6 +851,11 @@ evidence_capture() { # <id> <description>
   }
   _evidence_object_captures "${dir}" || rc=1
   _evidence_merge "${dir}" || rc=1
+  if [ "${id}" = "01-bootstrap" ]; then
+    _evidence_topology_required "${dir}/raw.json" 1 || rc=1
+  else
+    _evidence_topology_required "${dir}/raw.json" || rc=1
+  fi
   _evidence_normalize "${dir}" "${id}" || rc=1
   _evidence_observations "${dir}" || rc=1
   _evidence_compare "${checkpoints}/${previous}/normalized.json" \

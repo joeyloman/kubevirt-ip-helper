@@ -37,7 +37,7 @@ func ippoolBehaviorNewTestPool(name, network string) *kihv1.IPPool {
 			APIVersion: "kubevirtiphelper.k8s.binbash.org/v1",
 			Kind:       "IPPool",
 		},
-		ObjectMeta: metav1.ObjectMeta{Name: name},
+		ObjectMeta: testPoolMetadata(name, network),
 		Spec: kihv1.IPPoolSpec{
 			NetworkName:   network,
 			BindInterface: "eth-test",
@@ -88,6 +88,7 @@ func ippoolBehaviorNewTestController(t *testing.T, srv *httptest.Server) (*Contr
 		kihClientset: cs,
 		appStatus:    &appStatus,
 		gate:         newTestGate("pool1"),
+		scope:        testNetworkScope("infra/net-a"),
 	}
 
 	return c, c.ipam, c.dhcp, c.cache, c.metrics
@@ -141,14 +142,15 @@ func ippoolBehaviorAssertDHCPPoolOptions(t *testing.T, d *kihdhcp.DHCPAllocator,
 // cluster-wide VirtualMachineNetworkConfig LIST the claim protection takes its
 // authoritative snapshot from, and can be switched into failing modes.
 type ippoolBehaviorRestState struct {
-	mu       sync.Mutex
-	pool     *kihv1.IPPool
-	failGet  bool
-	failPut  bool
-	getCount int
-	putCount int
-	putPath  string
-	lastBody *kihv1.IPPool
+	mu        sync.Mutex
+	pool      *kihv1.IPPool
+	failGet   bool
+	failPut   bool
+	getStatus int
+	getCount  int
+	putCount  int
+	putPath   string
+	lastBody  *kihv1.IPPool
 	// vmnetcfgs backs the cluster-wide list of the claim protection sweep
 	// and its per-object re-verification reads
 	vmnetcfgs []*kihv1.VirtualMachineNetworkConfig
@@ -183,7 +185,11 @@ func (s *ippoolBehaviorRestState) ippoolBehaviorHandler() http.Handler {
 		switch r.Method {
 		case http.MethodGet:
 			s.getCount++
-			if s.failGet {
+			if s.getStatus != 0 {
+				ippoolBehaviorWriteKubeError(w, s.getStatus)
+				return
+			}
+			if s.failGet || s.pool == nil || restPath != "/"+s.pool.Name {
 				ippoolBehaviorWriteKubeError(w, http.StatusNotFound)
 				return
 			}
@@ -371,14 +377,14 @@ func TestHandleIPPoolObjectChangeAppInitIgnoresUpdate(t *testing.T) {
 	c, _, d, ca, _ := ippoolBehaviorNewTestController(t, nil)
 	c.appStatus.Store(APP_INIT)
 
-	oldPool := ippoolBehaviorNewTestPool("pool1", "net-a")
+	oldPool := ippoolBehaviorNewTestPool("pool1", "infra/net-a")
 	oldPool.Status.LastUpdate = metav1.Now()
 	if err := ca.Add(oldPool); err != nil {
 		t.Fatalf("failed to seed cache: %s", err.Error())
 	}
 	cached := *oldPool
 
-	newPool := ippoolBehaviorNewTestPool("pool1", "net-a")
+	newPool := ippoolBehaviorNewTestPool("pool1", "infra/net-a")
 	// restart-class fields
 	newPool.Spec.IPv4Config.ServerIP = "10.10.10.99"
 	newPool.Spec.IPv4Config.Subnet = "10.20.0.0/16"
@@ -392,10 +398,10 @@ func TestHandleIPPoolObjectChangeAppInitIgnoresUpdate(t *testing.T) {
 	if c.appStatus.Load() != APP_INIT {
 		t.Errorf("app status changed during init: got %d, want %d", c.appStatus.Load(), APP_INIT)
 	}
-	if d.CheckPool("net-a") {
+	if d.CheckPool("infra/net-a") {
 		t.Errorf("a dhcp pool was created although updates are ignored during init")
 	}
-	got, err := ca.Get("pool", "net-a")
+	got, err := ca.Get("pool", "infra/net-a")
 	if err != nil {
 		t.Fatalf("cached pool missing: %s", err.Error())
 	}
@@ -410,7 +416,7 @@ func TestHandleIPPoolObjectChangeAppInitIgnoresUpdate(t *testing.T) {
 func TestHandleIPPoolObjectChangeNoChangeKeepsState(t *testing.T) {
 	c, _, d, ca, _ := ippoolBehaviorNewTestController(t, nil)
 
-	oldPool := ippoolBehaviorNewTestPool("pool1", "net-a")
+	oldPool := ippoolBehaviorNewTestPool("pool1", "infra/net-a")
 	oldPool.Status.IPv4.Used = 7
 	if err := ca.Add(oldPool); err != nil {
 		t.Fatalf("failed to seed cache: %s", err.Error())
@@ -419,10 +425,10 @@ func TestHandleIPPoolObjectChangeNoChangeKeepsState(t *testing.T) {
 	if err := c.createOrUpdateDHCPPool(oldPool); err != nil {
 		t.Fatalf("failed to seed dhcp pool: %s", err.Error())
 	}
-	before := d.GetPool("net-a")
+	before := d.GetPool("infra/net-a")
 
 	// identical spec, different status: no pool option changed
-	newPool := ippoolBehaviorNewTestPool("pool1", "net-a")
+	newPool := ippoolBehaviorNewTestPool("pool1", "infra/net-a")
 	newPool.Status.IPv4.Used = 99
 
 	if err := c.handleIPPoolObjectChange(*oldPool, newPool); err != nil {
@@ -432,14 +438,14 @@ func TestHandleIPPoolObjectChangeNoChangeKeepsState(t *testing.T) {
 	if c.appStatus.Load() != APP_RUNNING {
 		t.Errorf("app status changed on no-change update: got %d, want %d", c.appStatus.Load(), APP_RUNNING)
 	}
-	got, err := ca.Get("pool", "net-a")
+	got, err := ca.Get("pool", "infra/net-a")
 	if err != nil {
 		t.Fatalf("cached pool missing: %s", err.Error())
 	}
 	if !reflect.DeepEqual(got.(kihv1.IPPool), cached) {
 		t.Errorf("no-change update must not refresh the cache with the new object")
 	}
-	if !reflect.DeepEqual(d.GetPool("net-a"), before) {
+	if !reflect.DeepEqual(d.GetPool("infra/net-a"), before) {
 		t.Errorf("no-change update modified the dhcp pool")
 	}
 }
@@ -447,7 +453,7 @@ func TestHandleIPPoolObjectChangeNoChangeKeepsState(t *testing.T) {
 func TestHandleIPPoolObjectChangeReloadUpdatesPoolAndCache(t *testing.T) {
 	c, _, d, ca, _ := ippoolBehaviorNewTestController(t, nil)
 
-	oldPool := ippoolBehaviorNewTestPool("pool1", "net-a")
+	oldPool := ippoolBehaviorNewTestPool("pool1", "infra/net-a")
 	if err := ca.Add(oldPool); err != nil {
 		t.Fatalf("failed to seed cache: %s", err.Error())
 	}
@@ -455,7 +461,7 @@ func TestHandleIPPoolObjectChangeReloadUpdatesPoolAndCache(t *testing.T) {
 		t.Fatalf("failed to seed dhcp pool: %s", err.Error())
 	}
 
-	newPool := ippoolBehaviorNewTestPool("pool1", "net-a")
+	newPool := ippoolBehaviorNewTestPool("pool1", "infra/net-a")
 	newPool.Spec.IPv4Config.LeaseTime = 4200
 	newPool.Spec.IPv4Config.DomainName = "corp.example.com"
 	newPool.Spec.IPv4Config.DNS = []string{"10.10.10.5"}
@@ -473,7 +479,7 @@ func TestHandleIPPoolObjectChangeReloadUpdatesPoolAndCache(t *testing.T) {
 		t.Errorf("reloadable change was classified as restart: app status got %d, want %d", c.appStatus.Load(), APP_RUNNING)
 	}
 
-	ippoolBehaviorAssertDHCPPoolOptions(t, d, "net-a",
+	ippoolBehaviorAssertDHCPPoolOptions(t, d, "infra/net-a",
 		"10.10.10.1", "255.255.255.0", "10.10.10.254",
 		[]net.IP{net.ParseIP("10.10.10.5")},
 		[]net.IP{net.ParseIP("10.10.10.6"), net.ParseIP("10.10.10.7")},
@@ -481,7 +487,7 @@ func TestHandleIPPoolObjectChangeReloadUpdatesPoolAndCache(t *testing.T) {
 		[]string{"corp.example.com", "example.com"},
 		4200, "eth-test")
 
-	stored, err := ca.Get("pool", "net-a")
+	stored, err := ca.Get("pool", "infra/net-a")
 	if err != nil {
 		t.Fatalf("updated pool missing from cache: %s", err.Error())
 	}
@@ -506,8 +512,8 @@ func TestHandleIPPoolObjectChangeReloadUpdatesPoolAndCache(t *testing.T) {
 func TestHandleIPPoolObjectChangeReloadAddsNewCacheEntry(t *testing.T) {
 	c, _, d, ca, _ := ippoolBehaviorNewTestController(t, nil)
 
-	oldPool := ippoolBehaviorNewTestPool("pool1", "net-a")
-	newPool := ippoolBehaviorNewTestPool("pool1", "net-a")
+	oldPool := ippoolBehaviorNewTestPool("pool1", "infra/net-a")
+	newPool := ippoolBehaviorNewTestPool("pool1", "infra/net-a")
 	newPool.Spec.IPv4Config.LeaseTime = 4200
 
 	// cache deliberately empty: the pool is not known yet
@@ -518,14 +524,14 @@ func TestHandleIPPoolObjectChangeReloadAddsNewCacheEntry(t *testing.T) {
 	if !ca.Check(newPool) {
 		t.Errorf("expected the reloaded pool to be added to the cache")
 	}
-	stored, err := ca.Get("pool", "net-a")
+	stored, err := ca.Get("pool", "infra/net-a")
 	if err != nil {
 		t.Fatalf("updated pool missing from cache: %s", err.Error())
 	}
 	if stored.(kihv1.IPPool).Spec.IPv4Config.LeaseTime != 4200 {
 		t.Errorf("cache does not hold the reloaded pool")
 	}
-	if !d.CheckPool("net-a") {
+	if !d.CheckPool("infra/net-a") {
 		t.Errorf("expected a dhcp pool to be created for the reloaded network")
 	}
 	if c.appStatus.Load() != APP_RUNNING {
@@ -544,7 +550,7 @@ func TestHandleIPPoolObjectChangeRejectedInvalidSubnet(t *testing.T) {
 	// projection before the change even classifies as reload or restart,
 	// so serving state must remain untouched
 	if err := d.AddPool(
-		"net-a",
+		"infra/net-a",
 		"10.10.10.1",
 		"255.255.255.0",
 		"10.10.10.254",
@@ -557,14 +563,14 @@ func TestHandleIPPoolObjectChangeRejectedInvalidSubnet(t *testing.T) {
 	); err != nil {
 		t.Fatalf("failed to seed dhcp pool: %s", err.Error())
 	}
-	oldPool := ippoolBehaviorNewTestPool("pool1", "net-a")
+	oldPool := ippoolBehaviorNewTestPool("pool1", "infra/net-a")
 	oldPool.Spec.IPv4Config.Subnet = "not-a-subnet"
 	oldPool.Spec.IPv4Config.LeaseTime = 3600
 	if err := ca.Add(oldPool); err != nil {
 		t.Fatalf("failed to seed cache: %s", err.Error())
 	}
 
-	newPool := ippoolBehaviorNewTestPool("pool1", "net-a")
+	newPool := ippoolBehaviorNewTestPool("pool1", "infra/net-a")
 	newPool.Spec.IPv4Config.Subnet = "not-a-subnet"
 	newPool.Spec.IPv4Config.LeaseTime = 4200
 
@@ -577,10 +583,10 @@ func TestHandleIPPoolObjectChangeRejectedInvalidSubnet(t *testing.T) {
 	}
 
 	// the active dhcp pool must survive the rejected update
-	if !d.CheckPool("net-a") {
+	if !d.CheckPool("infra/net-a") {
 		t.Errorf("the active dhcp pool was deleted although the replacement was rejected")
 	}
-	stored, err := ca.Get("pool", "net-a")
+	stored, err := ca.Get("pool", "infra/net-a")
 	if err != nil {
 		t.Fatalf("the valid pool is missing from cache: %s", err.Error())
 	}
@@ -604,13 +610,13 @@ func TestHandleIPPoolObjectChangeRejectedInvalidSubnet(t *testing.T) {
 func TestHandleIPPoolObjectChangeRejectsUnparseableSubnetUpdate(t *testing.T) {
 	c, _, d, ca, _ := ippoolBehaviorNewTestController(t, nil)
 
-	oldPool := ippoolBehaviorNewTestPool("pool1", "net-a")
+	oldPool := ippoolBehaviorNewTestPool("pool1", "infra/net-a")
 	if err := ca.Add(oldPool); err != nil {
 		t.Fatalf("failed to cache the registered pool: %s", err.Error())
 	}
 
 	if err := d.AddPool(
-		"net-a",
+		"infra/net-a",
 		"10.10.10.1",
 		"255.255.255.0",
 		"10.10.10.254",
@@ -624,7 +630,7 @@ func TestHandleIPPoolObjectChangeRejectsUnparseableSubnetUpdate(t *testing.T) {
 		t.Fatalf("failed to seed the active dhcp pool: %s", err.Error())
 	}
 
-	newPool := ippoolBehaviorNewTestPool("pool1", "net-a")
+	newPool := ippoolBehaviorNewTestPool("pool1", "infra/net-a")
 	newPool.Spec.IPv4Config.Subnet = "10.10.10.0/33"
 
 	if err := c.handleIPPoolObjectChange(*oldPool, newPool); err == nil {
@@ -634,7 +640,7 @@ func TestHandleIPPoolObjectChangeRejectsUnparseableSubnetUpdate(t *testing.T) {
 	if c.appStatus.Load() != APP_RUNNING {
 		t.Errorf("the rejected update started an application restart: app status got %d, want %d", c.appStatus.Load(), APP_RUNNING)
 	}
-	if plc := d.CheckPool("net-a"); !plc {
+	if plc := d.CheckPool("infra/net-a"); !plc {
 		t.Error("the rejected update removed the active dhcp pool")
 	}
 	if !ca.Check(oldPool) {
@@ -643,14 +649,14 @@ func TestHandleIPPoolObjectChangeRejectsUnparseableSubnetUpdate(t *testing.T) {
 
 	// restoring the previously registered subnet reconciles as no-change:
 	// the registration keeps serving without a restart cycle
-	restored := ippoolBehaviorNewTestPool("pool1", "net-a")
+	restored := ippoolBehaviorNewTestPool("pool1", "infra/net-a")
 	if err := c.handleIPPoolObjectChange(*oldPool, restored); err != nil {
 		t.Errorf("handleIPPoolObjectChange rejected the restored spec: %v", err)
 	}
 	if c.appStatus.Load() != APP_RUNNING {
 		t.Errorf("the restored spec started an application restart: app status got %d, want %d", c.appStatus.Load(), APP_RUNNING)
 	}
-	if !d.CheckPool("net-a") {
+	if !d.CheckPool("infra/net-a") {
 		t.Error("the restored spec removed the active dhcp pool")
 	}
 }
@@ -677,13 +683,13 @@ func TestHandleIPPoolObjectChangeRejectsUnregistrableRangeUpdate(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			c, _, d, ca, _ := ippoolBehaviorNewTestController(t, nil)
 
-			oldPool := ippoolBehaviorNewTestPool("pool1", "net-a")
+			oldPool := ippoolBehaviorNewTestPool("pool1", "infra/net-a")
 			if err := ca.Add(oldPool); err != nil {
 				t.Fatalf("failed to cache the registered pool: %s", err.Error())
 			}
 
 			if err := d.AddPool(
-				"net-a",
+				"infra/net-a",
 				"10.10.10.1",
 				"255.255.255.0",
 				"10.10.10.254",
@@ -697,7 +703,7 @@ func TestHandleIPPoolObjectChangeRejectsUnregistrableRangeUpdate(t *testing.T) {
 				t.Fatalf("failed to seed the active dhcp pool: %s", err.Error())
 			}
 
-			newPool := ippoolBehaviorNewTestPool("pool1", "net-a")
+			newPool := ippoolBehaviorNewTestPool("pool1", "infra/net-a")
 			tc.mutate(newPool)
 
 			if err := c.handleIPPoolObjectChange(*oldPool, newPool); err == nil {
@@ -706,7 +712,7 @@ func TestHandleIPPoolObjectChangeRejectsUnregistrableRangeUpdate(t *testing.T) {
 			if c.appStatus.Load() != APP_RUNNING {
 				t.Errorf("the rejected update started an application restart: app status got %d, want %d", c.appStatus.Load(), APP_RUNNING)
 			}
-			if !d.CheckPool("net-a") {
+			if !d.CheckPool("infra/net-a") {
 				t.Error("the rejected update removed the active dhcp pool")
 			}
 			if !ca.Check(oldPool) {
@@ -719,12 +725,12 @@ func TestHandleIPPoolObjectChangeRejectsUnregistrableRangeUpdate(t *testing.T) {
 func TestCreateOrUpdateDHCPPoolProjectsOptions(t *testing.T) {
 	c, _, d, _, _ := ippoolBehaviorNewTestController(t, nil)
 
-	pool := ippoolBehaviorNewTestPool("pool1", "net-a")
+	pool := ippoolBehaviorNewTestPool("pool1", "infra/net-a")
 	if err := c.createOrUpdateDHCPPool(pool); err != nil {
 		t.Fatalf("unexpected error: %s", err.Error())
 	}
 
-	ippoolBehaviorAssertDHCPPoolOptions(t, d, "net-a",
+	ippoolBehaviorAssertDHCPPoolOptions(t, d, "infra/net-a",
 		"10.10.10.1", "255.255.255.0", "10.10.10.254",
 		[]net.IP{net.ParseIP("10.10.10.2"), net.ParseIP("10.10.10.3")},
 		[]net.IP{net.ParseIP("10.10.10.4")},
@@ -739,7 +745,7 @@ func TestCreateOrUpdateDHCPPoolProjectsOptions(t *testing.T) {
 		t.Fatalf("unexpected error: %s", err.Error())
 	}
 
-	ippoolBehaviorAssertDHCPPoolOptions(t, d, "net-a",
+	ippoolBehaviorAssertDHCPPoolOptions(t, d, "infra/net-a",
 		"10.10.10.1", "255.255.255.0", "10.10.10.254",
 		[]net.IP{net.ParseIP("10.10.10.9")},
 		[]net.IP{net.ParseIP("10.10.10.4")},
@@ -751,13 +757,13 @@ func TestCreateOrUpdateDHCPPoolProjectsOptions(t *testing.T) {
 func TestCreateOrUpdateDHCPPoolRejectsInvalidSubnet(t *testing.T) {
 	c, _, d, _, _ := ippoolBehaviorNewTestController(t, nil)
 
-	pool := ippoolBehaviorNewTestPool("pool1", "net-a")
+	pool := ippoolBehaviorNewTestPool("pool1", "infra/net-a")
 	pool.Spec.IPv4Config.Subnet = "not-a-subnet"
 
 	if err := c.createOrUpdateDHCPPool(pool); err == nil {
 		t.Fatal("expected the subnet parse error")
 	}
-	if d.CheckPool("net-a") {
+	if d.CheckPool("infra/net-a") {
 		t.Errorf("no pool should be registered after the failed subnet parse")
 	}
 }
@@ -765,7 +771,7 @@ func TestCreateOrUpdateDHCPPoolRejectsInvalidSubnet(t *testing.T) {
 func TestRegisterIPPoolValidatesSubnetBeforeNetlink(t *testing.T) {
 	c, _, d, ca, _ := ippoolBehaviorNewTestController(t, nil)
 
-	pool := ippoolBehaviorNewTestPool("pool1", "net-a")
+	pool := ippoolBehaviorNewTestPool("pool1", "infra/net-a")
 	pool.Spec.IPv4Config.Subnet = "300.1.2.0/24"
 
 	cleanup, err := c.registerIPPool(pool)
@@ -775,7 +781,7 @@ func TestRegisterIPPoolValidatesSubnetBeforeNetlink(t *testing.T) {
 	if cleanup {
 		t.Errorf("cleanup must stay false when validation fails before any sub-resource is created")
 	}
-	if d.CheckPool("net-a") {
+	if d.CheckPool("infra/net-a") {
 		t.Errorf("dhcp pool must not be registered when the subnet is invalid")
 	}
 	if ca.Check(pool) {
@@ -790,7 +796,7 @@ func TestRegisterIPPoolValidatesSubnetBeforeNetlink(t *testing.T) {
 }
 
 func TestResetIPPoolStatusReconstructsStatus(t *testing.T) {
-	stored := ippoolBehaviorNewTestPool("pool1", "net-a")
+	stored := ippoolBehaviorNewTestPool("pool1", "infra/net-a")
 	stored.Status.LastUpdate = metav1.NewTime(time.Unix(1700000000, 0))
 	stored.Status.LastUpdateBeforeStart = metav1.NewTime(time.Unix(1699999999, 0))
 	stored.Status.IPv4.Allocated = map[string]string{"10.10.10.99": "USED"}
@@ -803,14 +809,14 @@ func TestResetIPPoolStatusReconstructsStatus(t *testing.T) {
 	defer srv.Close()
 
 	c, alloc, _, _, _ := ippoolBehaviorNewTestController(t, srv)
-	if err := alloc.NewSubnet("net-a", "10.10.10.0/24", "10.10.10.10", "10.10.10.50"); err != nil {
+	if err := alloc.NewSubnet("infra/net-a", "10.10.10.0/24", "10.10.10.10", "10.10.10.50"); err != nil {
 		t.Fatalf("failed to register subnet: %s", err.Error())
 	}
-	if _, err := alloc.GetIP("net-a", "10.10.10.10"); err != nil {
+	if _, err := alloc.GetIP("infra/net-a", "10.10.10.10"); err != nil {
 		t.Fatalf("failed to allocate an ip: %s", err.Error())
 	}
 
-	pool := ippoolBehaviorNewTestPool("pool1", "net-a")
+	pool := ippoolBehaviorNewTestPool("pool1", "infra/net-a")
 	pool.Spec.IPv4Config.Pool.Exclude = []string{"10.10.10.20", "10.10.10.21"}
 
 	uPool, err := c.resetIPPoolStatus(pool, map[string]string{
@@ -865,13 +871,13 @@ func TestResetIPPoolStatusReconstructsStatus(t *testing.T) {
 }
 
 func TestResetIPPoolStatusFirstStartSetsLastUpdateBeforeStart(t *testing.T) {
-	rs := ippoolBehaviorNewRestState(ippoolBehaviorNewTestPool("pool1", "net-a")) // zero status timestamps
+	rs := ippoolBehaviorNewRestState(ippoolBehaviorNewTestPool("pool1", "infra/net-a")) // zero status timestamps
 	srv := httptest.NewServer(rs.ippoolBehaviorHandler())
 	defer srv.Close()
 
 	c, _, _, _, _ := ippoolBehaviorNewTestController(t, srv)
 
-	pool := ippoolBehaviorNewTestPool("pool1", "net-a")
+	pool := ippoolBehaviorNewTestPool("pool1", "infra/net-a")
 	uPool, err := c.resetIPPoolStatus(pool, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %s", err.Error())
@@ -898,14 +904,14 @@ func TestResetIPPoolStatusFirstStartSetsLastUpdateBeforeStart(t *testing.T) {
 }
 
 func TestResetIPPoolStatusGetErrorIsReturned(t *testing.T) {
-	rs := ippoolBehaviorNewRestState(ippoolBehaviorNewTestPool("pool1", "net-a"))
+	rs := ippoolBehaviorNewRestState(ippoolBehaviorNewTestPool("pool1", "infra/net-a"))
 	rs.failGet = true
 	srv := httptest.NewServer(rs.ippoolBehaviorHandler())
 	defer srv.Close()
 
 	c, _, _, _, _ := ippoolBehaviorNewTestController(t, srv)
 
-	uPool, err := c.resetIPPoolStatus(ippoolBehaviorNewTestPool("pool1", "net-a"), nil)
+	uPool, err := c.resetIPPoolStatus(ippoolBehaviorNewTestPool("pool1", "infra/net-a"), nil)
 	if err == nil {
 		t.Fatalf("expected the GET failure to be returned")
 	}
@@ -915,14 +921,14 @@ func TestResetIPPoolStatusGetErrorIsReturned(t *testing.T) {
 }
 
 func TestResetIPPoolStatusUpdateStatusErrorIsReturned(t *testing.T) {
-	rs := ippoolBehaviorNewRestState(ippoolBehaviorNewTestPool("pool1", "net-a"))
+	rs := ippoolBehaviorNewRestState(ippoolBehaviorNewTestPool("pool1", "infra/net-a"))
 	rs.failPut = true
 	srv := httptest.NewServer(rs.ippoolBehaviorHandler())
 	defer srv.Close()
 
 	c, _, _, _, _ := ippoolBehaviorNewTestController(t, srv)
 
-	uPool, err := c.resetIPPoolStatus(ippoolBehaviorNewTestPool("pool1", "net-a"), nil)
+	uPool, err := c.resetIPPoolStatus(ippoolBehaviorNewTestPool("pool1", "infra/net-a"), nil)
 	if err == nil {
 		t.Fatalf("expected the status update failure to be returned")
 	}
@@ -932,7 +938,7 @@ func TestResetIPPoolStatusUpdateStatusErrorIsReturned(t *testing.T) {
 }
 
 func TestResetIPPoolMetricsSetsGaugesFromAPI(t *testing.T) {
-	stored := ippoolBehaviorNewTestPool("pool1", "net-a")
+	stored := ippoolBehaviorNewTestPool("pool1", "infra/net-a")
 	stored.Status.IPv4.Used = 7
 	stored.Status.IPv4.Available = 93
 
@@ -942,14 +948,14 @@ func TestResetIPPoolMetricsSetsGaugesFromAPI(t *testing.T) {
 
 	c, _, _, _, m := ippoolBehaviorNewTestController(t, srv)
 
-	if err := c.resetIPPoolMetrics(ippoolBehaviorNewTestPool("pool1", "net-a")); err != nil {
+	if err := c.resetIPPoolMetrics(ippoolBehaviorNewTestPool("pool1", "infra/net-a")); err != nil {
 		t.Fatalf("unexpected error: %s", err.Error())
 	}
 
 	labels := map[string]string{
 		"ippool":  "pool1",
 		"subnet":  "10.10.10.0/24",
-		"network": "net-a",
+		"network": "infra/net-a",
 	}
 	if v, ok := ippoolBehaviorMetricValue(t, m, "kubevirtiphelper_ippool_used", labels); !ok || v != 7 {
 		t.Errorf("ippool used gauge: got value %v found %v, want 7", v, ok)
@@ -966,14 +972,14 @@ func TestResetIPPoolMetricsSetsGaugesFromAPI(t *testing.T) {
 }
 
 func TestResetIPPoolMetricsGetErrorIsReturned(t *testing.T) {
-	rs := ippoolBehaviorNewRestState(ippoolBehaviorNewTestPool("pool1", "net-a"))
+	rs := ippoolBehaviorNewRestState(ippoolBehaviorNewTestPool("pool1", "infra/net-a"))
 	rs.failGet = true
 	srv := httptest.NewServer(rs.ippoolBehaviorHandler())
 	defer srv.Close()
 
 	c, _, _, _, _ := ippoolBehaviorNewTestController(t, srv)
 
-	if err := c.resetIPPoolMetrics(ippoolBehaviorNewTestPool("pool1", "net-a")); err == nil {
+	if err := c.resetIPPoolMetrics(ippoolBehaviorNewTestPool("pool1", "infra/net-a")); err == nil {
 		t.Fatalf("expected the GET failure to be returned")
 	}
 }
@@ -997,7 +1003,8 @@ func TestRegisterIPPoolRejectsIPv6BeforeAnyMutation(t *testing.T) {
 		network.AddIpToNic = orig
 	})
 
-	pool := ippoolBehaviorNewTestPool("pool-v6", "net-v6")
+	pool := ippoolBehaviorNewTestPool("pool-v6", "infra/net-v6")
+	c.scope = testNetworkScope(pool.Spec.NetworkName)
 	pool.Spec.IPv4Config.Subnet = "2001:db8::/64"
 	pool.Spec.IPv4Config.Pool.Start = "2001:db8::1"
 	pool.Spec.IPv4Config.Pool.End = "2001:db8::2"
@@ -1034,7 +1041,7 @@ func TestHandleIPPoolObjectChangeRejectsIPv6KeepsLiveState(t *testing.T) {
 	c, _, dhcp, cache, _ := ippoolBehaviorNewTestController(t, nil)
 	c.appStatus.Store(APP_RUNNING)
 
-	oldPool := ippoolBehaviorNewTestPool("pool1", "net-a")
+	oldPool := ippoolBehaviorNewTestPool("pool1", "infra/net-a")
 	if err := c.createOrUpdateDHCPPool(oldPool); err != nil {
 		t.Fatalf("seeding the live dhcp pool: %s", err)
 	}
@@ -1081,7 +1088,7 @@ func TestRegisterIPPoolValidatesExcludeEntriesBeforeNetlink(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			c, _, d, ca, _ := ippoolBehaviorNewTestController(t, nil)
 
-			pool := ippoolBehaviorNewTestPool("pool1", "net-a")
+			pool := ippoolBehaviorNewTestPool("pool1", "infra/net-a")
 			pool.Spec.IPv4Config.Pool.Exclude = tc.exclude
 
 			cleanup, err := c.registerIPPool(pool)
@@ -1096,13 +1103,13 @@ func TestRegisterIPPoolValidatesExcludeEntriesBeforeNetlink(t *testing.T) {
 			}
 
 			// the rejection happened before any mutation
-			if d.CheckPool("net-a") {
+			if d.CheckPool("infra/net-a") {
 				t.Error("no dhcp pool may exist after the pre-mutation rejection")
 			}
 			if ca.Check(pool) {
 				t.Error("no cache entry may exist after the pre-mutation rejection")
 			}
-			if used := c.ipam.Used("net-a"); used != 0 {
+			if used := c.ipam.Used("infra/net-a"); used != 0 {
 				t.Errorf("ipam used = %d, want 0 (the rejection must precede the subnet registration)", used)
 			}
 		})
@@ -1128,13 +1135,13 @@ func TestHandleIPPoolObjectChangeRejectsUnclaimableExcludeUpdate(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			c, _, d, ca, _ := ippoolBehaviorNewTestController(t, nil)
 
-			oldPool := ippoolBehaviorNewTestPool("pool1", "net-a")
+			oldPool := ippoolBehaviorNewTestPool("pool1", "infra/net-a")
 			if err := ca.Add(oldPool); err != nil {
 				t.Fatalf("failed to cache the registered pool: %s", err.Error())
 			}
 
 			if err := d.AddPool(
-				"net-a",
+				"infra/net-a",
 				"10.10.10.1",
 				"255.255.255.0",
 				"10.10.10.254",
@@ -1148,7 +1155,7 @@ func TestHandleIPPoolObjectChangeRejectsUnclaimableExcludeUpdate(t *testing.T) {
 				t.Fatalf("failed to seed the active dhcp pool: %s", err.Error())
 			}
 
-			newPool := ippoolBehaviorNewTestPool("pool1", "net-a")
+			newPool := ippoolBehaviorNewTestPool("pool1", "infra/net-a")
 			newPool.Spec.IPv4Config.Pool.Exclude = tc.exclude
 
 			if err := c.handleIPPoolObjectChange(*oldPool, newPool); err == nil {
@@ -1157,7 +1164,7 @@ func TestHandleIPPoolObjectChangeRejectsUnclaimableExcludeUpdate(t *testing.T) {
 			if c.appStatus.Load() != APP_RUNNING {
 				t.Errorf("the rejected update started an application restart: app status got %d, want %d", c.appStatus.Load(), APP_RUNNING)
 			}
-			if !d.CheckPool("net-a") {
+			if !d.CheckPool("infra/net-a") {
 				t.Error("the rejected update removed the active dhcp pool")
 			}
 			if !ca.Check(oldPool) {
@@ -1193,7 +1200,7 @@ func TestRegisterIPPoolValidatesAddressProjectionBeforeNetlink(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			c, _, d, ca, _ := ippoolBehaviorNewTestController(t, nil)
 
-			pool := ippoolBehaviorNewTestPool("pool1", "net-a")
+			pool := ippoolBehaviorNewTestPool("pool1", "infra/net-a")
 			tc.mutate(pool)
 
 			cleanup, err := c.registerIPPool(pool)
@@ -1208,13 +1215,13 @@ func TestRegisterIPPoolValidatesAddressProjectionBeforeNetlink(t *testing.T) {
 			}
 
 			// the rejection happened before any mutation
-			if d.CheckPool("net-a") {
+			if d.CheckPool("infra/net-a") {
 				t.Error("no dhcp pool may exist after the pre-mutation rejection")
 			}
 			if ca.Check(pool) {
 				t.Error("no cache entry may exist after the pre-mutation rejection")
 			}
-			if used := c.ipam.Used("net-a"); used != 0 {
+			if used := c.ipam.Used("infra/net-a"); used != 0 {
 				t.Errorf("ipam used = %d, want 0 (the rejection must precede the subnet registration)", used)
 			}
 		})
@@ -1242,13 +1249,13 @@ func TestHandleIPPoolObjectChangeRejectsInvalidAddressProjectionUpdate(t *testin
 		t.Run(tc.name, func(t *testing.T) {
 			c, _, d, ca, _ := ippoolBehaviorNewTestController(t, nil)
 
-			oldPool := ippoolBehaviorNewTestPool("pool1", "net-a")
+			oldPool := ippoolBehaviorNewTestPool("pool1", "infra/net-a")
 			if err := ca.Add(oldPool); err != nil {
 				t.Fatalf("failed to cache the registered pool: %s", err.Error())
 			}
 
 			if err := d.AddPool(
-				"net-a",
+				"infra/net-a",
 				"10.10.10.1",
 				"255.255.255.0",
 				"10.10.10.254",
@@ -1262,7 +1269,7 @@ func TestHandleIPPoolObjectChangeRejectsInvalidAddressProjectionUpdate(t *testin
 				t.Fatalf("failed to seed the active dhcp pool: %s", err.Error())
 			}
 
-			newPool := ippoolBehaviorNewTestPool("pool1", "net-a")
+			newPool := ippoolBehaviorNewTestPool("pool1", "infra/net-a")
 			tc.mutate(newPool)
 
 			if err := c.handleIPPoolObjectChange(*oldPool, newPool); err == nil {
@@ -1271,7 +1278,7 @@ func TestHandleIPPoolObjectChangeRejectsInvalidAddressProjectionUpdate(t *testin
 			if c.appStatus.Load() != APP_RUNNING {
 				t.Errorf("the rejected update started an application restart: app status got %d, want %d", c.appStatus.Load(), APP_RUNNING)
 			}
-			if !d.CheckPool("net-a") {
+			if !d.CheckPool("infra/net-a") {
 				t.Error("the rejected update removed the active dhcp pool")
 			}
 			if !ca.Check(oldPool) {
@@ -1285,12 +1292,12 @@ func TestHandleIPPoolObjectChangeRejectsInvalidAddressProjectionUpdate(t *testin
 	t.Run("unset router is admitted", func(t *testing.T) {
 		c, _, d, ca, _ := ippoolBehaviorNewTestController(t, nil)
 
-		oldPool := ippoolBehaviorNewTestPool("pool1", "net-a")
+		oldPool := ippoolBehaviorNewTestPool("pool1", "infra/net-a")
 		if err := ca.Add(oldPool); err != nil {
 			t.Fatalf("failed to cache the registered pool: %s", err.Error())
 		}
 		if err := d.AddPool(
-			"net-a",
+			"infra/net-a",
 			"10.10.10.1",
 			"255.255.255.0",
 			"10.10.10.254",
@@ -1299,13 +1306,13 @@ func TestHandleIPPoolObjectChangeRejectsInvalidAddressProjectionUpdate(t *testin
 			t.Fatalf("failed to seed the active dhcp pool: %s", err.Error())
 		}
 
-		newPool := ippoolBehaviorNewTestPool("pool1", "net-a")
+		newPool := ippoolBehaviorNewTestPool("pool1", "infra/net-a")
 		newPool.Spec.IPv4Config.Router = ""
 
 		if err := c.handleIPPoolObjectChange(*oldPool, newPool); err != nil {
 			t.Fatalf("the unset router must be admitted: %s", err)
 		}
-		if !d.CheckPool("net-a") {
+		if !d.CheckPool("infra/net-a") {
 			t.Error("the admitted reload must keep the dhcp pool registered")
 		}
 	})
@@ -1318,7 +1325,7 @@ func TestHandleIPPoolObjectChangeRejectsInvalidAddressProjectionUpdate(t *testin
 // never succeed. the ledger is only consulted when the exclude entries
 // actually changed.
 func TestHandleIPPoolObjectChangeRejectsExcludeOverlappingLiveClaim(t *testing.T) {
-	stored := ippoolBehaviorNewTestPool("pool1", "net-a")
+	stored := ippoolBehaviorNewTestPool("pool1", "infra/net-a")
 	stored.Status.IPv4.Allocated = map[string]string{
 		"10.10.10.20": kihipam.ExcludedOwner,
 		"10.10.10.30": "default/vm-test [02:00:00:00:00:01]",
@@ -1334,16 +1341,16 @@ func TestHandleIPPoolObjectChangeRejectsExcludeOverlappingLiveClaim(t *testing.T
 	// never-converging conflict (a gone owner would be revalidated away
 	// as a stale record instead)
 	rs.vmnetcfgs = []*kihv1.VirtualMachineNetworkConfig{
-		recoveryNewVMNetCfg("default", "vm-test", "10.10.10.30", "02:00:00:00:00:01", "net-a"),
+		recoveryNewVMNetCfg("default", "vm-test", "10.10.10.30", "02:00:00:00:00:01", "infra/net-a"),
 	}
 
-	oldPool := ippoolBehaviorNewTestPool("pool1", "net-a")
+	oldPool := ippoolBehaviorNewTestPool("pool1", "infra/net-a")
 	if err := ca.Add(oldPool); err != nil {
 		t.Fatalf("failed to cache the registered pool: %s", err.Error())
 	}
 
 	if err := d.AddPool(
-		"net-a",
+		"infra/net-a",
 		"10.10.10.1",
 		"255.255.255.0",
 		"10.10.10.254",
@@ -1359,7 +1366,7 @@ func TestHandleIPPoolObjectChangeRejectsExcludeOverlappingLiveClaim(t *testing.T
 
 	// the unchanged exclude list reconciles as no-change without
 	// consulting the ledger
-	unchanged := ippoolBehaviorNewTestPool("pool1", "net-a")
+	unchanged := ippoolBehaviorNewTestPool("pool1", "infra/net-a")
 	if err := c.handleIPPoolObjectChange(*oldPool, unchanged); err != nil {
 		t.Fatalf("the unchanged exclude list must reconcile as no-change: %v", err)
 	}
@@ -1369,7 +1376,7 @@ func TestHandleIPPoolObjectChangeRejectsExcludeOverlappingLiveClaim(t *testing.T
 
 	// adding the claimed address to the exclude list is rejected before
 	// the teardown
-	newPool := ippoolBehaviorNewTestPool("pool1", "net-a")
+	newPool := ippoolBehaviorNewTestPool("pool1", "infra/net-a")
 	newPool.Spec.IPv4Config.Pool.Exclude = []string{"10.10.10.20", "10.10.10.30"}
 
 	if err := c.handleIPPoolObjectChange(*oldPool, newPool); err == nil {
@@ -1378,7 +1385,7 @@ func TestHandleIPPoolObjectChangeRejectsExcludeOverlappingLiveClaim(t *testing.T
 	if c.appStatus.Load() != APP_RUNNING {
 		t.Errorf("the rejected update started an application restart: app status got %d, want %d", c.appStatus.Load(), APP_RUNNING)
 	}
-	if !d.CheckPool("net-a") {
+	if !d.CheckPool("infra/net-a") {
 		t.Error("the rejected update removed the active dhcp pool")
 	}
 	if !ca.Check(oldPool) {
@@ -1402,7 +1409,7 @@ func TestRegisterIPPoolCachesTheInstalledSpecNotTheStatusReadback(t *testing.T) 
 	stubNicMutation(t)
 
 	// the api already serves a newer spec than the informer delivery
-	stored := ippoolBehaviorNewTestPool("pool1", "net-a")
+	stored := ippoolBehaviorNewTestPool("pool1", "infra/net-a")
 	stored.Spec.IPv4Config.LeaseTime = 7200
 	rs := ippoolBehaviorNewRestState(stored)
 	srv := httptest.NewServer(rs.ippoolBehaviorHandler())
@@ -1416,13 +1423,13 @@ func TestRegisterIPPoolCachesTheInstalledSpecNotTheStatusReadback(t *testing.T) 
 
 	// the registration installs the input spec, whose lease time is the
 	// older one
-	pool := ippoolBehaviorNewTestPool("pool1", "net-a")
+	pool := ippoolBehaviorNewTestPool("pool1", "infra/net-a")
 	if _, err := c.registerIPPool(pool); err != nil {
 		t.Fatalf("the registration failed: %s", err)
 	}
 
 	// the dhcp pool was built from the input spec (the older lease time)
-	ippoolBehaviorAssertDHCPPoolOptions(t, d, "net-a",
+	ippoolBehaviorAssertDHCPPoolOptions(t, d, "infra/net-a",
 		"10.10.10.1", "255.255.255.0", "10.10.10.254",
 		[]net.IP{net.ParseIP("10.10.10.2"), net.ParseIP("10.10.10.3")},
 		[]net.IP{net.ParseIP("10.10.10.4")},
@@ -1432,7 +1439,7 @@ func TestRegisterIPPoolCachesTheInstalledSpecNotTheStatusReadback(t *testing.T) 
 
 	// the cached projection is the installed spec, not the readback of
 	// the api GET
-	cached, err := ca.Get("pool", "net-a")
+	cached, err := ca.Get("pool", "infra/net-a")
 	if err != nil {
 		t.Fatalf("the registration did not publish the pool into the cache: %s", err)
 	}
@@ -1462,7 +1469,7 @@ func TestResyncUpdateAfterRegistrationSpecRaceIsStillDetected(t *testing.T) {
 	stubNicMutation(t)
 
 	// the api already serves a newer spec than the informer delivery
-	stored := ippoolBehaviorNewTestPool("pool1", "net-a")
+	stored := ippoolBehaviorNewTestPool("pool1", "infra/net-a")
 	stored.Spec.IPv4Config.LeaseTime = 7200
 	rs := ippoolBehaviorNewRestState(stored)
 	srv := httptest.NewServer(rs.ippoolBehaviorHandler())
@@ -1473,14 +1480,14 @@ func TestResyncUpdateAfterRegistrationSpecRaceIsStillDetected(t *testing.T) {
 		return nil
 	}
 
-	pool := ippoolBehaviorNewTestPool("pool1", "net-a")
+	pool := ippoolBehaviorNewTestPool("pool1", "infra/net-a")
 	if _, err := c.registerIPPool(pool); err != nil {
 		t.Fatalf("the registration failed: %s", err)
 	}
 
 	// the resync delivers the newer spec: a reload-class field, so no
 	// restart is triggered
-	cached, err := ca.Get("pool", "net-a")
+	cached, err := ca.Get("pool", "infra/net-a")
 	if err != nil {
 		t.Fatalf("the registration did not publish the pool into the cache: %s", err)
 	}
@@ -1491,10 +1498,10 @@ func TestResyncUpdateAfterRegistrationSpecRaceIsStillDetected(t *testing.T) {
 
 	// the change was reconciled instead of swallowed as a no-change: the
 	// dhcp pool and the cache carry the newer lease time
-	if got := d.GetPool("net-a").LeaseTime; got != 7200 {
+	if got := d.GetPool("infra/net-a").LeaseTime; got != 7200 {
 		t.Errorf("dhcp pool lease time = %d, want 7200 (the resync must reload the newer options)", got)
 	}
-	cached, err = ca.Get("pool", "net-a")
+	cached, err = ca.Get("pool", "infra/net-a")
 	if err != nil {
 		t.Fatalf("the resync dropped the pool from the cache: %s", err)
 	}

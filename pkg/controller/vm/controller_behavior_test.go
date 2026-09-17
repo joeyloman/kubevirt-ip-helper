@@ -37,7 +37,7 @@ const (
 	// create a vmnetcfg object.
 	vmnetcfgNotFoundJSON = `{"apiVersion":"v1","kind":"Status","status":"Failure","message":"virtualmachinenetworkconfigs.kubevirtiphelper.k8s.binbash.org \"vm-test\" not found","reason":"NotFound","code":404}`
 
-	vmnetcfgBodyJSON = `{"apiVersion":"kubevirtiphelper.k8s.binbash.org/v1","kind":"VirtualMachineNetworkConfig","metadata":{"name":"vm-test","namespace":"default","resourceVersion":"1"},"spec":{"vmname":"vm-test"}}`
+	vmnetcfgBodyJSON = `{"apiVersion":"kubevirtiphelper.k8s.binbash.org/v1","kind":"VirtualMachineNetworkConfig","metadata":{"name":"vm-test","namespace":"default","resourceVersion":"1"},"spec":{"vmname":"vm-test","networkconfig":[{"macaddress":"02:00:00:00:00:01","networkname":"default/net-a"}]}}`
 
 	serverErrorJSON = `{"apiVersion":"v1","kind":"Status","status":"Failure","message":"boom","reason":"InternalError","code":500}`
 )
@@ -86,6 +86,8 @@ func newTestController(t *testing.T, queue workqueue.RateLimitingInterface, inde
 		dhcp.NewDHCPAllocator(),
 		metrics.NewMetricsAllocator(),
 		kihClientset,
+		vmTestScope("default", "net-a"),
+		&sync.Mutex{},
 	)
 	t.Cleanup(queue.ShutDown)
 
@@ -109,7 +111,7 @@ func testVirtualMachine(withNIC bool) *kubevirtv1.VirtualMachine {
 			{Name: "nic0", MacAddress: "02:00:00:00:00:01"},
 		}
 		vm.Spec.Template.Spec.Networks = []kubevirtv1.Network{
-			{Name: "nic0", NetworkSource: kubevirtv1.NetworkSource{Multus: &kubevirtv1.MultusNetwork{NetworkName: "default/net"}}},
+			{Name: "nic0", NetworkSource: kubevirtv1.NetworkSource{Multus: &kubevirtv1.MultusNetwork{NetworkName: "default/net-a"}}},
 		}
 	}
 
@@ -568,6 +570,8 @@ func TestEventListenerStopsWhenContextIsCancelled(t *testing.T) {
 		nil,
 		client,
 		kubevirtClient,
+		vmTestScope("default", "net-a"),
+		&sync.Mutex{},
 	)
 
 	done := make(chan error, 1)
@@ -632,6 +636,8 @@ func newTestEventHandler(kubeConfig, kubeContext string) *EventHandler {
 		nil,
 		nil,
 		nil,
+		vmTestScope("default", "net-a"),
+		&sync.Mutex{},
 	)
 }
 

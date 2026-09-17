@@ -34,6 +34,7 @@ package ippool
 import (
 	"errors"
 	"net/http/httptest"
+	"reflect"
 	"testing"
 	"time"
 
@@ -41,6 +42,7 @@ import (
 
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/network"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/util"
 )
 
@@ -49,7 +51,7 @@ import (
 // recorded address if the protection missed its claim.
 func recoveryNewPool(name, network string) *kihv1.IPPool {
 	return &kihv1.IPPool{
-		ObjectMeta: metav1.ObjectMeta{Name: name},
+		ObjectMeta: testPoolMetadata(name, network),
 		Spec: kihv1.IPPoolSpec{
 			NetworkName:   network,
 			BindInterface: "eth-test",
@@ -86,12 +88,16 @@ func recoveryNewController(t *testing.T, stored *kihv1.IPPool) (*Controller, *ip
 	t.Cleanup(srv.Close)
 
 	c, _, _, _, _ := ippoolBehaviorNewTestController(t, srv)
+	c.scope = testNetworkScope(stored.Spec.NetworkName)
 
 	// the host-level steps of the registration run through their test
 	// seams: the nic address add is stubbed off the host interfaces and
 	// the dhcp listener stays a no-op, so the recovery fixtures run the
 	// real registration sequence without privileged operations
 	stubNicMutation(t)
+	origRemove := network.RemoveIpFromNic
+	network.RemoveIpFromNic = func(nic string, ip4 string) error { return nil }
+	t.Cleanup(func() { network.RemoveIpFromNic = origRemove })
 	c.runListener = func(networkName string, nic string) error {
 		return nil
 	}
@@ -137,11 +143,11 @@ func TestRegistrationNormalizesTheLegacyStatusReference(t *testing.T) {
 	legacyRef := legacyNamespace + "/" + legacyVMName + " [" + legacyMAC + "]"
 	canonicalRef := util.AllocationRef(legacyNamespace, legacyVMName, legacyMAC)
 
-	stored := recoveryNewPool("pool1", "net-a")
+	stored := recoveryNewPool("pool1", "infra/net-a")
 	stored.Status.IPv4.Allocated = map[string]string{"10.0.0.2": legacyRef}
 
 	c, rs, _ := recoveryNewController(t, stored)
-	pool := recoveryNewPool("pool1", "net-a")
+	pool := recoveryNewPool("pool1", "infra/net-a")
 
 	err := recoveryRegistrationSteps(t, c, pool)
 	if err != nil {
@@ -160,7 +166,7 @@ func TestRegistrationNormalizesTheLegacyStatusReference(t *testing.T) {
 	}
 
 	// the published pool carries the canonical record
-	published, pubErr := c.cache.Get("pool", "net-a")
+	published, pubErr := c.cache.Get("pool", "infra/net-a")
 	if pubErr != nil {
 		t.Fatalf("the registered pool must be published: %s", pubErr)
 	}
@@ -172,10 +178,10 @@ func TestRegistrationNormalizesTheLegacyStatusReference(t *testing.T) {
 	// owner-validated reclaim of the recorded address succeeds, the lease
 	// is served, and the ownership check of the record write agrees
 	// (a matching entry is confirmed read-only)
-	if _, err := c.ipam.ReclaimIP("net-a", "10.0.0.2", canonicalRef); err != nil {
+	if _, err := c.ipam.ReclaimIP("infra/net-a", "10.0.0.2", canonicalRef); err != nil {
 		t.Errorf("the restoring binding reclaiming its own recorded address: %s", err)
 	}
-	if err := c.dhcp.AddLease(legacyMAC, "net-a", "10.0.0.2", legacyNamespace+"/"+legacyVMName); err != nil {
+	if err := c.dhcp.AddLease(legacyMAC, "infra/net-a", "10.0.0.2", legacyNamespace+"/"+legacyVMName); err != nil {
 		t.Errorf("restoring the dhcp lease: %s", err)
 	}
 	if !c.dhcp.CheckLease(legacyMAC) {
@@ -183,7 +189,7 @@ func TestRegistrationNormalizesTheLegacyStatusReference(t *testing.T) {
 	}
 
 	// a genuinely different owner is still rejected
-	if _, err := c.ipam.ReclaimIP("net-a", "10.0.0.2", util.AllocationRef("default", "vm-other", "02:00:00:00:00:99")); err == nil {
+	if _, err := c.ipam.ReclaimIP("infra/net-a", "10.0.0.2", util.AllocationRef("default", "vm-other", "02:00:00:00:00:99")); err == nil {
 		t.Error("a different owner must not reclaim the protected claim")
 	}
 }
@@ -208,14 +214,14 @@ func TestRegistrationProtectsTheSpecOnlyClaim(t *testing.T) {
 
 	// the ledger lost the record: the pool status survived without the
 	// entry of the existing binding
-	stored := recoveryNewPool("pool1", "net-a")
+	stored := recoveryNewPool("pool1", "infra/net-a")
 	stored.Status.IPv4.Allocated = map[string]string{}
 
 	c, rs, _ := recoveryNewController(t, stored)
 	rs.vmnetcfgs = []*kihv1.VirtualMachineNetworkConfig{
-		recoveryNewVMNetCfg(oldNamespace, oldVMName, "10.0.0.2", oldMAC, "net-a"),
+		recoveryNewVMNetCfg(oldNamespace, oldVMName, "10.0.0.2", oldMAC, "infra/net-a"),
 	}
-	pool := recoveryNewPool("pool1", "net-a")
+	pool := recoveryNewPool("pool1", "infra/net-a")
 
 	err := recoveryRegistrationSteps(t, c, pool)
 	if err != nil {
@@ -228,7 +234,7 @@ func TestRegistrationProtectsTheSpecOnlyClaim(t *testing.T) {
 	if got, ok := rs.lastBody.Status.IPv4.Allocated["10.0.0.2"]; ok {
 		t.Errorf("republished ledger entry = %q, want none before the binding restored", got)
 	}
-	if used := c.ipam.Used("net-a"); used != 1 {
+	if used := c.ipam.Used("infra/net-a"); used != 1 {
 		t.Errorf("ipam used = %d, want 1 (the spec claim is pinned)", used)
 	}
 
@@ -236,17 +242,17 @@ func TestRegistrationProtectsTheSpecOnlyClaim(t *testing.T) {
 	// existing address: the one-address pool is exhausted by the pin
 	// (the application is past its startup gate here - the controller's
 	// appStatus is APP_RUNNING - so no global deferral masks this)
-	if _, err := c.ipam.GetIP("net-a", ""); err == nil {
+	if _, err := c.ipam.GetIP("infra/net-a", ""); err == nil {
 		t.Error("a fresh allocation must not receive the existing vm's address")
 	}
 
 	// the original binding restores its own address and dhcp lease through
 	// the production primitives: its reclaim is idempotent against the
 	// pin and its own record write rebuilds the ledger entry
-	if _, err := c.ipam.ReclaimIP("net-a", "10.0.0.2", oldRef); err != nil {
+	if _, err := c.ipam.ReclaimIP("infra/net-a", "10.0.0.2", oldRef); err != nil {
 		t.Errorf("the original binding restoring its recorded address: %s", err)
 	}
-	if err := c.dhcp.AddLease(oldMAC, "net-a", "10.0.0.2", oldNamespace+"/"+oldVMName); err != nil {
+	if err := c.dhcp.AddLease(oldMAC, "infra/net-a", "10.0.0.2", oldNamespace+"/"+oldVMName); err != nil {
 		t.Errorf("restoring the dhcp lease: %s", err)
 	}
 	if got := c.dhcp.GetLease(oldMAC).ClientIP.String(); got != "10.0.0.2" {
@@ -254,7 +260,7 @@ func TestRegistrationProtectsTheSpecOnlyClaim(t *testing.T) {
 	}
 
 	// a foreign binding cannot take the protected claim
-	if _, err := c.ipam.ReclaimIP("net-a", "10.0.0.2", util.AllocationRef("other-ns", "vm-other", "02:00:00:00:00:99")); err == nil {
+	if _, err := c.ipam.ReclaimIP("infra/net-a", "10.0.0.2", util.AllocationRef("other-ns", "vm-other", "02:00:00:00:00:99")); err == nil {
 		t.Error("a foreign binding must not reclaim the protected claim")
 	}
 }
@@ -264,7 +270,7 @@ func TestRegistrationProtectsTheSpecOnlyClaim(t *testing.T) {
 // at a malformed earlier nic, must keep the exclude pass authoritative,
 // and must skip out-of-range claims without publishing them.
 func TestRegistrationSweepCoversNamespacesAndMalformedNics(t *testing.T) {
-	stored := recoveryNewPool("pool1", "net-a")
+	stored := recoveryNewPool("pool1", "infra/net-a")
 	stored.Spec.IPv4Config.Pool.Start = "10.0.0.2"
 	stored.Spec.IPv4Config.Pool.End = "10.0.0.5"
 	stored.Spec.IPv4Config.Pool.Exclude = []string{"10.0.0.4"}
@@ -274,22 +280,22 @@ func TestRegistrationSweepCoversNamespacesAndMalformedNics(t *testing.T) {
 
 	// ns-a/vm-a: the malformed nic comes first and must not stop the
 	// protection of the later healthy nic
-	malformedFirst := recoveryNewVMNetCfg("ns-a", "vm-a", "10.0.0.3", "not-a-mac", "net-a")
+	malformedFirst := recoveryNewVMNetCfg("ns-a", "vm-a", "10.0.0.3", "not-a-mac", "infra/net-a")
 	malformedFirst.Spec.NetworkConfig = append(malformedFirst.Spec.NetworkConfig, kihv1.NetworkConfig{
-		IPAddress: "10.0.0.2", MACAddress: "02:00:00:00:00:11", NetworkName: "net-a",
+		IPAddress: "10.0.0.2", MACAddress: "02:00:00:00:00:11", NetworkName: "infra/net-a",
 	})
 
 	// ns-b/vm-b: a claim from another namespace of the same network
-	foreignNamespace := recoveryNewVMNetCfg("ns-b", "vm-b", "10.0.0.5", "02:00:00:00:00:12", "net-a")
+	foreignNamespace := recoveryNewVMNetCfg("ns-b", "vm-b", "10.0.0.5", "02:00:00:00:00:12", "infra/net-a")
 
 	// ns-c/vm-c: a claim on an excluded address - the exclude pass wins
-	excludedClaim := recoveryNewVMNetCfg("ns-c", "vm-c", "10.0.0.4", "02:00:00:00:00:13", "net-a")
+	excludedClaim := recoveryNewVMNetCfg("ns-c", "vm-c", "10.0.0.4", "02:00:00:00:00:13", "infra/net-a")
 
 	// ns-d/vm-d: an out-of-range claim which the allocator can never hand
 	// out, and a nic of another network which is not this pool's business
-	outOfRange := recoveryNewVMNetCfg("ns-d", "vm-d", "10.0.0.99", "02:00:00:00:00:14", "net-a")
+	outOfRange := recoveryNewVMNetCfg("ns-d", "vm-d", "10.0.0.99", "02:00:00:00:00:14", "infra/net-a")
 	outOfRange.Spec.NetworkConfig = append(outOfRange.Spec.NetworkConfig, kihv1.NetworkConfig{
-		IPAddress: "10.0.1.2", MACAddress: "02:00:00:00:00:15", NetworkName: "net-other",
+		IPAddress: "10.0.1.2", MACAddress: "02:00:00:00:00:15", NetworkName: "infra/net-other",
 	})
 
 	rs.vmnetcfgs = []*kihv1.VirtualMachineNetworkConfig{malformedFirst, foreignNamespace, excludedClaim, outOfRange}
@@ -303,49 +309,49 @@ func TestRegistrationSweepCoversNamespacesAndMalformedNics(t *testing.T) {
 
 	// the healthy claim after the malformed nic is pinned under its owner
 	healthyRef := util.AllocationRef("ns-a", "vm-a", "02:00:00:00:00:11")
-	if _, err := c.ipam.ReclaimIP("net-a", "10.0.0.2", healthyRef); err != nil {
+	if _, err := c.ipam.ReclaimIP("infra/net-a", "10.0.0.2", healthyRef); err != nil {
 		t.Errorf("the healthy nic's own reclaim against its pin: %s", err)
 	}
-	if _, err := c.ipam.ReclaimIP("net-a", "10.0.0.2", util.AllocationRef("ns-a", "vm-a", "02:00:00:00:00:99")); err == nil {
+	if _, err := c.ipam.ReclaimIP("infra/net-a", "10.0.0.2", util.AllocationRef("ns-a", "vm-a", "02:00:00:00:00:99")); err == nil {
 		t.Error("a different owner must not reclaim the healthy nic's pin")
 	}
 
 	// the malformed nic's address is protected without an owner identity:
 	// neither a fresh allocation nor any binding can take it, and only the
 	// binding of its own vm can retake it once the macaddress is corrected
-	if _, err := c.ipam.GetIP("net-a", "10.0.0.3"); err == nil {
+	if _, err := c.ipam.GetIP("infra/net-a", "10.0.0.3"); err == nil {
 		t.Error("the malformed nic's address must not be handable to a fresh allocation")
 	}
 	correctedRef := util.AllocationRef("ns-a", "vm-a", "02:00:00:00:00:20")
-	if _, err := c.ipam.ReclaimIP("net-a", "10.0.0.3", correctedRef); err == nil {
+	if _, err := c.ipam.ReclaimIP("infra/net-a", "10.0.0.3", correctedRef); err == nil {
 		t.Error("a plain reclaim must not take the ownerless pin")
 	}
-	if _, err := c.ipam.ReclaimIPClaimant("net-a", "10.0.0.3", correctedRef, "ns-a/vm-a"); err != nil {
+	if _, err := c.ipam.ReclaimIPClaimant("infra/net-a", "10.0.0.3", correctedRef, "ns-a/vm-a"); err != nil {
 		t.Errorf("the corrected binding of the claiming vm retaking its pin: %s", err)
 	}
 
 	// the claim of the other namespace is pinned under its owner
 	foreignRef := util.AllocationRef("ns-b", "vm-b", "02:00:00:00:00:12")
-	if _, err := c.ipam.ReclaimIP("net-a", "10.0.0.5", foreignRef); err != nil {
+	if _, err := c.ipam.ReclaimIP("infra/net-a", "10.0.0.5", foreignRef); err != nil {
 		t.Errorf("the other namespace's own reclaim against its pin: %s", err)
 	}
 
 	// the excluded address stays reserved for the exclude pass
-	if _, err := c.ipam.ReclaimIP("net-a", "10.0.0.4", util.AllocationRef("ns-c", "vm-c", "02:00:00:00:00:13")); err == nil {
+	if _, err := c.ipam.ReclaimIP("infra/net-a", "10.0.0.4", util.AllocationRef("ns-c", "vm-c", "02:00:00:00:00:13")); err == nil {
 		t.Error("a binding must not reclaim an excluded address")
 	}
 
 	// the out-of-range claim is neither pinned nor published
-	if _, err := c.ipam.GetIP("net-a", "10.0.0.99"); err == nil {
+	if _, err := c.ipam.GetIP("infra/net-a", "10.0.0.99"); err == nil {
 		t.Error("an out-of-range claim must not be pinned")
 	}
 
 	// the accounting: the four in-range addresses are all reserved (two
 	// owner pins, one ownerless pin, one exclude)
-	if used := c.ipam.Used("net-a"); used != 4 {
+	if used := c.ipam.Used("infra/net-a"); used != 4 {
 		t.Errorf("ipam used = %d, want 4", used)
 	}
-	if _, err := c.ipam.GetIP("net-a", ""); err == nil {
+	if _, err := c.ipam.GetIP("infra/net-a", ""); err == nil {
 		t.Error("the pool must be exhausted after the protection")
 	}
 
@@ -367,15 +373,15 @@ func TestRegistrationSweepCoversNamespacesAndMalformedNics(t *testing.T) {
 // unseen claim would otherwise be handed to a fresh allocation. The pool
 // stays unregistered, so no allocator state is exposed at all.
 func TestRegistrationWithoutTheClaimSnapshotDoesNotPublish(t *testing.T) {
-	stored := recoveryNewPool("pool1", "net-a")
+	stored := recoveryNewPool("pool1", "infra/net-a")
 	stored.Status.IPv4.Allocated = map[string]string{}
 
 	c, rs, _ := recoveryNewController(t, stored)
 	rs.failVMNetCfgList = true
 	rs.vmnetcfgs = []*kihv1.VirtualMachineNetworkConfig{
-		recoveryNewVMNetCfg("default", "vm-old", "10.0.0.2", "02:00:00:00:00:10", "net-a"),
+		recoveryNewVMNetCfg("default", "vm-old", "10.0.0.2", "02:00:00:00:00:10", "infra/net-a"),
 	}
-	pool := recoveryNewPool("pool1", "net-a")
+	pool := recoveryNewPool("pool1", "infra/net-a")
 
 	if err := recoveryRegistrationSteps(t, c, pool); err == nil {
 		t.Fatal("the registration must fail when the claim snapshot cannot be obtained")
@@ -385,7 +391,7 @@ func TestRegistrationWithoutTheClaimSnapshotDoesNotPublish(t *testing.T) {
 	if rs.putCount != 0 {
 		t.Errorf("pool status writes = %d, want 0 (the failure precedes the publication)", rs.putCount)
 	}
-	if _, cacheErr := c.cache.Get("pool", "net-a"); cacheErr == nil {
+	if _, cacheErr := c.cache.Get("pool", "infra/net-a"); cacheErr == nil {
 		t.Error("the pool must not be published into the cache")
 	}
 
@@ -399,13 +405,13 @@ func TestRegistrationWithoutTheClaimSnapshotDoesNotPublish(t *testing.T) {
 		t.Fatalf("the retried registration steps: %s", err)
 	}
 	oldRef := util.AllocationRef("default", "vm-old", "02:00:00:00:00:10")
-	if used := c.ipam.Used("net-a"); used != 1 {
+	if used := c.ipam.Used("infra/net-a"); used != 1 {
 		t.Errorf("ipam used after the retry = %d, want 1 (the spec claim is pinned)", used)
 	}
-	if _, err := c.ipam.ReclaimIP("net-a", "10.0.0.2", oldRef); err != nil {
+	if _, err := c.ipam.ReclaimIP("infra/net-a", "10.0.0.2", oldRef); err != nil {
 		t.Errorf("the pinned claim of the retry must belong to its recorded owner: %s", err)
 	}
-	if _, err := c.cache.Get("pool", "net-a"); err != nil {
+	if _, err := c.cache.Get("pool", "infra/net-a"); err != nil {
 		t.Errorf("the retried registration must publish the pool: %s", err)
 	}
 }
@@ -439,7 +445,7 @@ func TestRegistrationDoesNotHonorTheHijackGuardedClaim(t *testing.T) {
 	oldRef := util.AllocationRef(oldNamespace, oldVMName, oldMAC)
 	guardedRef := util.AllocationRef("default", "aaa-new", "02:00:00:00:00:20")
 
-	stored := recoveryNewPool("pool1", "net-a")
+	stored := recoveryNewPool("pool1", "infra/net-a")
 	stored.Status.IPv4.Allocated = map[string]string{}
 	// the previous era recorded its last status update an hour ago: the
 	// guarded object was created half an hour after it, inside the
@@ -449,12 +455,12 @@ func TestRegistrationDoesNotHonorTheHijackGuardedClaim(t *testing.T) {
 	c, rs, _ := recoveryNewController(t, stored)
 	rs.vmnetcfgs = []*kihv1.VirtualMachineNetworkConfig{
 		// the guarded request appears first in the LIST
-		recoveryNewStatuslessVMNetCfg("default", "aaa-new", "10.0.0.2", "02:00:00:00:00:20", "net-a", 30*time.Minute),
+		recoveryNewStatuslessVMNetCfg("default", "aaa-new", "10.0.0.2", "02:00:00:00:00:20", "infra/net-a", 30*time.Minute),
 		// the established vm carries an OK status and records the same
 		// address, but its ledger entry was lost
-		recoveryNewVMNetCfg(oldNamespace, oldVMName, "10.0.0.2", oldMAC, "net-a"),
+		recoveryNewVMNetCfg(oldNamespace, oldVMName, "10.0.0.2", oldMAC, "infra/net-a"),
 	}
-	pool := recoveryNewPool("pool1", "net-a")
+	pool := recoveryNewPool("pool1", "infra/net-a")
 
 	if err := recoveryRegistrationSteps(t, c, pool); err != nil {
 		t.Fatalf("the registration steps: %s", err)
@@ -462,10 +468,10 @@ func TestRegistrationDoesNotHonorTheHijackGuardedClaim(t *testing.T) {
 
 	// the established assignment owns the pin; the guarded request never
 	// claimed anything
-	if _, err := c.ipam.ReclaimIP("net-a", "10.0.0.2", oldRef); err != nil {
+	if _, err := c.ipam.ReclaimIP("infra/net-a", "10.0.0.2", oldRef); err != nil {
 		t.Errorf("the established vm reclaiming its recorded address: %s", err)
 	}
-	if _, err := c.ipam.ReclaimIP("net-a", "10.0.0.2", guardedRef); err == nil {
+	if _, err := c.ipam.ReclaimIP("infra/net-a", "10.0.0.2", guardedRef); err == nil {
 		t.Error("the hijack guarded request must not own the pin")
 	}
 }
@@ -474,24 +480,24 @@ func TestRegistrationDoesNotHonorTheHijackGuardedClaim(t *testing.T) {
 // sweep leaves its requested address unassigned, so the address stays
 // available exactly as before the guard rejected the object.
 func TestRegistrationLeavesTheGuardedRequestUnclaimed(t *testing.T) {
-	stored := recoveryNewPool("pool1", "net-a")
+	stored := recoveryNewPool("pool1", "infra/net-a")
 	stored.Status.IPv4.Allocated = map[string]string{}
 	stored.Status.LastUpdate = metav1.NewTime(time.Now().Add(-time.Hour))
 
 	c, rs, _ := recoveryNewController(t, stored)
 	rs.vmnetcfgs = []*kihv1.VirtualMachineNetworkConfig{
-		recoveryNewStatuslessVMNetCfg("default", "aaa-new", "10.0.0.2", "02:00:00:00:00:20", "net-a", 30*time.Minute),
+		recoveryNewStatuslessVMNetCfg("default", "aaa-new", "10.0.0.2", "02:00:00:00:00:20", "infra/net-a", 30*time.Minute),
 	}
-	pool := recoveryNewPool("pool1", "net-a")
+	pool := recoveryNewPool("pool1", "infra/net-a")
 
 	if err := recoveryRegistrationSteps(t, c, pool); err != nil {
 		t.Fatalf("the registration steps: %s", err)
 	}
 
-	if used := c.ipam.Used("net-a"); used != 0 {
+	if used := c.ipam.Used("infra/net-a"); used != 0 {
 		t.Errorf("ipam used = %d, want 0 (a guarded request claims nothing)", used)
 	}
-	if ip, err := c.ipam.GetIP("net-a", ""); err != nil || ip != "10.0.0.2" {
+	if ip, err := c.ipam.GetIP("infra/net-a", ""); err != nil || ip != "10.0.0.2" {
 		t.Errorf("the unclaimed address must stay available, got ip %q err %v", ip, err)
 	}
 }
@@ -514,7 +520,7 @@ func TestRegistrationPrefersTheEstablishedAssignmentRegardlessOfListOrder(t *tes
 	estRef := util.AllocationRef(estNamespace, estVMName, estMAC)
 	requestRef := util.AllocationRef("default", "vm-req", "02:00:00:00:00:20")
 
-	stored := recoveryNewPool("pool1", "net-a")
+	stored := recoveryNewPool("pool1", "infra/net-a")
 	stored.Status.IPv4.Allocated = map[string]string{}
 
 	c, rs, _ := recoveryNewController(t, stored)
@@ -522,19 +528,19 @@ func TestRegistrationPrefersTheEstablishedAssignmentRegardlessOfListOrder(t *tes
 		// the bare request appears first in the LIST and is admitted (its
 		// object predates the last status update, so no hijack guard
 		// applies)
-		recoveryNewStatuslessVMNetCfg("default", "vm-req", "10.0.0.2", "02:00:00:00:00:20", "net-a", 2*time.Hour),
-		recoveryNewVMNetCfg(estNamespace, estVMName, "10.0.0.2", estMAC, "net-a"),
+		recoveryNewStatuslessVMNetCfg("default", "vm-req", "10.0.0.2", "02:00:00:00:00:20", "infra/net-a", 2*time.Hour),
+		recoveryNewVMNetCfg(estNamespace, estVMName, "10.0.0.2", estMAC, "infra/net-a"),
 	}
-	pool := recoveryNewPool("pool1", "net-a")
+	pool := recoveryNewPool("pool1", "infra/net-a")
 
 	if err := recoveryRegistrationSteps(t, c, pool); err != nil {
 		t.Fatalf("the registration steps: %s", err)
 	}
 
-	if _, err := c.ipam.ReclaimIP("net-a", "10.0.0.2", estRef); err != nil {
+	if _, err := c.ipam.ReclaimIP("infra/net-a", "10.0.0.2", estRef); err != nil {
 		t.Errorf("the established assignment must own the pin: %s", err)
 	}
-	if _, err := c.ipam.ReclaimIP("net-a", "10.0.0.2", requestRef); err == nil {
+	if _, err := c.ipam.ReclaimIP("infra/net-a", "10.0.0.2", requestRef); err == nil {
 		t.Error("the bare request must not own the pin")
 	}
 }
@@ -547,12 +553,12 @@ func TestRegistrationPrefersTheEstablishedAssignmentRegardlessOfListOrder(t *tes
 // legitimate vm and no orphan record survives which a fresh helper
 // restart would treat as authoritative and reserve again.
 func TestRegistrationDropsTheStaleSpecClaim(t *testing.T) {
-	stored := recoveryNewPool("pool1", "net-a")
+	stored := recoveryNewPool("pool1", "infra/net-a")
 	stored.Status.IPv4.Allocated = map[string]string{}
 
 	c, rs, _ := recoveryNewController(t, stored)
 	rs.vmnetcfgs = []*kihv1.VirtualMachineNetworkConfig{
-		recoveryNewVMNetCfg("default", "vm-old", "10.0.0.2", "02:00:00:00:00:10", "net-a"),
+		recoveryNewVMNetCfg("default", "vm-old", "10.0.0.2", "02:00:00:00:00:10", "infra/net-a"),
 	}
 
 	// the concurrent vm cleanup completes between the frozen LIST
@@ -565,7 +571,7 @@ func TestRegistrationDropsTheStaleSpecClaim(t *testing.T) {
 		rs.vmnetcfgs[0].Spec.NetworkConfig = nil
 	}
 
-	pool := recoveryNewPool("pool1", "net-a")
+	pool := recoveryNewPool("pool1", "infra/net-a")
 
 	if err := recoveryRegistrationSteps(t, c, pool); err != nil {
 		t.Fatalf("the registration steps: %s", err)
@@ -573,7 +579,7 @@ func TestRegistrationDropsTheStaleSpecClaim(t *testing.T) {
 
 	// the stale pin was dropped: nothing is reserved and nothing was
 	// published for the removed nic
-	if used := c.ipam.Used("net-a"); used != 0 {
+	if used := c.ipam.Used("infra/net-a"); used != 0 {
 		t.Errorf("ipam used = %d, want 0 (the stale pin was dropped)", used)
 	}
 	if got, ok := rs.lastBody.Status.IPv4.Allocated["10.0.0.2"]; ok {
@@ -581,7 +587,7 @@ func TestRegistrationDropsTheStaleSpecClaim(t *testing.T) {
 	}
 
 	// the address is available to the next legitimate vm
-	if ip, err := c.ipam.GetIP("net-a", ""); err != nil || ip != "10.0.0.2" {
+	if ip, err := c.ipam.GetIP("infra/net-a", ""); err != nil || ip != "10.0.0.2" {
 		t.Errorf("the freed address must be allocatable, got ip %q err %v", ip, err)
 	}
 }
@@ -590,12 +596,12 @@ func TestRegistrationDropsTheStaleSpecClaim(t *testing.T) {
 // leaves a stale claim as well: the re-verification read reports the
 // object as gone and the pin is dropped.
 func TestRegistrationDropsTheClaimOfTheDeletedObject(t *testing.T) {
-	stored := recoveryNewPool("pool1", "net-a")
+	stored := recoveryNewPool("pool1", "infra/net-a")
 	stored.Status.IPv4.Allocated = map[string]string{}
 
 	c, rs, _ := recoveryNewController(t, stored)
 	rs.vmnetcfgs = []*kihv1.VirtualMachineNetworkConfig{
-		recoveryNewVMNetCfg("default", "vm-old", "10.0.0.2", "02:00:00:00:00:10", "net-a"),
+		recoveryNewVMNetCfg("default", "vm-old", "10.0.0.2", "02:00:00:00:00:10", "infra/net-a"),
 	}
 	rs.vmnetcfgListHook = func() {
 		rs.mu.Lock()
@@ -603,13 +609,13 @@ func TestRegistrationDropsTheClaimOfTheDeletedObject(t *testing.T) {
 		rs.vmnetcfgs = nil
 	}
 
-	pool := recoveryNewPool("pool1", "net-a")
+	pool := recoveryNewPool("pool1", "infra/net-a")
 
 	if err := recoveryRegistrationSteps(t, c, pool); err != nil {
 		t.Fatalf("the registration steps: %s", err)
 	}
 
-	if used := c.ipam.Used("net-a"); used != 0 {
+	if used := c.ipam.Used("infra/net-a"); used != 0 {
 		t.Errorf("ipam used = %d, want 0 (the claim of the deleted object was dropped)", used)
 	}
 }
@@ -618,15 +624,15 @@ func TestRegistrationDropsTheClaimOfTheDeletedObject(t *testing.T) {
 // before any publication instead of publishing a pin nobody vouches for
 // anymore; the retried registration converges once the read succeeds.
 func TestRegistrationFailsOnUnverifiableClaim(t *testing.T) {
-	stored := recoveryNewPool("pool1", "net-a")
+	stored := recoveryNewPool("pool1", "infra/net-a")
 	stored.Status.IPv4.Allocated = map[string]string{}
 
 	c, rs, _ := recoveryNewController(t, stored)
 	rs.failVMNetCfgGet = true
 	rs.vmnetcfgs = []*kihv1.VirtualMachineNetworkConfig{
-		recoveryNewVMNetCfg("default", "vm-old", "10.0.0.2", "02:00:00:00:00:10", "net-a"),
+		recoveryNewVMNetCfg("default", "vm-old", "10.0.0.2", "02:00:00:00:00:10", "infra/net-a"),
 	}
-	pool := recoveryNewPool("pool1", "net-a")
+	pool := recoveryNewPool("pool1", "infra/net-a")
 
 	if err := recoveryRegistrationSteps(t, c, pool); err == nil {
 		t.Fatal("the registration must fail when a pinned claim cannot be verified")
@@ -634,7 +640,7 @@ func TestRegistrationFailsOnUnverifiableClaim(t *testing.T) {
 	if rs.putCount != 0 {
 		t.Errorf("pool status writes = %d, want 0 (the failure precedes the publication)", rs.putCount)
 	}
-	if _, cacheErr := c.cache.Get("pool", "net-a"); cacheErr == nil {
+	if _, cacheErr := c.cache.Get("pool", "infra/net-a"); cacheErr == nil {
 		t.Error("the pool must not be published into the cache")
 	}
 
@@ -645,7 +651,7 @@ func TestRegistrationFailsOnUnverifiableClaim(t *testing.T) {
 	if err := recoveryRegistrationSteps(t, c, pool); err != nil {
 		t.Fatalf("the retried registration steps: %s", err)
 	}
-	if used := c.ipam.Used("net-a"); used != 1 {
+	if used := c.ipam.Used("infra/net-a"); used != 1 {
 		t.Errorf("ipam used after the retry = %d, want 1", used)
 	}
 }
@@ -657,7 +663,7 @@ func TestRegistrationFailsOnUnverifiableClaim(t *testing.T) {
 // unparseable ledger reference stays an unattributed pin which no binding
 // can ever reclaim.
 func TestRegistrationAttributesTheUnusableMacClaim(t *testing.T) {
-	stored := recoveryNewPool("pool1", "net-a")
+	stored := recoveryNewPool("pool1", "infra/net-a")
 	stored.Spec.IPv4Config.Pool.Start = "10.0.0.2"
 	stored.Spec.IPv4Config.Pool.End = "10.0.0.3"
 	// an unparseable historical ledger reference keeps its conservative
@@ -666,7 +672,7 @@ func TestRegistrationAttributesTheUnusableMacClaim(t *testing.T) {
 
 	c, rs, _ := recoveryNewController(t, stored)
 	rs.vmnetcfgs = []*kihv1.VirtualMachineNetworkConfig{
-		recoveryNewVMNetCfg("default", "vm-broken", "10.0.0.3", "not-a-mac", "net-a"),
+		recoveryNewVMNetCfg("default", "vm-broken", "10.0.0.3", "not-a-mac", "infra/net-a"),
 	}
 	pool := stored.DeepCopy()
 
@@ -679,20 +685,20 @@ func TestRegistrationAttributesTheUnusableMacClaim(t *testing.T) {
 	if got := rs.lastBody.Status.IPv4.Allocated["10.0.0.2"]; got != "garbage" {
 		t.Errorf("the unparseable ledger entry must be republished verbatim, got %q", got)
 	}
-	if _, err := c.ipam.ReclaimIPClaimant("net-a", "10.0.0.2", util.AllocationRef("default", "anyone", "02:00:00:00:00:99"), "default/anyone"); err == nil {
+	if _, err := c.ipam.ReclaimIPClaimant("infra/net-a", "10.0.0.2", util.AllocationRef("default", "anyone", "02:00:00:00:00:99"), "default/anyone"); err == nil {
 		t.Error("an unattributed pin must stay unreclaimable")
 	}
 
 	// the unusable-mac spec pin: attributed to its vm, retaken by the
 	// corrected binding of that vm only
 	correctedRef := util.AllocationRef("default", "vm-broken", "02:00:00:00:00:30")
-	if _, err := c.ipam.ReclaimIP("net-a", "10.0.0.3", correctedRef); err == nil {
+	if _, err := c.ipam.ReclaimIP("infra/net-a", "10.0.0.3", correctedRef); err == nil {
 		t.Error("a plain reclaim must not take the ownerless pin")
 	}
-	if _, err := c.ipam.ReclaimIPClaimant("net-a", "10.0.0.3", correctedRef, "default/other-vm"); err == nil {
+	if _, err := c.ipam.ReclaimIPClaimant("infra/net-a", "10.0.0.3", correctedRef, "default/other-vm"); err == nil {
 		t.Error("a foreign claimant must not take the attributed pin")
 	}
-	if _, err := c.ipam.ReclaimIPClaimant("net-a", "10.0.0.3", correctedRef, "default/vm-broken"); err != nil {
+	if _, err := c.ipam.ReclaimIPClaimant("infra/net-a", "10.0.0.3", correctedRef, "default/vm-broken"); err != nil {
 		t.Errorf("the corrected binding of the claiming vm retaking its pin: %s", err)
 	}
 }
@@ -706,7 +712,7 @@ func TestRegistrationAttributesTheUnusableMacClaim(t *testing.T) {
 // same address fails the registration forever - each resync tearing the
 // half-built registration down and rebuilding it.
 func TestRegisterIPPoolRejectsExcludeOverlappingLiveClaim(t *testing.T) {
-	stored := recoveryNewPool("pool1", "net-a")
+	stored := recoveryNewPool("pool1", "infra/net-a")
 	stored.Status.IPv4.Allocated = map[string]string{"10.0.0.2": "default/vm-test [02:00:00:00:00:01]"}
 
 	c, rs, _ := recoveryNewController(t, stored)
@@ -716,10 +722,10 @@ func TestRegisterIPPoolRejectsExcludeOverlappingLiveClaim(t *testing.T) {
 	// revalidated away by the admission check instead - see
 	// TestRegisterIPPoolAdmitsExcludeOverStaleLedgerRecord below.)
 	rs.vmnetcfgs = []*kihv1.VirtualMachineNetworkConfig{
-		recoveryNewVMNetCfg("default", "vm-test", "10.0.0.2", "02:00:00:00:00:01", "net-a"),
+		recoveryNewVMNetCfg("default", "vm-test", "10.0.0.2", "02:00:00:00:00:01", "infra/net-a"),
 	}
 
-	pool := recoveryNewPool("pool1", "net-a")
+	pool := recoveryNewPool("pool1", "infra/net-a")
 	pool.Spec.IPv4Config.Pool.Exclude = []string{"10.0.0.2"}
 
 	cleanup, err := c.registerIPPool(pool)
@@ -735,13 +741,13 @@ func TestRegisterIPPoolRejectsExcludeOverlappingLiveClaim(t *testing.T) {
 
 	// the rejection happened before any mutation: nothing of the pool is
 	// registered anywhere
-	if c.dhcp.CheckPool("net-a") {
+	if c.dhcp.CheckPool("infra/net-a") {
 		t.Error("no dhcp pool may exist after the pre-mutation rejection")
 	}
 	// Used discriminates a missing subnet (0) from a registered subnet
 	// whose single address the exclude pass claimed (1): the probe is
 	// read-only, unlike an allocation attempt
-	if used := c.ipam.Used("net-a"); used != 0 {
+	if used := c.ipam.Used("infra/net-a"); used != 0 {
 		t.Errorf("ipam used = %d, want 0 (the rejection must precede the subnet registration)", used)
 	}
 }
@@ -762,7 +768,7 @@ func TestRegisterIPPoolAdmitsExcludeOverStaleLedgerRecord(t *testing.T) {
 		ownerMAC       = "02:00:00:00:00:50"
 	)
 
-	stored := recoveryNewPool("pool1", "net-a")
+	stored := recoveryNewPool("pool1", "infra/net-a")
 	stored.Status.IPv4.Allocated = map[string]string{
 		"10.0.0.2": util.AllocationRef(ownerNamespace, ownerVMName, ownerMAC),
 	}
@@ -777,7 +783,7 @@ func TestRegisterIPPoolAdmitsExcludeOverStaleLedgerRecord(t *testing.T) {
 		return false, nil
 	}
 
-	pool := recoveryNewPool("pool1", "net-a")
+	pool := recoveryNewPool("pool1", "infra/net-a")
 	pool.Spec.IPv4Config.Pool.Exclude = []string{"10.0.0.2"}
 
 	if err := recoveryRegistrationSteps(t, c, pool); err != nil {
@@ -792,7 +798,7 @@ func TestRegisterIPPoolAdmitsExcludeOverStaleLedgerRecord(t *testing.T) {
 	}
 
 	// the excluded address is not available to a fresh allocation
-	if ip, err := c.ipam.GetIP("net-a", ""); err == nil {
+	if ip, err := c.ipam.GetIP("infra/net-a", ""); err == nil {
 		t.Errorf("the excluded address must stay unallocatable, got ip %q", ip)
 	}
 }
@@ -814,7 +820,7 @@ func TestRegisterIPPoolRetriesExcludeOverUnverifiableOwner(t *testing.T) {
 		ownerMAC       = "02:00:00:00:00:60"
 	)
 
-	stored := recoveryNewPool("pool1", "net-a")
+	stored := recoveryNewPool("pool1", "infra/net-a")
 	stored.Status.IPv4.Allocated = map[string]string{
 		"10.0.0.2": util.AllocationRef(ownerNamespace, ownerVMName, ownerMAC),
 	}
@@ -823,7 +829,7 @@ func TestRegisterIPPoolRetriesExcludeOverUnverifiableOwner(t *testing.T) {
 	// the vmnetcfg read of the owner revalidation fails transiently
 	rs.failVMNetCfgGet = true
 
-	pool := recoveryNewPool("pool1", "net-a")
+	pool := recoveryNewPool("pool1", "infra/net-a")
 	pool.Spec.IPv4Config.Pool.Exclude = []string{"10.0.0.2"}
 
 	// the startup replay is active, so the gate classification of the
@@ -887,14 +893,14 @@ func TestRegistrationKeepsThePinOfAMacSpellingDrift(t *testing.T) {
 		driftVMName    = "vm-drift"
 	)
 
-	stored := recoveryNewPool("pool1", "net-a")
+	stored := recoveryNewPool("pool1", "infra/net-a")
 	stored.Status.IPv4.Allocated = map[string]string{}
 
 	c, rs, _ := recoveryNewController(t, stored)
 
 	// the LIST snapshot carries the legacy spelling, like the spec of a
 	// vm which was created before the canonical normalization existed
-	drifted := recoveryNewVMNetCfg(driftNamespace, driftVMName, "10.0.0.2", "02-AA-BB-CC-DD-01", "net-a")
+	drifted := recoveryNewVMNetCfg(driftNamespace, driftVMName, "10.0.0.2", "02-AA-BB-CC-DD-01", "infra/net-a")
 	rs.vmnetcfgs = []*kihv1.VirtualMachineNetworkConfig{drifted}
 
 	// between the frozen LIST snapshot and the re-verification reads the
@@ -904,11 +910,11 @@ func TestRegistrationKeepsThePinOfAMacSpellingDrift(t *testing.T) {
 		rs.mu.Lock()
 		defer rs.mu.Unlock()
 
-		reformatted := recoveryNewVMNetCfg(driftNamespace, driftVMName, "10.0.0.2", "02:aa:bb:cc:dd:01", "net-a")
+		reformatted := recoveryNewVMNetCfg(driftNamespace, driftVMName, "10.0.0.2", "02:aa:bb:cc:dd:01", "infra/net-a")
 		rs.vmnetcfgs = []*kihv1.VirtualMachineNetworkConfig{reformatted}
 	}
 
-	pool := recoveryNewPool("pool1", "net-a")
+	pool := recoveryNewPool("pool1", "infra/net-a")
 
 	if err := recoveryRegistrationSteps(t, c, pool); err != nil {
 		t.Fatalf("the registration steps: %s", err)
@@ -916,16 +922,16 @@ func TestRegistrationKeepsThePinOfAMacSpellingDrift(t *testing.T) {
 
 	// the drifted owner keeps its pin: the address is not available to a
 	// fresh allocation
-	if used := c.ipam.Used("net-a"); used != 1 {
+	if used := c.ipam.Used("infra/net-a"); used != 1 {
 		t.Errorf("ipam used = %d, want 1 (the drifted owner keeps its pin)", used)
 	}
-	if ip, err := c.ipam.GetIP("net-a", ""); err == nil {
+	if ip, err := c.ipam.GetIP("infra/net-a", ""); err == nil {
 		t.Errorf("the recorded address must stay unavailable to a fresh allocation, got ip %q err %v", ip, err)
 	}
 
 	// the canonical owner reclaims its own address idempotently
 	ownerRef := util.AllocationRef(driftNamespace, driftVMName, "02:aa:bb:cc:dd:01")
-	if _, err := c.ipam.ReclaimIP("net-a", "10.0.0.2", ownerRef); err != nil {
+	if _, err := c.ipam.ReclaimIP("infra/net-a", "10.0.0.2", ownerRef); err != nil {
 		t.Errorf("the drifted vm reclaiming its recorded address under the canonical spelling: %s", err)
 	}
 }
@@ -945,15 +951,15 @@ func TestRegistrationPromotesTheSurvivorOfADroppedWinner(t *testing.T) {
 		survivorMAC     = "02:00:00:00:00:31"
 	)
 
-	stored := recoveryNewPool("pool1", "net-a")
+	stored := recoveryNewPool("pool1", "infra/net-a")
 	stored.Status.IPv4.Allocated = map[string]string{}
 
 	c, rs, _ := recoveryNewController(t, stored)
 	rs.vmnetcfgs = []*kihv1.VirtualMachineNetworkConfig{
 		// both claimants are established assignments without a ledger
 		// entry (a historical partial write lost both records)
-		recoveryNewVMNetCfg(winnerNamespace, winnerVMName, "10.0.0.2", winnerMAC, "net-a"),
-		recoveryNewVMNetCfg(winnerNamespace, "vm-survivor", "10.0.0.2", survivorMAC, "net-a"),
+		recoveryNewVMNetCfg(winnerNamespace, winnerVMName, "10.0.0.2", winnerMAC, "infra/net-a"),
+		recoveryNewVMNetCfg(winnerNamespace, "vm-survivor", "10.0.0.2", survivorMAC, "infra/net-a"),
 	}
 
 	// the winner disappears between the frozen LIST snapshot and the
@@ -963,11 +969,11 @@ func TestRegistrationPromotesTheSurvivorOfADroppedWinner(t *testing.T) {
 		defer rs.mu.Unlock()
 
 		rs.vmnetcfgs = []*kihv1.VirtualMachineNetworkConfig{
-			recoveryNewVMNetCfg(winnerNamespace, "vm-survivor", "10.0.0.2", survivorMAC, "net-a"),
+			recoveryNewVMNetCfg(winnerNamespace, "vm-survivor", "10.0.0.2", survivorMAC, "infra/net-a"),
 		}
 	}
 
-	pool := recoveryNewPool("pool1", "net-a")
+	pool := recoveryNewPool("pool1", "infra/net-a")
 
 	if err := recoveryRegistrationSteps(t, c, pool); err != nil {
 		t.Fatalf("the registration steps: %s", err)
@@ -975,21 +981,21 @@ func TestRegistrationPromotesTheSurvivorOfADroppedWinner(t *testing.T) {
 
 	// the promoted survivor owns the pin: the address is not available
 	// to a fresh allocation
-	if used := c.ipam.Used("net-a"); used != 1 {
+	if used := c.ipam.Used("infra/net-a"); used != 1 {
 		t.Errorf("ipam used = %d, want 1 (the promoted survivor owns the pin)", used)
 	}
-	if ip, err := c.ipam.GetIP("net-a", ""); err == nil {
+	if ip, err := c.ipam.GetIP("infra/net-a", ""); err == nil {
 		t.Errorf("the survivor's recorded address must stay unavailable to a fresh allocation, got ip %q err %v", ip, err)
 	}
 
 	// the survivor reclaims its own address idempotently, the dropped
 	// winner does not
 	survivorRef := util.AllocationRef(winnerNamespace, "vm-survivor", survivorMAC)
-	if _, err := c.ipam.ReclaimIP("net-a", "10.0.0.2", survivorRef); err != nil {
+	if _, err := c.ipam.ReclaimIP("infra/net-a", "10.0.0.2", survivorRef); err != nil {
 		t.Errorf("the promoted survivor reclaiming its recorded address: %s", err)
 	}
 	winnerRef := util.AllocationRef(winnerNamespace, winnerVMName, winnerMAC)
-	if _, err := c.ipam.ReclaimIP("net-a", "10.0.0.2", winnerRef); err == nil {
+	if _, err := c.ipam.ReclaimIP("infra/net-a", "10.0.0.2", winnerRef); err == nil {
 		t.Error("the dropped winner must not own the pin anymore")
 	}
 }
@@ -1007,7 +1013,7 @@ func TestRegistrationDropsTheLedgerRecordOfAPositivelyRemovedOwner(t *testing.T)
 		ownerMAC       = "02:00:00:00:00:40"
 	)
 
-	stored := recoveryNewPool("pool1", "net-a")
+	stored := recoveryNewPool("pool1", "infra/net-a")
 	stored.Status.IPv4.Allocated = map[string]string{
 		"10.0.0.2": util.AllocationRef(ownerNamespace, ownerVMName, ownerMAC),
 	}
@@ -1016,10 +1022,10 @@ func TestRegistrationDropsTheLedgerRecordOfAPositivelyRemovedOwner(t *testing.T)
 
 	// the owner's object exists, but its spec records the binding on
 	// another network: the nic of this pool was removed
-	moved := recoveryNewVMNetCfg(ownerNamespace, ownerVMName, "10.9.9.9", ownerMAC, "net-b")
+	moved := recoveryNewVMNetCfg(ownerNamespace, ownerVMName, "10.9.9.9", ownerMAC, "infra/net-b")
 	rs.vmnetcfgs = []*kihv1.VirtualMachineNetworkConfig{moved}
 
-	pool := recoveryNewPool("pool1", "net-a")
+	pool := recoveryNewPool("pool1", "infra/net-a")
 
 	err := recoveryRegistrationSteps(t, c, pool)
 	if err != nil {
@@ -1030,10 +1036,10 @@ func TestRegistrationDropsTheLedgerRecordOfAPositivelyRemovedOwner(t *testing.T)
 	if got, republished := rs.lastBody.Status.IPv4.Allocated["10.0.0.2"]; republished {
 		t.Errorf("the record of the positively removed owner must not be republished, got %q", got)
 	}
-	if used := c.ipam.Used("net-a"); used != 0 {
+	if used := c.ipam.Used("infra/net-a"); used != 0 {
 		t.Errorf("ipam used = %d, want 0 (the stale record pins nothing)", used)
 	}
-	if ip, err := c.ipam.GetIP("net-a", ""); err != nil || ip != "10.0.0.2" {
+	if ip, err := c.ipam.GetIP("infra/net-a", ""); err != nil || ip != "10.0.0.2" {
 		t.Errorf("the reclaimed address must be available to a fresh allocation, got ip %q err %v", ip, err)
 	}
 }
@@ -1050,7 +1056,7 @@ func TestRegistrationDropsTheLedgerRecordOfAGoneVM(t *testing.T) {
 		ownerMAC       = "02:00:00:00:00:41"
 	)
 
-	stored := recoveryNewPool("pool1", "net-a")
+	stored := recoveryNewPool("pool1", "infra/net-a")
 	stored.Status.IPv4.Allocated = map[string]string{
 		"10.0.0.2": util.AllocationRef(ownerNamespace, ownerVMName, ownerMAC),
 	}
@@ -1066,7 +1072,7 @@ func TestRegistrationDropsTheLedgerRecordOfAGoneVM(t *testing.T) {
 		return false, nil
 	}
 
-	pool := recoveryNewPool("pool1", "net-a")
+	pool := recoveryNewPool("pool1", "infra/net-a")
 
 	err := recoveryRegistrationSteps(t, c, pool)
 	if err != nil {
@@ -1076,7 +1082,7 @@ func TestRegistrationDropsTheLedgerRecordOfAGoneVM(t *testing.T) {
 	if got, republished := rs.lastBody.Status.IPv4.Allocated["10.0.0.2"]; republished {
 		t.Errorf("the record of the gone vm must not be republished, got %q", got)
 	}
-	if used := c.ipam.Used("net-a"); used != 0 {
+	if used := c.ipam.Used("infra/net-a"); used != 0 {
 		t.Errorf("ipam used = %d, want 0 (the orphan record pins nothing)", used)
 	}
 }
@@ -1092,7 +1098,7 @@ func TestRegistrationKeepsTheLedgerRecordOfAReconstructibleOwner(t *testing.T) {
 		ownerMAC       = "02:00:00:00:00:42"
 	)
 
-	stored := recoveryNewPool("pool1", "net-a")
+	stored := recoveryNewPool("pool1", "infra/net-a")
 	stored.Status.IPv4.Allocated = map[string]string{
 		"10.0.0.2": util.AllocationRef(ownerNamespace, ownerVMName, ownerMAC),
 	}
@@ -1104,7 +1110,7 @@ func TestRegistrationKeepsTheLedgerRecordOfAReconstructibleOwner(t *testing.T) {
 		return true, nil
 	}
 
-	pool := recoveryNewPool("pool1", "net-a")
+	pool := recoveryNewPool("pool1", "infra/net-a")
 
 	err := recoveryRegistrationSteps(t, c, pool)
 	if err != nil {
@@ -1116,10 +1122,10 @@ func TestRegistrationKeepsTheLedgerRecordOfAReconstructibleOwner(t *testing.T) {
 	} else if ref != util.AllocationRef(ownerNamespace, ownerVMName, ownerMAC) {
 		t.Errorf("the republished record = %q, want the canonical owner reference", ref)
 	}
-	if used := c.ipam.Used("net-a"); used != 1 {
+	if used := c.ipam.Used("infra/net-a"); used != 1 {
 		t.Errorf("ipam used = %d, want 1 (the reconstructible owner keeps its pin)", used)
 	}
-	if ip, err := c.ipam.GetIP("net-a", ""); err == nil {
+	if ip, err := c.ipam.GetIP("infra/net-a", ""); err == nil {
 		t.Errorf("the recorded address must stay unavailable to a fresh allocation, got ip %q", ip)
 	}
 }
@@ -1135,7 +1141,7 @@ func TestRegistrationKeepsTheLedgerRecordOfAnUnverifiableOwner(t *testing.T) {
 		ownerMAC       = "02:00:00:00:00:43"
 	)
 
-	stored := recoveryNewPool("pool1", "net-a")
+	stored := recoveryNewPool("pool1", "infra/net-a")
 	stored.Status.IPv4.Allocated = map[string]string{
 		"10.0.0.2": util.AllocationRef(ownerNamespace, ownerVMName, ownerMAC),
 	}
@@ -1145,7 +1151,7 @@ func TestRegistrationKeepsTheLedgerRecordOfAnUnverifiableOwner(t *testing.T) {
 	// the owner's object cannot be read at all
 	rs.failVMNetCfgGet = true
 
-	pool := recoveryNewPool("pool1", "net-a")
+	pool := recoveryNewPool("pool1", "infra/net-a")
 
 	err := recoveryRegistrationSteps(t, c, pool)
 	if err != nil {
@@ -1155,7 +1161,168 @@ func TestRegistrationKeepsTheLedgerRecordOfAnUnverifiableOwner(t *testing.T) {
 	if _, republished := rs.lastBody.Status.IPv4.Allocated["10.0.0.2"]; !republished {
 		t.Errorf("the record of the unverifiable owner must stay republished (fail closed)")
 	}
-	if used := c.ipam.Used("net-a"); used != 1 {
+	if used := c.ipam.Used("infra/net-a"); used != 1 {
 		t.Errorf("ipam used = %d, want 1 (the unverifiable owner keeps its pin)", used)
+	}
+}
+
+func TestRegistrationRejectsUnselectedAndMismatchedPoolsBeforeMutation(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*kihv1.IPPool)
+	}{
+		{"missing network label", func(p *kihv1.IPPool) { delete(p.Labels, util.NetworkLabel) }},
+		{"missing namespace label", func(p *kihv1.IPPool) { delete(p.Labels, util.NetworkNamespaceLabel) }},
+		{"same NAD name in another namespace", func(p *kihv1.IPPool) {
+			p.Labels[util.NetworkNamespaceLabel] = "other"
+			p.Spec.NetworkName = "other/net-a"
+		}},
+		{"selected foreign spec", func(p *kihv1.IPPool) { p.Spec.NetworkName = "other/net-a" }},
+		{"selected bare spec", func(p *kihv1.IPPool) { p.Spec.NetworkName = "net-a" }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name+"/fresh-api", func(t *testing.T) {
+			pool := recoveryNewPool("pool1", "infra/net-a")
+			c, rs, _ := recoveryNewController(t, pool.DeepCopy())
+			c.appStatus.Store(APP_INIT)
+			tc.mutate(rs.pool)
+			pool = rs.pool.DeepCopy()
+			before := rs.pool.DeepCopy()
+			hostWrites := 0
+			network.AddIpToNic = func(string, string) error { hostWrites++; return nil }
+			cleanup, err := c.registerIPPool(pool)
+			if !errors.Is(err, ErrPoolUnregistrable) || cleanup {
+				t.Fatalf("scope rejection = (%v, %v), want definitive rejection before mutation", cleanup, err)
+			}
+			if hostWrites != 0 || rs.putCount != 0 || !reflect.DeepEqual(rs.pool, before) || c.cache.Check(pool) || c.dhcp.CheckPool("infra/net-a") {
+				t.Fatal("scope rejection mutated host, API, cache, or DHCP state")
+			}
+			if err := c.ipam.NewSubnet("infra/net-a", "10.0.0.0/29", "10.0.0.2", "10.0.0.2"); err != nil {
+				t.Fatalf("rejected pool left an allocator registration: %v", err)
+			}
+		})
+	}
+}
+
+func TestRegistrationRechecksSelectorBeforePublishingProtectedClaims(t *testing.T) {
+	pool := recoveryNewPool("pool1", "infra/net-a")
+	c, rs, _ := recoveryNewController(t, pool.DeepCopy())
+	rs.vmnetcfgListHook = func() {
+		rs.mu.Lock()
+		defer rs.mu.Unlock()
+		delete(rs.pool.Labels, util.NetworkNamespaceLabel)
+		rs.pool.Status.IPv4.Allocated = map[string]string{"10.0.0.2": "retained-ledger"}
+	}
+	if err := recoveryRegistrationSteps(t, c, pool); err == nil {
+		t.Fatal("registration committed after its API selector changed")
+	}
+	if rs.putCount != 0 || rs.pool.Status.IPv4.Allocated["10.0.0.2"] != "retained-ledger" {
+		t.Fatal("stale registration overwrote the live object's durable ledger")
+	}
+	if c.cache.Check(pool) || c.dhcp.CheckPool(pool.Spec.NetworkName) {
+		t.Fatal("failed selector revalidation published a local registration")
+	}
+	if err := c.ipam.NewSubnet(pool.Spec.NetworkName, "10.0.0.0/29", "10.0.0.2", "10.0.0.2"); err != nil {
+		t.Fatalf("failed registration leaked its allocator: %v", err)
+	}
+}
+
+func TestRegistrationQualifiesLegacyBareNICInObjectNamespace(t *testing.T) {
+	for _, namespace := range []string{"infra", "tenant"} {
+		for _, ledger := range []bool{false, true} {
+			name := namespace + "/spec-only"
+			if ledger {
+				name = namespace + "/ledger"
+			}
+			t.Run(name, func(t *testing.T) {
+				pool := recoveryNewPool("pool1", "infra/net-a")
+				const mac = "02-AA-BB-CC-DD-01"
+				ref := util.AllocationRef(namespace, "vm", mac)
+				if ledger {
+					pool.Status.IPv4.Allocated = map[string]string{"10.0.0.2": ref}
+				}
+				c, rs, _ := recoveryNewController(t, pool)
+				// Deliberately legacy bare spelling: it belongs to infra only
+				// when the VMNetCfg itself is in infra.
+				rs.vmnetcfgs = []*kihv1.VirtualMachineNetworkConfig{
+					recoveryNewVMNetCfg(namespace, "vm", "10.0.0.2", mac, "net-a"),
+				}
+				rs.vmnetcfgs[0].Status.NetworkConfig[0].MACAddress = "02:aa:bb:cc:dd:01"
+				if err := recoveryRegistrationSteps(t, c, pool); err != nil {
+					t.Fatal(err)
+				}
+				if namespace == "infra" {
+					if _, err := c.ipam.GetIP(pool.Spec.NetworkName, ""); err == nil {
+						t.Fatal("local legacy NIC lost protection")
+					}
+					if _, err := c.ipam.ReclaimIP(pool.Spec.NetworkName, "10.0.0.2", ref); err != nil {
+						t.Fatalf("canonical owner cannot restore legacy NIC: %v", err)
+					}
+					if ledger && rs.pool.Status.IPv4.Allocated["10.0.0.2"] != ref {
+						t.Fatal("local legacy ledger record was dropped")
+					}
+				} else {
+					if _, present := rs.pool.Status.IPv4.Allocated["10.0.0.2"]; present {
+						t.Fatal("foreign namespace's bare NIC kept this pool's stale ledger record")
+					}
+					if ip, err := c.ipam.GetIP(pool.Spec.NetworkName, ""); err != nil || ip != "10.0.0.2" {
+						t.Fatalf("foreign bare NIC reserved this network's address: %q, %v", ip, err)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestRegistrationForeignSameMACStatusCannotBypassHijackGuard(t *testing.T) {
+	pool := recoveryNewPool("pool1", "infra/net-a")
+	pool.Status.LastUpdate = metav1.NewTime(time.Now().Add(-time.Hour))
+	c, rs, _ := recoveryNewController(t, pool)
+	vm := recoveryNewStatuslessVMNetCfg("tenant", "vm", "10.0.0.2", "02-AA-BB-CC-DD-01", pool.Spec.NetworkName, 30*time.Minute)
+	vm.Status.NetworkConfig = []kihv1.NetworkConfigStatus{
+		{NetworkName: "net-a", MACAddress: "02:aa:bb:cc:dd:01", Status: "OK"},
+	}
+	rs.vmnetcfgs = []*kihv1.VirtualMachineNetworkConfig{vm}
+	if err := recoveryRegistrationSteps(t, c, pool); err != nil {
+		t.Fatal(err)
+	}
+	if ip, err := c.ipam.GetIP(pool.Spec.NetworkName, ""); err != nil || ip != "10.0.0.2" {
+		t.Fatalf("foreign same-MAC status exempted a guarded request: %q, %v", ip, err)
+	}
+}
+
+func TestRegistrationForeignSameMACStatusCannotEstablishClaim(t *testing.T) {
+	pool := recoveryNewPool("pool1", "infra/net-a")
+	c, rs, _ := recoveryNewController(t, pool)
+	request := recoveryNewStatuslessVMNetCfg("tenant", "aaa-request", "10.0.0.2", "02-AA-BB-CC-DD-01", pool.Spec.NetworkName, 2*time.Hour)
+	request.Status.NetworkConfig = []kihv1.NetworkConfigStatus{
+		{NetworkName: "net-a", MACAddress: "02:aa:bb:cc:dd:01", Status: "OK"},
+	}
+	established := recoveryNewVMNetCfg("tenant", "established", "10.0.0.2", "02:00:00:00:00:02", pool.Spec.NetworkName)
+	rs.vmnetcfgs = []*kihv1.VirtualMachineNetworkConfig{request, established}
+	if err := recoveryRegistrationSteps(t, c, pool); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.ipam.ReclaimIP(pool.Spec.NetworkName, "10.0.0.2", util.AllocationRef("tenant", "established", "02:00:00:00:00:02")); err != nil {
+		t.Fatalf("foreign status outranked the established owned assignment: %v", err)
+	}
+	if _, err := c.ipam.ReclaimIP(pool.Spec.NetworkName, "10.0.0.2", util.AllocationRef("tenant", "aaa-request", "02:aa:bb:cc:dd:01")); err == nil {
+		t.Fatal("request adopted its foreign same-MAC status as an owned assignment")
+	}
+}
+
+func TestRegistrationOwnedStatusMatchesCanonicalMAC(t *testing.T) {
+	pool := recoveryNewPool("pool1", "infra/net-a")
+	c, rs, _ := recoveryNewController(t, pool)
+	vm := recoveryNewVMNetCfg("infra", "vm", "10.0.0.2", "02-AA-BB-CC-DD-01", "net-a")
+	vm.Status.NetworkConfig[0].MACAddress = "02:aa:bb:cc:dd:01"
+	vm.Status.NetworkConfig[0].NetworkName = pool.Spec.NetworkName
+	vm.Status.NetworkConfig[0].Status = "ERROR"
+	rs.vmnetcfgs = []*kihv1.VirtualMachineNetworkConfig{vm}
+	if err := recoveryRegistrationSteps(t, c, pool); err != nil {
+		t.Fatal(err)
+	}
+	if ip, err := c.ipam.GetIP(pool.Spec.NetworkName, ""); err != nil || ip != "10.0.0.2" {
+		t.Fatalf("MAC spelling drift hid the owned ERROR status and reserved a rejected claim: %q, %v", ip, err)
 	}
 }
