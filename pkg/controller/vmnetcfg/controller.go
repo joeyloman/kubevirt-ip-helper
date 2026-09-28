@@ -415,8 +415,30 @@ func (c *Controller) sync(event Event) (err error) {
 	case DELETE:
 		// an object which is gone can never produce a settled sync anymore:
 		// the gate settles it so a startup-time deletion does not block the
-		// controller startup forever
+		// controller startup forever. the settle stays unconditional: the
+		// counted attempts are deduplicated by name, so a same-name
+		// replacement under this key settles the same key again through
+		// its own sync
 		c.markInitAttempt(event.key)
+
+		// the informer removes an object from the store before delivering
+		// its delete event, so an object under this key is a same-name
+		// replacement created while the deletion (or its rate-limited
+		// retry) was in flight: the owner checks of the release path are
+		// name-based (namespace/VMName, MAC) and cannot distinguish the
+		// deleted binding from the successor's, and the pending unwind
+		// records are keyed by this object's name with the old
+		// generation's owner, so replaying either would tear down the
+		// replacement's live lease, claim and ledger entry. the replay is
+		// skipped and the replacement's own events manage the object; its
+		// eventual deletion replays the still-recorded unwinds of the old
+		// generation (owner-validated and idempotent).
+		if exists {
+			log.Warnf("(vmnetcfg.sync) VirtualMachineNetworkConfig %s was deleted but a same-name replacement exists, skipping the deletion replay", event.key)
+			c.metrics.UpdateLogStatus("warning")
+
+			return
+		}
 
 		// the object is gone for good (a regular deletion converged its
 		// own cleanup, a force-delete stripped the finalizers externally):
@@ -432,20 +454,7 @@ func (c *Controller) sync(event Event) (err error) {
 		// rebuild reclaims them. every release is owner-validated and
 		// idempotent, so the replay of a controller-managed deletion whose
 		// finalizer cleanup already converged is a no-op
-		//
-		// the informer removes an object from the store before delivering
-		// its delete event, so an object under this key is a same-name
-		// replacement created while the deletion (or its rate-limited
-		// retry) was in flight: the owner checks of the release path are
-		// name-based (namespace/VMName, MAC) and cannot distinguish the
-		// deleted binding from the successor's, so replaying the tombstone
-		// here would tear down the replacement's live lease, claim and
-		// ledger entry. the release is skipped and the replacement's own
-		// events manage the object.
-		if exists {
-			log.Warnf("(vmnetcfg.sync) VirtualMachineNetworkConfig %s was deleted but a same-name replacement exists, skipping the tombstone release", event.key)
-			c.metrics.UpdateLogStatus("warning")
-		} else if event.vmnetcfg != nil {
+		if event.vmnetcfg != nil {
 			if err := c.releaseDeletedBinding(event.vmnetcfg); err != nil {
 				return err
 			}
