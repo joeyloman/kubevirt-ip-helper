@@ -1368,75 +1368,84 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 		}
 	}
 
+	// resolve the pool objects which can hold the ledger record: the
+	// cache first (the registered, serving pool of this era), and on a
+	// miss the api (F04). a pool object can exist without a cache entry
+	// - an unregistrable spec, or a registration which is blocked by the
+	// very record this cleanup removes: an exclude entry conflicting
+	// with this binding's live claim, where the registration requires
+	// the release of the claim while the finalization used to require
+	// the registration. durable cleanup must not require healthy serving
+	// registration of the object it cleans up: the owner-validated
+	// ledger removal runs against the api-resolved pool object directly,
+	// and UpdateStatus preserves the counters of a network the allocator
+	// does not know, so the write cannot corrupt its durable status
+	var poolNames []string
+	registered := true
+
 	pool, poolErr := c.cache.Get("pool", netCfg.NetworkName)
-	if poolErr != nil {
-		if deleting {
-			// a deleted pool object takes its whole status ledger with it,
-			// so on the deletion path the un-record may only be skipped
-			// when the pool is truly gone: verify that through the api. a
-			// pool object which merely missed the cache still holds the
-			// ledger entry, and the finalizer must stay (error) until the
-			// entry is removed, or the record is orphaned forever
-			apiPools, listErr := c.kihClientset.KubevirtiphelperV1().IPPools().List(c.ctx, metav1.ListOptions{})
-			if listErr == nil {
-				poolExists := false
-				for _, p := range apiPools.Items {
-					if p.Spec.NetworkName == netCfg.NetworkName {
-						poolExists = true
-						break
-					}
-				}
+	if poolErr == nil {
+		poolNames = append(poolNames, pool.(kihv1.IPPool).Name)
+	} else {
+		registered = false
 
-				if !poolExists {
-					log.Warnf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] the pool of network %s does not exist anymore, its status record is gone with it",
-						vmnetcfg.Namespace, vmnetcfg.Name, netCfg.NetworkName)
+		apiPools, listErr := c.kihClientset.KubevirtiphelperV1().IPPools().List(c.ctx, metav1.ListOptions{})
+		if listErr != nil {
+			// the api verification itself failed: fail conservatively,
+			// the record might still exist in a live pool object
+			return fmt.Errorf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] cannot verify the pool of network %s, cache miss: %s: %s",
+				vmnetcfg.Namespace, vmnetcfg.Name, netCfg.NetworkName, poolErr.Error(), listErr.Error())
+		}
 
-					return
-				}
-			} else {
-				// the api verification itself failed: fail conservatively,
-				// the record might still exist in a live pool object
-				return fmt.Errorf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] cannot verify the pool of network %s during deletion, cache miss: %s: %s",
-					vmnetcfg.Namespace, vmnetcfg.Name, netCfg.NetworkName, poolErr.Error(), listErr.Error())
+		// several pool objects may claim the same network: the record
+		// can live in any of them, and every removal is owner-validated
+		// and idempotent, so each match is cleaned
+		for i := range apiPools.Items {
+			if apiPools.Items[i].Spec.NetworkName == netCfg.NetworkName {
+				poolNames = append(poolNames, apiPools.Items[i].Name)
 			}
 		}
 
-		// the status entry cannot be removed while the pool is not cached:
-		// this is a failed cleanup, not a converged one. proceeding would
-		// orphan the ledger entry forever. the releases above are
-		// owner-checked and idempotent, so the retried cleanup converges
-		// once the pool is cached again
-		return fmt.Errorf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] %s",
-			vmnetcfg.Namespace, vmnetcfg.Name, poolErr.Error())
+		if len(poolNames) == 0 {
+			// a deleted pool object takes its whole status ledger with
+			// it: the record is gone with the pool, and the local
+			// releases below still run (owner-validated no-ops for a
+			// network which is not registered in this era)
+			log.Warnf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] the pool of network %s does not exist anymore, its status record is gone with it",
+				vmnetcfg.Namespace, vmnetcfg.Name, netCfg.NetworkName)
+			c.metrics.UpdateLogStatus("warning")
+		}
 	}
 
-	if err := c.updateIPPoolStatus(
-		DELETE,
-		vmnetcfg.Namespace,
-		vmnetcfg.Spec.VMName,
-		netCfg.IPAddress,
-		netCfg.NetworkName,
-		netCfg.MACAddress,
-		pool.(kihv1.IPPool).Name,
-	); err != nil {
-		// the entry of another owner is not this vmnetcfg's to remove; a
-		// deleting object must still finish, so the entry is reported and
-		// kept
-		if deleting && errors.Is(err, util.ErrForeignOwner) {
-			log.Warnf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] the allocation of ip %s in the %s status belongs to another owner, leaving the entry",
-				vmnetcfg.Namespace, vmnetcfg.Name, netCfg.IPAddress, pool.(kihv1.IPPool).Name)
-			c.metrics.UpdateLogStatus("warning")
-		} else {
-			// during a live transition the durable un-record happens
-			// before any local release: a failed status write leaves the
-			// lease, the ipam claim and the record fully intact, so the
-			// owner keeps serving and the retried cleanup converges from
-			// a consistent state. releasing before the un-record would
-			// need a re-mark band-aid, whose anonymous re-mark cannot
-			// idempotently recover the owner-mapped reservation and
-			// bricks a one-address pool behind the sticky error status.
-			return fmt.Errorf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] %s",
-				vmnetcfg.Namespace, vmnetcfg.Name, err.Error())
+	for _, poolName := range poolNames {
+		if err := c.updateIPPoolStatus(
+			DELETE,
+			vmnetcfg.Namespace,
+			vmnetcfg.Spec.VMName,
+			netCfg.IPAddress,
+			netCfg.NetworkName,
+			netCfg.MACAddress,
+			poolName,
+		); err != nil {
+			// the entry of another owner is not this vmnetcfg's to
+			// remove; a deleting object must still finish, so the entry
+			// is reported and kept
+			if deleting && errors.Is(err, util.ErrForeignOwner) {
+				log.Warnf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] the allocation of ip %s in the %s status belongs to another owner, leaving the entry",
+					vmnetcfg.Namespace, vmnetcfg.Name, netCfg.IPAddress, poolName)
+				c.metrics.UpdateLogStatus("warning")
+			} else {
+				// during a live transition the durable un-record happens
+				// before any local release: a failed status write leaves the
+				// lease, the ipam claim and the record fully intact, so the
+				// owner keeps serving and the retried cleanup converges from
+				// a consistent state. releasing before the un-record would
+				// need a re-mark band-aid, whose anonymous re-mark cannot
+				// idempotently recover the owner-mapped reservation and
+				// bricks a one-address pool behind the sticky error status.
+				return fmt.Errorf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] %s",
+					vmnetcfg.Namespace, vmnetcfg.Name, err.Error())
+			}
 		}
 	}
 
@@ -1455,11 +1464,14 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 
 	// the release above changed the pool accounting: republish the
 	// metrics so the gauges do not stay stale after the last allocation
-	// of a pool was cleaned
-	if err := c.updateIPPoolMetrics(pool.(kihv1.IPPool).Name); err != nil {
-		log.Errorf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] %s",
-			vmnetcfg.Namespace, vmnetcfg.Name, err)
-		c.metrics.UpdateLogStatus("error")
+	// of a pool was cleaned. an api-resolved pool is not registered in
+	// this era, so it has no live accounting the gauges could describe
+	if registered {
+		if err := c.updateIPPoolMetrics(poolNames[0]); err != nil {
+			log.Errorf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] %s",
+				vmnetcfg.Namespace, vmnetcfg.Name, err)
+			c.metrics.UpdateLogStatus("error")
+		}
 	}
 
 	return

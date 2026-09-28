@@ -235,3 +235,75 @@ func TestUpdateStatusUnknownEventDoesNotTouchLedger(t *testing.T) {
 		t.Errorf("existing ledger entry = %q, want it untouched", got)
 	}
 }
+
+// The counters describe the serving state of the pool: UpdateStatus only
+// recomputes them from the in-memory allocator while the network is
+// registered in it. a pool which exists without a registration (an
+// unregistrable spec, or a registration blocked by the very record this
+// write removes - F04) keeps its persisted counters: Used and Available
+// of an unknown network report zero, so recomputing them would corrupt
+// the durable status of a pool whose ledger still holds live entries.
+func TestUpdateStatusPreservesCountersOfAnUnregisteredNetwork(t *testing.T) {
+	ctx, client, allocator, api := newUpdateStatusEnv(t, 0, 0)
+
+	api.mu.Lock()
+	api.pool.Spec.NetworkName = "net-a"
+	api.pool.Status.IPv4.Allocated = map[string]string{"10.0.0.5": "ns/vm-a [02:00:00:00:00:01]"}
+	api.pool.Status.IPv4.Used = 7
+	api.pool.Status.IPv4.Available = 13
+	api.mu.Unlock()
+
+	if allocator.HasSubnet("net-a") {
+		t.Fatal("the fixture must keep net-a unregistered")
+	}
+
+	if err := UpdateStatus(ctx, client, allocator, EventDelete, "ns", "vm-a", "10.0.0.5", "net-a", "02:00:00:00:00:01", "pool-a"); err != nil {
+		t.Fatalf("UpdateStatus: %v", err)
+	}
+
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	if _, still := api.pool.Status.IPv4.Allocated["10.0.0.5"]; still {
+		t.Error("the ledger entry survived the delete")
+	}
+	if got := api.pool.Status.IPv4.Used; got != 7 {
+		t.Errorf("Used = %d, want the persisted 7 preserved", got)
+	}
+	if got := api.pool.Status.IPv4.Available; got != 13 {
+		t.Errorf("Available = %d, want the persisted 13 preserved", got)
+	}
+}
+
+// A registered network keeps its counters recomputed from the live
+// allocator on every write, so the persisted status matches the serving
+// state of this era.
+func TestUpdateStatusRecomputesCountersOfARegisteredNetwork(t *testing.T) {
+	ctx, client, allocator, api := newUpdateStatusEnv(t, 0, 0)
+
+	api.mu.Lock()
+	api.pool.Spec.NetworkName = "net-a"
+	api.mu.Unlock()
+
+	if err := allocator.NewSubnet("net-a", "10.0.0.0/29", "10.0.0.1", "10.0.0.6"); err != nil {
+		t.Fatalf("NewSubnet: %v", err)
+	}
+
+	// the counters mirror the live claims of the allocator, not the
+	// ledger alone: the recorded address is claimed like a real
+	// allocation would be
+	if _, err := allocator.ReclaimIP("net-a", "10.0.0.5", "ns/vm-a [02:00:00:00:00:01]"); err != nil {
+		t.Fatalf("ReclaimIP: %v", err)
+	}
+	if err := UpdateStatus(ctx, client, allocator, EventAdd, "ns", "vm-a", "10.0.0.5", "net-a", "02:00:00:00:00:01", "pool-a"); err != nil {
+		t.Fatalf("UpdateStatus: %v", err)
+	}
+
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	if got := api.pool.Status.IPv4.Used; got != 1 {
+		t.Errorf("Used = %d, want 1 recomputed from the live allocator", got)
+	}
+	if got := api.pool.Status.IPv4.Available; got != 5 {
+		t.Errorf("Available = %d, want 5 recomputed from the live allocator", got)
+	}
+}

@@ -207,54 +207,57 @@ func (c *Controller) rememberPendingUnwind(key string, entry pendingLedgerDelete
 	c.pendingUnwinds[key] = append(c.pendingUnwinds[key], entry)
 }
 
-// pendingUnwindPoolName resolves the pool object which holds the ledger
-// record of a pending unwind. an entry with a known pool name replays
-// against it directly; the entry of a captured divergent tuple may have
-// been recorded while its pool was not cached (the recursive cleanup
-// failed before the record could be removed), so it knows the network
-// but not the pool name and the resolution repeats at replay time.
+// pendingUnwindPoolNames resolves the pool objects which can hold the
+// ledger record of a pending unwind. an entry with a known pool name
+// replays against it directly; the entry of a captured divergent tuple
+// may have been recorded while its pool was not reachable (the api was
+// down while the recursive cleanup failed), so it knows the network but
+// not the pool name and the resolution repeats at replay time.
 //
-// the verification mirrors the deleting cleanup itself: a deleted pool
-// object takes its whole status ledger with it, so a pool which is
-// verifiably gone through the api classifies the recorded removal as
-// converged without any write - an entry whose pool died between the
-// attempts would otherwise stay pending forever and pin the finalizers
-// of the deleting object until the next process era. a pool which
-// exists but is not cached stays unresolved instead: the ledger write
-// recomputes the pool counters from the in-memory ipam, which only
-// knows registered pools (Used of an unknown network reports zero), so
-// replaying against an uncached pool would corrupt its durable
-// counters - the entry converges when the pool registers, the same
-// fail-closed gate as the deleting cleanup.
-func (c *Controller) pendingUnwindPoolName(entry pendingLedgerDelete) (poolName string, converged bool, err error) {
+// the verification mirrors the cleanup itself (F04): the cache first,
+// then the api list by network. a pool which is verifiably gone took
+// its whole status ledger with it, so the recorded removal is converged
+// without any write - an entry whose pool died between the attempts
+// would otherwise stay pending forever and pin the finalizers of the
+// deleting object until the next process era. a pool which exists
+// without a cache entry is replayed against directly instead: durable
+// cleanup must not require healthy serving registration of the object
+// it cleans up, and UpdateStatus preserves the counters of a network
+// the allocator does not know, so the write cannot corrupt its durable
+// status. several pool objects may claim the same network: the record
+// can live in any of them, and every removal is owner-validated and
+// idempotent, so each match is replayed. an entry which cannot be
+// verified at all (the api list fails) stays pending: the record might
+// still exist in a live pool object.
+func (c *Controller) pendingUnwindPoolNames(entry pendingLedgerDelete) (poolNames []string, converged bool, err error) {
 	if entry.poolName != "" {
-		return entry.poolName, false, nil
+		return []string{entry.poolName}, false, nil
 	}
 
 	pool, cacheErr := c.cache.Get("pool", entry.networkName)
 	if cacheErr == nil {
-		return pool.(kihv1.IPPool).Name, false, nil
+		return []string{pool.(kihv1.IPPool).Name}, false, nil
 	}
 
-	// the api list verifies whether the pool object still exists: the
-	// cache alone cannot distinguish a pool which died with its ledger
-	// from one which merely is not cached yet
 	apiPools, listErr := c.kihClientset.KubevirtiphelperV1().IPPools().List(c.ctx, metav1.ListOptions{})
 	if listErr != nil {
 		// the api verification itself failed: fail conservatively, the
 		// record might still exist in a live pool object
-		return "", false, fmt.Errorf("cannot verify the pool of network %s, cache miss: %s: %s",
+		return nil, false, fmt.Errorf("cannot verify the pool of network %s, cache miss: %s: %s",
 			entry.networkName, cacheErr.Error(), listErr.Error())
 	}
 
 	for i := range apiPools.Items {
 		if apiPools.Items[i].Spec.NetworkName == entry.networkName {
-			return "", false, fmt.Errorf("the pool of network %s exists but is not cached, its registration must precede the ledger replay: %s",
-				entry.networkName, cacheErr.Error())
+			poolNames = append(poolNames, apiPools.Items[i].Name)
 		}
 	}
 
-	return "", true, nil
+	if len(poolNames) == 0 {
+		return nil, true, nil
+	}
+
+	return poolNames, false, nil
 }
 
 // drainPendingUnwinds replays the recorded ledger deletions of a deleted
@@ -274,7 +277,7 @@ func (c *Controller) drainPendingUnwinds(key string) {
 	c.mutex.Unlock()
 
 	for _, entry := range pending {
-		poolName, converged, resolveErr := c.pendingUnwindPoolName(entry)
+		poolNames, converged, resolveErr := c.pendingUnwindPoolNames(entry)
 		if converged {
 			// the pool object is verifiably gone and took its whole
 			// status ledger with it: the recorded removal is done
@@ -287,46 +290,48 @@ func (c *Controller) drainPendingUnwinds(key string) {
 		}
 
 		if resolveErr != nil {
-			// the pool of the recorded tuple is not cached anymore and
-			// this object is gone, so no reconciliation will arrive:
-			// the entry gets its one final attempt and is dropped like
+			// the pool of the recorded tuple cannot be verified and this
+			// object is gone, so no reconciliation will arrive: the
+			// entry gets its one final attempt and is dropped like
 			// every other failure, the next era's registration
 			// revalidates the ledger
-			log.Warnf("(vmnetcfg.drainPendingUnwinds) [%s] dropping the pending ledger record of ip %s in network %s after the deletion, the pool is not cached and the next era's registration revalidates the ledger: %s",
+			log.Warnf("(vmnetcfg.drainPendingUnwinds) [%s] dropping the pending ledger record of ip %s in network %s after the deletion, the next era's registration revalidates the ledger: %s",
 				key, entry.ip, entry.networkName, resolveErr)
 			c.metrics.UpdateLogStatus("warning")
 
 			continue
 		}
 
-		err := c.updateIPPoolStatus(
-			DELETE,
-			entry.namespace,
-			entry.vmName,
-			entry.ip,
-			entry.networkName,
-			entry.macAddress,
-			poolName,
-		)
-		if err == nil {
-			log.Warnf("(vmnetcfg.drainPendingUnwinds) [%s] removed the pending ledger record of ip %s in pool %s after the deletion",
-				key, entry.ip, poolName)
-			c.metrics.UpdateLogStatus("warning")
+		for _, poolName := range poolNames {
+			err := c.updateIPPoolStatus(
+				DELETE,
+				entry.namespace,
+				entry.vmName,
+				entry.ip,
+				entry.networkName,
+				entry.macAddress,
+				poolName,
+			)
+			if err == nil {
+				log.Warnf("(vmnetcfg.drainPendingUnwinds) [%s] removed the pending ledger record of ip %s in pool %s after the deletion",
+					key, entry.ip, poolName)
+				c.metrics.UpdateLogStatus("warning")
 
-			continue
-		}
+				continue
+			}
 
-		if errors.Is(err, util.ErrForeignOwner) || apierrors.IsNotFound(err) {
-			log.Warnf("(vmnetcfg.drainPendingUnwinds) [%s] the pending ledger record of ip %s in pool %s converged: %s",
+			if errors.Is(err, util.ErrForeignOwner) || apierrors.IsNotFound(err) {
+				log.Warnf("(vmnetcfg.drainPendingUnwinds) [%s] the pending ledger record of ip %s in pool %s converged: %s",
+					key, entry.ip, poolName, err)
+				c.metrics.UpdateLogStatus("warning")
+
+				continue
+			}
+
+			log.Warnf("(vmnetcfg.drainPendingUnwinds) [%s] dropping the pending ledger record of ip %s in pool %s after the deletion, the next era's registration revalidates the ledger: %s",
 				key, entry.ip, poolName, err)
 			c.metrics.UpdateLogStatus("warning")
-
-			continue
 		}
-
-		log.Warnf("(vmnetcfg.drainPendingUnwinds) [%s] dropping the pending ledger record of ip %s in pool %s after the deletion, the next era's registration revalidates the ledger: %s",
-			key, entry.ip, poolName, err)
-		c.metrics.UpdateLogStatus("warning")
 	}
 }
 
@@ -354,7 +359,7 @@ func (c *Controller) retryPendingUnwinds(vmnetcfg *kihv1.VirtualMachineNetworkCo
 	var retryErr error
 
 	for _, entry := range pending {
-		poolName, converged, resolveErr := c.pendingUnwindPoolName(entry)
+		poolNames, converged, resolveErr := c.pendingUnwindPoolNames(entry)
 		if converged {
 			// the pool object is verifiably gone and took its whole
 			// status ledger with it: the recorded removal is done
@@ -367,8 +372,8 @@ func (c *Controller) retryPendingUnwinds(vmnetcfg *kihv1.VirtualMachineNetworkCo
 		}
 
 		if resolveErr != nil {
-			// the pool of the recorded tuple is not cached (yet): the
-			// record may live in its pool object, so the entry stays
+			// the pool of the recorded tuple cannot be verified: the
+			// record may live in a live pool object, so the entry stays
 			// recorded and the retried reconciliation resolves it again
 			log.Errorf("(vmnetcfg.retryPendingUnwinds) [%s/%s] cannot resolve the pool of network %s for the pending ledger record of ip %s: %s",
 				vmnetcfg.Namespace, vmnetcfg.Name, entry.networkName, entry.ip, resolveErr)
@@ -383,41 +388,49 @@ func (c *Controller) retryPendingUnwinds(vmnetcfg *kihv1.VirtualMachineNetworkCo
 			continue
 		}
 
-		err := c.updateIPPoolStatus(
-			DELETE,
-			entry.namespace,
-			entry.vmName,
-			entry.ip,
-			entry.networkName,
-			entry.macAddress,
-			poolName,
-		)
-		if err == nil {
-			log.Warnf("(vmnetcfg.retryPendingUnwinds) [%s/%s] removed the pending ledger record of ip %s in pool %s",
-				vmnetcfg.Namespace, vmnetcfg.Name, entry.ip, poolName)
-			c.metrics.UpdateLogStatus("warning")
+		for _, poolName := range poolNames {
+			err := c.updateIPPoolStatus(
+				DELETE,
+				entry.namespace,
+				entry.vmName,
+				entry.ip,
+				entry.networkName,
+				entry.macAddress,
+				poolName,
+			)
+			if err == nil {
+				log.Warnf("(vmnetcfg.retryPendingUnwinds) [%s/%s] removed the pending ledger record of ip %s in pool %s",
+					vmnetcfg.Namespace, vmnetcfg.Name, entry.ip, poolName)
+				c.metrics.UpdateLogStatus("warning")
 
-			continue
-		}
+				continue
+			}
 
-		if errors.Is(err, util.ErrForeignOwner) || apierrors.IsNotFound(err) {
-			// the record belongs to another owner now, or the pool is gone
-			// with its ledger: converged, nothing left to replay
-			log.Warnf("(vmnetcfg.retryPendingUnwinds) [%s/%s] the pending ledger record of ip %s in pool %s converged: %s",
+			if errors.Is(err, util.ErrForeignOwner) || apierrors.IsNotFound(err) {
+				// the record belongs to another owner now, or the pool is
+				// gone with its ledger: converged, nothing left to replay
+				// against this pool
+				log.Warnf("(vmnetcfg.retryPendingUnwinds) [%s/%s] the pending ledger record of ip %s in pool %s converged: %s",
+					vmnetcfg.Namespace, vmnetcfg.Name, entry.ip, poolName, err)
+				c.metrics.UpdateLogStatus("warning")
+
+				continue
+			}
+
+			log.Errorf("(vmnetcfg.retryPendingUnwinds) [%s/%s] cannot remove the pending ledger record of ip %s in pool %s: %s",
 				vmnetcfg.Namespace, vmnetcfg.Name, entry.ip, poolName, err)
-			c.metrics.UpdateLogStatus("warning")
+			c.metrics.UpdateLogStatus("error")
 
-			continue
-		}
+			// the entry is recorded once however many pool objects
+			// claimed the network: a second failure of the same entry
+			// must not duplicate it
+			c.rememberPendingUnwind(key, entry)
 
-		log.Errorf("(vmnetcfg.retryPendingUnwinds) [%s/%s] cannot remove the pending ledger record of ip %s in pool %s: %s",
-			vmnetcfg.Namespace, vmnetcfg.Name, entry.ip, poolName, err)
-		c.metrics.UpdateLogStatus("error")
+			if retryErr == nil {
+				retryErr = err
+			}
 
-		c.rememberPendingUnwind(key, entry)
-
-		if retryErr == nil {
-			retryErr = err
+			break
 		}
 	}
 

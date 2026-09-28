@@ -457,3 +457,27 @@ func TestIPAMIPOwnedByIsDeterministicAcrossMultipleClaims(t *testing.T) {
 		}
 	}
 }
+
+// HasSubnet gates the persisted pool counter recomputation (F04): the
+// counters may only be recomputed from the in-memory state while the
+// network is registered in the allocator, because Used and Available of
+// an unknown network report zero.
+func TestIPAMHasSubnetTracksRegistration(t *testing.T) {
+	a := New()
+
+	if a.HasSubnet("net") {
+		t.Error("an unknown network must not report a subnet")
+	}
+
+	mustAddTwoAddressSubnet(t, a, "net")
+
+	if !a.HasSubnet("net") {
+		t.Error("a registered network must report its subnet")
+	}
+
+	a.DeleteSubnet("net")
+
+	if a.HasSubnet("net") {
+		t.Error("a deleted network must not report a subnet anymore")
+	}
+}

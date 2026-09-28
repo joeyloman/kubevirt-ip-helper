@@ -1505,3 +1505,73 @@ func TestResyncUpdateAfterRegistrationSpecRaceIsStillDetected(t *testing.T) {
 		t.Errorf("app status = %d, want %d: a lease time change is a reload, not a restart", c.appStatus.Load(), APP_RUNNING)
 	}
 }
+
+// The F04 cycle-break complement to the vmnetcfg regressions: an exclude
+// entry which the persisted ledger records for a live binding blocks the
+// registration definitively (the exclude pass can never claim the
+// address while its record names a live owner), and the terminating
+// binding's own cleanup removes that record without requiring the
+// registration (pinned on the vmnetcfg side). once the record is gone
+// the registration must succeed, so the cycle closes instead of pinning
+// both objects forever.
+func TestRegisterIPPoolExcludeConflictClearsWithTheRecord(t *testing.T) {
+	stubNicMutation(t)
+
+	pool := ippoolBehaviorNewTestPool("pool1", "net-a")
+	pool.Spec.IPv4Config.Pool.Exclude = []string{"10.10.10.50"}
+
+	// the persisted ledger records the exclude address for a live binding
+	recorded := pool.DeepCopy()
+	recorded.Status.IPv4.Allocated = map[string]string{
+		"10.10.10.50": "ns/vm-a [02:00:00:00:00:01]",
+	}
+
+	rs := ippoolBehaviorNewRestState(recorded)
+	rs.vmnetcfgs = []*kihv1.VirtualMachineNetworkConfig{
+		{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "vm-a"},
+			Spec: kihv1.VirtualMachineNetworkConfigSpec{
+				VMName: "vm-a",
+				NetworkConfig: []kihv1.NetworkConfig{
+					{IPAddress: "10.10.10.50", MACAddress: "02:00:00:00:00:01", NetworkName: "net-a"},
+				},
+			},
+		},
+	}
+	srv := httptest.NewServer(rs.ippoolBehaviorHandler())
+	t.Cleanup(srv.Close)
+
+	c, _, d, ca, _ := ippoolBehaviorNewTestController(t, srv)
+	c.runListener = func(networkName string, nic string) error {
+		return nil
+	}
+
+	// the live record blocks the registration definitively
+	cleanup, err := c.registerIPPool(pool)
+	if err == nil || !errors.Is(err, ErrPoolUnregistrable) {
+		t.Fatalf("registration = %v (cleanup %v), want the ErrPoolUnregistrable classification", err, cleanup)
+	}
+	if d.CheckPool("net-a") {
+		t.Error("no dhcp pool may exist for the rejected registration")
+	}
+	if ca.Check(pool) {
+		t.Error("no cache entry may exist for the rejected registration")
+	}
+
+	// the terminating binding's cleanup removed its record (F04): the
+	// exclude entry conflicts with nothing anymore
+	rs.mu.Lock()
+	delete(rs.pool.Status.IPv4.Allocated, "10.10.10.50")
+	rs.mu.Unlock()
+
+	// the registration succeeds and the network is served
+	if cleanup, err = c.registerIPPool(pool); err != nil {
+		t.Fatalf("the registration must succeed once the record is gone: %s (cleanup %v)", err, cleanup)
+	}
+	if !d.CheckPool("net-a") {
+		t.Error("the dhcp pool of the registered network must exist")
+	}
+	if !ca.Check(pool) {
+		t.Error("the pool must be cached by its registration")
+	}
+}

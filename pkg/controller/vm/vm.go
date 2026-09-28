@@ -347,47 +347,64 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 	// next registration re-pins to the ghost owner
 	var unrecordedPoolName string
 	if netCfg.IPAddress != "" {
+		// resolve the pool objects which can hold the ledger record: the
+		// cache first (the registered, serving pool of this era), and on
+		// a miss the api (F04). a pool object can exist without a cache
+		// entry - an unregistrable spec, or a registration which is
+		// blocked by the very record this cleanup removes: an exclude
+		// entry conflicting with this binding's live claim, where the
+		// registration requires the release of the claim while the
+		// cleanup used to require the registration. durable cleanup must
+		// not require healthy serving registration of the object it
+		// cleans up: the owner-validated ledger removal runs against the
+		// api-resolved pool object directly, and UpdateStatus preserves
+		// the counters of a network the allocator does not know, so the
+		// write cannot corrupt its durable status
+		var poolNames []string
+
 		pool, poolErr := c.cache.Get("pool", netCfg.NetworkName)
-		if poolErr != nil {
-			// a deleted pool object takes its whole status ledger with it,
-			// so the un-record may only be skipped when the pool is truly
-			// gone: verify that through the api. a pool object which merely
-			// missed the cache still holds the ledger entry, and skipping
-			// the un-record would orphan it forever
+		if poolErr == nil {
+			poolNames = append(poolNames, pool.(kihv1.IPPool).Name)
+		} else {
 			apiPools, listErr := c.kihClientset.KubevirtiphelperV1().IPPools().List(c.ctx, metav1.ListOptions{})
-			if listErr == nil {
-				poolExists := false
-				for _, p := range apiPools.Items {
-					if p.Spec.NetworkName == netCfg.NetworkName {
-						poolExists = true
-
-						break
-					}
-				}
-
-				if !poolExists {
-					log.Warnf("(vm.cleanupNetworkInterface) [%s/%s] the pool of network %s does not exist anymore, its status record is gone with it",
-						vmnetcfg.Namespace, vmnetcfg.Name, netCfg.NetworkName)
-				} else {
-					return fmt.Errorf("(vm.cleanupNetworkInterface) [%s/%s] cannot un-record ip %s of network %s: %s",
-						vmnetcfg.Namespace, vmnetcfg.Name, netCfg.IPAddress, netCfg.NetworkName, poolErr.Error())
-				}
-			} else if listErr != nil {
+			if listErr != nil {
 				// the api verification itself failed: fail conservatively,
 				// the record might still exist in a live pool object
 				return fmt.Errorf("(vm.cleanupNetworkInterface) [%s/%s] cannot verify the pool of network %s, cache miss: %s: %s",
 					vmnetcfg.Namespace, vmnetcfg.Name, netCfg.NetworkName, poolErr.Error(), listErr.Error())
 			}
-		} else {
-			if statusErr := c.updateIPPoolStatus(
+
+			// several pool objects may claim the same network: the record
+			// can live in any of them, and every removal is owner-validated
+			// and idempotent, so each match is cleaned
+			for i := range apiPools.Items {
+				if apiPools.Items[i].Spec.NetworkName == netCfg.NetworkName {
+					poolNames = append(poolNames, apiPools.Items[i].Name)
+				}
+			}
+
+			if len(poolNames) == 0 {
+				// a deleted pool object takes its whole status ledger with
+				// it: the record is gone with the pool, and the releases
+				// below still run (owner-validated no-ops for a network
+				// which is not registered in this era)
+				log.Warnf("(vm.cleanupNetworkInterface) [%s/%s] the pool of network %s does not exist anymore, its status record is gone with it",
+					vmnetcfg.Namespace, vmnetcfg.Name, netCfg.NetworkName)
+				c.metrics.UpdateLogStatus("warning")
+			}
+		}
+
+		for _, poolName := range poolNames {
+			statusErr := c.updateIPPoolStatus(
 				DELETE,
 				vmnetcfg.Namespace,
 				vmnetcfg.Spec.VMName,
 				netCfg.IPAddress,
 				netCfg.NetworkName,
 				netCfg.MACAddress,
-				pool.(kihv1.IPPool).Name,
-			); statusErr != nil {
+				poolName,
+			)
+			if statusErr != nil {
 				// the status entry of another owner is not this vm's to
 				// remove; replaying the cleanup must not abort the durable
 				// update over it. the entry stays, but the live state of this
@@ -404,10 +421,14 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 				}
 
 				log.Warnf("(vm.cleanupNetworkInterface) [%s/%s] the allocation of ip %s in the %s status belongs to another owner, leaving the entry",
-					vmnetcfg.Namespace, vmnetcfg.Name, netCfg.IPAddress, pool.(kihv1.IPPool).Name)
+					vmnetcfg.Namespace, vmnetcfg.Name, netCfg.IPAddress, poolName)
 				c.metrics.UpdateLogStatus("warning")
-			} else {
-				unrecordedPoolName = pool.(kihv1.IPPool).Name
+			} else if c.ipam.HasSubnet(netCfg.NetworkName) {
+				// the counter republish below recomputes from the live
+				// allocator: it applies whenever the allocator knows the
+				// network, cached or not, because the un-record above
+				// persisted the pre-release counts
+				unrecordedPoolName = poolName
 			}
 		}
 	}

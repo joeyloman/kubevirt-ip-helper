@@ -114,8 +114,18 @@ func UpdateStatus(
 			return fmt.Errorf("unsupported ippool status event %s for ip %s in pool %s", event, ip, poolName)
 		}
 		updatedPool.Status.IPv4.Allocated = updatedAllocated
-		updatedPool.Status.IPv4.Used = ipam.Used(networkName)
-		updatedPool.Status.IPv4.Available = ipam.Available(networkName)
+		// the counters describe the serving state of the pool: they are
+		// only recomputed from the in-memory allocator while the network
+		// is registered in it. a pool which exists without a registration
+		// (an unregistrable spec, or a registration blocked by the very
+		// record this write removes) keeps its persisted counters: Used
+		// and Available of an unknown network report zero, so
+		// recomputing them would corrupt the durable status of a pool
+		// whose ledger still holds live entries
+		if ipam.HasSubnet(networkName) {
+			updatedPool.Status.IPv4.Used = ipam.Used(networkName)
+			updatedPool.Status.IPv4.Available = ipam.Available(networkName)
+		}
 		updatedPool.Status.LastUpdate = metav1.Now()
 
 		if _, err := client.KubevirtiphelperV1().IPPools().UpdateStatus(ctx, updatedPool, metav1.UpdateOptions{}); err == nil {

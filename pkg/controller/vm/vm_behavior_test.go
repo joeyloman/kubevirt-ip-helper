@@ -1168,7 +1168,15 @@ func TestCleanupNetworkInterfaceReleasesAllState(t *testing.T) {
 	}
 }
 
-func TestCleanupNetworkInterfaceFailsWhenPoolUnknown(t *testing.T) {
+// the pool exists in the api but is not cached (F04: an unregistrable
+// spec, or a registration blocked by the very record this cleanup
+// removes). durable cleanup must not require healthy serving
+// registration of the object it cleans up: the un-record runs against
+// the api-resolved pool object directly, converges in one pass - the
+// record is removed, the live state is released and the persisted
+// counters are republished post-release - instead of failing on the
+// cache miss and pinning the vm's cleanup forever.
+func TestCleanupNetworkInterfaceProceedsAgainstAnUncachedPool(t *testing.T) {
 	c, f := vmBehaviorNewTestController(t)
 
 	mac := "aa:bb:cc:00:00:01"
@@ -1183,9 +1191,7 @@ func TestCleanupNetworkInterfaceFailsWhenPoolUnknown(t *testing.T) {
 		Spec:       kihv1.VirtualMachineNetworkConfigSpec{VMName: "vm1"},
 	}
 
-	// the pool exists in the api but missed the cache: the status entry
-	// cannot be un-recorded, so the cleanup must report failure (proceeding
-	// silently would orphan the record forever), not a converged success
+	// the pool exists in the api but missed the cache
 	f.mu.Lock()
 	f.pools["pool-a"] = &kihv1.IPPool{
 		ObjectMeta: metav1.ObjectMeta{Name: "pool-a", ResourceVersion: "1"},
@@ -1196,35 +1202,36 @@ func TestCleanupNetworkInterfaceFailsWhenPoolUnknown(t *testing.T) {
 	}
 	f.mu.Unlock()
 
-	err := c.cleanupNetworkInterface(vmnetcfg, &kihv1.NetworkConfig{MACAddress: mac, NetworkName: networkName, IPAddress: ip})
-	if err == nil || !strings.Contains(err.Error(), "does not exists in cache") {
-		t.Fatalf("expected pool cache miss error, got %v", err)
-	}
-	if n := len(f.requestsFor(http.MethodPut, "/status")); n != 0 {
-		t.Errorf("expected no pool status update when the pool misses the cache, got %d", n)
-	}
-	// the un-record failed before any local release: the address stays
-	// fully intact for the retried cleanup
-	if !c.dhcp.CheckLease(mac) {
-		t.Error("expected the lease still registered after the failed un-record")
-	}
-	if used := c.ipam.Used(networkName); used != 1 {
-		t.Errorf("expected the ipam claim kept after the failed un-record, used=%d", used)
+	if err := c.cleanupNetworkInterface(vmnetcfg, &kihv1.NetworkConfig{MACAddress: mac, NetworkName: networkName, IPAddress: ip}); err != nil {
+		t.Fatalf("the cleanup must proceed against the uncached pool: %v", err)
 	}
 
-	// once the pool is cached the retried cleanup converges: the releases
-	// are idempotent and the record is removed
+	// the un-record and the post-release count republish both ran
+	// against the api-resolved pool object
+	if n := len(f.requestsFor(http.MethodPut, "/ippools/pool-a/status")); n != 2 {
+		t.Errorf("pool status updates = %d, want 2 (un-record and count republish)", n)
+	}
+	if pool := f.storedPool("pool-a"); pool != nil {
+		if _, stillThere := pool.Status.IPv4.Allocated[ip]; stillThere {
+			t.Errorf("expected %s removed from allocations, got %v", ip, pool.Status.IPv4.Allocated)
+		}
+		if got := pool.Status.IPv4.Used; got != 0 {
+			t.Errorf("persisted Used = %d, want 0 republished after the release", got)
+		}
+	}
+	if c.dhcp.CheckLease(mac) {
+		t.Error("expected dhcp lease to be deleted")
+	}
+	if used := c.ipam.Used(networkName); used != 0 {
+		t.Errorf("expected the ipam claim released, used=%d", used)
+	}
+
+	// the cached replay converges as the idempotent no-op it now is
 	storePool(t, c, f, "pool-a", networkName, map[string]string{
 		ip: "ns1/vm1 [" + mac + "]",
 	})
 	if err := c.cleanupNetworkInterface(vmnetcfg, &kihv1.NetworkConfig{MACAddress: mac, NetworkName: networkName, IPAddress: ip}); err != nil {
 		t.Fatalf("retried cleanupNetworkInterface: %v", err)
-	}
-	if c.dhcp.CheckLease(mac) {
-		t.Error("expected dhcp lease to be deleted")
-	}
-	if n := len(f.requestsFor(http.MethodPut, "/ippools/pool-a/status")); n != 2 {
-		t.Errorf("expected 2 pool status updates after the retry (un-record and count republish), got %d", n)
 	}
 	if pool := f.storedPool("pool-a"); pool != nil {
 		if _, stillThere := pool.Status.IPv4.Allocated[ip]; stillThere {

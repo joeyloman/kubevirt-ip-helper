@@ -304,14 +304,15 @@ func TestVMNetCfgDivergentTupleUnwindNeverTouchesTheSuccessorClaim(t *testing.T)
 }
 
 // TestVMNetCfgDivergentTupleUnwindConvergesWhenThePoolDied: a captured
-// tuple whose pool was not cached at record time is recorded without a
+// tuple whose pool could not be resolved at record time (the api was
+// unreachable while the recursive cleanup failed) is recorded without a
 // pool name. when the pool object dies before the replay - it takes its
 // whole status ledger with it - the recorded removal is converged
 // without any write: the replay must classify it through the api and
 // release the finalizers instead of pinning them on a pending entry
-// whose record does not exist anymore (a cache-only resolution cannot
-// tell a dead pool from an uncached one and would pin until the next
-// process era).
+// whose record does not exist anymore (a resolution which cannot tell a
+// dead pool from an unreachable api would pin until the next process
+// era).
 func TestVMNetCfgDivergentTupleUnwindConvergesWhenThePoolDied(t *testing.T) {
 	e := newTestEnv(t)
 	e.appStatus.Store(APP_RUNNING)
@@ -331,14 +332,16 @@ func TestVMNetCfgDivergentTupleUnwindConvergesWhenThePoolDied(t *testing.T) {
 	})
 	e.seedVMNetCfg(vmnetcfg)
 
-	// the pool object exists but is not cached: the deleting cleanup
-	// releases the live state of the captured tuple, fails before the
-	// record removal and records the tuple without a pool name
+	// the pool object exists but is not cached, and the api list fails:
+	// the deleting cleanup releases the live state of the captured
+	// tuple, cannot verify the pool and records the tuple without a
+	// pool name
 	if err := e.cache.Delete("pool", testNetwork); err != nil {
 		t.Fatalf("uncaching the pool: %s", err)
 	}
+	e.api.ippoolListCode = http.StatusInternalServerError
 	if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, vmnetcfg); err == nil {
-		t.Fatal("the uncached pool must fail the deletion")
+		t.Fatal("the unverifiable pool must fail the deletion")
 	}
 	if _, still := e.getStoredPool().Status.IPv4.Allocated["10.0.0.2"]; !still {
 		t.Fatal("the ledger record must survive the failed removal")
@@ -347,10 +350,12 @@ func TestVMNetCfgDivergentTupleUnwindConvergesWhenThePoolDied(t *testing.T) {
 		t.Fatalf("finalizers = %v, want kept until the record removal converges", final.Finalizers)
 	}
 
-	// the pool object dies before the retry: its ledger is gone with it
+	// the pool object dies before the retry and the api recovers: its
+	// ledger is gone with it
 	e.api.mu.Lock()
 	delete(e.api.ippools, testPoolName)
 	e.api.mu.Unlock()
+	e.api.ippoolListCode = 0
 
 	// the replay classifies the pool as verifiably gone and the deletion
 	// finalizes
@@ -362,15 +367,17 @@ func TestVMNetCfgDivergentTupleUnwindConvergesWhenThePoolDied(t *testing.T) {
 	}
 }
 
-// TestVMNetCfgDivergentTupleUnwindWaitsForThePoolRegistration: a pool
-// which exists but is not cached (an unregistered pool) still holds the
-// ledger record, yet the replay must not write it: the ledger write
-// recomputes the pool counters from the in-memory ipam, which only knows
-// registered pools, so replaying against the uncached pool would corrupt
-// its durable counters. the entry stays pending and the finalizers stay
-// on - the same fail-closed gate as the deleting cleanup - until the
-// pool registers and the replay converges.
-func TestVMNetCfgDivergentTupleUnwindWaitsForThePoolRegistration(t *testing.T) {
+// TestVMNetCfgDivergentTupleUnwindProceedsAgainstTheUnregisteredPool:
+// the recorded tuple of a divergent cleanup is replayed against the
+// api-resolved pool object even while the pool is not cached (F04):
+// durable cleanup must not wait for the serving registration, because
+// the registration can be blocked by the very record the replay removes
+// (an exclude entry conflicting with the recorded claim). the write
+// recomputes the counters from the live allocator - the subnet of this
+// network is registered, only the pool object is not - so the persisted
+// status converges to the serving state instead of being pinned on a
+// fail-closed entry.
+func TestVMNetCfgDivergentTupleUnwindProceedsAgainstTheUnregisteredPool(t *testing.T) {
 	e := newTestEnv(t)
 	e.appStatus.Store(APP_RUNNING)
 	e.addSubnet("10.0.0.1", "10.0.0.2")
@@ -389,46 +396,37 @@ func TestVMNetCfgDivergentTupleUnwindWaitsForThePoolRegistration(t *testing.T) {
 	})
 	e.seedVMNetCfg(vmnetcfg)
 
-	// the unregistered pool: the first attempt records the tuple without
-	// a pool name and keeps the record
+	// the pool object exists but is not cached, and the api list fails:
+	// the first attempt records the tuple without a pool name
 	if err := e.cache.Delete("pool", testNetwork); err != nil {
 		t.Fatalf("uncaching the pool: %s", err)
 	}
+	e.api.ippoolListCode = http.StatusInternalServerError
 	if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, vmnetcfg); err == nil {
-		t.Fatal("the uncached pool must fail the deletion")
-	}
-
-	// the replay stays fail-closed while the pool exists uncached: the
-	// finalizers stay on and no status write touches the pool
-	if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, e.getStoredVMNetCfg()); err == nil {
-		t.Fatal("the replay must stay pending while the pool is not cached")
+		t.Fatal("the unverifiable pool must fail the deletion")
 	}
 	if final := e.getStoredVMNetCfg(); len(final.Finalizers) != 1 {
-		t.Fatalf("finalizers = %v, want kept while the pool is unregistered", final.Finalizers)
-	}
-	if _, still := e.getStoredPool().Status.IPv4.Allocated["10.0.0.2"]; !still {
-		t.Fatal("the ledger record must stay until the replay converges")
-	}
-	if n := e.countRequests(http.MethodPut, ippoolStatusPath); n != 0 {
-		t.Errorf("pool status writes = %d, want 0: an uncached pool must never be written", n)
+		t.Fatalf("finalizers = %v, want kept until the replay converges", final.Finalizers)
 	}
 
-	// the pool registers: the replay resolves the name, removes the
-	// record and the deletion finalizes
-	e.api.mu.Lock()
-	registered := e.api.ippools[testPoolName].DeepCopy()
-	e.api.mu.Unlock()
-	if err := e.cache.Upsert(registered); err != nil {
-		t.Fatalf("registering the pool into the cache: %s", err)
-	}
+	// the api recovers while the pool still exists uncached: the replay
+	// resolves the pool name through the api list and removes the record
+	// without any registration of the pool
+	e.api.ippoolListCode = 0
 	if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, e.getStoredVMNetCfg()); err != nil {
-		t.Fatalf("the retried deletion must converge after the registration: %s", err)
+		t.Fatalf("the replay must proceed against the unregistered pool: %s", err)
 	}
 	pool := e.getStoredPool()
 	if got, still := pool.Status.IPv4.Allocated["10.0.0.2"]; still {
-		t.Errorf("the ledger record survived the retried deletion: %q", got)
+		t.Errorf("the ledger record survived the replay: %q", got)
 	}
 	if final := e.getStoredVMNetCfg(); len(final.Finalizers) != 0 {
-		t.Errorf("finalizers = %v, want removed after the registration converged the replay", final.Finalizers)
+		t.Errorf("finalizers = %v, want removed after the replay converged", final.Finalizers)
+	}
+	if used := e.ipam.Used(testNetwork); used != 0 {
+		t.Errorf("ipam used = %d, want 0: the claim was released by the first attempt", used)
+	}
+	if got := pool.Status.IPv4.Used; got != 0 {
+		t.Errorf("Used = %d, want 0 recomputed from the live allocator of the registered subnet", got)
 	}
 }

@@ -664,6 +664,22 @@ func (a *IPAllocator) IPOwnedBy(name string, owner string) (ip string, found boo
 	return ip, found
 }
 
+// HasSubnet reports whether the network is registered in this allocator.
+// the persisted pool counters may only be recomputed from its in-memory
+// state while it is: Used and Available of an unregistered network
+// report zero, so recomputing the counters of a pool which exists
+// without a registration (an unregistrable spec, or a registration
+// blocked by the very ledger record a cleanup removes) would corrupt
+// its durable status while its ledger still holds live entries.
+func (a *IPAllocator) HasSubnet(name string) bool {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	_, exists := a.ipam[name]
+
+	return exists
+}
+
 func (a *IPAllocator) Used(name string) (i int) {
 	a.mutex.Lock()
 	defer a.mutex.Unlock()

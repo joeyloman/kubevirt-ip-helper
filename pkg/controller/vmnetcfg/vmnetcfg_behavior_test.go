@@ -299,7 +299,11 @@ type fakeAPIServer struct {
 	conflictPath      string
 	conflictCount     int
 	poolStatusPutCode int
-	vmnetcfgPutCode   int
+	// ippoolListCode fails the cluster-wide ippool list with the given
+	// http code: the cleanup resolution and the pending unwind replay
+	// must fail closed while the api is unreachable
+	ippoolListCode  int
+	vmnetcfgPutCode int
 	// vmnetcfgPutDropConn commits every vmnetcfg PUT but closes the
 	// connection before a response byte is written: the client observes
 	// a lost response (EOF) for a write the server actually applied,
@@ -414,10 +418,20 @@ func (f *fakeAPIServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	switch p[0] {
 	case "ippools":
 		if len(p) < 2 {
-			// the cluster-wide list serves the deletion-path pool
-			// verification: it decides whether a cache-missed pool is
-			// truly gone (its ledger died with it) or merely missed the
-			// cache
+			// the cluster-wide list serves the cleanup resolution and the
+			// deletion-path pool verification: it decides whether a
+			// cache-missed pool is truly gone (its ledger died with it),
+			// merely missed the cache, or holds the record of a cleanup
+			// which must proceed against the unregistered pool
+			f.mu.Lock()
+			failCode := f.ippoolListCode
+			f.mu.Unlock()
+			if failCode != 0 {
+				writeStatus(w, failCode, metav1.StatusReasonInternalError, "boom")
+
+				return
+			}
+
 			f.mu.Lock()
 			list := &kihv1.IPPoolList{}
 			for _, pool := range f.ippools {
