@@ -10,6 +10,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
@@ -65,6 +66,12 @@ type Event struct {
 	poolName           string
 	poolNetworkName    string
 	oldPoolNetworkName string
+	// poolUID carries the deleted object's uid on a DELETE event: the
+	// cache is keyed by the networkname, so a pool which is deleted and
+	// recreated under the same name resolves the replacement's live
+	// registration; only a uid match proves the cache entry belongs to
+	// the deleted generation
+	poolUID types.UID
 }
 
 func NewEventHandler(
@@ -195,6 +202,7 @@ func (e *EventHandler) EventListener() (err error) {
 					action:          DELETE,
 					poolName:        pool.ObjectMeta.Name,
 					poolNetworkName: pool.Spec.NetworkName,
+					poolUID:         pool.ObjectMeta.UID,
 				})
 			}
 		},

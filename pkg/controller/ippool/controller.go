@@ -341,6 +341,22 @@ func (c *Controller) sync(event Event) (err error) {
 
 			return
 		}
+		if p.ObjectMeta.UID != event.poolUID {
+			// the informer removes an object from the store before
+			// delivering its delete event, so a cache entry under the
+			// deleted object's name and networkname whose uid differs is a
+			// same-name replacement registered while the deletion (or its
+			// rate-limited retry) was in flight: tearing down the live
+			// registration now would stop the replacement's DHCP listener,
+			// delete its ipam subnet, dhcp pool and cache entry until its
+			// resync re-registers them. the cleanup is dropped and the
+			// replacement's own events manage the object.
+			log.Warnf("(ippool.sync) IPPool %s [networkname %s] was deleted but a same-name replacement exists, skipping the cleanup of the live state",
+				event.poolName, event.poolNetworkName)
+			c.metrics.UpdateLogStatus("warning")
+
+			return
+		}
 		if err = c.cleanupIPPoolObjects(&p); err != nil {
 			log.Errorf("(ippool.sync) failed to cleanup pool %s: %s", event.poolName, err.Error())
 			c.metrics.UpdateLogStatus("error")
