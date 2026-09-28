@@ -584,11 +584,41 @@ func (h *Handler) validateIPPoolAdmission(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// the sibling handlers apply the same guard: an AdmissionReview
+	// without a request or without an old object cannot be validated, so
+	// a well-formed allow is answered instead of dereferencing a nil
+	// request (which would panic the handler and, with this entry's
+	// implicit failurePolicy Fail, turn every IPPool deletion into an
+	// apiserver webhook failure)
+	if ar.Request == nil || len(ar.Request.OldObject.Raw) == 0 {
+		log.Errorf("the AdmissionReview carries no old object, allowing the request")
+
+		w.Header().Set("Content-Type", "application/json")
+		ar.Response = &admissionv1.AdmissionResponse{
+			UID:     "",
+			Allowed: true,
+		}
+		json.NewEncoder(w).Encode(&ar)
+
+		return
+	}
+
 	pool := &kihv1.IPPool{}
 	if err := json.Unmarshal(ar.Request.OldObject.Raw, &pool); err != nil {
 		log.Errorf("cannot unmarshal json to pool: %s", err)
-		w.WriteHeader(http.StatusInternalServerError)
-		fmt.Fprintf(w, "cannot unmarshal json to pool: %s", err)
+
+		// a corrupt old object cannot be validated; the internal
+		// validators of the sibling handlers answer a well-formed allow in
+		// the same situation, so a half-written 500 body the apiserver
+		// reads as a webhook failure is never produced here
+		w.Header().Set("Content-Type", "application/json")
+		ar.Response = &admissionv1.AdmissionResponse{
+			UID:     ar.Request.UID,
+			Allowed: true,
+		}
+		json.NewEncoder(w).Encode(&ar)
+
+		return
 	}
 
 	ar.Response = h.validateIPPool(ar, pool)
