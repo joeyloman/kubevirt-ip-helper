@@ -1,6 +1,7 @@
 package vmnetcfg
 
 import (
+	"net/http"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -169,5 +170,265 @@ func TestVMNetCfgDeletionLeavesTheForeignLeaseTuple(t *testing.T) {
 	pool := e.getStoredPool()
 	if got, still := pool.Status.IPv4.Allocated["10.0.0.2"]; !still || got != foreignRef {
 		t.Errorf("allocated[10.0.0.2] = %q (present %v), want the foreign record untouched", got, still)
+	}
+}
+
+// TestVMNetCfgDivergentTupleDeletionRetriesUntilTheRecordConverges pins
+// the F03 gap: the deleting cleanup of a divergent tuple releases the
+// lease and the claim before it removes the tuple's ledger record, and
+// the captured tuple is unreconstructible once the by-mac lease deletion
+// ran - neither the spec nor any lease records it anymore. a transient
+// failure of that record removal must therefore stay reachable: the
+// failure records the captured tuple as a pending unwind, the retried
+// deletion replays the owner-validated record removal before it removes
+// the finalizers (the deletion guard), and the record never survives the
+// deletion of the object. the pre-fix retry finalized here with the
+// record stranded, blocking a later binding of the address for the era
+// (a process loss between the attempts is covered by the next era's
+// pool registration, which drops the record of a positively removed
+// binding - pinned by the ippool recovery tests).
+func TestVMNetCfgDivergentTupleDeletionRetriesUntilTheRecordConverges(t *testing.T) {
+	e := newTestEnv(t)
+	e.appStatus.Store(APP_RUNNING)
+	e.addSubnet("10.0.0.1", "10.0.0.2")
+
+	ownerRef := util.AllocationRef(testNamespace, testVMName, testMAC)
+	e.seedPool(map[string]string{"10.0.0.2": ownerRef})
+	if _, err := e.ipam.ReclaimIP(testNetwork, "10.0.0.2", ownerRef); err != nil {
+		t.Fatalf("seeding the quarantined claim: %s", err)
+	}
+	if err := e.dhcp.AddLease(testMAC, testNetwork, "10.0.0.2", testNamespace+"/"+testVMName); err != nil {
+		t.Fatalf("seeding the quarantined lease: %s", err)
+	}
+
+	// the spec tuple is empty: the recorded removal must converge through
+	// the pending unwind, because no spec entry can reach it anymore
+	vmnetcfg := newDeletingVMNetCfg([]kihv1.NetworkConfig{
+		{IPAddress: "", MACAddress: testMAC, NetworkName: testNetwork},
+	})
+	e.seedVMNetCfg(vmnetcfg)
+
+	// the record removal of the captured tuple fails transiently
+	e.api.poolStatusPutCode = http.StatusInternalServerError
+	if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, vmnetcfg); err == nil {
+		t.Fatal("the failed record removal must fail the deletion")
+	}
+
+	// the destructive half of the cleanup already ran: the tuple is only
+	// reachable through the recorded pending unwind now
+	if e.dhcp.CheckLease(testMAC) {
+		t.Error("the lease must be released by the first deletion attempt")
+	}
+	if used := e.ipam.Used(testNetwork); used != 0 {
+		t.Errorf("ipam used = %d, want the claim released by the first attempt", used)
+	}
+	if _, still := e.getStoredPool().Status.IPv4.Allocated["10.0.0.2"]; !still {
+		t.Fatal("the ledger record of the captured tuple must survive the failed removal")
+	}
+	if final := e.getStoredVMNetCfg(); len(final.Finalizers) != 1 {
+		t.Fatalf("finalizers = %v, want kept until the record removal converges", final.Finalizers)
+	}
+
+	// the retry converges the record removal before it finalizes
+	e.api.poolStatusPutCode = 0
+	if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, e.getStoredVMNetCfg()); err != nil {
+		t.Fatalf("the retried deletion must converge: %s", err)
+	}
+	pool := e.getStoredPool()
+	if got, still := pool.Status.IPv4.Allocated["10.0.0.2"]; still {
+		t.Errorf("the ledger record survived the retried deletion: %q", got)
+	}
+	if final := e.getStoredVMNetCfg(); len(final.Finalizers) != 0 {
+		t.Errorf("finalizers = %v, want removed after the record converged", final.Finalizers)
+	}
+}
+
+// TestVMNetCfgDivergentTupleUnwindNeverTouchesTheSuccessorClaim: after
+// the failed record removal released the captured tuple's claim, a
+// successor may take the address over while the stale record still names
+// the deleting binding. the replayed removal is owner-validated on the
+// ledger layer alone: it removes only the stale record of this binding,
+// never the successor's claim.
+func TestVMNetCfgDivergentTupleUnwindNeverTouchesTheSuccessorClaim(t *testing.T) {
+	e := newTestEnv(t)
+	e.appStatus.Store(APP_RUNNING)
+	e.addSubnet("10.0.0.1", "10.0.0.2")
+
+	ownerRef := util.AllocationRef(testNamespace, testVMName, testMAC)
+	e.seedPool(map[string]string{"10.0.0.2": ownerRef})
+	if _, err := e.ipam.ReclaimIP(testNetwork, "10.0.0.2", ownerRef); err != nil {
+		t.Fatalf("seeding the quarantined claim: %s", err)
+	}
+	if err := e.dhcp.AddLease(testMAC, testNetwork, "10.0.0.2", testNamespace+"/"+testVMName); err != nil {
+		t.Fatalf("seeding the quarantined lease: %s", err)
+	}
+
+	vmnetcfg := newDeletingVMNetCfg([]kihv1.NetworkConfig{
+		{IPAddress: "", MACAddress: testMAC, NetworkName: testNetwork},
+	})
+	e.seedVMNetCfg(vmnetcfg)
+
+	// the first attempt releases the live state and fails the record
+	e.api.poolStatusPutCode = http.StatusInternalServerError
+	if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, vmnetcfg); err == nil {
+		t.Fatal("the failed record removal must fail the deletion")
+	}
+
+	// a successor takes the released address over while the stale record
+	// still names the deleting binding (its own ledger write would be
+	// rejected as foreign - the stale record blocks it until the replay)
+	successorRef := util.AllocationRef("other-ns", "other-vm", testMAC2)
+	if _, err := e.ipam.ReclaimIP(testNetwork, "10.0.0.2", successorRef); err != nil {
+		t.Fatalf("seeding the successor claim: %s", err)
+	}
+
+	e.api.poolStatusPutCode = 0
+	if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, e.getStoredVMNetCfg()); err != nil {
+		t.Fatalf("the retried deletion must converge: %s", err)
+	}
+
+	// only the stale record went away; the successor keeps the claim
+	pool := e.getStoredPool()
+	if got, still := pool.Status.IPv4.Allocated["10.0.0.2"]; still {
+		t.Errorf("the stale ledger record survived the retried deletion: %q", got)
+	}
+	if ip, found := e.ipam.IPOwnedBy(testNetwork, successorRef); !found || ip != "10.0.0.2" {
+		t.Errorf("successor claim = %s (found %v), want the untouched 10.0.0.2", ip, found)
+	}
+	if used := e.ipam.Used(testNetwork); used != 1 {
+		t.Errorf("ipam used = %d, want 1: only the successor's claim remains", used)
+	}
+	if final := e.getStoredVMNetCfg(); len(final.Finalizers) != 0 {
+		t.Errorf("finalizers = %v, want removed after the record converged", final.Finalizers)
+	}
+}
+
+// TestVMNetCfgDivergentTupleUnwindConvergesWhenThePoolDied: a captured
+// tuple whose pool was not cached at record time is recorded without a
+// pool name. when the pool object dies before the replay - it takes its
+// whole status ledger with it - the recorded removal is converged
+// without any write: the replay must classify it through the api and
+// release the finalizers instead of pinning them on a pending entry
+// whose record does not exist anymore (a cache-only resolution cannot
+// tell a dead pool from an uncached one and would pin until the next
+// process era).
+func TestVMNetCfgDivergentTupleUnwindConvergesWhenThePoolDied(t *testing.T) {
+	e := newTestEnv(t)
+	e.appStatus.Store(APP_RUNNING)
+	e.addSubnet("10.0.0.1", "10.0.0.2")
+
+	ownerRef := util.AllocationRef(testNamespace, testVMName, testMAC)
+	e.seedPool(map[string]string{"10.0.0.2": ownerRef})
+	if _, err := e.ipam.ReclaimIP(testNetwork, "10.0.0.2", ownerRef); err != nil {
+		t.Fatalf("seeding the quarantined claim: %s", err)
+	}
+	if err := e.dhcp.AddLease(testMAC, testNetwork, "10.0.0.2", testNamespace+"/"+testVMName); err != nil {
+		t.Fatalf("seeding the quarantined lease: %s", err)
+	}
+
+	vmnetcfg := newDeletingVMNetCfg([]kihv1.NetworkConfig{
+		{IPAddress: "", MACAddress: testMAC, NetworkName: testNetwork},
+	})
+	e.seedVMNetCfg(vmnetcfg)
+
+	// the pool object exists but is not cached: the deleting cleanup
+	// releases the live state of the captured tuple, fails before the
+	// record removal and records the tuple without a pool name
+	if err := e.cache.Delete("pool", testNetwork); err != nil {
+		t.Fatalf("uncaching the pool: %s", err)
+	}
+	if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, vmnetcfg); err == nil {
+		t.Fatal("the uncached pool must fail the deletion")
+	}
+	if _, still := e.getStoredPool().Status.IPv4.Allocated["10.0.0.2"]; !still {
+		t.Fatal("the ledger record must survive the failed removal")
+	}
+	if final := e.getStoredVMNetCfg(); len(final.Finalizers) != 1 {
+		t.Fatalf("finalizers = %v, want kept until the record removal converges", final.Finalizers)
+	}
+
+	// the pool object dies before the retry: its ledger is gone with it
+	e.api.mu.Lock()
+	delete(e.api.ippools, testPoolName)
+	e.api.mu.Unlock()
+
+	// the replay classifies the pool as verifiably gone and the deletion
+	// finalizes
+	if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, e.getStoredVMNetCfg()); err != nil {
+		t.Fatalf("the retried deletion must converge after the pool died: %s", err)
+	}
+	if final := e.getStoredVMNetCfg(); len(final.Finalizers) != 0 {
+		t.Errorf("finalizers = %v, want removed: the pool took its ledger with it", final.Finalizers)
+	}
+}
+
+// TestVMNetCfgDivergentTupleUnwindWaitsForThePoolRegistration: a pool
+// which exists but is not cached (an unregistered pool) still holds the
+// ledger record, yet the replay must not write it: the ledger write
+// recomputes the pool counters from the in-memory ipam, which only knows
+// registered pools, so replaying against the uncached pool would corrupt
+// its durable counters. the entry stays pending and the finalizers stay
+// on - the same fail-closed gate as the deleting cleanup - until the
+// pool registers and the replay converges.
+func TestVMNetCfgDivergentTupleUnwindWaitsForThePoolRegistration(t *testing.T) {
+	e := newTestEnv(t)
+	e.appStatus.Store(APP_RUNNING)
+	e.addSubnet("10.0.0.1", "10.0.0.2")
+
+	ownerRef := util.AllocationRef(testNamespace, testVMName, testMAC)
+	e.seedPool(map[string]string{"10.0.0.2": ownerRef})
+	if _, err := e.ipam.ReclaimIP(testNetwork, "10.0.0.2", ownerRef); err != nil {
+		t.Fatalf("seeding the quarantined claim: %s", err)
+	}
+	if err := e.dhcp.AddLease(testMAC, testNetwork, "10.0.0.2", testNamespace+"/"+testVMName); err != nil {
+		t.Fatalf("seeding the quarantined lease: %s", err)
+	}
+
+	vmnetcfg := newDeletingVMNetCfg([]kihv1.NetworkConfig{
+		{IPAddress: "", MACAddress: testMAC, NetworkName: testNetwork},
+	})
+	e.seedVMNetCfg(vmnetcfg)
+
+	// the unregistered pool: the first attempt records the tuple without
+	// a pool name and keeps the record
+	if err := e.cache.Delete("pool", testNetwork); err != nil {
+		t.Fatalf("uncaching the pool: %s", err)
+	}
+	if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, vmnetcfg); err == nil {
+		t.Fatal("the uncached pool must fail the deletion")
+	}
+
+	// the replay stays fail-closed while the pool exists uncached: the
+	// finalizers stay on and no status write touches the pool
+	if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, e.getStoredVMNetCfg()); err == nil {
+		t.Fatal("the replay must stay pending while the pool is not cached")
+	}
+	if final := e.getStoredVMNetCfg(); len(final.Finalizers) != 1 {
+		t.Fatalf("finalizers = %v, want kept while the pool is unregistered", final.Finalizers)
+	}
+	if _, still := e.getStoredPool().Status.IPv4.Allocated["10.0.0.2"]; !still {
+		t.Fatal("the ledger record must stay until the replay converges")
+	}
+	if n := e.countRequests(http.MethodPut, ippoolStatusPath); n != 0 {
+		t.Errorf("pool status writes = %d, want 0: an uncached pool must never be written", n)
+	}
+
+	// the pool registers: the replay resolves the name, removes the
+	// record and the deletion finalizes
+	e.api.mu.Lock()
+	registered := e.api.ippools[testPoolName].DeepCopy()
+	e.api.mu.Unlock()
+	if err := e.cache.Upsert(registered); err != nil {
+		t.Fatalf("registering the pool into the cache: %s", err)
+	}
+	if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, e.getStoredVMNetCfg()); err != nil {
+		t.Fatalf("the retried deletion must converge after the registration: %s", err)
+	}
+	pool := e.getStoredPool()
+	if got, still := pool.Status.IPv4.Allocated["10.0.0.2"]; still {
+		t.Errorf("the ledger record survived the retried deletion: %q", got)
+	}
+	if final := e.getStoredVMNetCfg(); len(final.Finalizers) != 0 {
+		t.Errorf("finalizers = %v, want removed after the registration converged the replay", final.Finalizers)
 	}
 }

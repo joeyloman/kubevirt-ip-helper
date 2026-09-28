@@ -46,20 +46,24 @@ type allocatedNetworkConfig struct {
 }
 
 // pendingLedgerDelete records the ledger entry of a nic whose compensating
-// or unwind delete failed while a concurrent cleanup removed the nic: the
-// tuple is not reconstructible from the spec anymore once the removal is
-// durable, so the controller keeps it reachable and replays the
-// owner-validated deletion on the reconciliations of the owning object
-// until it converges (a restart loses the record, but the pool
-// registration revalidates the persisted ledger and drops the orphaned
-// entry of a positively removed binding).
+// or unwind delete failed while a concurrent cleanup removed the nic, or
+// of a divergent tuple whose deleting cleanup released the live state
+// before the record removal failed: the tuple is not reconstructible from
+// the spec or any lease anymore, so the controller keeps it reachable and
+// replays the owner-validated deletion on the reconciliations of the
+// owning object until it converges (a restart loses the record, but the
+// pool registration revalidates the persisted ledger and drops the
+// orphaned entry of a positively removed binding).
 type pendingLedgerDelete struct {
 	namespace   string
 	vmName      string
 	ip          string
 	networkName string
 	macAddress  string
-	poolName    string
+	// poolName names the pool object which holds the record; a captured
+	// tuple whose pool was not cached at record time leaves it empty and
+	// the replay resolves it from the network name instead
+	poolName string
 }
 
 // rollbackNetworkAllocation reverts the allocation side effects of a
@@ -1326,6 +1330,39 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 				NetworkName: capturedLease.PoolName,
 				IPAddress:   capturedLease.ClientIP.String(),
 			}, true); err != nil {
+				// the captured tuple is unreconstructible now: the lease
+				// was deleted, the claim released, and neither the spec
+				// nor any lease records it anymore (F03). its unfinished
+				// ledger removal must stay reachable or the retried
+				// deletion finalizes with the record stranded - no
+				// reconciliation ever iterates this tuple again. the
+				// pending unwind replays the owner-validated record
+				// removal on every reconciliation of this object and the
+				// deletion guard keeps the finalizers until it converges;
+				// a process loss between the attempts is covered by the
+				// next era's pool registration, which revalidates the
+				// persisted ledger and drops the record of a positively
+				// removed binding. the pool of the captured network may
+				// not be cached at this point, so the pool name stays
+				// optional here and the replay resolves it once the pool
+				// is cached again
+				poolName := ""
+				if pool, poolErr := c.cache.Get("pool", capturedLease.PoolName); poolErr == nil {
+					poolName = pool.(kihv1.IPPool).Name
+				}
+
+				c.rememberPendingUnwind(
+					fmt.Sprintf("%s/%s", vmnetcfg.Namespace, vmnetcfg.Name),
+					pendingLedgerDelete{
+						namespace:   vmnetcfg.Namespace,
+						vmName:      vmnetcfg.Spec.VMName,
+						ip:          capturedLease.ClientIP.String(),
+						networkName: capturedLease.PoolName,
+						macAddress:  netCfg.MACAddress,
+						poolName:    poolName,
+					},
+				)
+
 				return err
 			}
 		}
