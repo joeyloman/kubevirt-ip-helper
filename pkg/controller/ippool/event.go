@@ -44,18 +44,19 @@ const (
 const resyncPeriod = time.Minute
 
 type EventHandler struct {
-	ctx            context.Context
-	ipam           *ipam.IPAllocator
-	dhcp           *dhcp.DHCPAllocator
-	metrics        *metrics.MetricsAllocator
-	cache          *kihcache.CacheAllocator
-	kubeConfig     string
-	kubeContext    string
-	kubeRestConfig *rest.Config
-	kihClientset   *kihclientset.Clientset
-	kcli           kubecli.KubevirtClient
-	appStatus      *atomic.Int32
-	startupGate    *gate.Gate
+	ctx               context.Context
+	ipam              *ipam.IPAllocator
+	dhcp              *dhcp.DHCPAllocator
+	metrics           *metrics.MetricsAllocator
+	cache             *kihcache.CacheAllocator
+	kubeConfig        string
+	kubeContext       string
+	kubeRestConfig    *rest.Config
+	kihClientset      *kihclientset.Clientset
+	kihWatchClientset *kihclientset.Clientset
+	kcli              kubecli.KubevirtClient
+	appStatus         *atomic.Int32
+	startupGate       *gate.Gate
 }
 
 type Event struct {
@@ -105,10 +106,17 @@ func (e *EventHandler) Init() (err error) {
 		return
 	}
 
-	// the kubevirt client serves the one-shot VirtualMachine existence
-	// checks of the ledger revalidation (the 30s bound of the config
-	// stays: unlike the informer clients there is no watch connection
-	// whose long-poll a timeout would tear down)
+	// the 30s bound of the config stays on kihClientset: it serves the
+	// one-shot controller api calls and the kubevirt client's VirtualMachine
+	// existence checks. the informer watches below need their own client,
+	// since a watch long-poll is torn down by the http client timeout (a
+	// constant re-watch churn), and an initial list which takes longer
+	// than the timeout would never complete the cache sync
+	e.kihWatchClientset, err = kihclientset.NewForConfig(watchRestConfig(e.kubeRestConfig))
+	if err != nil {
+		return
+	}
+
 	e.kcli, err = kubecli.GetKubevirtClientFromRESTConfig(e.kubeRestConfig)
 	if err != nil {
 		return
@@ -117,11 +125,24 @@ func (e *EventHandler) Init() (err error) {
 	return
 }
 
+// watchRestConfig strips the one-shot client timeout for the informer
+// client: the timeout applies to the watch connections too, so the
+// reflector's long-poll would be torn down by the http client every time
+// it expires (a constant re-watch churn), and an initial list which takes
+// longer than the timeout would never complete, leaving the controller
+// blocked in the cache sync wait. the one-shot bound stays on the config
+// handed to the kihClientset.
+func watchRestConfig(config *rest.Config) *rest.Config {
+	watchConfig := rest.CopyConfig(config)
+	watchConfig.Timeout = 0
+
+	return watchConfig
+}
+
 func (e *EventHandler) getKubeConfig() (config *rest.Config, err error) {
 	// bound every controller api call: a hang against the api must not
 	// wedge the reconcilers behind an unresponsive transport
 	const configTimeout = 30 * time.Second
-
 	if !util.FileExists(e.kubeConfig) {
 		if config, err = rest.InClusterConfig(); err != nil {
 			return
@@ -145,7 +166,15 @@ func (e *EventHandler) getKubeConfig() (config *rest.Config, err error) {
 func (e *EventHandler) EventListener() (err error) {
 	log.Infof("(ippool.EventListener) starting the IPPool event listener")
 
-	vmWatcher := cache.NewListWatchFromClient(e.kihClientset.KubevirtiphelperV1().RESTClient(), "ippools", corev1.NamespaceAll, fields.Everything())
+	// Init wires a timeout-free watch clientset; handlers constructed
+	// directly without Init (the tests) only carry the one-shot clientset,
+	// which keeps their unavailable-apiserver semantics intact
+	watchClientset := e.kihWatchClientset
+	if watchClientset == nil {
+		watchClientset = e.kihClientset
+	}
+
+	vmWatcher := cache.NewListWatchFromClient(watchClientset.KubevirtiphelperV1().RESTClient(), "ippools", corev1.NamespaceAll, fields.Everything())
 
 	queue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
 

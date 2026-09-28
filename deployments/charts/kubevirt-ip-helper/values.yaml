@@ -48,12 +48,6 @@ kubevirtiphelper:
       cpu: 200m
       memory: 128Mi
   
-  autoscaling:
-    enabled: false
-    minReplicas: 1
-    maxReplicas: 100
-    targetCPUUtilizationPercentage: 80
-    # targetMemoryUtilizationPercentage: 80
   
   nodeSelector: {}
   
@@ -110,12 +104,6 @@ webhook:
       cpu: 100m
       memory: 8Mi
   
-  autoscaling:
-    enabled: false
-    minReplicas: 1
-    maxReplicas: 100
-    targetCPUUtilizationPercentage: 80
-    # targetMemoryUtilizationPercentage: 80
   
   nodeSelector: {}
   

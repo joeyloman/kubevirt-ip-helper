@@ -63,7 +63,11 @@ func (h *Handler) Run(certRenewalPeriod int64) {
 
 		tlsPair, err := h.generateTLSKeyAndCert()
 		if err != nil {
-			log.Errorf("%s", err.Error())
+			// without a usable key/cert pair there is nothing to store:
+			// createSecret would panic on the empty certificate, so a
+			// generation failure (transient apiserver error, keygen
+			// failure) must abort here and let the pod restart retry
+			log.Fatalf("(webhook.config) %s", err.Error())
 		}
 
 		if err := h.createSecret(tlsPair); err != nil {

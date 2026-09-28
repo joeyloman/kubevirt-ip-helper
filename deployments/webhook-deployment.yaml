@@ -137,6 +137,28 @@ spec:
           - name: LOGLEVEL
             value: INFO
         imagePullPolicy: Always
+        # the readyz endpoint rides the TLS admission server on 8443: a
+        # probe failure (wedged or unlistened server) must restart the
+        # pod, since a silently dead webhook turns every ippool deletion
+        # into an apiserver-timeout hang
+        livenessProbe:
+          httpGet:
+            scheme: HTTPS
+            path: /readyz
+            port: 8443
+          initialDelaySeconds: 15
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            scheme: HTTPS
+            path: /readyz
+            port: 8443
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 3
         resources:
           requests:
             cpu: 100m

@@ -839,7 +839,13 @@ func (h *Handler) Run() {
 		MaxHeaderBytes: 1 << 20, // 1048576
 	}
 
-	log.Error(h.httpServer.ListenAndServeTLS(certPath, keyPath))
+	// a fatal listen error (missing/corrupt tls data, port bind failure)
+	// must kill the process: returning would leave a webhook serving
+	// nothing, which no probe currently detects and which hangs every
+	// ippool deletion until the apiserver times out
+	if err := h.httpServer.ListenAndServeTLS(certPath, keyPath); err != nil && err != http.ErrServerClosed {
+		log.Fatalf("(webhook.service) %s", err.Error())
+	}
 }
 
 func (h *Handler) Stop() error {

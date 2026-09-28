@@ -110,14 +110,31 @@ func (h *Handler) createAndSignCSR(pCsr []byte) ([]byte, error) {
 		return nil, fmt.Errorf("error while approving signing request: %s", err.Error())
 	}
 
-	time.Sleep(2 * time.Second)
+	// the signer issues asynchronously: a fixed sleep returns an empty
+	// Status.Certificate on a slow signer, which would be stored as an
+	// empty tls.crt the renewal scheduler can never heal, so poll until
+	// the certificate is present and fail loudly otherwise
+	var certificate []byte
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		updatedCsr, err := h.clientset.CertificatesV1().CertificateSigningRequests().Get(context.TODO(), h.csrName, metav1.GetOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("error while getting the updated signing request: %s", err.Error())
+		}
 
-	updatedCsr, err := h.clientset.CertificatesV1().CertificateSigningRequests().Get(context.TODO(), h.csrName, metav1.GetOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("error while getting the updated signing request: %s", err.Error())
+		if len(updatedCsr.Status.Certificate) > 0 {
+			certificate = updatedCsr.Status.Certificate
+			break
+		}
+
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("timed out waiting for the signer to issue the certificate for csr %s", h.csrName)
+		}
+
+		time.Sleep(2 * time.Second)
 	}
 
-	return updatedCsr.Status.Certificate, nil
+	return certificate, nil
 }
 
 func (h *Handler) getTLSDataFromSecret() (tlsPair tls.Certificate, err error) {
