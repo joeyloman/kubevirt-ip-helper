@@ -76,21 +76,23 @@ func NewEventHandler(
 	kubeContext string,
 	kubeRestConfig *rest.Config,
 	kihClientset *kihclientset.Clientset,
+	kihWatchClientset *kihclientset.Clientset,
 	appStatus *atomic.Int32,
 	startupGate *gate.Gate,
 ) *EventHandler {
 	return &EventHandler{
-		ctx:            ctx,
-		ipam:           ipam,
-		dhcp:           dhcp,
-		metrics:        metrics,
-		cache:          cache,
-		kubeConfig:     kubeConfig,
-		kubeContext:    kubeContext,
-		kubeRestConfig: kubeRestConfig,
-		kihClientset:   kihClientset,
-		appStatus:      appStatus,
-		startupGate:    startupGate,
+		ctx:               ctx,
+		ipam:              ipam,
+		dhcp:              dhcp,
+		metrics:           metrics,
+		cache:             cache,
+		kubeConfig:        kubeConfig,
+		kubeContext:       kubeContext,
+		kubeRestConfig:    kubeRestConfig,
+		kihClientset:      kihClientset,
+		kihWatchClientset: kihWatchClientset,
+		appStatus:         appStatus,
+		startupGate:       startupGate,
 	}
 }
 
@@ -111,7 +113,7 @@ func (e *EventHandler) Init() (err error) {
 	// since a watch long-poll is torn down by the http client timeout (a
 	// constant re-watch churn), and an initial list which takes longer
 	// than the timeout would never complete the cache sync
-	e.kihWatchClientset, err = kihclientset.NewForConfig(watchRestConfig(e.kubeRestConfig))
+	e.kihWatchClientset, err = kihclientset.NewForConfig(util.WatchRestConfig(e.kubeRestConfig))
 	if err != nil {
 		return
 	}
@@ -124,20 +126,6 @@ func (e *EventHandler) Init() (err error) {
 	}
 
 	return
-}
-
-// watchRestConfig strips the one-shot client timeout for the informer
-// client: the timeout applies to the watch connections too, so the
-// reflector's long-poll would be torn down by the http client every time
-// it expires (a constant re-watch churn), and an initial list which takes
-// longer than the timeout would never complete, leaving the controller
-// blocked in the cache sync wait. the one-shot bound stays on the config
-// handed to the kihClientset.
-func watchRestConfig(config *rest.Config) *rest.Config {
-	watchConfig := rest.CopyConfig(config)
-	watchConfig.Timeout = 0
-
-	return watchConfig
 }
 
 func (e *EventHandler) getKubeConfig() (config *rest.Config, err error) {
@@ -168,15 +156,7 @@ func (e *EventHandler) getKubeConfig() (config *rest.Config, err error) {
 func (e *EventHandler) EventListener() (err error) {
 	log.Infof("(vmnetcfg.EventListener) starting the VirtualMachineNetworkConfig event listener")
 
-	// Init wires a timeout-free watch clientset; handlers constructed
-	// directly without Init (the tests) only carry the one-shot clientset,
-	// which keeps their unavailable-apiserver semantics intact
-	watchClientset := e.kihWatchClientset
-	if watchClientset == nil {
-		watchClientset = e.kihClientset
-	}
-
-	vmWatcher := cache.NewListWatchFromClient(watchClientset.KubevirtiphelperV1().RESTClient(), "virtualmachinenetworkconfigs", corev1.NamespaceAll, fields.Everything())
+	vmWatcher := cache.NewListWatchFromClient(e.kihWatchClientset.KubevirtiphelperV1().RESTClient(), "virtualmachinenetworkconfigs", corev1.NamespaceAll, fields.Everything())
 
 	queue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
 

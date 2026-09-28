@@ -558,6 +558,7 @@ func TestEventListenerStopsWhenContextIsCancelled(t *testing.T) {
 		"",
 		nil,
 		newUnavailableClientset(t),
+		newUnavailableClientset(t),
 		new(atomic.Int32),
 		nil,
 	)

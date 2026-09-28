@@ -137,6 +137,18 @@ spec:
           - name: LOGLEVEL
             value: INFO
         imagePullPolicy: Always
+        # the TLS server binds :8443 only after the cert bootstrap finished,
+        # which can take up to the 60s CSR issuance deadline: the startup
+        # probe keeps liveness/readiness suppressed until the server
+        # answers, so a slow signer cannot kill the pod mid-bootstrap
+        # (restarts would reset the secret and loop forever)
+        startupProbe:
+          httpGet:
+            scheme: HTTPS
+            path: /readyz
+            port: 8443
+          periodSeconds: 10
+          failureThreshold: 30
         # the readyz endpoint rides the TLS admission server on 8443: a
         # probe failure (wedged or unlistened server) must restart the
         # pod, since a silently dead webhook turns every ippool deletion

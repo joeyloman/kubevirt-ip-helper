@@ -494,6 +494,7 @@ func (h *handler) RunServices(ctx context.Context) error {
 		h.kubeContext,
 		nil,
 		nil,
+		nil,
 		era.appStatus,
 		era.ippoolGate,
 	)
@@ -562,6 +563,7 @@ func (h *handler) RunServices(ctx context.Context) error {
 		era.cache,
 		h.kubeConfigFile,
 		h.kubeContext,
+		nil,
 		nil,
 		nil,
 		era.appStatus,

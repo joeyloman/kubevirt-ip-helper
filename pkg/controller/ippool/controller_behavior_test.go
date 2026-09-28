@@ -567,6 +567,7 @@ func TestEventListenerStopsWhenContextIsCancelled(t *testing.T) {
 		"",
 		nil,
 		newUnavailableClientset(t),
+		newUnavailableClientset(t),
 		new(atomic.Int32),
 		nil,
 	)
@@ -630,6 +631,7 @@ func newTestEventHandler(kubeConfig, kubeContext string) *EventHandler {
 		kihcache.NewCacheAllocator(),
 		kubeConfig,
 		kubeContext,
+		nil,
 		nil,
 		nil,
 		new(atomic.Int32),

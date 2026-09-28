@@ -127,6 +127,16 @@ func (h *Handler) createAndSignCSR(pCsr []byte) ([]byte, error) {
 			break
 		}
 
+		// a rejected request (the kubelet-serving signer validates the
+		// request against the node objects) never gets a certificate:
+		// surface the signer's reason immediately instead of burning the
+		// full deadline on a poll that cannot succeed
+		for _, condition := range updatedCsr.Status.Conditions {
+			if condition.Type == certsv1.CertificateFailed {
+				return nil, fmt.Errorf("the signer rejected csr %s: %s: %s", h.csrName, condition.Reason, condition.Message)
+			}
+		}
+
 		if time.Now().After(deadline) {
 			return nil, fmt.Errorf("timed out waiting for the signer to issue the certificate for csr %s", h.csrName)
 		}

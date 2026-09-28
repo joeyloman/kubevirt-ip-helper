@@ -25,6 +25,7 @@ import (
 	kihclientset "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/clientset/versioned"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/metrics"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/util"
 )
 
 // shutdownWait is the bounded amount of time a test waits for a controller
@@ -700,7 +701,7 @@ func TestGetKubeConfigUnknownContextFails(t *testing.T) {
 func TestWatchRestConfigStripsTheClientTimeout(t *testing.T) {
 	config := &rest.Config{Host: "https://example.com", Timeout: 30 * time.Second}
 
-	watchConfig := watchRestConfig(config)
+	watchConfig := util.WatchRestConfig(config)
 
 	if watchConfig.Timeout != 0 {
 		t.Errorf("watch config timeout = %v, want it stripped", watchConfig.Timeout)
