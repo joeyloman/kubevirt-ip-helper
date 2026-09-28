@@ -1345,6 +1345,28 @@ func (c *Controller) sweepOrphanedBinding(vmnetcfg *kihv1.VirtualMachineNetworkC
 	return true
 }
 
+// releaseDeletedBinding replays the allocation release of a vmnetcfg whose
+// object is already gone. a manually created binding carries no cleanup
+// finalizer, so its deletion never produces a terminating sync, and a
+// force-deleted controller-managed binding can converge the same way; both
+// would otherwise strand their lease, claim and ledger entry until the
+// next era rebuild reclaims them. every release is owner-validated and
+// idempotent: a converged cleanup replays as a no-op, a foreign or
+// successor entry is left to its owner, and a failed release returns an
+// error so the retried sync converges.
+func (c *Controller) releaseDeletedBinding(vmnetcfg *kihv1.VirtualMachineNetworkConfig) (err error) {
+	for i := range vmnetcfg.Spec.NetworkConfig {
+		if err := c.cleanupNetworkInterface(vmnetcfg, &vmnetcfg.Spec.NetworkConfig[i], true); err != nil {
+			return fmt.Errorf("(vmnetcfg.releaseDeletedBinding) [%s/%s] %s",
+				vmnetcfg.Namespace, vmnetcfg.Name, err.Error())
+		}
+	}
+
+	c.deleteVirtualMachineNetworkConfigMetrics(vmnetcfg)
+
+	return
+}
+
 func (c *Controller) cleanupVirtualMachineNetworkConfig(vmnetcfg *kihv1.VirtualMachineNetworkConfig) (err error) {
 	log.Debugf("(vmnetcfg.cleanupVirtualMachineNetworkConfig) [%s/%s] starting cleanup for vmnetcfg",
 		vmnetcfg.Namespace, vmnetcfg.Name)

@@ -64,6 +64,11 @@ type EventHandler struct {
 type Event struct {
 	key    string
 	action string
+	// vmnetcfg carries the tombstone object of a DELETE event: a manually
+	// created vmnetcfg carries no cleanup finalizer, so its deletion never
+	// produces a terminating sync and the replay of its release needs the
+	// last-seen spec
+	vmnetcfg *kihv1.VirtualMachineNetworkConfig
 }
 
 func NewEventHandler(
@@ -188,8 +193,9 @@ func (e *EventHandler) EventListener() (err error) {
 			key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(vmnetcfg)
 			if err == nil {
 				queue.Add(Event{
-					key:    key,
-					action: DELETE,
+					key:      key,
+					action:   DELETE,
+					vmnetcfg: vmnetcfg,
 				})
 			}
 		},

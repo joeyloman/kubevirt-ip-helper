@@ -424,6 +424,19 @@ func (c *Controller) sync(event Event) (err error) {
 		// them, so a stranded record cannot keep the entry resident for
 		// the rest of the era
 		c.drainPendingUnwinds(event.key)
+
+		// a manually created vmnetcfg carries no cleanup finalizer, so its
+		// deletion never produced a terminating sync: replay the release
+		// from the tombstone the informer delivered, or the lease, the
+		// claim and the ledger entry stay resident until the next era
+		// rebuild reclaims them. every release is owner-validated and
+		// idempotent, so the replay of a controller-managed deletion whose
+		// finalizer cleanup already converged is a no-op
+		if event.vmnetcfg != nil {
+			if err := c.releaseDeletedBinding(event.vmnetcfg); err != nil {
+				return err
+			}
+		}
 	}
 
 	return
