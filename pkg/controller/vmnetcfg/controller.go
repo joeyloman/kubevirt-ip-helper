@@ -432,7 +432,20 @@ func (c *Controller) sync(event Event) (err error) {
 		// rebuild reclaims them. every release is owner-validated and
 		// idempotent, so the replay of a controller-managed deletion whose
 		// finalizer cleanup already converged is a no-op
-		if event.vmnetcfg != nil {
+		//
+		// the informer removes an object from the store before delivering
+		// its delete event, so an object under this key is a same-name
+		// replacement created while the deletion (or its rate-limited
+		// retry) was in flight: the owner checks of the release path are
+		// name-based (namespace/VMName, MAC) and cannot distinguish the
+		// deleted binding from the successor's, so replaying the tombstone
+		// here would tear down the replacement's live lease, claim and
+		// ledger entry. the release is skipped and the replacement's own
+		// events manage the object.
+		if exists {
+			log.Warnf("(vmnetcfg.sync) VirtualMachineNetworkConfig %s was deleted but a same-name replacement exists, skipping the tombstone release", event.key)
+			c.metrics.UpdateLogStatus("warning")
+		} else if event.vmnetcfg != nil {
 			if err := c.releaseDeletedBinding(event.vmnetcfg); err != nil {
 				return err
 			}
