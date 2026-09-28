@@ -393,3 +393,67 @@ func TestIPAMNewConstructorAlias(t *testing.T) {
 		t.Errorf("Used = %d, want 1", got)
 	}
 }
+
+// IPOwnedBy resolves the reservation adoption of the vmnetcfg reconcile
+// flow: it reports the live claim of exactly the given allocation
+// reference, so a binding can adopt its own held reservation instead of
+// allocating a second address while the first stays claimed.
+func TestIPAMIPOwnedByFindsOnlyTheOwnersLiveClaim(t *testing.T) {
+	a := New()
+	mustAddTwoAddressSubnet(t, a, "net")
+
+	owner := "ns/vm [02:00:00:00:00:01]"
+	foreign := "ns/vm2 [02:00:00:00:00:02]"
+
+	// a claimless owner, an empty owner and an unknown network find nothing
+	if ip, found := a.IPOwnedBy("net", owner); found {
+		t.Errorf("IPOwnedBy = %s, want not found for a claimless owner", ip)
+	}
+	if _, found := a.IPOwnedBy("net", ""); found {
+		t.Error("an empty owner must never match a claim")
+	}
+	if _, found := a.IPOwnedBy("missing", owner); found {
+		t.Error("an unknown network must never report a claim")
+	}
+
+	// the live claim of the owner is found, the foreign owner's is not
+	first, err := a.AllocateIP("net", owner)
+	if err != nil {
+		t.Fatalf("AllocateIP: %v", err)
+	}
+	if _, err := a.AllocateIP("net", foreign); err != nil {
+		t.Fatalf("AllocateIP: %v", err)
+	}
+	if ip, found := a.IPOwnedBy("net", owner); !found || ip != first {
+		t.Errorf("IPOwnedBy = %s (found %v), want the owner's claim %s", ip, found, first)
+	}
+
+	// a released claim is gone: the adoption never resurrects it
+	if err := a.ReleaseIPOwnedBy("net", first, owner); err != nil {
+		t.Fatalf("ReleaseIPOwnedBy: %v", err)
+	}
+	if ip, found := a.IPOwnedBy("net", owner); found {
+		t.Errorf("IPOwnedBy = %s, want not found after the release", ip)
+	}
+}
+
+// a stale state which ever holds two claims of one owner in one network
+// must resolve deterministically instead of following the map iteration
+// order: the lowest address wins.
+func TestIPAMIPOwnedByIsDeterministicAcrossMultipleClaims(t *testing.T) {
+	a := New()
+	mustAddTwoAddressSubnet(t, a, "net")
+
+	owner := "ns/vm [02:00:00:00:00:01]"
+	for _, ip := range []string{"192.168.99.1", "192.168.99.2"} {
+		if _, err := a.ReclaimIP("net", ip, owner); err != nil {
+			t.Fatalf("ReclaimIP(%s): %v", ip, err)
+		}
+	}
+
+	for range 10 {
+		if ip, found := a.IPOwnedBy("net", owner); !found || ip != "192.168.99.1" {
+			t.Fatalf("IPOwnedBy = %s (found %v), want the lowest claimed address 192.168.99.1", ip, found)
+		}
+	}
+}

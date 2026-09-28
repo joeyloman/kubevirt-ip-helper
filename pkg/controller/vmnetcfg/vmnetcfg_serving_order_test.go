@@ -154,10 +154,9 @@ func TestParkedLedgerWriteKeepsTheAddressUnserved(t *testing.T) {
 // commit and the authoritative reread alike: the controller cannot know
 // whether the write landed, so the reservations of the sync stay held
 // without serving anything - a write which landed must never be destroyed.
-// the claim and the record of the unresolved assignment are bounded by the
-// era (the registration sweep revalidates the ledger), and the retried sync
-// converges on a fresh address while the held reservation keeps protecting
-// the possibly committed one.
+// the retried sync then adopts the held reservation (F02): the possibly
+// committed address becomes the durable assignment instead of consuming
+// the second address and leaving the first held for the rest of the era.
 func TestUnreadableCommitOutcomeKeepsReservationsUnserved(t *testing.T) {
 	e := newTestEnv(t)
 	e.appStatus.Store(APP_RUNNING)
@@ -202,29 +201,27 @@ func TestUnreadableCommitOutcomeKeepsReservationsUnserved(t *testing.T) {
 		t.Errorf("held ledger record = %q, want the owner reference of this binding", got)
 	}
 
-	// once the API answers again the retried sync converges on the other
-	// address while the held reservation keeps protecting the possibly
-	// committed one
+	// once the API answers again the retried sync adopts the held
+	// reservation: the possibly committed address becomes the durable
+	// assignment, and no second address is consumed
 	e.api.vmnetcfgPutCode = 0
 	e.api.vmnetcfgGetFailFrom = 0
 	if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, e.getStoredVMNetCfg()); err != nil {
 		t.Fatalf("retried sync: %v", err)
 	}
 
-	lease := e.dhcp.GetLease(testMAC)
-	if lease.ClientIP == nil || lease.ClientIP.String() == heldIP {
-		t.Fatalf("lease = %v, want the freshly allocated other address after the retry", lease.ClientIP)
+	if lease := e.dhcp.GetLease(testMAC); lease.ClientIP == nil || lease.ClientIP.String() != heldIP {
+		t.Fatalf("lease = %v, want the adopted %s after the retry", lease.ClientIP, heldIP)
 	}
-	freshIP := lease.ClientIP.String()
 	stored := e.getStoredVMNetCfg()
-	if len(stored.Spec.NetworkConfig) != 1 || stored.Spec.NetworkConfig[0].IPAddress != freshIP {
-		t.Errorf("stored spec = %+v, want the second address committed after the retry", stored.Spec.NetworkConfig)
+	if len(stored.Spec.NetworkConfig) != 1 || stored.Spec.NetworkConfig[0].IPAddress != heldIP {
+		t.Errorf("stored spec = %+v, want the adopted address committed after the retry", stored.Spec.NetworkConfig)
 	}
-	if used := e.ipam.Used(testNetwork); used != 2 {
-		t.Errorf("ipam used = %d, want 2 (the new claim plus the held reservation)", used)
+	if used := e.ipam.Used(testNetwork); used != 1 {
+		t.Errorf("ipam used = %d, want 1 (the adopted reservation, no second claim)", used)
 	}
 	if got := e.getStoredPool().Status.IPv4.Allocated[heldIP]; got != testNamespace+"/"+testVMName+" ["+testMAC+"]" {
-		t.Errorf("ledger record of the held reservation = %q, want it kept for the rest of the era", got)
+		t.Errorf("ledger record of the adopted reservation = %q, want the owner record", got)
 	}
 }
 

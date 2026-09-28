@@ -628,6 +628,42 @@ func (a *IPAllocator) ReleaseIPOwnedBy(name string, givenIP string, owner string
 	return
 }
 
+// IPOwnedBy reports the address which the given allocation reference
+// holds in the named network, if any. the reconcile flow uses it to adopt
+// a binding's own held reservation instead of allocating a second address
+// while the first stays claimed (the quarantined reservation of a sync
+// whose commit failed or could not be resolved): the claim is what keeps
+// the address unavailable to every competing allocation, so adopting it
+// preserves the reservation continuously. one nic claims one address, so
+// an owner holds at most one claim per network in practice; should stale
+// state ever produce more, the lowest address wins deterministically
+// instead of following the map iteration order.
+func (a *IPAllocator) IPOwnedBy(name string, owner string) (ip string, found bool) {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	if _, exists := a.ipam[name]; !exists {
+		return "", false
+	}
+
+	if owner == "" {
+		return "", false
+	}
+
+	for candidate, current := range a.ipam[name].owners {
+		if current != owner || !a.ipam[name].ips[candidate] {
+			continue
+		}
+
+		if !found || candidate < ip {
+			ip = candidate
+			found = true
+		}
+	}
+
+	return ip, found
+}
+
 func (a *IPAllocator) Used(name string) (i int) {
 	a.mutex.Lock()
 	defer a.mutex.Unlock()

@@ -86,12 +86,16 @@ func TestVMNetCfgOldAddressCleanupStatusFailureStaysConsistent(t *testing.T) {
 	}
 }
 
-// The reviewer's brick scenario: a one-address pool serves an existing vm,
-// the desired ip is cleared to request automatic allocation again, and the
-// pool status un-record fails transiently. The vm must keep serving until
-// the api recovers, and then rebind its address - never a sticky error
-// status with a used one-address pool and no lease.
-func TestVMNetCfgClearedAddressRecoversAfterCleanupFailure(t *testing.T) {
+// The reviewer's brick scenario, updated for the reservation adoption
+// (F02): a one-address pool serves an existing vm and the desired ip is
+// cleared to request automatic allocation again. The binding's own lease
+// still serves the address, so the sync adopts it into the durable spec
+// instead of tearing the serving state down: the reset converges on the
+// first attempt - no destructive cleanup whose status write could fail,
+// no release window in which a competing allocation could take the
+// served address, and no sticky error status behind a re-marked
+// anonymous reservation.
+func TestVMNetCfgClearedAddressAdoptsItsServingLease(t *testing.T) {
 	e := newTestEnv(t)
 	e.addSubnet("10.0.0.1", "10.0.0.1")
 	e.seedPool(map[string]string{"10.0.0.1": canonicalLegacy})
@@ -110,48 +114,50 @@ func TestVMNetCfgClearedAddressRecoversAfterCleanupFailure(t *testing.T) {
 	e.seedVMNetCfg(vmnetcfg)
 
 	// steady state: the cleared-address reset is a live transition of a
-	// running application (the startup replay defers fresh allocations
-	// instead, covered by the finding-4 tests)
+	// running application
 	e.appStatus.Store(APP_RUNNING)
 
-	// the transient cleanup failure during the address reset
+	// even a failing pool status api cannot interrupt the adoption: the
+	// own record is only confirmed read-only, so the reset converges
+	// without any status write
 	e.api.poolStatusPutCode = http.StatusInternalServerError
-	if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, vmnetcfg); err == nil {
-		t.Fatal("want the status failure to fail the sync")
+	if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, vmnetcfg); err != nil {
+		t.Fatalf("the adoption must converge despite the failing status api: %s", err)
 	}
 
-	// fail closed without bricking: the vm still serves
+	// the vm served continuously: the lease never left the dhcp state
 	lease := e.dhcp.GetLease(testMAC)
 	if lease.ClientIP == nil || lease.ClientIP.String() != "10.0.0.1" {
-		t.Fatalf("lease = %v, want the address kept through the failed reset", lease.ClientIP)
+		t.Fatalf("lease = %v, want the continuously serving 10.0.0.1", lease.ClientIP)
 	}
 	if used := e.ipam.Used(testNetwork); used != 1 {
-		t.Fatalf("ipam used = %d, want 1 (the own claim, not an anonymous re-mark)", used)
-	}
-	stored := e.getStoredVMNetCfg()
-	if got := stored.Status.NetworkConfig[0].Status; got != "OK" {
-		t.Errorf("nic status = %q, want the preserved OK (no sticky error)", got)
+		t.Fatalf("ipam used = %d, want 1 (the own claim, never released)", used)
 	}
 
-	// the api recovers and the binding reclaims its address
-	e.api.poolStatusPutCode = 0
-	if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, vmnetcfg); err != nil {
-		t.Fatalf("the recovered sync must succeed: %s", err)
+	// the durable spec records the adopted address again, and the status
+	// stays honest
+	stored := e.getStoredVMNetCfg()
+	if len(stored.Spec.NetworkConfig) != 1 || stored.Spec.NetworkConfig[0].IPAddress != "10.0.0.1" {
+		t.Errorf("stored spec = %+v, want the adopted 10.0.0.1 recorded", stored.Spec.NetworkConfig)
 	}
-	lease = e.dhcp.GetLease(testMAC)
-	if lease.ClientIP == nil || lease.ClientIP.String() != "10.0.0.1" {
-		t.Fatalf("lease = %v, want the rebound 10.0.0.1 (the one-address pool hands it back to its owner)", lease.ClientIP)
-	}
-	if used := e.ipam.Used(testNetwork); used != 1 {
-		t.Errorf("ipam used = %d, want 1 after the recovery", used)
+	if got := stored.Status.NetworkConfig[0].Status; got != "OK" {
+		t.Errorf("nic status = %q, want OK", got)
 	}
 	pool := e.getStoredPool()
 	if got := pool.Status.IPv4.Allocated["10.0.0.1"]; got != canonicalLegacy {
-		t.Errorf("status entry = %q, want the owner record rebuilt", got)
+		t.Errorf("status entry = %q, want the owner record preserved", got)
 	}
-	stored = e.getStoredVMNetCfg()
-	if got := stored.Status.NetworkConfig[0].Status; got != "OK" {
-		t.Errorf("nic status after recovery = %q, want OK", got)
+
+	// the adopted state survives the resync unchanged
+	e.api.poolStatusPutCode = 0
+	if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, e.getStoredVMNetCfg()); err != nil {
+		t.Fatalf("the resync must stay converged: %s", err)
+	}
+	if lease := e.dhcp.GetLease(testMAC); lease.ClientIP == nil || lease.ClientIP.String() != "10.0.0.1" {
+		t.Errorf("lease after the resync = %v, want 10.0.0.1", lease.ClientIP)
+	}
+	if used := e.ipam.Used(testNetwork); used != 1 {
+		t.Errorf("ipam used after the resync = %d, want 1", used)
 	}
 }
 
