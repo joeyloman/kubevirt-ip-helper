@@ -8,7 +8,7 @@ replace k8s.io/client-go => k8s.io/client-go v0.24.0
 
 require (
 	github.com/google/uuid v1.3.0
-	github.com/insomniacslk/dhcp v0.0.0-20230612134759-b20c9ba983df
+	github.com/insomniacslk/dhcp v0.0.0-20260719225207-c76316d4aa82
 	github.com/prometheus/client_golang v1.11.1
 	github.com/prometheus/client_model v0.2.0
 	github.com/sirupsen/logrus v1.9.3
