@@ -499,7 +499,14 @@ func (h *handler) RunServices(ctx context.Context) error {
 		era.ippoolGate,
 	)
 	if err := h.ippoolEventHandler.Init(); err != nil {
-		handleErr(err)
+		// the drainStoppedEra path must own this failure: a panic here
+		// would kill the process inside the leader-election goroutine
+		// without releasing the lease, unlabeling the leader pod or
+		// stopping the DHCP listeners
+		log.Errorf("(app.RunServices) failed to initialize the ippool event listener: %s", err.Error())
+		h.metrics.UpdateLogStatus("error")
+
+		return fmt.Errorf("cannot initialize the ippool event listener: %s", err.Error())
 	}
 	h.listenerWg.Add(1)
 	go func() {
@@ -570,7 +577,14 @@ func (h *handler) RunServices(ctx context.Context) error {
 		era.vmnetcfgGate,
 	)
 	if err := h.vmnetcfgEventHandler.Init(); err != nil {
-		handleErr(err)
+		// the drainStoppedEra path must own this failure: a panic here
+		// would kill the process inside the leader-election goroutine
+		// without releasing the lease, unlabeling the leader pod or
+		// stopping the DHCP listeners
+		log.Errorf("(app.RunServices) failed to initialize the vmnetcfg event listener: %s", err.Error())
+		h.metrics.UpdateLogStatus("error")
+
+		return fmt.Errorf("cannot initialize the vmnetcfg event listener: %s", err.Error())
 	}
 	h.listenerWg.Add(1)
 	go func() {
@@ -618,7 +632,14 @@ func (h *handler) RunServices(ctx context.Context) error {
 		nil,
 	)
 	if err := h.vmEventHandler.Init(); err != nil {
-		handleErr(err)
+		// the drainStoppedEra path must own this failure: a panic here
+		// would kill the process inside the leader-election goroutine
+		// without releasing the lease, unlabeling the leader pod or
+		// stopping the DHCP listeners
+		log.Errorf("(app.RunServices) failed to initialize the vm event listener: %s", err.Error())
+		h.metrics.UpdateLogStatus("error")
+
+		return fmt.Errorf("cannot initialize the vm event listener: %s", err.Error())
 	}
 	h.listenerWg.Add(1)
 	go func() {
