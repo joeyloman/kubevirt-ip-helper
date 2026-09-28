@@ -288,6 +288,25 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 
 	ref := fmt.Sprintf("%s/%s", vmnetcfg.Namespace, vmnetcfg.Spec.VMName)
 
+	// the tuple of the own live lease is captured before any deletion: a
+	// quarantined allocation (a vmnetcfg sync whose durable object update
+	// failed after the lease, the claim and the ledger entry were applied)
+	// keeps its claim and its ledger record under a tuple which the
+	// present spec does not record anymore, so removing the mac's lease
+	// below would drop the last reference to that tuple while its claim
+	// and ledger entry survive - orphaning the address for the rest of
+	// the era, because no reconciliation iterates a tuple which neither
+	// the spec nor any lease records. a foreign lease is never captured:
+	// its tuple belongs to another owner. the captured tuple is cleaned
+	// through the same owner-validated release flow; the recursion cannot
+	// cycle, because each level consumed the lease it captured and a next
+	// level needs a concurrently re-created own lease with yet another
+	// tuple.
+	var capturedLease dhcp.DHCPLease
+	if lease := c.dhcp.GetLease(netCfg.MACAddress); lease.Reference == ref && lease.ClientIP != nil {
+		capturedLease = lease
+	}
+
 	// freeing an ip which is leased to another vm of the same network
 	// would leave the other lease serving an address ipam could reissue to
 	// a third client; ipam itself holds no owner references, so this
@@ -397,9 +416,11 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 	// durable un-record of this nic's own entry ran above, while the
 	// lease and the reservation below belong to the successor's binding
 	// and a claim which diverges from the live state is never freed under
-	// a foreign lease
+	// a foreign lease. the mac's own captured lease is a different live
+	// state: if it serves a tuple the spec does not record, its claim and
+	// ledger entry are still this binding's to release.
 	if successorLive {
-		return
+		return c.releaseDivergentTuple(vmnetcfg, netCfg, capturedLease)
 	}
 
 	// the owner check and the deletion run under one lock acquisition, so
@@ -483,7 +504,34 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 		}
 	}
 
-	return
+	// the mac's captured lease may serve a tuple the spec does not record
+	// (a quarantined allocation or a pre-move tuple): its claim and its
+	// ledger entry are released here, after the spec tuple's own release
+	// converged
+	return c.releaseDivergentTuple(vmnetcfg, netCfg, capturedLease)
+}
+
+// releaseDivergentTuple releases the reservations of a captured lease
+// whose served tuple diverges from the spec's record: the by-mac deletion
+// removed the last reference to the served tuple, so its ipam claim and
+// its ledger entry are cleaned through the same owner-validated flow the
+// spec tuple uses. a captured lease which matches the spec record (the
+// common case) is a no-op.
+func (c *Controller) releaseDivergentTuple(vmnetcfg *kihv1.VirtualMachineNetworkConfig, netCfg *kihv1.NetworkConfig, capturedLease dhcp.DHCPLease) (err error) {
+	if capturedLease.ClientIP == nil ||
+		(capturedLease.PoolName == netCfg.NetworkName && capturedLease.ClientIP.String() == netCfg.IPAddress) {
+		return nil
+	}
+
+	log.Warnf("(vm.cleanupNetworkInterface) [%s/%s] the deleted lease of hwaddr %s served the unrecorded tuple (network %s, ip %s), releasing its reservations",
+		vmnetcfg.Namespace, vmnetcfg.Name, netCfg.MACAddress, capturedLease.PoolName, capturedLease.ClientIP.String())
+	c.metrics.UpdateLogStatus("warning")
+
+	return c.cleanupNetworkInterface(vmnetcfg, &kihv1.NetworkConfig{
+		MACAddress:  netCfg.MACAddress,
+		NetworkName: capturedLease.PoolName,
+		IPAddress:   capturedLease.ClientIP.String(),
+	})
 }
 
 func (c *Controller) updateIPPoolStatus(event string, vmnetcfgNamespace string, vmnetcfgVMName string, ip string, networkName string, hwAddr string, poolName string) (err error) {
