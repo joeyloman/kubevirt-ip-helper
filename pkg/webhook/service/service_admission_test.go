@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	admissionv1 "k8s.io/api/admission/v1"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 // a request-less AdmissionReview (or one whose old object is missing or
@@ -20,18 +21,22 @@ func TestValidateIPPoolAdmissionMalformedReviews(t *testing.T) {
 	tests := []struct {
 		name string
 		body string
+		uid  string
 	}{
 		{
 			name: "request-less AdmissionReview",
 			body: `{}`,
+			uid:  "",
 		},
 		{
 			name: "missing old object",
 			body: `{"request":{"uid":"test-uid-1"}}`,
+			uid:  "",
 		},
 		{
 			name: "corrupt old object",
 			body: `{"request":{"uid":"test-uid-2","oldObject":{"raw":"bm90LWFwb29s"}}}`,
+			uid:  "test-uid-2",
 		},
 	}
 
@@ -62,6 +67,10 @@ func TestValidateIPPoolAdmissionMalformedReviews(t *testing.T) {
 
 			if !ar.Response.Allowed {
 				t.Fatalf("expected the request to be allowed, denied with: %s", ar.Response.Result)
+			}
+
+			if ar.Response.UID != types.UID(test.uid) {
+				t.Fatalf("response uid = %q, want the request uid %q", ar.Response.UID, test.uid)
 			}
 		})
 	}

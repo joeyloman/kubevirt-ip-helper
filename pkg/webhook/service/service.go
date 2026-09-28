@@ -574,6 +574,18 @@ func (h *Handler) validateVmNetCfg(ar *admissionv1.AdmissionReview) *admissionv1
 	return allow
 }
 
+// writeAdmissionResponse writes exactly one well-formed AdmissionReview
+// response: the single-write invariant of every admission handler lives
+// here, so a response path can never half-write a status code and then
+// fall through into a second write of the same connection (the bug class
+// the /validate-ippool handler once had).
+func writeAdmissionResponse(w http.ResponseWriter, ar *admissionv1.AdmissionReview, resp *admissionv1.AdmissionResponse) {
+	ar.Response = resp
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(&ar)
+}
+
 func (h *Handler) validateIPPoolAdmission(w http.ResponseWriter, r *http.Request) {
 	ar := &admissionv1.AdmissionReview{}
 	if err := json.NewDecoder(r.Body).Decode(&ar); err != nil {
@@ -593,12 +605,10 @@ func (h *Handler) validateIPPoolAdmission(w http.ResponseWriter, r *http.Request
 	if ar.Request == nil || len(ar.Request.OldObject.Raw) == 0 {
 		log.Errorf("the AdmissionReview carries no old object, allowing the request")
 
-		w.Header().Set("Content-Type", "application/json")
-		ar.Response = &admissionv1.AdmissionResponse{
+		writeAdmissionResponse(w, ar, &admissionv1.AdmissionResponse{
 			UID:     "",
 			Allowed: true,
-		}
-		json.NewEncoder(w).Encode(&ar)
+		})
 
 		return
 	}
@@ -611,20 +621,15 @@ func (h *Handler) validateIPPoolAdmission(w http.ResponseWriter, r *http.Request
 		// validators of the sibling handlers answer a well-formed allow in
 		// the same situation, so a half-written 500 body the apiserver
 		// reads as a webhook failure is never produced here
-		w.Header().Set("Content-Type", "application/json")
-		ar.Response = &admissionv1.AdmissionResponse{
+		writeAdmissionResponse(w, ar, &admissionv1.AdmissionResponse{
 			UID:     ar.Request.UID,
 			Allowed: true,
-		}
-		json.NewEncoder(w).Encode(&ar)
+		})
 
 		return
 	}
 
-	ar.Response = h.validateIPPool(ar, pool)
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(&ar)
+	writeAdmissionResponse(w, ar, h.validateIPPool(ar, pool))
 }
 
 // evaluateIPPoolSpec returns the sorted problems of an ipv4 configuration
@@ -805,20 +810,15 @@ func (h *Handler) validateIPPoolSpecAdmission(w http.ResponseWriter, r *http.Req
 	if ar.Request == nil || len(ar.Request.Object.Raw) == 0 {
 		log.Errorf("the AdmissionReview carries no object, allowing the request")
 
-		w.Header().Set("Content-Type", "application/json")
-		ar.Response = &admissionv1.AdmissionResponse{
+		writeAdmissionResponse(w, ar, &admissionv1.AdmissionResponse{
 			UID:     "",
 			Allowed: true,
-		}
-		json.NewEncoder(w).Encode(&ar)
+		})
 
 		return
 	}
 
-	ar.Response = h.validateIPPoolSpec(ar)
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(&ar)
+	writeAdmissionResponse(w, ar, h.validateIPPoolSpec(ar))
 }
 
 func (h *Handler) validateVmNetCfgAdmission(w http.ResponseWriter, r *http.Request) {
@@ -834,20 +834,15 @@ func (h *Handler) validateVmNetCfgAdmission(w http.ResponseWriter, r *http.Reque
 	if ar.Request == nil || len(ar.Request.Object.Raw) == 0 {
 		log.Errorf("the AdmissionReview carries no object, allowing the request")
 
-		w.Header().Set("Content-Type", "application/json")
-		ar.Response = &admissionv1.AdmissionResponse{
+		writeAdmissionResponse(w, ar, &admissionv1.AdmissionResponse{
 			UID:     "",
 			Allowed: true,
-		}
-		json.NewEncoder(w).Encode(&ar)
+		})
 
 		return
 	}
 
-	ar.Response = h.validateVmNetCfg(ar)
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(&ar)
+	writeAdmissionResponse(w, ar, h.validateVmNetCfg(ar))
 }
 
 func (h *Handler) Run() {
