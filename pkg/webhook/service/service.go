@@ -18,6 +18,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	admissionv1 "k8s.io/api/admission/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 )
 
@@ -605,8 +606,17 @@ func (h *Handler) validateIPPoolAdmission(w http.ResponseWriter, r *http.Request
 	if ar.Request == nil || len(ar.Request.OldObject.Raw) == 0 {
 		log.Errorf("the AdmissionReview carries no old object, allowing the request")
 
+		// the response uid must be copied from the request uid: a response
+		// whose uid does not match its request is a failed webhook call for
+		// the apiserver, which on this entry's implicit failurePolicy Fail
+		// would deny the deletion anyway. a request-less review carries no
+		// uid to echo
+		respUID := types.UID("")
+		if ar.Request != nil {
+			respUID = ar.Request.UID
+		}
 		writeAdmissionResponse(w, ar, &admissionv1.AdmissionResponse{
-			UID:     "",
+			UID:     respUID,
 			Allowed: true,
 		})
 
@@ -810,8 +820,15 @@ func (h *Handler) validateIPPoolSpecAdmission(w http.ResponseWriter, r *http.Req
 	if ar.Request == nil || len(ar.Request.Object.Raw) == 0 {
 		log.Errorf("the AdmissionReview carries no object, allowing the request")
 
+		// the response uid must be copied from the request uid: a response
+		// whose uid does not match its request is a failed webhook call
+		// for the apiserver. a request-less review carries no uid to echo
+		respUID := types.UID("")
+		if ar.Request != nil {
+			respUID = ar.Request.UID
+		}
 		writeAdmissionResponse(w, ar, &admissionv1.AdmissionResponse{
-			UID:     "",
+			UID:     respUID,
 			Allowed: true,
 		})
 
@@ -834,8 +851,15 @@ func (h *Handler) validateVmNetCfgAdmission(w http.ResponseWriter, r *http.Reque
 	if ar.Request == nil || len(ar.Request.Object.Raw) == 0 {
 		log.Errorf("the AdmissionReview carries no object, allowing the request")
 
+		// the response uid must be copied from the request uid: a response
+		// whose uid does not match its request is a failed webhook call
+		// for the apiserver. a request-less review carries no uid to echo
+		respUID := types.UID("")
+		if ar.Request != nil {
+			respUID = ar.Request.UID
+		}
 		writeAdmissionResponse(w, ar, &admissionv1.AdmissionResponse{
-			UID:     "",
+			UID:     respUID,
 			Allowed: true,
 		})
 

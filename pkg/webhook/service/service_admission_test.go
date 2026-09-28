@@ -31,7 +31,7 @@ func TestValidateIPPoolAdmissionMalformedReviews(t *testing.T) {
 		{
 			name: "missing old object",
 			body: `{"request":{"uid":"test-uid-1"}}`,
-			uid:  "",
+			uid:  "test-uid-1",
 		},
 		{
 			name: "corrupt old object",
