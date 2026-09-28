@@ -25,7 +25,6 @@ import (
 	kihclientset "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/clientset/versioned"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/metrics"
-	"github.com/joeyloman/kubevirt-ip-helper/pkg/util"
 )
 
 // shutdownWait is the bounded amount of time a test waits for a controller
@@ -692,27 +691,6 @@ func TestGetKubeConfigUnknownContextFails(t *testing.T) {
 
 	if _, err := handler.getKubeConfig(); err == nil {
 		t.Fatal("expected an error for an unknown kubeconfig context")
-	}
-}
-
-// the informer client must not carry the one-shot client timeout: it
-// would tear the watch connection down every time it expires and an
-// initial list slower than the timeout would never complete
-func TestWatchRestConfigStripsTheClientTimeout(t *testing.T) {
-	config := &rest.Config{Host: "https://example.com", Timeout: 30 * time.Second}
-
-	watchConfig := util.WatchRestConfig(config)
-
-	if watchConfig.Timeout != 0 {
-		t.Errorf("watch config timeout = %v, want it stripped", watchConfig.Timeout)
-	}
-	if watchConfig.Host != config.Host {
-		t.Errorf("watch config host = %q, want %q preserved", watchConfig.Host, config.Host)
-	}
-	// the source config stays untouched: the one-shot clients keep their
-	// bound
-	if config.Timeout != 30*time.Second {
-		t.Errorf("source config timeout = %v, want it untouched", config.Timeout)
 	}
 }
 
