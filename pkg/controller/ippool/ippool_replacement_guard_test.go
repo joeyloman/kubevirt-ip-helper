@@ -48,11 +48,31 @@ func TestSyncDeleteSkipsCleanupForSameNameReplacement(t *testing.T) {
 	if err := controller.ipam.NewSubnet("net-d", "192.168.1.0/24", "192.168.1.10", "192.168.1.100"); err == nil {
 		t.Error("the replacement's ipam subnet was deleted by the stale delete")
 	}
+}
 
-	// the replacement's own delete tears the live registration down
-	own := Event{key: "pool-d", action: DELETE, poolName: "pool-d", poolNetworkName: "net-d", poolUID: "replacement-uid"}
+// the paired control: with the guard's condition satisfied (the tombstone
+// uid matches the cached registration), the same fixture tears the live
+// registration down - which is what makes the skip assertions above
+// meaningful.
+func TestSyncDeleteWithMatchingUidTearsDownLiveRegistration(t *testing.T) {
+	var appStatus atomic.Int32
+	appStatus.Store(APP_INIT)
+	startupGate := newTestGate("pool-d")
+	controller, cache := newTestController(t, newTestQueue(), newTestIndexer(), nil, &appStatus, startupGate)
+
+	pool := testPool("pool-d", "net-d", 60)
+	pool.ObjectMeta.UID = "live-uid"
+	if err := cache.Add(pool); err != nil {
+		t.Fatalf("seeding the live registration: %v", err)
+	}
+	if err := controller.ipam.NewSubnet("net-d", "192.168.1.0/24", "192.168.1.10", "192.168.1.100"); err != nil {
+		t.Fatalf("seeding the subnet: %v", err)
+	}
+	controller.registeredPools = map[string]string{"pool-d": "net-d"}
+
+	own := Event{key: "pool-d", action: DELETE, poolName: "pool-d", poolNetworkName: "net-d", poolUID: "live-uid"}
 	if err := controller.sync(own); err != nil {
-		t.Fatalf("the replacement's delete sync failed: %v", err)
+		t.Fatalf("the delete sync failed: %v", err)
 	}
 
 	if _, err := cache.Get("pool", "net-d"); err == nil {
