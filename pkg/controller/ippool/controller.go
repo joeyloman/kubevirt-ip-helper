@@ -293,6 +293,20 @@ func (c *Controller) sync(event Event) (err error) {
 		if registeredNet, live := c.registeredPools[event.poolName]; live && registeredNet != event.poolNetworkName {
 			if oldPool, oldErr := c.cache.Get("pool", registeredNet); oldErr == nil && oldPool.(kihv1.IPPool).Name == event.poolName {
 				p := oldPool.(kihv1.IPPool)
+				if event.poolUID != "" && p.ObjectMeta.UID != event.poolUID {
+					// the cache entry under the recorded networkname is a
+					// same-name replacement registered while the deletion
+					// (or its rate-limited retry) was in flight: tearing
+					// down the live registration now would stop the
+					// replacement's DHCP listener until its resync
+					// re-registers it. the cleanup is dropped and the
+					// replacement's own events manage the object.
+					log.Warnf("(ippool.sync) IPPool %s was deleted but a same-name replacement exists under networkname %s, skipping the cleanup of the live state",
+						event.poolName, registeredNet)
+					c.metrics.UpdateLogStatus("warning")
+
+					return
+				}
 				if err = c.cleanupIPPoolObjects(&p); err != nil {
 					log.Errorf("(ippool.sync) failed to cleanup the renamed pool %s under networkname %s: %s", event.poolName, registeredNet, err.Error())
 					c.metrics.UpdateLogStatus("error")
@@ -341,7 +355,7 @@ func (c *Controller) sync(event Event) (err error) {
 
 			return
 		}
-		if p.ObjectMeta.UID != event.poolUID {
+		if event.poolUID != "" && p.ObjectMeta.UID != event.poolUID {
 			// the informer removes an object from the store before
 			// delivering its delete event, so a cache entry under the
 			// deleted object's name and networkname whose uid differs is a
@@ -350,7 +364,12 @@ func (c *Controller) sync(event Event) (err error) {
 			// registration now would stop the replacement's DHCP listener,
 			// delete its ipam subnet, dhcp pool and cache entry until its
 			// resync re-registers them. the cleanup is dropped and the
-			// replacement's own events manage the object.
+			// replacement's own events manage the object. an empty event
+			// uid (a tombstone whose metadata was degraded, for example a
+			// DeletedFinalStateUnknown delivery) is treated as an unknown
+			// generation and falls back to the name-only behavior: an
+			// unidentifiable generation must not read as a mismatch and
+			// silently retain the live registration.
 			log.Warnf("(ippool.sync) IPPool %s [networkname %s] was deleted but a same-name replacement exists, skipping the cleanup of the live state",
 				event.poolName, event.poolNetworkName)
 			c.metrics.UpdateLogStatus("warning")
