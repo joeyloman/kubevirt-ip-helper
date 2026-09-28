@@ -115,12 +115,12 @@ func TestVerifyClaimedNicsKeepsDurableRestore(t *testing.T) {
 }
 
 // TestVerifyFailureStillUnwindsContestedClaims: the pre-commit verification
-// of the claimed nics fails its re-read, so the pending commit is lost. The
-// contested claim of this sync (the pool status records its address for
-// another owner) must still be unwound - the retried sync takes the
-// lease-based repair path for the nic, which never unwinds a contested
-// claim, so skipping the rollback would leave the lease serving an address
-// whose ledger record belongs to another owner forever.
+// of the claimed nics fails its re-read, so the pending commit is lost and
+// every allocation of this sync is unwound. the contested restore (the
+// pool status records its address for another owner) had its lease
+// published in-loop and must not keep serving a foreign-owned address,
+// and the fresh allocation's publication never ran, so its claim and
+// record are released and removed without any duplicate-ip risk.
 func TestVerifyFailureStillUnwindsContestedClaims(t *testing.T) {
 	e := newTestEnv(t)
 	e.appStatus.Store(APP_RUNNING)
@@ -145,27 +145,28 @@ func TestVerifyFailureStillUnwindsContestedClaims(t *testing.T) {
 		t.Fatal("want the failed verification to fail the sync")
 	}
 
-	// the contested claim of the first nic is unwound
+	// the contested lease of the first nic is deleted by the rollback
 	if e.dhcp.CheckLease(testMAC) {
 		t.Error("the contested lease must be deleted by the rollback")
 	}
-	if used := e.ipam.Used(testNetwork); used != 1 {
-		t.Errorf("ipam used = %d, want 1 (only the quarantined claim of the second nic kept)", used)
+	if used := e.ipam.Used(testNetwork); used != 0 {
+		t.Errorf("ipam used = %d, want 0 (both claims are unwound)", used)
 	}
 
-	// the uncontested allocation of the second nic stays quarantined
-	if !e.dhcp.CheckLease(testMAC2) {
-		t.Error("the served lease of the uncontested second nic must stay quarantined")
+	// the fresh allocation of the second nic is unwound: its publication
+	// waits for the commit which the failed verification prevents
+	if e.dhcp.CheckLease(testMAC2) {
+		t.Error("the fresh lease of the second nic must not exist before the commit")
 	}
 
-	// the foreign ledger record was never clobbered, and the quarantined
-	// record of the second nic is kept for the retried sync
+	// the foreign ledger record was never clobbered, and the unwound
+	// record of the second nic is removed
 	pool := e.getStoredPool()
 	if got := pool.Status.IPv4.Allocated["10.0.0.1"]; got != "other-ns/other-vm [02:00:00:00:00:99]" {
 		t.Errorf("allocated[10.0.0.1] = %q, want the foreign owner preserved", got)
 	}
-	if got := pool.Status.IPv4.Allocated["10.0.0.2"]; got != testNamespace+"/"+testVMName+" ["+testMAC2+"]" {
-		t.Errorf("allocated[10.0.0.2] = %q, want the quarantined record kept", got)
+	if got := pool.Status.IPv4.Allocated["10.0.0.2"]; got != "" {
+		t.Errorf("allocated[10.0.0.2] = %q, want the unwound record removed", got)
 	}
 
 	// the failure is pre-commit: the durable object was never written

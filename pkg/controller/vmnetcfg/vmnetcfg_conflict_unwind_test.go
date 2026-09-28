@@ -30,8 +30,9 @@ import (
 // spec update lands and the commit Update fails with a resourceVersion
 // conflict. The conflict branch must re-verify: the vanished nic's freshly
 // allocated lease, claim and ledger record are unwound instead of being
-// left behind orphaned (without the re-verification the rollback would
-// only quarantine them, because the allocation was uncontested).
+// left behind orphaned - and the re-verification is the only unwind for a
+// vanished restored nic, whose recreated state the failed-commit
+// resolution does not reach.
 func TestCommitConflictUnwindsVanishedClaimedNic(t *testing.T) {
 	e := newTestEnv(t)
 	e.appStatus.Store(APP_RUNNING)

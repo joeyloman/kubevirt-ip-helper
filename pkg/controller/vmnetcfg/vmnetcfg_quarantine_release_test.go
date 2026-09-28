@@ -10,17 +10,16 @@ import (
 )
 
 // The deleted-lease tuple regression tests: the deleting cleanup deletes
-// the lease by mac unconditionally, but a quarantined allocation (a sync
-// whose durable object update failed after the lease was already served)
-// keeps its claim and its ledger record under a tuple which the present
-// spec does not record anymore, and a nic which moved networks keeps its
-// pre-move tuple in the lease. The by-mac deletion used to remove the last
-// reference to that tuple while its claim and ledger entry survived the
-// deletion of the object - orphaning the address for the rest of the era,
-// because no reconciliation ever iterates a tuple which neither the spec
-// nor any lease records. The deleting cleanup captures the tuple of the
-// own live lease before the deletion and releases its reservations through
-// the same owner-validated flow.
+// the lease by mac unconditionally, but a divergent lease (a lease whose
+// served tuple the present spec does not record anymore - a nic which
+// moved networks keeps its pre-move tuple in the lease) can hold a claim
+// and a ledger record under that very tuple. The by-mac deletion used to
+// remove the last reference to that tuple while its claim and ledger
+// entry survived the deletion of the object - orphaning the address for
+// the rest of the era, because no reconciliation ever iterates a tuple
+// which neither the spec nor any lease records. The deleting cleanup
+// captures the tuple of the own live lease before the deletion and
+// releases its reservations through the same owner-validated flow.
 
 // newDeletingVMNetCfg builds a controller-managed binding which the
 // apiserver marked for deletion.
@@ -44,11 +43,11 @@ func newDeletingVMNetCfg(netCfgs []kihv1.NetworkConfig) *kihv1.VirtualMachineNet
 }
 
 // TestVMNetCfgDeletionReleasesTheQuarantinedAllocation pins the orphaned
-// reservation of a quarantined allocation: the spec tuple of the nic is
-// empty (the durable object update failed, so the address never made it
-// into the spec), while its lease, claim and ledger record are live. the
-// deleting cleanup must release all three layers of the tuple the lease
-// served, not only the lease itself.
+// reservation of a divergent lease: the spec tuple of the nic is empty
+// while its lease, claim and ledger record are live (the address the
+// lease serves never made it into the spec). the deleting cleanup must
+// release all three layers of the tuple the lease served, not only the
+// lease itself.
 func TestVMNetCfgDeletionReleasesTheQuarantinedAllocation(t *testing.T) {
 	e := newTestEnv(t)
 	e.appStatus.Store(APP_RUNNING)

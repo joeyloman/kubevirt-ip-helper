@@ -38,8 +38,10 @@ type allocatedNetworkConfig struct {
 	ipAddress   string
 	poolName    string
 	// contested marks an allocation whose address the pool status records
-	// for another owner; such a claim must never survive the rollback,
-	// while an uncontested one may already be served to its guest
+	// for another owner; such a claim is queued for the rollback even
+	// when the stored spec already records it, because an address which
+	// the ledger attributes to a foreign owner must never stay claimed,
+	// recorded or served through this binding's identity
 	contested bool
 }
 
@@ -66,24 +68,16 @@ type pendingLedgerDelete struct {
 // ipam state which already excludes the unwound allocation, and the pool
 // metrics republish the settled accounting.
 //
-// only contested allocations are unwound: the dhcp server may already have
-// acked the lease of an uncontested applied allocation to its guest, so
-// deleting that lease would let the address be reissued while the old
-// guest keeps using it (duplicate ip). the lease, the ipam claim and the
-// pool status record of an uncontested allocation therefore stay as a
-// quarantine: the retried sync's regular mismatch cleanup releases them
-// through the owner-validated path and re-allocates, converging exactly
-// like a regular ip change. a contested address must never be served by
-// this binding's lease, so it is always released.
+// every allocation which reaches the rollback is unpublished: the lease
+// of a fresh allocation is published only after its binding commit
+// succeeded (F01), so its address was never ACK-eligible and unwinding it
+// cannot hand a served address to a second guest. a contested allocation
+// (the ledger records its address for another owner) may have published
+// its lease in-loop as a restore: the lease is deleted because a
+// foreign-owned address must never be served through this binding's
+// identity. every release is owner-validated, so a successor which took
+// the address over in the meantime is never freed with them.
 func (c *Controller) rollbackNetworkAllocation(vmnetcfg *kihv1.VirtualMachineNetworkConfig, allocated allocatedNetworkConfig) {
-	if !allocated.contested {
-		log.Warnf("(vmnetcfg.rollbackNetworkAllocation) [%s/%s] keeping the served lease, claim and status record of ip %s (hwaddr %s, network %s) quarantined after the failed object update; the retried sync releases it through its regular cleanup",
-			vmnetcfg.Namespace, vmnetcfg.Name, allocated.ipAddress, allocated.macAddress, allocated.networkName)
-		c.metrics.UpdateLogStatus("warning")
-
-		return
-	}
-
 	ref := fmt.Sprintf("%s/%s", vmnetcfg.Namespace, vmnetcfg.Spec.VMName)
 
 	if err := c.dhcp.DeleteLeaseOwnedBy(allocated.macAddress, ref); err != nil {
@@ -131,6 +125,25 @@ func (c *Controller) rollbackNetworkAllocation(vmnetcfg *kihv1.VirtualMachineNet
 			log.Errorf("(vmnetcfg.rollbackNetworkAllocation) [%s/%s] failed to revert the ippool status for ip %s: %s",
 				vmnetcfg.Namespace, vmnetcfg.Name, allocated.ipAddress, err)
 			c.metrics.UpdateLogStatus("error")
+
+			// the pending commit was lost, so no spec entry will ever
+			// record this tuple again: a record whose owner-validated
+			// deletion failed must stay reachable, or no reconciliation
+			// of this object could remove it anymore (the finalizer
+			// iterates only the present spec nics). the claim is already
+			// released above, so the pending unwind only replays the
+			// ledger deletion
+			c.rememberPendingUnwind(
+				fmt.Sprintf("%s/%s", vmnetcfg.Namespace, vmnetcfg.Name),
+				pendingLedgerDelete{
+					namespace:   vmnetcfg.Namespace,
+					vmName:      vmnetcfg.Spec.VMName,
+					ip:          allocated.ipAddress,
+					networkName: allocated.networkName,
+					macAddress:  allocated.macAddress,
+					poolName:    allocated.poolName,
+				},
+			)
 		}
 	}
 
@@ -142,13 +155,12 @@ func (c *Controller) rollbackNetworkAllocation(vmnetcfg *kihv1.VirtualMachineNet
 }
 
 // rollbackAppliedAllocations processes the allocations queued by this sync,
-// newest first. Contested claims are unwound: their addresses must never be
-// served with the lease of this binding. Uncontested allocations remain
-// quarantined: their leases may already have been served by the DHCP server,
-// and their lease, claim, and status record converge through the retried
-// sync's regular owner-validated cleanup (see rollbackNetworkAllocation).
-// Restores of allocations already recorded in the saved spec are never
-// queued by the caller, and are kept applied.
+// newest first. Every queued allocation is unpublished - the fresh
+// allocations wait for their binding commit before their lease is published
+// (F01), and a contested claim must never stay claimed by this binding - so
+// the rollback fully unwinds the lease, the claim and the ledger record of
+// each entry. Restores of allocations already recorded in the saved spec are
+// never queued by the caller, and are kept applied.
 func (c *Controller) rollbackAppliedAllocations(vmnetcfg *kihv1.VirtualMachineNetworkConfig, applied []allocatedNetworkConfig) {
 	for i := len(applied) - 1; i >= 0; i-- {
 		c.rollbackNetworkAllocation(vmnetcfg, applied[i])
@@ -157,9 +169,8 @@ func (c *Controller) rollbackAppliedAllocations(vmnetcfg *kihv1.VirtualMachineNe
 
 // releaseOwnClaim releases an ipam claim which still carries this owner's
 // reference but which no live state justifies anymore: the claim of a nic
-// whose lease vanished during this reconciliation, or the claim of an
-// allocation whose dhcp lease could not be registered (nothing was served
-// and no ledger record was written). a successor which took the freed
+// whose lease vanished during this reconciliation. a successor which took
+// the freed
 // address over in the meantime (a fresh anonymous allocation or another
 // owner's named reclaim) is never released by it. the converged outcomes
 // (a foreign owner, an already-free address, a subnet which is gone) are
@@ -264,6 +275,14 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 	// ran must not keep a freshly recreated lease/claim/ledger entry which
 	// no reconciliation ever cleans again (the stale-spec restore race)
 	claimedNics := []allocatedNetworkConfig{}
+
+	// pendingLeases records the fresh allocations of this sync whose
+	// durable ownership record (the pool ledger entry) is already written
+	// but whose lease publication waits for the binding commit: the
+	// address of a fresh allocation becomes ACK-eligible only after the
+	// stored spec records the assignment, so a guest can never receive an
+	// address which a process loss would leave unreconstructible (F01)
+	pendingLeases := []allocatedNetworkConfig{}
 
 	// addresses which the stored spec already records (mac, networkname
 	// and ip): applying them again only restores the previous assignment
@@ -828,44 +847,83 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 			continue
 		}
 
-		if err := c.dhcp.AddLease(
-			v.MACAddress,
-			pool.(kihv1.IPPool).Spec.NetworkName,
-			ip,
-			vmRef,
-		); err != nil {
-			// dhcp must not serve the address when its owner reference
-			// cannot be registered: nothing was served, no ledger record
-			// was written and the pending spec entry is not durable yet,
-			// so the claim has no lease, no status record and no spec
-			// entry which any later reconciliation could detect again -
-			// quarantining it would block the address until a process
-			// restart. release it directly instead (a restored durable
-			// claim keeps its reservation: the spec entry protects it) and
-			// defer the failure so the remaining interfaces are still
-			// processed
-			log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] error registering the dhcp lease: %s",
-				vmnetcfg.Namespace, vmnetcfg.Name, err)
-			c.metrics.UpdateLogStatus("error")
+		if v.IPAddress == "" {
+			// F01: the address of a fresh allocation must complete its
+			// durable ownership before it can be served: the pool ledger
+			// record is written first, the binding commit below records
+			// the matching assignment, and only the deferred lease
+			// publication after that commit makes the address ACK-eligible.
+			// a ledger record whose spec assignment never landed is
+			// recoverable: nothing was served, so the registration sweep
+			// may drop it and free the address - a guest can never keep
+			// an address which no durable object records
+			if err := c.updateIPPoolStatus(
+				ADD,
+				vmnetcfg.Namespace,
+				vmnetcfg.Spec.VMName,
+				ip,
+				v.NetworkName,
+				v.MACAddress,
+				pool.(kihv1.IPPool).Name,
+			); err != nil {
+				// the durable ownership is missing and nothing was served:
+				// queue the claim for the post-sync unwind (a contested
+				// record is never claimed by this binding) and defer the
+				// failure so the remaining interfaces are still processed
+				log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] %s",
+					vmnetcfg.Namespace, vmnetcfg.Name, err)
+				c.metrics.UpdateLogStatus("error")
 
-			if !durableAllocations[v.MACAddress+"/"+v.NetworkName+"/"+ip] {
-				c.releaseOwnClaim(v.NetworkName, ip, ownerRef)
+				rememberApplied(pool.(kihv1.IPPool).Name, v.MACAddress, v.NetworkName, ip, errors.Is(err, util.ErrForeignOwner))
 
-				if err := c.updateIPPoolMetrics(pool.(kihv1.IPPool).Name); err != nil {
-					log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] %s",
-						vmnetcfg.Namespace, vmnetcfg.Name, err)
-					c.metrics.UpdateLogStatus("error")
+				newVmNetCfgs = append(newVmNetCfgs, v)
+
+				if restoreErr == nil {
+					restoreErr = fmt.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] cannot update the IPPool %s status for ip %s: %w",
+						vmnetcfg.Namespace, vmnetcfg.Name, pool.(kihv1.IPPool).Name, ip, err)
 				}
+
+				continue
 			}
 
-			newVmNetCfgs = append(newVmNetCfgs, v)
+			// the durable ownership record exists: the lease publication is
+			// deferred until the binding commit records the assignment
+			pendingLeases = append(pendingLeases, allocatedNetworkConfig{
+				macAddress:  v.MACAddress,
+				networkName: v.NetworkName,
+				ipAddress:   ip,
+				poolName:    pool.(kihv1.IPPool).Name,
+			})
+		} else {
+			// a restored assignment is durable in the stored spec already,
+			// so its lease may resume serving immediately: the spec sweep
+			// of the recovery protects the address of a recorded tuple even
+			// while the ledger write below is still repairing a record an
+			// earlier failure may have left missing
+			if err := c.dhcp.AddLease(
+				v.MACAddress,
+				pool.(kihv1.IPPool).Spec.NetworkName,
+				ip,
+				vmRef,
+			); err != nil {
+				// the lease could not be registered, so this interface is
+				// not serving: the restored claim stays reserved because
+				// the stored spec records the address and protects it
+				// through the recovery, and the retried sync re-attempts
+				// the publication
+				log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] error registering the dhcp lease: %s",
+					vmnetcfg.Namespace, vmnetcfg.Name, err)
+				c.metrics.UpdateLogStatus("error")
 
-			if restoreErr == nil {
-				restoreErr = fmt.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] cannot register the dhcp lease for hwaddr %s: %s",
-					vmnetcfg.Namespace, vmnetcfg.Name, v.MACAddress, err.Error())
+				newVmNetCfgs = append(newVmNetCfgs, v)
+
+				if restoreErr == nil {
+					restoreErr = fmt.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] cannot register the dhcp lease for hwaddr %s: %s",
+						vmnetcfg.Namespace, vmnetcfg.Name, v.MACAddress, err.Error())
+				}
+
+				continue
 			}
-
-			continue
 		}
 
 		n := kihv1.NetworkConfig{}
@@ -878,32 +936,38 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 		netcfgStatus.Message = "IP address successfully allocated"
 		newNetCfgStatusList = append(newNetCfgStatusList, netcfgStatus)
 
-		if err := c.updateIPPoolStatus(
-			ADD,
-			vmnetcfg.Namespace,
-			vmnetcfg.Spec.VMName,
-			ip,
-			v.NetworkName,
-			v.MACAddress,
-			pool.(kihv1.IPPool).Name,
-		); err != nil {
-			// the lease would be served while the durable allocation state
-			// is missing: queue this interface's claim for the post-sync
-			// unwind (a restored durable claim of a transient status write
-			// failure stays reserved and protected) and defer the failure
-			// so the remaining interfaces are still processed
-			log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] %s",
-				vmnetcfg.Namespace, vmnetcfg.Name, err)
-			c.metrics.UpdateLogStatus("error")
+		if v.IPAddress != "" {
+			// the lease of the restored assignment is published above; its
+			// durable ownership record is repaired here: a missing record
+			// is rebuilt and a matching one is confirmed, while a foreign
+			// record rejects the claim as contested
+			if err := c.updateIPPoolStatus(
+				ADD,
+				vmnetcfg.Namespace,
+				vmnetcfg.Spec.VMName,
+				ip,
+				v.NetworkName,
+				v.MACAddress,
+				pool.(kihv1.IPPool).Name,
+			); err != nil {
+				// the record repair failed: queue this interface's claim
+				// for the post-sync unwind (a restored durable claim of a
+				// transient status write failure stays reserved and
+				// protected) and defer the failure so the remaining
+				// interfaces are still processed
+				log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] %s",
+					vmnetcfg.Namespace, vmnetcfg.Name, err)
+				c.metrics.UpdateLogStatus("error")
 
-			rememberApplied(pool.(kihv1.IPPool).Name, v.MACAddress, v.NetworkName, ip, errors.Is(err, util.ErrForeignOwner))
+				rememberApplied(pool.(kihv1.IPPool).Name, v.MACAddress, v.NetworkName, ip, errors.Is(err, util.ErrForeignOwner))
 
-			if restoreErr == nil {
-				restoreErr = fmt.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] cannot update the IPPool %s status for ip %s: %w",
-					vmnetcfg.Namespace, vmnetcfg.Name, pool.(kihv1.IPPool).Name, ip, err)
+				if restoreErr == nil {
+					restoreErr = fmt.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] cannot update the IPPool %s status for ip %s: %w",
+						vmnetcfg.Namespace, vmnetcfg.Name, pool.(kihv1.IPPool).Name, ip, err)
+				}
+
+				continue
 			}
-
-			continue
 		}
 
 		if err := c.updateIPPoolMetrics(pool.(kihv1.IPPool).Name); err != nil {
@@ -939,23 +1003,26 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 		c.metrics.UpdateLogStatus("error")
 
 		// the verification could not run and the pending commit is lost
-		// either way: unwind the contested claims of this sync now (an
-		// uncontested allocation stays quarantined like below). the retried
-		// sync takes the lease-based repair path for these nics, which
-		// never unwinds a contested claim, so skipping the rollback here
-		// would leave their leases serving addresses whose ledger record
-		// belongs to another owner
+		// either way: every allocation queued by this sync is unpublished
+		// (the fresh lease publications wait for the commit), so the
+		// rollback fully unwinds the claims and ledger records without any
+		// duplicate-ip risk - a contested claim must never stay claimed by
+		// this binding either
 		c.rollbackAppliedAllocations(vmnetcfg, appliedAllocations)
 
 		return err
 	}
 
+	// a nic which vanished during the verification was unwound and dropped
+	// from the pending commit: its deferred lease publication must never
+	// run, or the sync would serve an address whose spec entry is gone
+	pendingLeases = prunePendingLeases(pendingLeases, newVmNetCfgs)
+
 	if restoreErr != nil {
-		// the contested claims of this sync are unwound while the
-		// uncontested applied allocations stay quarantined (see
-		// rollbackNetworkAllocation): a lease may already have been served
-		// for them, so releasing would risk a duplicate ip; the retried
-		// sync converges through its regular cleanup
+		// every allocation queued by this sync is unpublished (the fresh
+		// lease publications wait for the commit), so the rollback fully
+		// unwinds the claims and ledger records; the restored durable
+		// assignments stay applied because the caller never queues them
 		c.rollbackAppliedAllocations(vmnetcfg, appliedAllocations)
 
 		return fmt.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] %w",
@@ -1001,10 +1068,11 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 		// the claimed nics which the newer spec removed, or their freshly
 		// recreated lease/claim/ledger entry survives with no cleanup
 		// ever iterating it again (the vm controller never re-runs its
-		// own cleanup after its update succeeded). the unwind is
-		// owner-validated on every layer and a failed record delete is
-		// remembered as a pending unwind, so an unrelated conflicting
-		// write leaves the state untouched
+		// own cleanup after its update succeeded). the re-verification is
+		// the only unwind for a vanished restored nic - the resolution
+		// below reaches only the fresh allocations of this sync - and its
+		// unwind is owner-validated on every layer, so an unrelated
+		// conflicting write leaves the state untouched
 		if apierrors.IsConflict(err) {
 			if verifyErr := c.verifyClaimedNics(vmnetcfg, claimedNics, &newVmNetCfgs, &newNetCfgStatusList); verifyErr != nil {
 				log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] %s",
@@ -1013,11 +1081,13 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 			}
 		}
 
-		// the durable object still holds the previous configuration;
-		// contested claims are unwound and served allocations stay
-		// quarantined (see rollbackNetworkAllocation) until the retried
-		// sync converges through its regular cleanup
-		c.rollbackAppliedAllocations(vmnetcfg, appliedAllocations)
+		// F01: every fresh allocation of this sync is still unpublished
+		// (its lease waits for the commit), so the failed commit is
+		// resolved against the live object: a demonstrably unrecorded
+		// assignment is fully unwound without any duplicate-ip risk, a
+		// recorded one is durable and publishes, and an unreadable
+		// outcome keeps the reservations held without serving them
+		c.resolveFailedCommit(vmnetcfg, appliedAllocations)
 
 		return fmt.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] cannot update VirtualMachineNetworkConfig object: %s",
 			newVmNetCfg.Namespace, newVmNetCfg.Name, err.Error())
@@ -1025,6 +1095,12 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 
 	log.Debugf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] successfully processed the network configuration",
 		vmNetCfgObj.ObjectMeta.Namespace, vmNetCfgObj.ObjectMeta.Name)
+
+	// F01: the stored spec records every assignment of this sync now, so
+	// the deferred lease publications make the fresh addresses ACK-eligible
+	// exactly here: every servable address has both a durable ledger
+	// record and a durable binding assignment which the recovery rebuilds
+	publishErr := c.publishPendingLeases(vmnetcfg, pendingLeases, &newVmnetCfgStatus)
 
 	if err := c.updateVirtualMachineNetworkConfigStatus(vmNetCfgObj, &newVmnetCfgStatus); err != nil {
 		log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] %s",
@@ -1036,6 +1112,11 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 		log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] %s",
 			vmNetCfgObj.Namespace, vmNetCfgObj.Name, err)
 		c.metrics.UpdateLogStatus("error")
+	}
+
+	if publishErr != nil {
+		return fmt.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] %w",
+			vmnetcfg.Namespace, vmnetcfg.Name, publishErr)
 	}
 
 	return
@@ -1516,6 +1597,150 @@ func (c *Controller) unwindClaim(vmnetcfg *kihv1.VirtualMachineNetworkConfig, nc
 			vmnetcfg.Namespace, vmnetcfg.Name, err)
 		c.metrics.UpdateLogStatus("error")
 	}
+}
+
+// prunePendingLeases drops the deferred lease publications whose nic left
+// the pending commit (the pre-commit verification unwound it because the
+// live object no longer records it): a vanished nic's address must never
+// become ACK-eligible through this sync.
+func prunePendingLeases(pending []allocatedNetworkConfig, pendingSpec []kihv1.NetworkConfig) []allocatedNetworkConfig {
+	kept := pending[:0]
+	for _, nc := range pending {
+		recorded := false
+		for _, v := range pendingSpec {
+			if v.MACAddress == nc.macAddress && v.NetworkName == nc.networkName {
+				recorded = true
+
+				break
+			}
+		}
+
+		if recorded {
+			kept = append(kept, nc)
+		}
+	}
+
+	return kept
+}
+
+// publishPendingLeases registers the dhcp leases of the fresh allocations
+// whose binding commit succeeded: the stored spec records each assignment,
+// so the address becomes ACK-eligible exactly here and a process loss can
+// always reconstruct the ownership from the ledger record and the spec
+// entry (F01). a publication which fails leaves the durable ownership in
+// place - the stored spec records the address, so the retried sync restores
+// and republishes it - and marks the interface status ERROR so the failure
+// is visible and the re-attempt runs.
+func (c *Controller) publishPendingLeases(vmnetcfg *kihv1.VirtualMachineNetworkConfig, pending []allocatedNetworkConfig, status *kihv1.VirtualMachineNetworkConfigStatus) error {
+	if len(pending) == 0 {
+		return nil
+	}
+
+	vmRef := fmt.Sprintf("%s/%s", vmnetcfg.Namespace, vmnetcfg.Spec.VMName)
+
+	var publishErr error
+
+	for _, nc := range pending {
+		if err := c.dhcp.AddLease(nc.macAddress, nc.networkName, nc.ipAddress, vmRef); err != nil {
+			log.Errorf("(vmnetcfg.publishPendingLeases) [%s/%s] cannot publish the lease of hwaddr %s for ip %s after the committed assignment: %s",
+				vmnetcfg.Namespace, vmnetcfg.Name, nc.macAddress, nc.ipAddress, err)
+			c.metrics.UpdateLogStatus("error")
+
+			for i := range status.NetworkConfig {
+				if status.NetworkConfig[i].MACAddress == nc.macAddress && status.NetworkConfig[i].NetworkName == nc.networkName {
+					status.NetworkConfig[i].Status = "ERROR"
+					status.NetworkConfig[i].Message = err.Error()
+
+					break
+				}
+			}
+
+			if publishErr == nil {
+				publishErr = fmt.Errorf("(vmnetcfg.publishPendingLeases) cannot register the dhcp lease for hwaddr %s: %w", nc.macAddress, err)
+			}
+
+			continue
+		}
+
+		log.Debugf("(vmnetcfg.publishPendingLeases) [%s/%s] published the lease of hwaddr %s for ip %s after the committed assignment",
+			vmnetcfg.Namespace, vmnetcfg.Name, nc.macAddress, nc.ipAddress)
+	}
+
+	return publishErr
+}
+
+// resolveFailedCommit decides the fate of the fresh allocations of a sync
+// whose binding commit failed. nothing this sync allocated is ACK-eligible:
+// the deferred lease publications never ran, so unwinding a demonstrably
+// uncommitted assignment cannot hand a served address to a second guest -
+// the duplicate-ip risk which forced the old quarantine.
+//
+// the Update error alone does not prove the write did not land (a lost
+// response of a committed write looks the same), so the live object is the
+// authority: an assignment the stored spec records is durable, its ownership
+// is kept and its lease is published, and the returned commit error lets the
+// retried sync converge the status on the committed object. an assignment
+// the live spec does not record is fully unwound. an unreadable object is
+// treated conservatively: the claims and records stay held without serving,
+// so a write which landed is never destroyed; those reservations are bounded
+// by the era, because the registration sweep revalidates the persisted
+// ledger and drops the record of an assignment no spec records. a
+// definitively gone object unwinds like an unrecorded assignment: its own
+// deletion cleanup already released whatever landed.
+func (c *Controller) resolveFailedCommit(vmnetcfg *kihv1.VirtualMachineNetworkConfig, applied []allocatedNetworkConfig) {
+	if len(applied) == 0 {
+		return
+	}
+
+	live, err := c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs(vmnetcfg.Namespace).Get(c.ctx, vmnetcfg.Name, metav1.GetOptions{})
+	if err != nil {
+		if !apierrors.IsNotFound(err) {
+			log.Warnf("(vmnetcfg.resolveFailedCommit) [%s/%s] cannot reread the object after the failed commit, keeping the reservations of this sync held without serving them until the API answers again: %s",
+				vmnetcfg.Namespace, vmnetcfg.Name, err)
+			c.metrics.UpdateLogStatus("warning")
+
+			return
+		}
+
+		// the object is gone: no assignment of this sync can be recorded
+		// anymore, and whatever landed was released by the deletion cleanup
+		live = nil
+	}
+
+	vmRef := fmt.Sprintf("%s/%s", vmnetcfg.Namespace, vmnetcfg.Spec.VMName)
+
+	for i := len(applied) - 1; i >= 0; i-- {
+		nc := applied[i]
+
+		if live != nil && nicRecordsAssignment(live, nc) {
+			// the assignment is durable: publish the deferred lease and keep
+			// the ownership; the retried sync converges the status on the
+			// committed object
+			if err := c.dhcp.AddLease(nc.macAddress, nc.networkName, nc.ipAddress, vmRef); err != nil {
+				log.Errorf("(vmnetcfg.resolveFailedCommit) [%s/%s] cannot publish the lease of the committed assignment of hwaddr %s for ip %s: %s",
+					vmnetcfg.Namespace, vmnetcfg.Name, nc.macAddress, nc.ipAddress, err)
+				c.metrics.UpdateLogStatus("error")
+			}
+
+			continue
+		}
+
+		c.rollbackNetworkAllocation(vmnetcfg, nc)
+	}
+}
+
+// nicRecordsAssignment reports whether the given object's spec records the
+// full assignment (mac, networkname and address) of an allocation: the
+// address comparison is what makes a fresh assignment durable, unlike
+// nicRecorded which accepts the pre-commit address gap of this very sync.
+func nicRecordsAssignment(vmnetcfg *kihv1.VirtualMachineNetworkConfig, nc allocatedNetworkConfig) bool {
+	for _, v := range vmnetcfg.Spec.NetworkConfig {
+		if v.MACAddress == nc.macAddress && v.NetworkName == nc.networkName && v.IPAddress == nc.ipAddress {
+			return true
+		}
+	}
+
+	return false
 }
 
 // removeNicFromSpec and removeNicFromStatus drop the entries of a vanished

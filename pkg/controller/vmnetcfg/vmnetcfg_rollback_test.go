@@ -110,15 +110,14 @@ func TestVMNetCfgPoolStatusFailureKeepsRestoredDurableAllocation(t *testing.T) {
 }
 
 // within one sync the rollback must distinguish the allocation kinds: the
-// fresh allocation of an earlier nic stays quarantined (its lease may
-// already have been served to the guest; the retried sync adopts it into
-// the durable object), while the restored durable assignment of another
-// nic stays applied as well
-func TestVMNetCfgFailedSyncQuarantinesFreshAllocations(t *testing.T) {
+// fresh allocation of an earlier nic is unwound (its lease publication
+// waits for the commit which the failing nic prevents, so nothing was
+// served and releasing it cannot produce a duplicate ip), while the
+// restored durable assignment of another nic stays applied as well
+func TestVMNetCfgFailedSyncUnwindsFreshAllocations(t *testing.T) {
 	e := newTestEnv(t)
-	// steady state: a running application's sync failure quarantines only
-	// the fresh allocations of this sync
-	e.appStatus.Store(APP_RUNNING)
+	// steady state: a running application's sync failure unwinds only the
+	// fresh allocations of this sync
 	secondNetwork := "net-b"
 	const secondPoolName = "ippool-b"
 
@@ -161,21 +160,22 @@ func TestVMNetCfgFailedSyncQuarantinesFreshAllocations(t *testing.T) {
 		t.Errorf("durable ipam used = %d, want 1", used)
 	}
 
-	// the fresh allocation of the second nic stays quarantined: its lease
-	// may already have been served, so it is kept (lease, claim and record)
-	// until the retried sync adopts it
-	if freshLease := e.dhcp.GetLease(testMAC2); freshLease.ClientIP == nil || freshLease.ClientIP.String() != "10.0.0.1" {
-		t.Errorf("fresh lease = %v, want the quarantined lease kept", freshLease.ClientIP)
+	// the fresh allocation of the second nic is unwound: its publication
+	// waits for the commit which the missing pool of the third nic
+	// prevents, so nothing was served and its claim and record are
+	// released and removed
+	if e.dhcp.CheckLease(testMAC2) {
+		t.Error("the fresh lease of the second nic must not exist before the commit")
 	}
-	if used := e.ipam.Used(secondNetwork); used != 1 {
-		t.Errorf("fresh ipam used = %d, want the quarantined claim kept", used)
+	if used := e.ipam.Used(secondNetwork); used != 0 {
+		t.Errorf("fresh ipam used = %d, want 0 after the unwind", used)
 	}
 
 	e.api.mu.Lock()
 	poolBStored := e.api.ippools[secondPoolName].DeepCopy()
 	e.api.mu.Unlock()
-	if got := poolBStored.Status.IPv4.Allocated["10.0.0.1"]; got == "" {
-		t.Error("the quarantined status record of the second nic must be kept")
+	if got := poolBStored.Status.IPv4.Allocated["10.0.0.1"]; got != "" {
+		t.Error("the unwound status record of the second nic must be removed")
 	}
 }
 
@@ -222,14 +222,13 @@ func TestContestedRollbackClassifiesForeignOwnerOutcomesAsConverged(t *testing.T
 	}
 }
 
-// an allocation whose dhcp lease could not be registered was never served:
-// its claim must be released directly through releaseOwnClaim (the branch
-// the failed lease registration takes), because no lease, no ledger record
-// and no spec entry references the address anymore and no later
-// reconciliation could detect a quarantined claim again. the branch itself
-// only runs when the lease registration fails after the pre-validation,
-// which a second lease writer or a diverging mac spelling would cause.
-func TestUndeliveredClaimIsReleasedNotQuarantined(t *testing.T) {
+// releaseOwnClaim releases claims which no live state justifies anymore:
+// the converged outcomes (an already-free address, a foreign owner) are
+// not failures of the release, and a successor's claim is never released
+// with it. the helper serves the lease-vanished paths of the ownership
+// repair, where the claim of a nic which a concurrent cleanup removed
+// must not outlive its lease.
+func TestReleaseOwnClaimToleratesConvergedOutcomes(t *testing.T) {
 	e := newTestEnv(t)
 	e.addSubnet("10.0.0.1", "10.0.0.2")
 
