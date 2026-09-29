@@ -261,6 +261,20 @@ func (c *Controller) sync(event Event) (err error) {
 					// nothing to retry
 					log.Warnf("(ippool.sync) the DHCP listener of pool %s is already running, nothing to repair", event.poolName)
 					c.metrics.UpdateLogStatus("warning")
+				} else if errors.Is(runErr, dhcp.ErrAllocatorClosed) {
+					// the shutdown path of this era already closed the
+					// allocator (the leadership was lost and the fence
+					// ran before the era join): a worker which is still
+					// draining queues this repair against an allocator
+					// that can never serve again, and the appStatus stays
+					// APP_RUNNING until the era is gone, so the condition
+					// stays true. the listener lifecycle belongs to the
+					// era transition - the next era's registration
+					// re-serves the pool - so the closed allocator is the
+					// converged outcome of a repair racing the fence, not
+					// a failure worth an error alert or a retry spin
+					log.Warnf("(ippool.sync) the DHCP allocator of this era is closed, the listener of pool %s is not repaired", event.poolName)
+					c.metrics.UpdateLogStatus("warning")
 				} else {
 					log.Errorf("(ippool.sync) failed to restore the DHCP listener of pool %s: %s", event.poolName, runErr.Error())
 					c.metrics.UpdateLogStatus("error")

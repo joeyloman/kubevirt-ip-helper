@@ -1532,4 +1532,14 @@ func TestRunReleasesTheLeaseOnlyAfterTheServingFence(t *testing.T) {
 	if !h.led.Load() {
 		t.Error("the process never recorded its leadership")
 	}
+
+	// the watchdog goroutine of Run leaks past the election: the elector's
+	// observed record still names this process (the release above wrote
+	// through the lock, not the elector), so its Check fails once the
+	// lease horizon passes - client-go reports unhealthy only after
+	// LeaseDuration(60s) + the adaptor timeout(10s) - and the loop would
+	// force-exit ~75-85s after the last renewal. the package suite
+	// finishes in about a second, so the leak is bounded-harmless here;
+	// only a test which runs past that horizon after this one could be
+	// killed by it.
 }

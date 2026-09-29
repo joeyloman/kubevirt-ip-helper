@@ -1235,6 +1235,35 @@ func TestSyncUpdateListenerRepairAlreadyRunningConverges(t *testing.T) {
 	}
 }
 
+// TestSyncUpdateListenerRepairAgainstClosedAllocatorConverges: the era's
+// shutdown fence closes the dhcp allocator before the era join, and a
+// worker which is still draining its queue can run this listener repair
+// against the closed allocator while the appStatus is still APP_RUNNING.
+// the closed allocator is the converged outcome of a repair racing the
+// fence - the next era's registration re-serves the pool - so it must
+// not surface as an error-level alert, an error metric or a retryable
+// sync failure.
+func TestSyncUpdateListenerRepairAgainstClosedAllocatorConverges(t *testing.T) {
+	var appStatus atomic.Int32
+	appStatus.Store(APP_RUNNING)
+	pool := testPool("pool-n3", "net-n3", 60)
+
+	indexer := newTestIndexer()
+	indexer.Add(pool)
+
+	controller, cacheAllocator := newTestController(t, newTestQueue(), indexer, nil, &appStatus, nil)
+	if err := cacheAllocator.Add(pool); err != nil {
+		t.Fatalf("seeding cache: %v", err)
+	}
+	controller.runListener = func(networkName string, nic string) error {
+		return fmt.Errorf("%w: network %s", dhcp.ErrAllocatorClosed, networkName)
+	}
+
+	if err := controller.sync(testPoolEvent("pool-n3", UPDATE, "net-n3")); err != nil {
+		t.Errorf("sync(UPDATE) returned error %v, want nil for the converged closed-allocator repair", err)
+	}
+}
+
 // TestSyncUpdateResyncReroutesSwallowedNetworkNameChange pins the review
 // finding: a networkname change which arrives while the application is
 // initializing is ignored, but the registration keeps serving under the
