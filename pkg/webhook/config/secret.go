@@ -8,6 +8,7 @@ import (
 	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -49,6 +50,37 @@ func (h *Handler) createSecret(tlsPair tls.Certificate) (err error) {
 	_, err = h.clientset.CoreV1().Secrets(h.webhookNamespace).Create(h.ctx, &newSecret, metav1.CreateOptions{})
 
 	return
+}
+
+// updateSecret replaces the persisted pair in one resource-version-aware
+// update (F13): the previous data stays in place until the update
+// succeeds, concurrent replacements conflict on the resource version
+// instead of overwriting each other blindly, and a renewal which finds
+// no secret falls back to the bootstrap's conflict-safe creation.
+func (h *Handler) updateSecret(tlsPair tls.Certificate) (err error) {
+	pemKey, err := pemEncodePKCS8Key(tlsPair.PrivateKey)
+	if err != nil {
+		return err
+	}
+
+	current, getErr := h.clientset.CoreV1().Secrets(h.webhookNamespace).Get(h.ctx, h.webhookSecretName, metav1.GetOptions{})
+	if getErr != nil {
+		if apierrors.IsNotFound(getErr) {
+			return h.createSecret(tlsPair)
+		}
+
+		return fmt.Errorf("cannot read the webhook secret %s for its replacement: %s", h.webhookSecretName, getErr.Error())
+	}
+
+	updated := current.DeepCopy()
+	updated.Data["tls.key"] = pemKey
+	updated.Data["tls.crt"] = tlsPair.Certificate[0]
+
+	if _, err = h.clientset.CoreV1().Secrets(h.webhookNamespace).Update(h.ctx, updated, metav1.UpdateOptions{}); err != nil {
+		return fmt.Errorf("cannot replace the webhook secret %s: %s", h.webhookSecretName, err.Error())
+	}
+
+	return nil
 }
 
 func (h *Handler) getSecret() corev1.Secret {

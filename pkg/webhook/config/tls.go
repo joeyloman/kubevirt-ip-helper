@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"os"
 	"time"
@@ -189,19 +190,36 @@ func (h *Handler) createAndSignCSR(pCsr []byte) ([]byte, error) {
 	return certificate, nil
 }
 
+// errUnusableTLSPair marks a persisted secret whose tls.crt/tls.key data
+// cannot form a usable pair: a missing or empty field, garbage PEM, a
+// malformed DER body or a certificate which does not match the key. the
+// renewal treats it as due for replacement instead of serving it or
+// reading it as not-due (F13).
+var errUnusableTLSPair = errors.New("the persisted tls pair is unusable")
+
 func (h *Handler) getTLSDataFromSecret() (tlsPair tls.Certificate, err error) {
 	s := h.getSecret()
 
 	cert, exists := s.Data["tls.crt"]
-	if !exists {
-		return tlsPair, fmt.Errorf("tls.crt not found in secret")
+	if !exists || len(cert) == 0 {
+		return tlsPair, fmt.Errorf("%w: tls.crt not found in secret", errUnusableTLSPair)
 	}
-	tlsPair.Certificate = append(tlsPair.Certificate, cert)
 
 	key, exists := s.Data["tls.key"]
-	if !exists {
-		return tlsPair, fmt.Errorf("tls.key not found in secret")
+	if !exists || len(key) == 0 {
+		return tlsPair, fmt.Errorf("%w: tls.key not found in secret", errUnusableTLSPair)
 	}
+
+	// the loaded pair must be usable before anything serves or decides on
+	// it (F13): the previous raw extraction handed garbage to the expiry
+	// parse (whose nil-error dereference panicked on non-PEM data) and
+	// to the file writer, which installed the garbage as the serving
+	// credentials
+	if _, pairErr := tls.X509KeyPair(cert, key); pairErr != nil {
+		return tlsPair, fmt.Errorf("%w: %s", errUnusableTLSPair, pairErr.Error())
+	}
+
+	tlsPair.Certificate = append(tlsPair.Certificate, cert)
 	tlsPair.PrivateKey = key
 
 	return
@@ -240,38 +258,51 @@ func (h *Handler) renewTLSPair() (err error) {
 		return
 	}
 
-	if err = h.deleteSecret(); err != nil {
-		return
-	}
-
-	return h.createSecret(tlsPair)
+	// the replacement is one resource-version-aware update (F13): the
+	// previous delete/create destroyed the last-good pair as soon as the
+	// create failed (an apiserver error, a concurrent writer), leaving
+	// no persisted usable pair for any restart or renewal retry
+	return h.updateSecret(tlsPair)
 }
 
 func (h *Handler) GetCertExpireDate() (expireDate time.Time, err error) {
 	tlsPair, err := h.getTLSDataFromSecret()
 	if err != nil {
-		return time.Time{}, fmt.Errorf("cannot while fetching TLS data: %s", err.Error())
+		return time.Time{}, fmt.Errorf("cannot fetch the tls data: %w", err)
 	}
 
-	if len(tlsPair.Certificate[0]) == 0 {
-		return time.Time{}, fmt.Errorf("certificate is empty")
-	}
 	b, _ := pem.Decode(tlsPair.Certificate[0])
 	if b == nil {
-		return time.Time{}, fmt.Errorf("cannot decode TLS PEM data: %s", err.Error())
+		return time.Time{}, fmt.Errorf("%w: the tls.crt data is not PEM encoded", errUnusableTLSPair)
 	}
 
-	cert, err := x509.ParseCertificate(b.Bytes)
-	if err != nil {
-		return time.Time{}, fmt.Errorf("cannot parse TLS PEM data: %s", err.Error())
+	cert, parseErr := x509.ParseCertificate(b.Bytes)
+	if parseErr != nil {
+		return time.Time{}, fmt.Errorf("%w: %s", errUnusableTLSPair, parseErr.Error())
 	}
 
-	return cert.NotAfter, err
+	return cert.NotAfter, nil
 }
 
 func (h *Handler) checkCertExpireDate(certRenewalPeriod int64) bool {
 	expireDate, err := h.GetCertExpireDate()
 	if err != nil {
+		// an unusable persisted pair is due for the replacement
+		// immediately (F13): the secret survives restarts, so waiting or
+		// serving it never heals, and the renewal replaces it with a
+		// fresh pair. the not-due fallback stays for the errors which
+		// are not a data verdict: a read which failed between the secret
+		// check and here must not issue credentials while the persisted
+		// pair may still be fine, and the next scheduler tick retries
+		// the read - and even a transient read failure which reaches the
+		// renewal converges harmlessly, because the resource-version
+		// aware update replaces nothing until it succeeds
+		if errors.Is(err, errUnusableTLSPair) {
+			log.Warnf("(webhook.config) %s: the pair is due for replacement", err.Error())
+
+			return true
+		}
+
 		log.Errorf("%s", err.Error())
 
 		return false

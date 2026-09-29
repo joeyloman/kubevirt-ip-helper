@@ -48,7 +48,7 @@ func (h *Handler) Init() {
 	h.csrName = fmt.Sprintf("%s.%s.svc", h.webhookName, h.webhookNamespace)
 }
 
-func (h *Handler) Run(certRenewalPeriod int64) {
+func (h *Handler) Run(certRenewalPeriod int64) error {
 	if h.checkSecret() {
 		if h.checkCertExpireDate(certRenewalPeriod) {
 			if err := h.renewTLSPair(); err != nil {
@@ -87,5 +87,13 @@ func (h *Handler) Run(certRenewalPeriod int64) {
 
 	if err := h.writeTLSDataFromSecret(); err != nil {
 		log.Errorf("%s", err.Error())
+
+		// the serving files could not be produced from a usable pair
+		// (F13): the caller must not restart the server on this state,
+		// the current credentials keep serving and the next scheduler
+		// tick retries the whole renewal
+		return err
 	}
+
+	return nil
 }

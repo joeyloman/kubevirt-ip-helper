@@ -76,6 +76,14 @@ type issuanceState struct {
 	// of a concurrent bootstrap which published the shared secret
 	// between this pod's no-secret read and its publication
 	preExistingSecretOnCreate *corev1.Secret
+	// failSecretUpdate answers the resource-version-aware replacement
+	// with an apiserver error, the persistence failure after a
+	// successful issuance
+	failSecretUpdate bool
+	// lastUpdateRV records the resource version the last replacement
+	// carried, so the tests verify the update is resource-version aware
+	lastUpdateRV string
+	rvSeq        int
 }
 
 func issuanceAPIServer(t *testing.T) (*issuanceState, *kubernetes.Clientset) {
@@ -134,6 +142,8 @@ func (s *issuanceState) handle(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == http.MethodPost && strings.HasSuffix(path, "/secrets"):
 		s.createSecretRequest(w, r)
+	case r.Method == http.MethodPut && strings.Contains(path, "/secrets/"):
+		s.updateSecretRequest(w, r, path)
 	case r.Method == http.MethodGet && strings.Contains(path, "/secrets/"):
 		s.getSecretRequest(w, path)
 	case r.Method == http.MethodDelete && strings.Contains(path, "/secrets/"):
@@ -203,8 +213,51 @@ func (s *issuanceState) createSecretRequest(w http.ResponseWriter, r *http.Reque
 	}
 
 	secret.TypeMeta = metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"}
+	s.rvSeq++
+	secret.ResourceVersion = fmt.Sprintf("rv-%d", s.rvSeq)
 	s.secrets[secret.Name] = secret
 	s.writeObject(w, http.StatusCreated, secret)
+}
+
+// updateSecretRequest is the resource-version-aware replacement of the
+// scripted apiserver: the incoming object must carry the stored
+// resource version (a concurrent writer conflicts), the data is
+// replaced atomically and a fresh resource version is assigned.
+func (s *issuanceState) updateSecretRequest(w http.ResponseWriter, r *http.Request, path string) {
+	if s.failSecretUpdate {
+		s.writeStatus(w, http.StatusInternalServerError, "InternalError",
+			fmt.Sprintf("secrets %q cannot be updated", nameFromPath(path)))
+
+		return
+	}
+
+	incoming := &corev1.Secret{}
+	if err := json.NewDecoder(r.Body).Decode(incoming); err != nil {
+		s.writeStatus(w, http.StatusBadRequest, "BadRequest", err.Error())
+
+		return
+	}
+
+	stored, exists := s.secrets[nameFromPath(path)]
+	if !exists {
+		s.writeStatus(w, http.StatusNotFound, "NotFound",
+			fmt.Sprintf("secrets %q not found", nameFromPath(path)))
+
+		return
+	}
+
+	s.lastUpdateRV = incoming.ResourceVersion
+	if incoming.ResourceVersion != stored.ResourceVersion {
+		s.writeStatus(w, http.StatusConflict, "Conflict",
+			fmt.Sprintf("secrets %q was modified", nameFromPath(path)))
+
+		return
+	}
+
+	stored.Data = incoming.Data
+	s.rvSeq++
+	stored.ResourceVersion = fmt.Sprintf("rv-%d", s.rvSeq)
+	s.writeObject(w, http.StatusOK, stored)
 }
 
 func (s *issuanceState) getSecretRequest(w http.ResponseWriter, path string) {

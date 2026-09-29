@@ -78,7 +78,9 @@ func main() {
 	)
 
 	configHandler.Init()
-	configHandler.Run(certRenewalPeriod)
+	if err := configHandler.Run(certRenewalPeriod); err != nil {
+		log.Fatalf("(webhook) the initial credential load failed: %s", err.Error())
+	}
 	admissionHandler.Init()
 	serviceHandler.Init()
 	scheduler.StartCertRenewalScheduler(configHandler, serviceHandler, certRenewalPeriod)
