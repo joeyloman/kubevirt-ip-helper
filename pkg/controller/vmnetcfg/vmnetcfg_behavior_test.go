@@ -299,6 +299,15 @@ type fakeAPIServer struct {
 	conflictPath      string
 	conflictCount     int
 	poolStatusPutCode int
+	// poolPutDropConn commits the next that-many ippool /status PUTs but
+	// closes the connection before a response byte is written: the client
+	// observes a lost response (EOF) for a ledger write the server
+	// actually applied, which is the ambiguous-commit boundary of the
+	// pool ledger (the analog of vmnetcfgPutDropConn for the binding
+	// commit). an injected commit takes precedence over poolStatusPutCode,
+	// so a test can strand a committed record and fail the writes which
+	// follow it (the compensating delete of a rollback) deterministically
+	poolPutDropConn int
 	// ippoolListCode fails the cluster-wide ippool list with the given
 	// http code: the cleanup resolution and the pending unwind replay
 	// must fail closed while the api is unreachable
@@ -489,6 +498,10 @@ func (f *fakeAPIServer) handleIPPool(w http.ResponseWriter, r *http.Request, nam
 		if conflict {
 			f.conflictCount--
 		}
+		dropConn := f.poolPutDropConn
+		if dropConn > 0 {
+			f.poolPutDropConn--
+		}
 		failCode := f.poolStatusPutCode
 		f.mu.Unlock()
 		if conflict {
@@ -507,7 +520,10 @@ func (f *fakeAPIServer) handleIPPool(w http.ResponseWriter, r *http.Request, nam
 			writeStatus(w, http.StatusConflict, metav1.StatusReasonConflict, "please apply your changes to the latest version and try again")
 			return
 		}
-		if failCode != 0 {
+		// an injected commit takes precedence over the injected failure: a
+		// drop-conn write is one the server applied, so a failure code for
+		// the same write would be contradictory
+		if dropConn == 0 && failCode != 0 {
 			writeStatus(w, failCode, metav1.StatusReasonInternalError, "boom")
 			return
 		}
@@ -538,6 +554,16 @@ func (f *fakeAPIServer) handleIPPool(w http.ResponseWriter, r *http.Request, nam
 		bumpResourceVersion(&pool)
 		f.ippools[name] = pool.DeepCopy()
 		f.mu.Unlock()
+		if dropConn > 0 {
+			// the ledger write is committed: lose the response instead, so
+			// the client cannot know whether its update was applied
+			if hj, ok := w.(http.Hijacker); ok {
+				if conn, _, err := hj.Hijack(); err == nil {
+					_ = conn.Close()
+					return
+				}
+			}
+		}
 		f.writePool(w, &pool)
 	case r.Method == http.MethodPut && sub == "":
 		var pool kihv1.IPPool
