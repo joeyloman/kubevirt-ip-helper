@@ -409,6 +409,27 @@ func (c *Controller) handleIPPoolObjectChange(oldPool kihv1.IPPool, newPool *kih
 			oldPool.Spec.NetworkName, newPool.Spec.NetworkName)
 	}
 
+	// an update which moves the pool onto the bindinterface of another
+	// registered network is the same never-converging conflict the
+	// registration rejects up front (F10): without this guard the update
+	// stopped its own healthy listener, released its server ip from the
+	// nic and reinitialized the whole application, and the
+	// re-registration of the next era then rejected the pool forever
+	// because the registration's interface-ownership check saw the
+	// interface occupied - a deterministically invalid edit interrupted
+	// previously healthy service across the era. the ownership source is
+	// the registration's own check, and only an interface which actually
+	// changes is examined: the pool's own live registration claims its
+	// old interface, so a simultaneous networkname edit must never be
+	// read as a foreign claim on the unchanged interface (the restart
+	// tears the old registration down before the new one claims it)
+	if oldPool.Spec.BindInterface != newPool.Spec.BindInterface {
+		if otherNetwork, inUse := c.dhcp.NicClaimedByAnotherPool(newPool.Spec.BindInterface, newPool.Spec.NetworkName); inUse {
+			return fmt.Errorf("(ippool.handleIPPoolObjectChange) rejecting update for [%s]: the bindinterface [%s] is already registered by the pool of network [%s], keeping the currently registered configuration",
+				newPool.Name, newPool.Spec.BindInterface, otherNetwork)
+		}
+	}
+
 	// an exclude entry which the persisted ledger records for a live
 	// binding is the same never-converging conflict the registration
 	// rejects up front: without this guard the restart teardown would
