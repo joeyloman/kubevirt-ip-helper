@@ -270,6 +270,10 @@ func (c *Controller) pendingUnwindPoolNames(entry pendingLedgerDelete) (poolName
 // warning, because the next era's pool registration revalidates the
 // persisted ledger and drops the orphaned record of a positively
 // removed binding.
+// entries of an older generation of the key which the replay-time
+// generation validation kept resident arrive here as well once the
+// replacement itself is gone: the drain is the last owner-validated
+// attempt of every generation the key ever had.
 func (c *Controller) drainPendingUnwinds(key string) {
 	c.mutex.Lock()
 	pending := c.pendingUnwinds[key]
@@ -335,6 +339,28 @@ func (c *Controller) drainPendingUnwinds(key string) {
 	}
 }
 
+// pendingUnwindShadowsLiveObject reports whether the recorded entry's
+// ledger owner identity can describe state the given live object owns: the
+// pool ledger records an allocation under the name-based owner reference
+// (namespace/vmname [macaddress]), so a successor under the same key which
+// reuses the vmname and macaddress of the deleted generation is
+// indistinguishable from it in the ledger - only the uid of the recorded
+// generation tells their records apart, and the ledger itself carries no
+// uid.
+func pendingUnwindShadowsLiveObject(entry pendingLedgerDelete, vmnetcfg *kihv1.VirtualMachineNetworkConfig) bool {
+	if entry.namespace != vmnetcfg.Namespace || entry.vmName != vmnetcfg.Spec.VMName {
+		return false
+	}
+
+	for _, v := range vmnetcfg.Spec.NetworkConfig {
+		if v.MACAddress == entry.macAddress {
+			return true
+		}
+	}
+
+	return false
+}
+
 // retryPendingUnwinds replays the failed ledger deletions of an object at
 // the start of its reconciliation. a deletion which converged - the
 // record is gone, a foreign owner recorded the address in the meantime,
@@ -344,6 +370,10 @@ func (c *Controller) drainPendingUnwinds(key string) {
 // it. without this replay the orphaned record would block a later
 // binding's ledger write until the next pool registration revalidates
 // the persisted ledger.
+// a tagged entry which was recorded by a replaced generation of this key
+// is validated before any mutation: while the live object can own the
+// entry's name-based identity, the replay is aborted and the entry stays
+// recorded for the delete-event drain of the key (R02).
 func (c *Controller) retryPendingUnwinds(vmnetcfg *kihv1.VirtualMachineNetworkConfig) error {
 	key := fmt.Sprintf("%s/%s", vmnetcfg.Namespace, vmnetcfg.Name)
 
@@ -359,6 +389,31 @@ func (c *Controller) retryPendingUnwinds(vmnetcfg *kihv1.VirtualMachineNetworkCo
 	var retryErr error
 
 	for _, entry := range pending {
+		// R02: the ledger owner identity is name-based (namespace/vmname
+		// [macaddress]), so a same-key replacement which reuses the
+		// vmname and macaddress of the deleted generation writes records
+		// the dead generation's unwind cannot be distinguished from:
+		// replaying it would remove the successor's live record. the
+		// recorded generation is validated before any mutation: while
+		// the live object of another generation can own the entry's
+		// identity, the replay is aborted and the entry stays recorded
+		// - the delete-event drain of this key replays it once the
+		// successor is gone. an entry whose identity the live object
+		// cannot own (another vmname or macaddress) is replayed
+		// normally: the owner validation of the ledger write protects
+		// the successor, and skipping the replay would block the
+		// address of the dead generation's record until the next era.
+		// an untagged legacy entry keeps the delete-event replacement
+		// guard as its only protection, exactly like before
+		if entry.uid != "" && entry.uid != vmnetcfg.UID && pendingUnwindShadowsLiveObject(entry, vmnetcfg) {
+			log.Warnf("(vmnetcfg.retryPendingUnwinds) [%s/%s] the pending ledger record of ip %s in network %s was recorded by a replaced generation of this key, not replaying it against the live object",
+				vmnetcfg.Namespace, vmnetcfg.Name, entry.ip, entry.networkName)
+			c.metrics.UpdateLogStatus("warning")
+
+			c.rememberPendingUnwind(key, entry)
+
+			continue
+		}
 		poolNames, converged, resolveErr := c.pendingUnwindPoolNames(entry)
 		if converged {
 			// the pool object is verifiably gone and took its whole
@@ -548,9 +603,12 @@ func (c *Controller) sync(event Event) (err error) {
 		// records are keyed by this object's name with the old
 		// generation's owner, so replaying either would tear down the
 		// replacement's live lease, claim and ledger entry. the replay is
-		// skipped and the replacement's own events manage the object; its
-		// eventual deletion replays the still-recorded unwinds of the old
-		// generation (owner-validated and idempotent).
+		// skipped and the replacement's own events manage the object:
+		// their reconciliation additionally validates the recorded
+		// generation of every tagged unwind entry before replaying it
+		// (R02), and the eventual deletion of the replacement replays
+		// the still-recorded unwinds of the old generations
+		// (owner-validated and idempotent).
 		if exists {
 			log.Warnf("(vmnetcfg.sync) VirtualMachineNetworkConfig %s was deleted but a same-name replacement exists, skipping the deletion replay", event.key)
 			c.metrics.UpdateLogStatus("warning")

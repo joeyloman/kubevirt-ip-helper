@@ -8,6 +8,7 @@ import (
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/dhcp"
@@ -64,6 +65,13 @@ type pendingLedgerDelete struct {
 	// tuple whose pool was not cached at record time leaves it empty and
 	// the replay resolves it from the network name instead
 	poolName string
+	// uid tags the object generation whose sync recorded the entry: the
+	// ledger owner identity is name-based, so a same-key replacement can
+	// reuse it, and the replay validates the live generation before any
+	// mutation (R02). an entry recorded before the tag existed keeps the
+	// empty value and stays protected by the delete-event replacement
+	// guard alone
+	uid types.UID
 }
 
 // rollbackNetworkAllocation reverts the allocation side effects of a
@@ -146,6 +154,7 @@ func (c *Controller) rollbackNetworkAllocation(vmnetcfg *kihv1.VirtualMachineNet
 					networkName: allocated.networkName,
 					macAddress:  allocated.macAddress,
 					poolName:    allocated.poolName,
+					uid:         vmnetcfg.UID,
 				},
 			)
 		}
@@ -774,6 +783,7 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 								networkName: v.NetworkName,
 								macAddress:  v.MACAddress,
 								poolName:    pool.(kihv1.IPPool).Name,
+								uid:         vmnetcfg.UID,
 							},
 						)
 					}
@@ -1360,6 +1370,7 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 						networkName: capturedLease.PoolName,
 						macAddress:  netCfg.MACAddress,
 						poolName:    poolName,
+						uid:         vmnetcfg.UID,
 					},
 				)
 
@@ -1703,6 +1714,7 @@ func (c *Controller) unwindClaim(vmnetcfg *kihv1.VirtualMachineNetworkConfig, nc
 				networkName: nc.networkName,
 				macAddress:  nc.macAddress,
 				poolName:    nc.poolName,
+				uid:         vmnetcfg.UID,
 			},
 		)
 	}
