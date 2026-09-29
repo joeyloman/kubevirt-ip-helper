@@ -279,7 +279,44 @@ func (s *ippoolBehaviorRestState) ippoolBehaviorHandler() http.Handler {
 	// (/apis/.../v1/namespaces/{ns}/virtualmachinenetworkconfigs/{name})
 	mux.HandleFunc("/apis/kubevirtiphelper.k8s.binbash.org/v1/namespaces/", func(w http.ResponseWriter, r *http.Request) {
 		segments := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
-		if len(segments) != 7 || segments[3] != "namespaces" || segments[5] != "virtualmachinenetworkconfigs" {
+		if len(segments) < 6 || segments[3] != "namespaces" || segments[5] != "virtualmachinenetworkconfigs" {
+			ippoolBehaviorWriteKubeError(w, http.StatusNotFound)
+			return
+		}
+
+		// the namespaced list of the ledger owner resolution: the bindings
+		// of one namespace, served like the cluster-wide list of the claim
+		// sweep and switchable into the same failure mode
+		if len(segments) == 6 {
+			if r.Method != http.MethodGet {
+				ippoolBehaviorWriteKubeError(w, http.StatusMethodNotAllowed)
+				return
+			}
+
+			list := &kihv1.VirtualMachineNetworkConfigList{
+				TypeMeta: metav1.TypeMeta{APIVersion: kihv1.SchemeGroupVersion.String(), Kind: "VirtualMachineNetworkConfigList"},
+			}
+
+			s.mu.Lock()
+			if s.failVMNetCfgList {
+				s.mu.Unlock()
+				ippoolBehaviorWriteKubeError(w, http.StatusNotFound)
+				return
+			}
+			for _, obj := range s.vmnetcfgs {
+				if obj.Namespace == segments[4] {
+					list.Items = append(list.Items, *obj.DeepCopy())
+				}
+			}
+			s.mu.Unlock()
+
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(list)
+
+			return
+		}
+
+		if len(segments) != 7 {
 			ippoolBehaviorWriteKubeError(w, http.StatusNotFound)
 			return
 		}

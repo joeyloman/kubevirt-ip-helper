@@ -1275,21 +1275,32 @@ const (
 // authoritative absence, which may drop the record, from the uncertain
 // absence, which must keep it:
 //
-//   - the owning vmnetcfg exists and its spec still records the binding
-//     (canonical mac, this network, this address): the owner is live, and
-//     the live object is returned with the verdict so the caller can
-//     compare the recorded identity against the current spec.vmname
-//     (F09): a record whose nic a fresh read attributes to a different
-//     vm must not be republished under the recorded identity.
-//   - the owning vmnetcfg exists but no longer records the binding: the
-//     owner positively removed it (a nic edit or a completed move), so
-//     the record is stale and must not be resurrected.
-//   - the owning vmnetcfg is gone: only a VirtualMachine which is gone as
-//     well is the authoritative absence (a live vm's controller recreates
-//     its vmnetcfg, and the recreated binding reclaims the address), so
-//     the vm existence decides. a missing verifier (tests, a client which
-//     could not be built) is unverifiable and the consumer keeps the
-//     record.
+//   - the vmnetcfg addressed by the recorded vm name exists and its spec
+//     still records the binding (canonical mac, this network, this
+//     address): the owner is live, and the live object is returned with
+//     the verdict so the caller can compare the recorded identity
+//     against the current spec.vmname (F09): a record whose nic a fresh
+//     read attributes to a different vm must not be republished under
+//     the recorded identity.
+//   - the vmnetcfg addressed by the recorded vm name exists, belongs to
+//     the recorded vm, but no longer records the binding: the owner
+//     positively removed it (a nic edit or a completed move), so the
+//     record is stale and must not be resurrected.
+//   - the name-addressed object does not confirm the claim (it is gone,
+//     or it merely carries the recorded vm's name while belonging to
+//     another vm): the record carries the owner identity, not the object
+//     name - a manually created or renamed binding can claim the nic
+//     under any object name - so the claimant is resolved among the
+//     actual bindings of the namespace by the full owner tuple (the vm
+//     name, the canonical mac, the network and the address). a live
+//     binding which records the claim keeps the record, whatever its
+//     object name is called (R05).
+//   - no actual binding records the claim: only a VirtualMachine which
+//     is gone as well is the authoritative absence (a live vm's
+//     controller recreates its vmnetcfg, and the recreated binding
+//     reclaims the address), so the vm existence decides. a missing
+//     verifier (tests, a client which could not be built) is
+//     unverifiable and the consumer keeps the record.
 //   - any read which fails transiently is unverifiable: a claim the guest
 //     may still hold must not be dropped because one api read failed, and
 //     the next registration revalidates it again.
@@ -1298,17 +1309,22 @@ func (c *Controller) verifyLedgerOwner(pool *kihv1.IPPool, namespace string, vmN
 		c.ctx, vmName, metav1.GetOptions{},
 	)
 	if getErr == nil {
-		for _, v := range vmnetcfg.Spec.NetworkConfig {
-			if util.CanonicalHWAddr(v.MACAddress) == util.CanonicalHWAddr(hwAddr) &&
-				v.NetworkName == pool.Spec.NetworkName && v.IPAddress == ip {
-				return ownerLive, vmnetcfg
-			}
+		if specRecordsClaim(vmnetcfg, pool, hwAddr, ip) {
+			return ownerLive, vmnetcfg
 		}
 
-		return ownerGone, nil
-	}
+		// the name-addressed object belongs to the recorded vm but its
+		// spec does not record the binding anymore: the owner positively
+		// removed it, so the record is stale and must not be resurrected
+		if vmnetcfg.Spec.VMName == vmName {
+			return ownerGone, nil
+		}
 
-	if !apierrors.IsNotFound(getErr) {
+		// the name-addressed object belongs to another vm: it merely
+		// carries the recorded vm's name, so its existence says nothing
+		// about the recorded owner - the claimant is resolved among the
+		// actual bindings below instead of concluding anything here
+	} else if !apierrors.IsNotFound(getErr) {
 		log.Warnf("(ippool.verifyLedgerOwner) cannot verify the owner %s/%s of the recorded ip %s of IPPool %s, keeping the record: %s",
 			namespace, vmName, ip, pool.Name, getErr.Error())
 		c.metrics.UpdateLogStatus("warning")
@@ -1316,6 +1332,30 @@ func (c *Controller) verifyLedgerOwner(pool *kihv1.IPPool, namespace string, vmN
 		return ownerUnverified, nil
 	}
 
+	// resolve the claimant among the actual bindings of the namespace by
+	// the full owner tuple (R05): the record references the vm identity,
+	// and the binding which records the claim can carry any object name
+	bindings, listErr := c.kihClientset.KubevirtiphelperV1().VirtualMachineNetworkConfigs(namespace).List(
+		c.ctx, metav1.ListOptions{},
+	)
+	if listErr != nil {
+		log.Warnf("(ippool.verifyLedgerOwner) cannot resolve the claiming binding of the owner %s/%s of the recorded ip %s of IPPool %s among the actual bindings, keeping the record: %s",
+			namespace, vmName, ip, pool.Name, listErr.Error())
+		c.metrics.UpdateLogStatus("warning")
+
+		return ownerUnverified, nil
+	}
+	for i := range bindings.Items {
+		binding := &bindings.Items[i]
+		if binding.Spec.VMName != vmName || !specRecordsClaim(binding, pool, hwAddr, ip) {
+			continue
+		}
+
+		return ownerLive, binding
+	}
+
+	// no actual binding records the claim under the recorded identity:
+	// the vm existence decides whether the absence is authoritative
 	if c.verifyVM == nil {
 		log.Warnf("(ippool.verifyLedgerOwner) cannot verify the virtualmachine %s/%s behind the missing VirtualMachineNetworkConfig of the recorded ip %s of IPPool %s, keeping the record",
 			namespace, vmName, ip, pool.Name)
@@ -1337,6 +1377,19 @@ func (c *Controller) verifyLedgerOwner(pool *kihv1.IPPool, namespace string, vmN
 	}
 
 	return ownerGone, nil
+}
+
+// specRecordsClaim reports whether the binding's spec still records the
+// recorded claim: the canonical mac, this network and this address.
+func specRecordsClaim(vmnetcfg *kihv1.VirtualMachineNetworkConfig, pool *kihv1.IPPool, hwAddr string, ip string) bool {
+	for _, v := range vmnetcfg.Spec.NetworkConfig {
+		if util.CanonicalHWAddr(v.MACAddress) == util.CanonicalHWAddr(hwAddr) &&
+			v.NetworkName == pool.Spec.NetworkName && v.IPAddress == ip {
+			return true
+		}
+	}
+
+	return false
 }
 
 // excludeEntryConflicts verifies the persisted ledger record of an exclude
