@@ -196,6 +196,8 @@ EOF
 
 Now create a Virtual Machine in the same network as the \<NETWORKATTACHMENTDEFINITION_NAME> to test if the DHCP service works.
 
+The `serverip` and the `router` of a pool are the addresses of the helper's own interface and of the gateway: they must not lie inside the allocation range (`pool.start` to `pool.end`), because the allocator would hand an in-range address to a guest while the infrastructure still uses it. A pool whose `serverip` or `router` lies inside its allocation range is rejected - by the ippool admission check before the object is stored, and by the same check mirrored in the helper's own registration for objects which reach the controller anyway (for example when the webhook is not installed) - unless the address is also listed in `pool.exclude`, which reserves it explicitly. This is a compatibility change: a pool which previously served its own infrastructure address to a guest was accepted silently and is now rejected; fix such a pool by moving the address outside the allocation range or by adding it to the exclude list.
+
 ### Status information
 
 Status information about the IP reservations are kept in the status fields in the ippool objects and in the vmnetcfg objects.
@@ -230,13 +232,37 @@ Description: Amount of warnings or errors detected.
 
 Metrics are exported on port 8080 by default. This can be changed by adding the METRICS_PORT environment variable in the deployment. The deployment example also contains a servicemonitor object which can be automatically picked up by the Prometheus monitoring solution.
 
+## Operational limits and recovery
+
+### Address release and reuse
+
+IP addresses are released immediately when the deletion of a Virtual Machine is detected; a DHCPRELEASE or a DHCPDECLINE message from a guest does not free a controller reservation. The immediate release assumes that a removed guest stops using its address before it is reused: the controller cannot observe whether the guest of a deleted VirtualMachine has actually relinquished its interface, so the reuse of a released address must not race a lingering guest. Tear a guest's interface down together with its object.
+
+### Orphaned cleanup after retry exhaustion
+
+A force-deleted binding whose durable cleanup cannot complete - for example while the apiserver is unreachable - is retried with a bounded budget. When the budget is exhausted, the in-process state (the dhcp lease and the claim) is already released and exactly the persisted ledger record remains; no further retry is scheduled, so the address stays reserved until the next process era - a restart or a leader handoff - revalidates the ledger against the live objects during the pool registration and releases the record of a genuinely dead owner. Recovery procedure for a stuck reservation: restore apiserver availability, then restart the helper or trigger a leader handoff.
+
+### Readiness semantics
+
+The readiness probe reports process health, not serving authority: a standby which holds no leadership is Ready, and APP_RUNNING does not prove that every configured pool currently serves - a permanently rejected pool (for example an unregistrable projection) leaves the era running with that pool unserved. This is deliberate: readiness must not flap on apiserver outages or on a single bad pool. Inspect the per-pool status and the metrics instead when the serving state of every pool matters.
+
+### Scale and cleanup budgets
+
+No packet-load envelope has been measured: the dhcp server (a pinned library) starts one goroutine per received packet, known clients are logged per packet at the default log level, and the per-binding status metric deletion walks every stored series. Measure a representative concurrent-client workload with logging enabled before raising the scale, and bound the client count per helper accordingly.
+
+On leadership loss the local NIC cleanup runs after an optional pod-unlabel apiserver call which is bounded at 30 seconds, so the host cleanup can be delayed by that budget on a slow apiserver. The watchdog which force-exits a wedged leader leaves the leadership lease to expire on its own (60 seconds) rather than releasing it, so a standby never acquires in parallel with a serving predecessor.
+
+### Qualification status
+
+The unit and race suites do not qualify real leader failover, CSR issuance, trusted admission TLS, certificate renewal or a Helm rollout: no live dual-instance failover or webhook installation test has been executed against a real cluster. Treat those paths as unqualified until a cluster-level qualification run is performed.
+
 ## The kubevirt-ip-helper-webhook
 
 The kubevirt-ip-helper-webhook is a webhook service for the kubevirt-ip-helper which prevents deleting IPPools which are still in use and rejects VirtualMachineNetworkConfig objects which record a (vmname, macaddress) pair that another object of the same namespace already records.
 
 The IPPool deletion gate blocks a deletion only while an allocation record is backed by a live VirtualMachineNetworkConfig: a record whose (namespace, vmname, macaddress) has no live object anymore - for example the record a deleted hand-created vmnetcfg without the cleanup finalizer leaves behind, which the helper itself only revalidates at its next service era - is orphaned and does not block the deletion. The lookup errs toward blocking: a failed cluster-wide list keeps every record blocking and an unparseable reference can never be proven orphaned.
 
-The ippool admission check rejects an IPPool spec whose ipv4 configuration cannot serve: a subnet which does not parse as an ipv4 prefix (the crd schema accepts spellings like 10.0.0.0/33), an allocation range outside the subnet, a pool end before its start, a pool end or exclude entry equal to the broadcast address of the subnet, a pool range larger than the helper's cap of 65536 addresses, or an exclude address outside the allocation range. The checks mirror the helper controller's own registration validation, so a projection the controller would register is never rejected - the controller accepts an off-subnet serverip, so the admission check deliberately does too. The helper controller rejects such a projection on its own sync as well, but only after the object is stored - on update the previously registered configuration keeps serving while the object carries the broken spec and the rejection is re-logged on every resync. Only fields which are present are validated, so an omitted optional field stays the controller's business.
+The ippool admission check rejects an IPPool spec whose ipv4 configuration cannot serve: a subnet which does not parse as an ipv4 prefix (the crd schema accepts spellings like 10.0.0.0/33), an allocation range outside the subnet, a pool end before its start, a pool end or exclude entry equal to the broadcast address of the subnet, a pool range larger than the helper's cap of 65536 addresses, an exclude address outside the allocation range, or a `serverip` or `router` which lies inside the allocation range without also being excluded (the helper's interface address and the gateway are in use by the network infrastructure, and the allocator would otherwise hand them to a guest). The checks mirror the helper controller's own registration validation, so a projection the controller would register is never rejected - the controller accepts an off-subnet serverip, so the admission check deliberately does too. The helper controller rejects such a projection on its own sync as well, but only after the object is stored - on update the previously registered configuration keeps serving while the object carries the broken spec and the rejection is re-logged on every resync. Only fields which are present are validated, so an omitted optional field stays the controller's business.
 
 The vmnetcfg admission check also rejects an explicit `ipaddress` which does not lie between the start and the end of the allocation range of the IPPool serving its `networkname`: the helper's controller refuses such an interface too, but only after the object is stored, leaving a permanent ERROR status whose rejection is re-logged on every retry. The range check only runs when an IPPool for the networkname exists - a vmnetcfg whose network has no pool yet is the intended ordering of a vm created before its pool, and the controller's ERROR-then-recover path is its observed contract.
 
