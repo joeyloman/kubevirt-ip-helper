@@ -71,6 +71,7 @@ func newTestPooledAllocator(t *testing.T) *DHCPAllocator {
 	t.Helper()
 	a := NewDHCPAllocator()
 	if err := a.AddPool(
+		context.Background(),
 		"pool1",
 		"192.168.0.1",
 		"255.255.255.0",
@@ -553,6 +554,7 @@ func TestDHCPHandlerInformWithoutServedNetworkIsDropped(t *testing.T) {
 func TestDHCPHandlerInformAmbiguousNetworkIsDropped(t *testing.T) {
 	a := newTestPooledAllocator(t)
 	if err := a.AddPool(
+		context.Background(),
 		"pool2",
 		"192.168.0.2",
 		"255.255.255.0",
@@ -649,6 +651,7 @@ func TestDHCPHandlerBootReplyOpcodeNoReply(t *testing.T) {
 func TestDHCPHandlerDefaultLeaseTime(t *testing.T) {
 	a := NewDHCPAllocator()
 	if err := a.AddPool(
+		context.Background(),
 		"pool0",
 		"192.168.0.1",
 		"255.255.255.0",
@@ -684,11 +687,11 @@ func TestDHCPHandlerDefaultLeaseTime(t *testing.T) {
 
 func TestAddPoolOverwritesExistingPool(t *testing.T) {
 	a := New()
-	if err := a.AddPool("v1", "192.168.0.1", "255.255.255.0", "192.168.0.254", nil, "", nil, nil, 300, "eth0"); err != nil {
+	if err := a.AddPool(context.Background(), "v1", "192.168.0.1", "255.255.255.0", "192.168.0.254", nil, "", nil, nil, 300, "eth0"); err != nil {
 		t.Fatalf("first AddPool: %v", err)
 	}
 	// Re-adding the same pool name replaces the previous pool with no error.
-	if err := a.AddPool("v1", "192.168.0.1", "255.255.255.0", "192.168.0.1", nil, "", nil, nil, 600, "eth0"); err != nil {
+	if err := a.AddPool(context.Background(), "v1", "192.168.0.1", "255.255.255.0", "192.168.0.1", nil, "", nil, nil, 600, "eth0"); err != nil {
 		t.Fatalf("second AddPool: %v", err)
 	}
 
@@ -730,7 +733,7 @@ func TestAddPoolRejectsNonIPv4Addresses(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			a := NewDHCPAllocator()
 
-			err := a.AddPool("pool-x", tc.serverIP, tc.subnetMask, tc.router, tc.dns, "", nil, nil, 300, "eth0")
+			err := a.AddPool(context.Background(), "pool-x", tc.serverIP, tc.subnetMask, tc.router, tc.dns, "", nil, nil, 300, "eth0")
 			if err == nil {
 				t.Fatal("AddPool accepted a non-ipv4 address projection")
 			}
@@ -743,7 +746,7 @@ func TestAddPoolRejectsNonIPv4Addresses(t *testing.T) {
 	// an unset router is legitimate: no option 3 is emitted for it
 	t.Run("unset router is admitted", func(t *testing.T) {
 		a := NewDHCPAllocator()
-		if err := a.AddPool("pool-x", "192.168.0.1", "255.255.255.0", "", nil, "", nil, nil, 300, "eth0"); err != nil {
+		if err := a.AddPool(context.Background(), "pool-x", "192.168.0.1", "255.255.255.0", "", nil, "", nil, nil, 300, "eth0"); err != nil {
 			t.Fatalf("AddPool rejected an unset router: %v", err)
 		}
 		if !a.CheckPool("pool-x") {
@@ -1027,7 +1030,7 @@ func TestUsageWithMissingPoolDoesNotPanic(t *testing.T) {
 // literal addresses are tested here.
 func TestAddPoolAcceptsLiteralNTPAddresses(t *testing.T) {
 	a := New()
-	if err := a.AddPool("p", "192.168.0.1", "255.255.255.0", "192.168.0.254", nil, "", nil, []string{"10.0.0.53"}, 3600, "eth0"); err != nil {
+	if err := a.AddPool(context.Background(), "p", "192.168.0.1", "255.255.255.0", "192.168.0.254", nil, "", nil, []string{"10.0.0.53"}, 3600, "eth0"); err != nil {
 		t.Fatalf("AddPool: %v", err)
 	}
 
@@ -1042,7 +1045,7 @@ func TestAddPoolAcceptsLiteralNTPAddresses(t *testing.T) {
 
 func TestDHCPHandlerOmitsUnsetPoolOptions(t *testing.T) {
 	a := NewDHCPAllocator()
-	if err := a.AddPool("p", "192.168.0.1", "255.255.255.0", "192.168.0.254", nil, "", nil, nil, 7200, "eth0"); err != nil {
+	if err := a.AddPool(context.Background(), "p", "192.168.0.1", "255.255.255.0", "192.168.0.254", nil, "", nil, nil, 7200, "eth0"); err != nil {
 		t.Fatalf("AddPool: %v", err)
 	}
 	if err := a.AddLease("aa:bb:cc:dd:ee:04", "p", "192.168.0.50", ""); err != nil {
@@ -1085,6 +1088,7 @@ func TestDHCPHandlerOmitsUnsetPoolOptions(t *testing.T) {
 func TestDHCPPoolAccessesStaySynchronized(t *testing.T) {
 	a := NewDHCPAllocator()
 	if err := a.AddPool(
+		context.Background(),
 		"pool1",
 		"192.168.0.1",
 		"255.255.255.0",
@@ -1122,6 +1126,7 @@ func TestDHCPPoolAccessesStaySynchronized(t *testing.T) {
 			_ = a.DeletePool("pool1")
 
 			if err := a.AddPool(
+				context.Background(),
 				"pool1",
 				"192.168.0.1",
 				"255.255.255.0",
@@ -1229,7 +1234,7 @@ func TestAddPoolResolvesNTPHostnamesOutsideTheAllocatorLock(t *testing.T) {
 		},
 	}
 
-	if err := a.AddPool("net-a", "192.168.0.1", "255.255.255.0", "192.168.0.1", nil, "", nil, []string{"192.168.0.10", "ntp.example.invalid"}, 60, "lo"); err != nil {
+	if err := a.AddPool(context.Background(), "net-a", "192.168.0.1", "255.255.255.0", "192.168.0.1", nil, "", nil, []string{"192.168.0.10", "ntp.example.invalid"}, 60, "lo"); err != nil {
 		t.Fatalf("AddPool: %v", err)
 	}
 

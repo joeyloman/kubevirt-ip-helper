@@ -1,9 +1,15 @@
 package admission
 
-import "fmt"
+import (
+	"context"
+	"fmt"
+)
 
-func (h *Handler) getCaBundleFromCABundleConfigMap() (cert string, err error) {
-	c := h.getCABundleConfigMap()
+func (h *Handler) getCaBundleFromCABundleConfigMap(ctx context.Context) (cert string, err error) {
+	c, err := h.getCABundleConfigMap(ctx)
+	if err != nil {
+		return cert, err
+	}
 
 	cert, exists := c.Data["ca.crt"]
 	if !exists {

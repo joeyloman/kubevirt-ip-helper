@@ -1,6 +1,8 @@
 package util
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -25,5 +27,39 @@ func TestWatchRestConfigStripsTheClientTimeout(t *testing.T) {
 	// bound
 	if config.Timeout != 30*time.Second {
 		t.Errorf("source config timeout = %v, want it untouched", config.Timeout)
+	}
+}
+
+// the one-shot clients built from GetKubeConfig must carry a request
+// bound (F08): without it a tcp blackhole against the api hangs the
+// webhook's list, csr, secret and webhook-configuration calls forever
+func TestGetKubeConfigBoundsOneShotRequests(t *testing.T) {
+	kubeconfig := filepath.Join(t.TempDir(), "kubeconfig")
+	content := `apiVersion: v1
+kind: Config
+clusters:
+- name: test
+  cluster:
+    server: https://example.com
+contexts:
+- name: test
+  context:
+    cluster: test
+    user: test
+current-context: test
+users:
+- name: test
+  user: {}
+`
+	if err := os.WriteFile(kubeconfig, []byte(content), 0600); err != nil {
+		t.Fatalf("writing test kubeconfig: %s", err)
+	}
+
+	config, err := GetKubeConfig(kubeconfig, "")
+	if err != nil {
+		t.Fatalf("GetKubeConfig: %v", err)
+	}
+	if config.Timeout != 30*time.Second {
+		t.Errorf("config timeout = %v, want the 30s one-shot bound", config.Timeout)
 	}
 }

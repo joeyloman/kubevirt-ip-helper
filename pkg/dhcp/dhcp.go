@@ -137,14 +137,24 @@ func (a *DHCPAllocator) SetResolver(r *net.Resolver) {
 	a.resolver = r
 }
 
+// ntpResolutionBudget bounds the aggregate ntp resolution of one pool
+// registration (F08): the lookups of every hostname entry share it, so a
+// resolver which blackholes cannot hold the single ippool worker - and
+// with it the era join of a shutdown - forever. it is a variable so the
+// test can shrink it.
+var ntpResolutionBudget = 30 * time.Second
+
 // resolveNTPServers normalizes the ntp server entries into ip addresses,
-// resolving hostname entries through the resolver of the allocator.
-// AddPool runs it before taking the allocator lock: the dhcp packet
-// handler reads the pools and leases under the same mutex, so a slow or
-// broken resolver during one pool registration must not stall packet
-// processing on every pool. entries which cannot be resolved are logged
-// and skipped, so a pool with a broken ntp hostname still registers.
-func (a *DHCPAllocator) resolveNTPServers(NTPServers []string) (ntp []net.IP) {
+// resolving hostname entries through the resolver of the allocator under
+// the caller's context. AddPool runs it before taking the allocator lock:
+// the dhcp packet handler reads the pools and leases under the same
+// mutex, so a slow or broken resolver during one pool registration must
+// not stall packet processing on every pool. entries which cannot be
+// resolved are logged and skipped, so a pool with a broken ntp hostname
+// still registers - but a canceled context (the era ended, or the
+// aggregate budget fired) aborts the registration instead: cancellation
+// is not a resolution failure whose partial result may be published.
+func (a *DHCPAllocator) resolveNTPServers(ctx context.Context, NTPServers []string) (ntp []net.IP, err error) {
 	resolver := a.resolver
 	if resolver == nil {
 		resolver = net.DefaultResolver
@@ -158,9 +168,15 @@ func (a *DHCPAllocator) resolveNTPServers(NTPServers []string) (ntp []net.IP) {
 			continue
 		}
 
-		hostips, err := resolver.LookupIP(context.Background(), "ip", entry)
-		if err != nil {
-			log.Errorf("(dhcp.AddPool) cannot get any ip addresses from ntp domainname entry %s: %s", entry, err)
+		hostips, lookupErr := resolver.LookupIP(ctx, "ip", entry)
+		if lookupErr != nil {
+			if ctx.Err() != nil {
+				// the era was canceled or the aggregate budget fired:
+				// the lookup did not fail on its own, it was abandoned
+				return ntp, ctx.Err()
+			}
+
+			log.Errorf("(dhcp.AddPool) cannot get any ip addresses from ntp domainname entry %s: %s", entry, lookupErr)
 		}
 		for _, ip := range hostips {
 			if ip.To4() != nil {
@@ -173,6 +189,7 @@ func (a *DHCPAllocator) resolveNTPServers(NTPServers []string) (ntp []net.IP) {
 }
 
 func (a *DHCPAllocator) AddPool(
+	ctx context.Context,
 	name string,
 	serverIP string,
 	subnetMask string,
@@ -184,6 +201,14 @@ func (a *DHCPAllocator) AddPool(
 	leaseTime int,
 	nic string,
 ) (err error) {
+	// a canceled era must not publish into its allocator at all (F08):
+	// the registration of a dying era would surface as a pool entry of a
+	// torn-down registry - a needless mutation behind the fence - and a
+	// reload racing the era loss would replace the options of a network
+	// the shutdown is fencing
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("(dhcp.AddPool) the registration of pool %s was canceled: %w", name, err)
+	}
 	// validate the address projection before any state is taken: every
 	// address which reaches the wire must be an ipv4 literal, because
 	// the reply construction encodes the options through To4() - an
@@ -217,8 +242,18 @@ func (a *DHCPAllocator) AddPool(
 	}
 
 	// resolve the ntp hostnames before taking the lock, the packet
-	// handler must not wait behind a slow resolver
-	ntp := a.resolveNTPServers(NTPServers)
+	// handler must not wait behind a slow resolver. the resolution runs
+	// under the caller's context with one aggregate budget for every
+	// entry (F08): a canceled era or an exhausted budget aborts the
+	// registration before any state is taken, so a dying era never
+	// publishes partial replacement data and a blackholing resolver
+	// cannot hold the ippool worker and the era join unbounded
+	resolveCtx, resolveCancel := context.WithTimeout(ctx, ntpResolutionBudget)
+	ntp, resolveErr := a.resolveNTPServers(resolveCtx, NTPServers)
+	resolveCancel()
+	if resolveErr != nil {
+		return fmt.Errorf("(dhcp.AddPool) the ntp resolution of pool %s did not complete: %w", name, resolveErr)
+	}
 
 	a.mutex.Lock()
 	defer a.mutex.Unlock()

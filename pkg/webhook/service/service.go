@@ -99,11 +99,13 @@ func (h *Handler) Init() {
 }
 
 // listVirtualMachineNetworkConfigs lists the VirtualMachineNetworkConfig
-// objects of one namespace.
-func (h *Handler) listVirtualMachineNetworkConfigs(namespace string) (list *kihv1.VirtualMachineNetworkConfigList, err error) {
+// objects of one namespace. the call runs on the admission request's
+// context (F08): when the apiserver's webhook timeout drops the request,
+// the list aborts with it instead of lingering past the dropped caller.
+func (h *Handler) listVirtualMachineNetworkConfigs(ctx context.Context, namespace string) (list *kihv1.VirtualMachineNetworkConfigList, err error) {
 	raw, err := h.clientset.CoreV1().RESTClient().Get().
 		AbsPath(fmt.Sprintf("%s/namespaces/%s/virtualmachinenetworkconfigs", vmNetCfgAPIPath, namespace)).
-		Do(context.TODO()).Raw()
+		Do(ctx).Raw()
 	if err != nil {
 		return
 	}
@@ -118,10 +120,12 @@ func (h *Handler) listVirtualMachineNetworkConfigs(namespace string) (list *kihv
 
 // listIPPools lists the IPPool objects. the ippools are cluster-scoped and
 // are read through the generic apiserver path like the vmnetcfg objects.
-func (h *Handler) listIPPools() (list *kihv1.IPPoolList, err error) {
+// the call runs on the admission request's context (F08) like the other
+// lists of the admission path.
+func (h *Handler) listIPPools(ctx context.Context) (list *kihv1.IPPoolList, err error) {
 	raw, err := h.clientset.CoreV1().RESTClient().Get().
 		AbsPath("/apis/kubevirtiphelper.k8s.binbash.org/v1/ippools").
-		Do(context.TODO()).Raw()
+		Do(ctx).Raw()
 	if err != nil {
 		return
 	}
@@ -135,11 +139,12 @@ func (h *Handler) listIPPools() (list *kihv1.IPPoolList, err error) {
 }
 
 // listAllVirtualMachineNetworkConfigs lists the VirtualMachineNetworkConfig
-// objects of every namespace.
-func (h *Handler) listAllVirtualMachineNetworkConfigs() (list *kihv1.VirtualMachineNetworkConfigList, err error) {
+// objects of every namespace. the call runs on the admission request's
+// context (F08) like the other lists of the admission path.
+func (h *Handler) listAllVirtualMachineNetworkConfigs(ctx context.Context) (list *kihv1.VirtualMachineNetworkConfigList, err error) {
 	raw, err := h.clientset.CoreV1().RESTClient().Get().
 		AbsPath(fmt.Sprintf("%s/virtualmachinenetworkconfigs", vmNetCfgAPIPath)).
-		Do(context.TODO()).Raw()
+		Do(ctx).Raw()
 	if err != nil {
 		return
 	}
@@ -273,7 +278,7 @@ func evaluateIPPoolRecords(allocated map[string]string, index allocationOwnerInd
 // record blocking (the gate is then exactly the old one), and an unparseable
 // reference can never be proven orphaned either. only a record whose
 // (namespace, vmname, macaddress) matches no live object stops blocking.
-func (h *Handler) validateIPPool(ar *admissionv1.AdmissionReview, pool *kihv1.IPPool) *admissionv1.AdmissionResponse {
+func (h *Handler) validateIPPool(ctx context.Context, ar *admissionv1.AdmissionReview, pool *kihv1.IPPool) *admissionv1.AdmissionResponse {
 	allow := &admissionv1.AdmissionResponse{
 		UID:     ar.Request.UID,
 		Allowed: true,
@@ -283,7 +288,7 @@ func (h *Handler) validateIPPool(ar *admissionv1.AdmissionReview, pool *kihv1.IP
 	indexAvailable := true
 
 	if len(pool.Status.IPv4.Allocated) > 0 {
-		list, err := h.listAllVirtualMachineNetworkConfigs()
+		list, err := h.listAllVirtualMachineNetworkConfigs(ctx)
 		if err != nil {
 			indexAvailable = false
 			log.Errorf("(service.validateIPPool) cannot list the VirtualMachineNetworkConfigs, every allocation record of IPPool %s blocks the deletion: %s",
@@ -416,7 +421,7 @@ func checkNICMACAddress(nc kihv1.NetworkConfig) (denied *string) {
 // observed contract - the admission check must not break it. internal
 // failures fail open like the other vmnetcfg checks: the controller's own
 // range validation stays the authoritative guard.
-func (h *Handler) validateVmNetCfgIPAddresses(obj *kihv1.VirtualMachineNetworkConfig) (denied *string) {
+func (h *Handler) validateVmNetCfgIPAddresses(ctx context.Context, obj *kihv1.VirtualMachineNetworkConfig) (denied *string) {
 	lookupNeeded := false
 	for _, nc := range obj.Spec.NetworkConfig {
 		if nc.IPAddress != "" && nc.NetworkName != "" {
@@ -430,7 +435,7 @@ func (h *Handler) validateVmNetCfgIPAddresses(obj *kihv1.VirtualMachineNetworkCo
 		return nil
 	}
 
-	pools, err := h.listIPPools()
+	pools, err := h.listIPPools(ctx)
 	if err != nil {
 		log.Errorf("(service.validateVmNetCfgIPAddresses) cannot list the IPPools, allowing the request: %s", err.Error())
 
@@ -509,7 +514,7 @@ func checkNICIPAddress(nc kihv1.NetworkConfig, pool *kihv1.IPPool) (denied *stri
 // of the helper. internal failures fail open for the same reason: the
 // controller guards remain the authoritative defense and a webhook fault
 // must not block the controller's own vmnetcfg writes.
-func (h *Handler) validateVmNetCfg(ar *admissionv1.AdmissionReview) *admissionv1.AdmissionResponse {
+func (h *Handler) validateVmNetCfg(ctx context.Context, ar *admissionv1.AdmissionReview) *admissionv1.AdmissionResponse {
 	allow := &admissionv1.AdmissionResponse{
 		UID:     ar.Request.UID,
 		Allowed: true,
@@ -539,7 +544,7 @@ func (h *Handler) validateVmNetCfg(ar *admissionv1.AdmissionReview) *admissionv1
 		}
 	}
 
-	if msg := h.validateVmNetCfgIPAddresses(obj); msg != nil {
+	if msg := h.validateVmNetCfgIPAddresses(ctx, obj); msg != nil {
 		log.Warnf("(service.validateVmNetCfg) denying VirtualMachineNetworkConfig %s/%s: %s",
 			obj.Namespace, obj.Name, *msg)
 
@@ -551,7 +556,7 @@ func (h *Handler) validateVmNetCfg(ar *admissionv1.AdmissionReview) *admissionv1
 			},
 		}
 	}
-	list, err := h.listVirtualMachineNetworkConfigs(obj.Namespace)
+	list, err := h.listVirtualMachineNetworkConfigs(ctx, obj.Namespace)
 	if err != nil {
 		log.Errorf("cannot list the VirtualMachineNetworkConfigs of namespace %s, allowing the request: %s",
 			obj.Namespace, err.Error())
@@ -639,7 +644,7 @@ func (h *Handler) validateIPPoolAdmission(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	writeAdmissionResponse(w, ar, h.validateIPPool(ar, pool))
+	writeAdmissionResponse(w, ar, h.validateIPPool(r.Context(), ar, pool))
 }
 
 // evaluateIPPoolSpec returns the sorted problems of an ipv4 configuration
@@ -866,7 +871,7 @@ func (h *Handler) validateVmNetCfgAdmission(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	writeAdmissionResponse(w, ar, h.validateVmNetCfg(ar))
+	writeAdmissionResponse(w, ar, h.validateVmNetCfg(r.Context(), ar))
 }
 
 func (h *Handler) Run() {
@@ -897,6 +902,19 @@ func (h *Handler) Run() {
 	}
 }
 
+// httpDrainBudget bounds the graceful drain of the admission server
+// (F08): Shutdown waits for the in-flight admission requests, and the
+// process context it used to run on has no deadline, so a drain behind a
+// stalled connection wedged the renewal restart which calls Stop
+// synchronously. the admission requests are bounded by the apiserver's
+// webhook timeout through their propagated request contexts, so a drain
+// which cannot complete within this budget is a stalled connection, not a
+// legitimately slow admission. it is a variable so the test can shrink it.
+var httpDrainBudget = 30 * time.Second
+
 func (h *Handler) Stop() error {
-	return h.httpServer.Shutdown(h.ctx)
+	drainCtx, cancel := context.WithTimeout(context.Background(), httpDrainBudget)
+	defer cancel()
+
+	return h.httpServer.Shutdown(drainCtx)
 }

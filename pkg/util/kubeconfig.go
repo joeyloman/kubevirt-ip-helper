@@ -1,11 +1,22 @@
 package util
 
 import (
+	"time"
+
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 )
+
+// configTimeout bounds every one-shot request of the clients built from
+// this config (F08): without it a tcp blackhole against the api hangs the
+// caller forever - the webhook's list, csr, secret and webhook-configuration
+// calls all run on it. 30s matches the bound of the controller-side
+// kubeconfig builders. the informer clients are not built from the bound
+// config: the controllers strip it through WatchRestConfig (below), and
+// nothing in the webhook watches.
+const configTimeout = 30 * time.Second
 
 // GetKubeConfig returns the rest config for the given kubeconfig file and
 // context, falling back to the in-cluster config when the file does not
@@ -14,13 +25,20 @@ import (
 // rather than to a hard failure).
 func GetKubeConfig(kubeConfig string, kubeContext string) (config *rest.Config, err error) {
 	if !FileExists(kubeConfig) {
-		return rest.InClusterConfig()
+		config, err = rest.InClusterConfig()
+	} else {
+		config, err = clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+			&clientcmd.ClientConfigLoadingRules{ExplicitPath: kubeConfig},
+			&clientcmd.ConfigOverrides{ClusterInfo: clientcmdapi.Cluster{}, CurrentContext: kubeContext},
+		).ClientConfig()
+	}
+	if err != nil {
+		return
 	}
 
-	return clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
-		&clientcmd.ClientConfigLoadingRules{ExplicitPath: kubeConfig},
-		&clientcmd.ConfigOverrides{ClusterInfo: clientcmdapi.Cluster{}, CurrentContext: kubeContext},
-	).ClientConfig()
+	config.Timeout = configTimeout
+
+	return
 }
 
 // WatchRestConfig strips the one-shot client timeout for the informer

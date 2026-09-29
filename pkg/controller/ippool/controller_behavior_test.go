@@ -765,7 +765,7 @@ func TestSyncAddDuplicateNetworkNameDoesNotTouchForeignState(t *testing.T) {
 	if _, err := controller.ipam.GetIP("net-dup", "192.168.1.10"); err != nil {
 		t.Fatalf("allocating the foreign live ip: %v", err)
 	}
-	if err := controller.dhcp.AddPool("net-dup", "192.168.1.1", "255.255.255.0", "192.168.1.1", nil, "", nil, nil, 60, "test-fake-iface"); err != nil {
+	if err := controller.dhcp.AddPool(context.Background(), "net-dup", "192.168.1.1", "255.255.255.0", "192.168.1.1", nil, "", nil, nil, 60, "test-fake-iface"); err != nil {
 		t.Fatalf("registering the foreign dhcp pool: %v", err)
 	}
 	if err := cacheAllocator.Add(foreignPool); err != nil {
@@ -825,7 +825,7 @@ func TestSyncDeleteForeignCacheEntryKeepsLivePoolState(t *testing.T) {
 	if _, err := controller.ipam.GetIP("net-dup", "192.168.1.10"); err != nil {
 		t.Fatalf("allocating the live pool's ip: %v", err)
 	}
-	if err := controller.dhcp.AddPool("net-dup", "192.168.1.1", "255.255.255.0", "192.168.1.1", nil, "", nil, nil, 60, "test-fake-iface"); err != nil {
+	if err := controller.dhcp.AddPool(context.Background(), "net-dup", "192.168.1.1", "255.255.255.0", "192.168.1.1", nil, "", nil, nil, 60, "test-fake-iface"); err != nil {
 		t.Fatalf("registering the live pool's dhcp pool: %v", err)
 	}
 	if err := cacheAllocator.Add(foreignPool); err != nil {
@@ -877,7 +877,7 @@ func TestSyncDeleteRegisteredPoolFreesItsState(t *testing.T) {
 	if _, err := controller.ipam.GetIP("net-dup", "192.168.1.10"); err != nil {
 		t.Fatalf("allocating the live ip: %v", err)
 	}
-	if err := controller.dhcp.AddPool("net-dup", "192.168.1.1", "255.255.255.0", "192.168.1.1", nil, "", nil, nil, 60, "test-fake-iface"); err != nil {
+	if err := controller.dhcp.AddPool(context.Background(), "net-dup", "192.168.1.1", "255.255.255.0", "192.168.1.1", nil, "", nil, nil, 60, "test-fake-iface"); err != nil {
 		t.Fatalf("registering the dhcp pool: %v", err)
 	}
 	// a lease of the deleted network, which the teardown must drop with
@@ -1010,7 +1010,7 @@ func TestSyncUpdateRejectsNetworkNameChangeToClaimedNetwork(t *testing.T) {
 	}
 
 	// a live registration already owns the target networkname
-	if err := controller.dhcp.AddPool("net-claimed", "192.168.2.1", "255.255.255.0", "192.168.2.1", nil, "", nil, nil, 60, "test-fake-iface-2"); err != nil {
+	if err := controller.dhcp.AddPool(context.Background(), "net-claimed", "192.168.2.1", "255.255.255.0", "192.168.2.1", nil, "", nil, nil, 60, "test-fake-iface-2"); err != nil {
 		t.Fatalf("registering the claimant dhcp pool: %v", err)
 	}
 
@@ -1057,7 +1057,7 @@ func TestSyncAddRejectedPoolCountsAsHandledDuringInit(t *testing.T) {
 	if _, err := controller.ipam.GetIP("net-dup", "192.168.1.10"); err != nil {
 		t.Fatalf("allocating the live pool's ip: %v", err)
 	}
-	if err := controller.dhcp.AddPool("net-dup", "192.168.1.1", "255.255.255.0", "192.168.1.1", nil, "", nil, nil, 60, "test-fake-iface"); err != nil {
+	if err := controller.dhcp.AddPool(context.Background(), "net-dup", "192.168.1.1", "255.255.255.0", "192.168.1.1", nil, "", nil, nil, 60, "test-fake-iface"); err != nil {
 		t.Fatalf("registering the live pool's dhcp pool: %v", err)
 	}
 	if err := cacheAllocator.Add(foreignPool); err != nil {
@@ -1182,7 +1182,7 @@ func TestSyncUpdateForeignCacheEntryDoesNotCascadeRestart(t *testing.T) {
 	if _, err := controller.ipam.GetIP("net-shared", "192.168.1.10"); err != nil {
 		t.Fatalf("allocating the live pool's ip: %v", err)
 	}
-	if err := controller.dhcp.AddPool("net-shared", "192.168.1.1", "255.255.255.0", "192.168.1.1", nil, "", nil, nil, 60, "test-fake-iface"); err != nil {
+	if err := controller.dhcp.AddPool(context.Background(), "net-shared", "192.168.1.1", "255.255.255.0", "192.168.1.1", nil, "", nil, nil, 60, "test-fake-iface"); err != nil {
 		t.Fatalf("registering the live pool's dhcp pool: %v", err)
 	}
 	if err := cacheAllocator.Add(foreignPool); err != nil {

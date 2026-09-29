@@ -544,6 +544,7 @@ func TestHandleIPPoolObjectChangeRejectedInvalidSubnet(t *testing.T) {
 	// projection before the change even classifies as reload or restart,
 	// so serving state must remain untouched
 	if err := d.AddPool(
+		context.Background(),
 		"net-a",
 		"10.10.10.1",
 		"255.255.255.0",
@@ -610,6 +611,7 @@ func TestHandleIPPoolObjectChangeRejectsUnparseableSubnetUpdate(t *testing.T) {
 	}
 
 	if err := d.AddPool(
+		context.Background(),
 		"net-a",
 		"10.10.10.1",
 		"255.255.255.0",
@@ -683,6 +685,7 @@ func TestHandleIPPoolObjectChangeRejectsUnregistrableRangeUpdate(t *testing.T) {
 			}
 
 			if err := d.AddPool(
+				context.Background(),
 				"net-a",
 				"10.10.10.1",
 				"255.255.255.0",
@@ -1134,6 +1137,7 @@ func TestHandleIPPoolObjectChangeRejectsUnclaimableExcludeUpdate(t *testing.T) {
 			}
 
 			if err := d.AddPool(
+				context.Background(),
 				"net-a",
 				"10.10.10.1",
 				"255.255.255.0",
@@ -1248,6 +1252,7 @@ func TestHandleIPPoolObjectChangeRejectsInvalidAddressProjectionUpdate(t *testin
 			}
 
 			if err := d.AddPool(
+				context.Background(),
 				"net-a",
 				"10.10.10.1",
 				"255.255.255.0",
@@ -1290,6 +1295,7 @@ func TestHandleIPPoolObjectChangeRejectsInvalidAddressProjectionUpdate(t *testin
 			t.Fatalf("failed to cache the registered pool: %s", err.Error())
 		}
 		if err := d.AddPool(
+			context.Background(),
 			"net-a",
 			"10.10.10.1",
 			"255.255.255.0",
@@ -1343,6 +1349,7 @@ func TestHandleIPPoolObjectChangeRejectsExcludeOverlappingLiveClaim(t *testing.T
 	}
 
 	if err := d.AddPool(
+		context.Background(),
 		"net-a",
 		"10.10.10.1",
 		"255.255.255.0",

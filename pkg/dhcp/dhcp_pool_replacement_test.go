@@ -67,6 +67,7 @@ func TestReplacementKeepsServingWhileTheNTPResolutionBlocks(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		done <- a.AddPool(
+			context.Background(),
 			"pool1",
 			"192.168.0.1",
 			"255.255.255.0",
@@ -118,6 +119,7 @@ func TestRejectedReplacementKeepsTheOldPoolServing(t *testing.T) {
 	// the rejected replacement: a non-literal dns entry fails AddPool's
 	// own validation before any state is taken
 	if err := a.AddPool(
+		context.Background(),
 		"pool1",
 		"192.168.0.1",
 		"255.255.255.0",

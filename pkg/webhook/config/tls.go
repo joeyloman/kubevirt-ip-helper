@@ -69,15 +69,30 @@ func (h *Handler) checkCSR() bool {
 	return err == nil
 }
 
+// the one-shot csr calls run on the handler's process context (F08): it
+// is canceled when the process shuts down, and every call is additionally
+// bounded by the request timeout of the kubeconfig.
 func (h *Handler) getCSR() (*certsv1.CertificateSigningRequest, error) {
-	return h.clientset.CertificatesV1().CertificateSigningRequests().Get(context.TODO(), h.csrName, metav1.GetOptions{})
+	return h.clientset.CertificatesV1().CertificateSigningRequests().Get(h.ctx, h.csrName, metav1.GetOptions{})
 }
 
 func (h *Handler) deleteCSR() error {
-	return h.clientset.CertificatesV1().CertificateSigningRequests().Delete(context.TODO(), h.csrName, metav1.DeleteOptions{})
+	return h.clientset.CertificatesV1().CertificateSigningRequests().Delete(h.ctx, h.csrName, metav1.DeleteOptions{})
 }
 
+// csrSignBudget bounds the whole csr issuance (F08): the create, the
+// approval and every poll of the signer share one real deadline - the
+// previous wall-clock comparison ran only between the calls, so a single
+// blocked call could outlast the 60s budget the loop believed it
+// enforced. the budget derives from the handler's process context, so a
+// shutdown aborts an in-flight issuance as well. it is a variable so the
+// test can shrink it.
+var csrSignBudget = 60 * time.Second
+
 func (h *Handler) createAndSignCSR(pCsr []byte) ([]byte, error) {
+	signCtx, signCancel := context.WithTimeout(h.ctx, csrSignBudget)
+	defer signCancel()
+
 	newCsrObj := certsv1.CertificateSigningRequest{}
 	newCsrObj.ObjectMeta.Name = h.csrName
 	newCsrObj.Spec.Groups = []string{"system:authenticated"}
@@ -88,9 +103,9 @@ func (h *Handler) createAndSignCSR(pCsr []byte) ([]byte, error) {
 		certsv1.UsageKeyEncipherment,
 		certsv1.UsageServerAuth,
 	}
-	csrObj, err := h.clientset.CertificatesV1().CertificateSigningRequests().Create(context.TODO(), &newCsrObj, metav1.CreateOptions{})
+	csrObj, err := h.clientset.CertificatesV1().CertificateSigningRequests().Create(signCtx, &newCsrObj, metav1.CreateOptions{})
 	if err != nil {
-		return nil, fmt.Errorf("error while creating signing request: %s", err.Error())
+		return nil, fmt.Errorf("error while creating signing request: %w", err)
 	}
 
 	approval := certsv1.CertificateSigningRequest{
@@ -105,9 +120,9 @@ func (h *Handler) createAndSignCSR(pCsr []byte) ([]byte, error) {
 		},
 	}
 	approval.ObjectMeta = csrObj.ObjectMeta
-	_, err = h.clientset.CertificatesV1().CertificateSigningRequests().UpdateApproval(context.TODO(), h.csrName, &approval, metav1.UpdateOptions{})
+	_, err = h.clientset.CertificatesV1().CertificateSigningRequests().UpdateApproval(signCtx, h.csrName, &approval, metav1.UpdateOptions{})
 	if err != nil {
-		return nil, fmt.Errorf("error while approving signing request: %s", err.Error())
+		return nil, fmt.Errorf("error while approving signing request: %w", err)
 	}
 
 	// the signer issues asynchronously: a fixed sleep returns an empty
@@ -115,11 +130,10 @@ func (h *Handler) createAndSignCSR(pCsr []byte) ([]byte, error) {
 	// empty tls.crt the renewal scheduler can never heal, so poll until
 	// the certificate is present and fail loudly otherwise
 	var certificate []byte
-	deadline := time.Now().Add(60 * time.Second)
 	for {
-		updatedCsr, err := h.clientset.CertificatesV1().CertificateSigningRequests().Get(context.TODO(), h.csrName, metav1.GetOptions{})
+		updatedCsr, err := h.clientset.CertificatesV1().CertificateSigningRequests().Get(signCtx, h.csrName, metav1.GetOptions{})
 		if err != nil {
-			return nil, fmt.Errorf("error while getting the updated signing request: %s", err.Error())
+			return nil, fmt.Errorf("error while getting the updated signing request: %w", err)
 		}
 
 		if len(updatedCsr.Status.Certificate) > 0 {
@@ -137,11 +151,11 @@ func (h *Handler) createAndSignCSR(pCsr []byte) ([]byte, error) {
 			}
 		}
 
-		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("timed out waiting for the signer to issue the certificate for csr %s", h.csrName)
+		select {
+		case <-signCtx.Done():
+			return nil, fmt.Errorf("timed out waiting for the signer to issue the certificate for csr %s: %w", h.csrName, signCtx.Err())
+		case <-time.After(2 * time.Second):
 		}
-
-		time.Sleep(2 * time.Second)
 	}
 
 	return certificate, nil

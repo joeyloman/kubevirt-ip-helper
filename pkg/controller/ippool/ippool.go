@@ -517,8 +517,8 @@ func (c *Controller) handleIPPoolObjectChange(oldPool kihv1.IPPool, newPool *kih
 		if err := c.createOrUpdateDHCPPool(newPool); err != nil {
 			// a rejected reload must not enter the invalid configuration
 			// into the cache either: keep the previously cached pool
-			return fmt.Errorf("(ippool.handleIPPoolObjectChange) error while updating dhcppool [%s]: %s",
-				newPool.Spec.NetworkName, err.Error())
+			return fmt.Errorf("(ippool.handleIPPoolObjectChange) error while updating dhcppool [%s]: %w",
+				newPool.Spec.NetworkName, err)
 		}
 	}
 
@@ -604,6 +604,10 @@ func (c *Controller) createOrUpdateDHCPPool(pool *kihv1.IPPool) (err error) {
 	// delete-before-add here opened a pool-absent window (as long as the
 	// ntp resolution of the replacement takes) in which a valid renewal
 	// was nacked and the client needlessly lost its still-valid address.
+	// the resolution runs under the era context with one aggregate budget
+	// (F08): a canceled era or a blackholing resolver aborts the reload
+	// before any state is taken, so the worker never hangs on the era
+	// join and the live pool keeps serving
 	// the AddPool validation is the backstop of the up-front
 	// validatePoolProjection admission: a rejected replacement validates
 	// before any state is taken, so the previously registered pool keeps
@@ -612,6 +616,7 @@ func (c *Controller) createOrUpdateDHCPPool(pool *kihv1.IPPool) (err error) {
 	// the registration, and the up-front admission keeps the deterministic
 	// defects out of this path entirely)
 	if err := c.dhcp.AddPool(
+		c.ctx,
 		pool.Spec.NetworkName,
 		pool.Spec.IPv4Config.ServerIP,
 		net.IP(subnetMask).String(),
@@ -623,8 +628,8 @@ func (c *Controller) createOrUpdateDHCPPool(pool *kihv1.IPPool) (err error) {
 		pool.Spec.IPv4Config.LeaseTime,
 		pool.Spec.BindInterface,
 	); err != nil {
-		return fmt.Errorf("(ippool.createOrUpdateDHCPPool) cannot register the dhcp pool of network [%s]: %s",
-			pool.Spec.NetworkName, err.Error())
+		return fmt.Errorf("(ippool.createOrUpdateDHCPPool) cannot register the dhcp pool of network [%s]: %w",
+			pool.Spec.NetworkName, err)
 	}
 
 	return

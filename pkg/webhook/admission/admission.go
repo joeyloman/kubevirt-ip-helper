@@ -3,6 +3,7 @@ package admission
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/util"
 	log "github.com/sirupsen/logrus"
@@ -49,8 +50,14 @@ func (h *Handler) Init() {
 	}
 }
 
-func (h *Handler) checkValidatingWebhookConfiguration() bool {
-	_, err := h.clientset.AdmissionregistrationV1().ValidatingWebhookConfigurations().Get(context.TODO(), h.validatingWebhookConfigName, metav1.GetOptions{})
+// one aggregate budget for the registration one-shots of the webhook
+// configuration (the existence check, the ca bundle read and the
+// create/update): the boot path must not hang behind a stalled apiserver
+// (F08). it is a variable so the test can shrink it.
+var webhookRegistrationBudget = 30 * time.Second
+
+func (h *Handler) checkValidatingWebhookConfiguration(ctx context.Context) bool {
+	_, err := h.clientset.AdmissionregistrationV1().ValidatingWebhookConfigurations().Get(ctx, h.validatingWebhookConfigName, metav1.GetOptions{})
 	if err != nil {
 		return false
 	}
@@ -59,14 +66,20 @@ func (h *Handler) checkValidatingWebhookConfiguration() bool {
 }
 
 func (h *Handler) AddValidatingWebhookConfiguration() (err error) {
-	if h.checkValidatingWebhookConfiguration() {
+	// the registration one-shots run under one bounded context derived
+	// from the era context: a canceled era or an exhausted budget aborts
+	// the registration before any configuration is written (F08)
+	budgetCtx, cancel := context.WithTimeout(h.ctx, webhookRegistrationBudget)
+	defer cancel()
+
+	if h.checkValidatingWebhookConfiguration(budgetCtx) {
 		// the configuration already exists (created by an earlier version
 		// of this webhook or by an operator): reconcile the admission
 		// entries of this version into it instead of skipping entirely
-		return h.ensureMissingWebhookEntries()
+		return h.ensureMissingWebhookEntries(budgetCtx)
 	}
 
-	cert, err := h.getCaBundleFromCABundleConfigMap()
+	cert, err := h.getCaBundleFromCABundleConfigMap(budgetCtx)
 	if err != nil {
 		return
 	}
@@ -77,8 +90,7 @@ func (h *Handler) AddValidatingWebhookConfiguration() (err error) {
 	for _, webhook := range h.desiredWebhooks(cert) {
 		vwc.Webhooks = append(vwc.Webhooks, webhook)
 	}
-
-	_, err = h.clientset.AdmissionregistrationV1().ValidatingWebhookConfigurations().Create(context.TODO(), &vwc, metav1.CreateOptions{})
+	_, err = h.clientset.AdmissionregistrationV1().ValidatingWebhookConfigurations().Create(budgetCtx, &vwc, metav1.CreateOptions{})
 
 	return
 }
@@ -230,8 +242,8 @@ func (h *Handler) ippoolSpecWebhookName() string {
 // serves to an already existing ValidatingWebhookConfiguration. the
 // existing entries are left untouched so a concurrent renewal of the
 // serving certificate cannot be overwritten with a stale bundle.
-func (h *Handler) ensureMissingWebhookEntries() (err error) {
-	vwc, err := h.clientset.AdmissionregistrationV1().ValidatingWebhookConfigurations().Get(context.TODO(), h.validatingWebhookConfigName, metav1.GetOptions{})
+func (h *Handler) ensureMissingWebhookEntries(ctx context.Context) (err error) {
+	vwc, err := h.clientset.AdmissionregistrationV1().ValidatingWebhookConfigurations().Get(ctx, h.validatingWebhookConfigName, metav1.GetOptions{})
 	if err != nil {
 		return
 	}
@@ -257,7 +269,7 @@ func (h *Handler) ensureMissingWebhookEntries() (err error) {
 		return
 	}
 
-	cert, err := h.getCaBundleFromCABundleConfigMap()
+	cert, err := h.getCaBundleFromCABundleConfigMap(ctx)
 	if err != nil {
 		return
 	}
@@ -270,7 +282,7 @@ func (h *Handler) ensureMissingWebhookEntries() (err error) {
 		}
 	}
 
-	_, err = h.clientset.AdmissionregistrationV1().ValidatingWebhookConfigurations().Update(context.TODO(), vwc, metav1.UpdateOptions{})
+	_, err = h.clientset.AdmissionregistrationV1().ValidatingWebhookConfigurations().Update(ctx, vwc, metav1.UpdateOptions{})
 	if err == nil {
 		log.Infof("(admission.ensureMissingWebhookEntries) added the admission webhooks %v to the ValidatingWebhookConfiguration %s",
 			missing, h.validatingWebhookConfigName)

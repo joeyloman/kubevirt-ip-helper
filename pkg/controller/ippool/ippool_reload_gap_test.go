@@ -66,6 +66,7 @@ func TestReloadKeepsTheServingPoolRegisteredWhileTheReplacementResolves(t *testi
 	}
 	// the live registration of the old options, as a serving era holds it
 	if err := controller.dhcp.AddPool(
+		context.Background(),
 		"net-gap",
 		"192.168.1.1",
 		"255.255.255.0",
@@ -133,6 +134,7 @@ func TestRejectedReplacementKeepsTheServingPool(t *testing.T) {
 
 	controller, _ := newTestController(t, newTestQueue(), newTestIndexer(), nil, &appStatus, nil)
 	if err := controller.dhcp.AddPool(
+		context.Background(),
 		"net-gap2",
 		"192.168.1.1",
 		"255.255.255.0",
