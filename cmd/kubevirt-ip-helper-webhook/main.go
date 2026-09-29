@@ -83,7 +83,7 @@ func main() {
 	}
 	admissionHandler.Init()
 	serviceHandler.Init()
-	scheduler.StartCertRenewalScheduler(configHandler, serviceHandler, certRenewalPeriod)
+	scheduler.StartCertRenewalScheduler(ctx, configHandler, serviceHandler, certRenewalPeriod)
 	go serviceHandler.Run()
 	go Run()
 
@@ -91,9 +91,24 @@ func main() {
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	<-sig
+	received := <-sig
+	log.Infof("%s received %v, shutting down", progname, received)
+
+	// stop the renewal scheduling first (F14): no tick may restart the
+	// admission server under the shutdown drain, and the cancellation
+	// also aborts the api calls of a renewal which is still running
 	cancel()
-	os.Exit(1)
+
+	// drain the admission server with a fresh bounded context (F14):
+	// the process context is already canceled, Shutdown stops accepting
+	// new requests - the readiness probe withdraws with the closed
+	// listener - and waits for the in-flight requests within the drain
+	// budget (F08), terminating the ones which outlive it
+	if err := serviceHandler.Stop(); err != nil {
+		log.Errorf("(webhook) the graceful drain did not complete within its budget: %s", err.Error())
+	}
+
+	os.Exit(0)
 }
 
 func Run() {

@@ -908,9 +908,13 @@ func (h *Handler) Run() {
 // stalled connection wedged the renewal restart which calls Stop
 // synchronously. the admission requests are bounded by the apiserver's
 // webhook timeout through their propagated request contexts, so a drain
-// which cannot complete within this budget is a stalled connection, not a
-// legitimately slow admission. it is a variable so the test can shrink it.
-var httpDrainBudget = 30 * time.Second
+// which cannot complete within this budget is a stalled connection, not
+// a legitimately slow admission. it is a variable so the test can shrink
+// it. the 25s sit below the 30s termination grace period of the
+// deployments (F14): the process's own bounded exit must win the race
+// against kubelet's kill at the grace deadline, or a stalled drain ends
+// in a SIGKILL instead of the clean exit of the shutdown path.
+var httpDrainBudget = 25 * time.Second
 
 func (h *Handler) Stop() error {
 	drainCtx, cancel := context.WithTimeout(context.Background(), httpDrainBudget)
