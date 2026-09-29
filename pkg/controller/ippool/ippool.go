@@ -166,6 +166,19 @@ func (c *Controller) registerIPPool(pool *kihv1.IPPool) (cleanup bool, err error
 			pool.Name, pool.Spec.NetworkName, projectionErr.Error(), ErrPoolUnregistrable)
 	}
 
+	// an infrastructure address (the server ip, and the router when it is
+	// set) which lies inside the allocation range without being excluded
+	// would be handed to a fresh guest while the pool also serves it as
+	// its own dhcp identity (R08): the registration only reserves the
+	// exclude entries, so the configuration must move the address outside
+	// the range or exclude it explicitly. the rejection is deterministic
+	// and precedes every host, dhcp and allocator mutation, so it is
+	// unregistrable like the other projection defects.
+	if infraErr := validateInfrastructureAddresses(pool); infraErr != nil {
+		return cleanup, fmt.Errorf("error while validating the infrastructure addresses of pool [%s] for network [%s]: %s: %w",
+			pool.Name, pool.Spec.NetworkName, infraErr.Error(), ErrPoolUnregistrable)
+	}
+
 	// an exclude entry which the persisted ledger records for a live
 	// binding is a configuration conflict which can never converge: the
 	// exclude pass claims the address as EXCLUDED first, so the later
@@ -402,6 +415,16 @@ func (c *Controller) handleIPPoolObjectChange(oldPool kihv1.IPPool, newPool *kih
 	if projectionErr := validatePoolProjection(newPool); projectionErr != nil {
 		return fmt.Errorf("(ippool.handleIPPoolObjectChange) rejecting update for networkname [%s]: %s, keeping the currently registered configuration",
 			newPool.Spec.NetworkName, projectionErr.Error())
+	}
+
+	// an infrastructure address inside the allocation range is part of
+	// the same pre-teardown validation (R08): the edit would drain the
+	// live services here and the re-registration of the next era would
+	// then reject the pool forever, so the update is rejected while the
+	// registered configuration keeps serving
+	if infraErr := validateInfrastructureAddresses(newPool); infraErr != nil {
+		return fmt.Errorf("(ippool.handleIPPoolObjectChange) rejecting update for networkname [%s]: %s, keeping the currently registered configuration",
+			newPool.Spec.NetworkName, infraErr.Error())
 	}
 
 	if oldPool.Spec.NetworkName != newPool.Spec.NetworkName && c.dhcp.CheckPool(newPool.Spec.NetworkName) {
@@ -682,6 +705,52 @@ func validatePoolProjection(pool *kihv1.IPPool) error {
 	}
 
 	return nil
+}
+
+// validateInfrastructureAddresses reports whether the server ip and the
+// router of the pool spec can coexist with the allocation range they
+// serve (R08): the registration only reserves the exclude entries, so an
+// infrastructure address which lies inside the start..end range without
+// being excluded would be handed to a fresh guest while the pool also
+// answers it as its own dhcp identity. such an address must be moved
+// outside the range or excluded explicitly. only a parseable ipv4
+// address which lies inside the inclusive range is examined: an
+// unparseable or off-range entry stays the concern of the projection
+// validation, and the comparison uses the parsed addresses, not their
+// string spellings.
+func validateInfrastructureAddresses(pool *kihv1.IPPool) error {
+	startAddr, startErr := netip.ParseAddr(pool.Spec.IPv4Config.Pool.Start)
+	endAddr, endErr := netip.ParseAddr(pool.Spec.IPv4Config.Pool.End)
+	if startErr != nil || endErr != nil {
+		return nil
+	}
+
+	check := func(kind string, value string) error {
+		if value == "" {
+			return nil
+		}
+		addr, addrErr := netip.ParseAddr(value)
+		if addrErr != nil || !addr.Is4() {
+			return nil
+		}
+		if addr.Compare(startAddr) < 0 || addr.Compare(endAddr) > 0 {
+			return nil
+		}
+		for _, ex := range pool.Spec.IPv4Config.Pool.Exclude {
+			if exAddr, exErr := netip.ParseAddr(ex); exErr == nil && exAddr.Compare(addr) == 0 {
+				return nil
+			}
+		}
+
+		return fmt.Errorf("the %s %s lies within the pool range %s-%s and is not excluded; move it outside the allocation range or add it to the exclude list",
+			kind, value, pool.Spec.IPv4Config.Pool.Start, pool.Spec.IPv4Config.Pool.End)
+	}
+
+	if err := check("serverip", pool.Spec.IPv4Config.ServerIP); err != nil {
+		return err
+	}
+
+	return check("router", pool.Spec.IPv4Config.Router)
 }
 
 // specClaim records one admitted claim of the vmnetcfg claim sweep: the

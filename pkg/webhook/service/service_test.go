@@ -306,6 +306,26 @@ func TestEvaluateIPPoolSpec(t *testing.T) {
 			[]string{"the exclude address 192.168.16.200 is not within the pool range 192.168.16.10..192.168.16.20"},
 		},
 		{
+			"a serverip within the pool range without an exclude entry",
+			kihv1.IPv4Config{Subnet: "192.168.16.0/24", ServerIP: "192.168.16.15", Pool: kihv1.Pool{Start: "192.168.16.10", End: "192.168.16.20"}},
+			[]string{"the serverip 192.168.16.15 lies within the pool range 192.168.16.10-192.168.16.20 and is not excluded; move it outside the allocation range or add it to the exclude list"},
+		},
+		{
+			"a router within the pool range without an exclude entry",
+			kihv1.IPv4Config{Subnet: "192.168.16.0/24", ServerIP: "192.168.16.9", Router: "192.168.16.12", Pool: kihv1.Pool{Start: "192.168.16.10", End: "192.168.16.20"}},
+			[]string{"the router 192.168.16.12 lies within the pool range 192.168.16.10-192.168.16.20 and is not excluded; move it outside the allocation range or add it to the exclude list"},
+		},
+		{
+			"an in-range serverip with an exclude entry is admitted",
+			kihv1.IPv4Config{Subnet: "192.168.16.0/24", ServerIP: "192.168.16.15", Pool: kihv1.Pool{Start: "192.168.16.10", End: "192.168.16.20", Exclude: []string{"192.168.16.15"}}},
+			nil,
+		},
+		{
+			"a serverip inside the subnet but outside the pool range stays admitted",
+			kihv1.IPv4Config{Subnet: "192.168.16.0/24", ServerIP: "192.168.16.9", Router: "192.168.16.254", Pool: kihv1.Pool{Start: "192.168.16.10", End: "192.168.16.20"}},
+			nil,
+		},
+		{
 			"an exclude address equal to the broadcast address",
 			kihv1.IPv4Config{Subnet: "192.168.16.0/24", ServerIP: "192.168.16.9", Pool: kihv1.Pool{Start: "192.168.16.10", End: "192.168.16.20", Exclude: []string{"192.168.16.255"}}},
 			[]string{"the exclude address 192.168.16.255 equals the broadcast address 192.168.16.255 of the subnet 192.168.16.0/24", "the exclude address 192.168.16.255 is not within the pool range 192.168.16.10..192.168.16.20"},

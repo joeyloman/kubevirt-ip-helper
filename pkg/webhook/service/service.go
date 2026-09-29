@@ -651,12 +651,14 @@ func (h *Handler) validateIPPoolAdmission(w http.ResponseWriter, r *http.Request
 // which cannot serve: a subnet which does not parse as an ipv4 prefix, a
 // pool start or pool end outside the subnet, a pool end before its start,
 // a pool end or exclude entry equal to the broadcast address of the
-// subnet, a pool range larger than the cap, and an exclude address outside
-// the subnet or the allocation range. the checks mirror the controller's
-// own registration validation so a projection the controller would
-// register is never rejected: the serverip is parse-checked only, exactly
-// like the controller's projection validation. only fields which are
-// present are validated.
+// subnet, a pool range larger than the cap, an exclude address outside
+// the subnet or the allocation range, and a serverip or router inside the
+// allocation range without an exclude entry. the checks mirror the
+// controller's own registration validation so a projection the controller
+// would register is never rejected: the serverip is otherwise
+// parse-checked only, exactly like the controller's projection validation
+// (its off-subnet placement stays deliberately allowed). only fields which
+// are present are validated.
 func evaluateIPPoolSpec(cfg kihv1.IPv4Config) (problems []string) {
 	var prefix netip.Prefix
 	subnetParses := false
@@ -683,6 +685,11 @@ func evaluateIPPoolSpec(cfg kihv1.IPv4Config) (problems []string) {
 
 	var rangeStart, rangeEnd netip.Addr
 	rangeParses := true
+	// rangeRejected records a range problem the controller's own
+	// ValidateSubnetSpec rejects the registration for: the infrastructure
+	// address check below only fires on a range the controller would
+	// actually serve, mirroring the order of the registration validation.
+	rangeRejected := false
 	if cfg.Pool.Start != "" {
 		addr, err := netip.ParseAddr(cfg.Pool.Start)
 		if err != nil || !addr.Is4() {
@@ -693,6 +700,7 @@ func evaluateIPPoolSpec(cfg kihv1.IPv4Config) (problems []string) {
 
 			if subnetParses && !prefix.Contains(addr) {
 				problems = append(problems, fmt.Sprintf("the pool start %s is not within the subnet %s", cfg.Pool.Start, cfg.Subnet))
+				rangeRejected = true
 			}
 		}
 	}
@@ -707,6 +715,7 @@ func evaluateIPPoolSpec(cfg kihv1.IPv4Config) (problems []string) {
 
 			if subnetParses && !prefix.Contains(addr) {
 				problems = append(problems, fmt.Sprintf("the pool end %s is not within the subnet %s", cfg.Pool.End, cfg.Subnet))
+				rangeRejected = true
 			}
 		}
 	}
@@ -715,6 +724,7 @@ func evaluateIPPoolSpec(cfg kihv1.IPv4Config) (problems []string) {
 
 	if completeRange && rangeEnd.Compare(rangeStart) < 0 {
 		problems = append(problems, fmt.Sprintf("the pool end %s lies before the pool start %s", cfg.Pool.End, cfg.Pool.Start))
+		rangeRejected = true
 	}
 
 	// the broadcast address of the subnet can neither serve as the pool end
@@ -727,10 +737,12 @@ func evaluateIPPoolSpec(cfg kihv1.IPv4Config) (problems []string) {
 
 	if subnetParses && cfg.Pool.End != "" && rangeParses && rangeEnd == broadcast {
 		problems = append(problems, fmt.Sprintf("the pool end %s equals the broadcast address %s of the subnet %s", cfg.Pool.End, broadcast, cfg.Subnet))
+		rangeRejected = true
 	}
 
 	if completeRange && rangeEnd.Compare(rangeStart) >= 0 && ipv4RangeLen(rangeStart, rangeEnd) > maxPoolAddrs {
 		problems = append(problems, fmt.Sprintf("the pool range %s - %s is larger than the maximum of %d addresses", cfg.Pool.Start, cfg.Pool.End, maxPoolAddrs))
+		rangeRejected = true
 	}
 
 	for _, exclude := range cfg.Pool.Exclude {
@@ -755,6 +767,49 @@ func evaluateIPPoolSpec(cfg kihv1.IPv4Config) (problems []string) {
 
 		if cfg.Pool.Start != "" && cfg.Pool.End != "" && rangeParses && (addr.Compare(rangeStart) < 0 || addr.Compare(rangeEnd) > 0) {
 			problems = append(problems, fmt.Sprintf("the exclude address %s is not within the pool range %s..%s", exclude, cfg.Pool.Start, cfg.Pool.End))
+		}
+	}
+
+	// the serverip and the router are also checked against the allocation
+	// range itself, exactly like the controller's own registration
+	// validation (R08): the registration only reserves the exclude
+	// entries, so an infrastructure address inside the range must be
+	// excluded explicitly or the controller rejects the pool as
+	// unregistrable. only a parseable in-range address is reported: an
+	// unparseable or off-range entry stays the parse checks' concern and
+	// an off-subnet placement stays deliberately allowed, mirroring the
+	// controller.
+	if completeRange && !rangeRejected {
+		for _, infra := range []struct {
+			kind  string
+			value string
+		}{{"serverip", cfg.ServerIP}, {"router", cfg.Router}} {
+			if infra.value == "" {
+				continue
+			}
+
+			addr, addrErr := netip.ParseAddr(infra.value)
+			if addrErr != nil || !addr.Is4() {
+				continue
+			}
+
+			if addr.Compare(rangeStart) < 0 || addr.Compare(rangeEnd) > 0 {
+				continue
+			}
+
+			excluded := false
+			for _, exclude := range cfg.Pool.Exclude {
+				if exAddr, exErr := netip.ParseAddr(exclude); exErr == nil && exAddr.Compare(addr) == 0 {
+					excluded = true
+
+					break
+				}
+			}
+
+			if !excluded {
+				problems = append(problems, fmt.Sprintf("the %s %s lies within the pool range %s-%s and is not excluded; move it outside the allocation range or add it to the exclude list",
+					infra.kind, infra.value, cfg.Pool.Start, cfg.Pool.End))
+			}
 		}
 	}
 
