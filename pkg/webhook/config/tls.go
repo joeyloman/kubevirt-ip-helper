@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -56,6 +57,20 @@ func (h *Handler) generateTLSKeyAndCert() (tlsPair tls.Certificate, err error) {
 	cert, err := h.createAndSignCSR(pCsr)
 	if err != nil {
 		return
+	}
+
+	// the issued pair must be usable before anything is published (F12):
+	// the certificate is validated against the generated key as one
+	// pair, so a certificate which does not carry this key's public key
+	// (a replaced signing request that slipped through the identity
+	// checks, a signer defect) fails the bootstrap here instead of being
+	// persisted and serving nothing
+	pemKey, keyErr := pemEncodePKCS8Key(key)
+	if keyErr != nil {
+		return tlsPair, keyErr
+	}
+	if _, pairErr := tls.X509KeyPair(cert, pemKey); pairErr != nil {
+		return tlsPair, fmt.Errorf("the issued certificate does not pair with the generated key: %s", pairErr.Error())
 	}
 
 	tlsPair.Certificate = append(tlsPair.Certificate, cert)
@@ -134,6 +149,19 @@ func (h *Handler) createAndSignCSR(pCsr []byte) ([]byte, error) {
 		updatedCsr, err := h.clientset.CertificatesV1().CertificateSigningRequests().Get(signCtx, h.csrName, metav1.GetOptions{})
 		if err != nil {
 			return nil, fmt.Errorf("error while getting the updated signing request: %w", err)
+		}
+
+		// the csr name is shared by every bootstrap of the deployment
+		// (F12): a concurrent pod can delete this object and create its
+		// own under the same name, and a name-only GET would then pair
+		// the other attempt's certificate with this attempt's key - an
+		// unusable pair that would be published as the shared secret.
+		// the polled object must be the one this attempt created: the
+		// uid is unique per object, and the request bytes are the key
+		// material this attempt submitted
+		if updatedCsr.UID != csrObj.UID || !bytes.Equal(updatedCsr.Spec.Request, pCsr) {
+			return nil, fmt.Errorf("the signing request %s was replaced by a concurrent issuance attempt, aborting instead of pairing its certificate with the generated key",
+				h.csrName)
 		}
 
 		if len(updatedCsr.Status.Certificate) > 0 {

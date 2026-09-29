@@ -1,6 +1,7 @@
 package config
 
 import (
+	"crypto"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
@@ -14,15 +15,26 @@ import (
 // it is canceled when the process shuts down, and every call is
 // additionally bounded by the request timeout of the kubeconfig.
 
-func (h *Handler) createSecret(tlsPair tls.Certificate) (err error) {
-	bKey, err := x509.MarshalPKCS8PrivateKey(tlsPair.PrivateKey)
+// pemEncodePKCS8Key marshals a private key to the PEM spelling the
+// secret publication and the pair validation share.
+func pemEncodePKCS8Key(key crypto.PrivateKey) ([]byte, error) {
+	bKey, err := x509.MarshalPKCS8PrivateKey(key)
 	if err != nil {
-		return fmt.Errorf("unable to marshal private key: %s", err.Error())
-
+		return nil, fmt.Errorf("unable to marshal private key: %s", err.Error())
 	}
+
 	pemKey := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: bKey})
 	if pemKey == nil {
-		return fmt.Errorf("failed to encode key to PEM")
+		return nil, fmt.Errorf("failed to encode key to PEM")
+	}
+
+	return pemKey, nil
+}
+
+func (h *Handler) createSecret(tlsPair tls.Certificate) (err error) {
+	pemKey, err := pemEncodePKCS8Key(tlsPair.PrivateKey)
+	if err != nil {
+		return err
 	}
 
 	newSecret := corev1.Secret{}
