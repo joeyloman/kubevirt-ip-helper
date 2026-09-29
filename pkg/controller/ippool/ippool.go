@@ -584,10 +584,7 @@ func (c *Controller) cleanupIPPoolObjects(pool *kihv1.IPPool) (err error) {
 func (c *Controller) createOrUpdateDHCPPool(pool *kihv1.IPPool) (err error) {
 	// validate the projection first: only an ipv4 subnet with a registrable
 	// range may replace the active dhcp pool, otherwise a rejected update
-	// would destroy the working configuration (the dhcp pool delete below
-	// runs before the mask projection, so an ipv6 subnet would already be
-	// masked to an all-ones v4 prefix or "<nil>" and handed to AddPool by
-	// the time any later check could reject it)
+	// must fail before the allocator is touched at all
 	if validateErr := ipam.ValidateSubnetSpec(pool.Spec.IPv4Config.Subnet, pool.Spec.IPv4Config.Pool.Start, pool.Spec.IPv4Config.Pool.End); validateErr != nil {
 		return fmt.Errorf("(ippool.createOrUpdateDHCPPool) invalid subnet [%s] and range [%s-%s] for network [%s]: %s",
 			pool.Spec.IPv4Config.Subnet, pool.Spec.IPv4Config.Pool.Start, pool.Spec.IPv4Config.Pool.End,
@@ -600,20 +597,20 @@ func (c *Controller) createOrUpdateDHCPPool(pool *kihv1.IPPool) (err error) {
 	}
 	subnetMask := net.CIDRMask(ipnet.Bits(), 32)
 
-	if c.dhcp.CheckPool(pool.Spec.NetworkName) {
-		if err := c.dhcp.DeletePool(pool.Spec.NetworkName); err != nil {
-			log.Errorf("(ippool.createOrUpdateDHCPPool) while deleting dhcppool [%s]: %s", pool.Spec.NetworkName, err.Error())
-			c.metrics.UpdateLogStatus("error")
-		}
-	}
-
-	// register the new subnet in dhcp. the AddPool validation is the
-	// backstop of the up-front validatePoolProjection admission: a pool
-	// which reaches this point with an invalid address projection has
-	// already destroyed its live dhcp pool above, so the error must
-	// surface instead of being silently dropped (the caller requeues and
-	// the resync re-runs the registration, and the up-front admission
-	// keeps the deterministic defects out of this path entirely)
+	// register the new subnet in dhcp (F07): AddPool resolves the ntp
+	// hostnames before it takes the allocator lock and then replaces the
+	// pool entry in one atomic step, so the live pool of the network keeps
+	// answering every request until the replacement is published - a
+	// delete-before-add here opened a pool-absent window (as long as the
+	// ntp resolution of the replacement takes) in which a valid renewal
+	// was nacked and the client needlessly lost its still-valid address.
+	// the AddPool validation is the backstop of the up-front
+	// validatePoolProjection admission: a rejected replacement validates
+	// before any state is taken, so the previously registered pool keeps
+	// serving instead of having been destroyed by an up-front delete whose
+	// error was only logged (the caller requeues and the resync re-runs
+	// the registration, and the up-front admission keeps the deterministic
+	// defects out of this path entirely)
 	if err := c.dhcp.AddPool(
 		pool.Spec.NetworkName,
 		pool.Spec.IPv4Config.ServerIP,

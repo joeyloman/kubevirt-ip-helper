@@ -1287,10 +1287,11 @@ func TestRemoveLeasesForNetwork(t *testing.T) {
 }
 
 // TestDHCPHandlerNoMatchedPoolNaksRequest: a request whose lease's pool is
-// gone (a deleted pool whose cleanup is still in flight, or the brief
-// reload window) must fail the client fast with a nak instead of dropping
-// the packet silently - a silent drop leaves the client retransmitting
-// against a server which can never serve the address again.
+// gone (a deleted pool whose cleanup is still in flight) must fail the
+// client fast with a nak instead of dropping the packet silently - a
+// silent drop leaves the client retransmitting against a server which can
+// never serve the address again. a reload no longer produces this state:
+// the replacement is published atomically over the live pool (F07).
 func TestDHCPHandlerNoMatchedPoolNaksRequest(t *testing.T) {
 	a := newTestPooledAllocator(t)
 	if err := a.DeletePool("pool1"); err != nil {

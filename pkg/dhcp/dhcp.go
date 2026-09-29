@@ -128,6 +128,15 @@ func NewDHCPAllocator() *DHCPAllocator {
 	}
 }
 
+// SetResolver overrides the resolver used for the ntp hostname resolution
+// of pool registrations: the nil default is net.DefaultResolver. the
+// override exists so cross-package tests can park a replacement inside
+// its resolution without swapping the global resolver (the F07 reload
+// regressions observe the serving state while a replacement resolves).
+func (a *DHCPAllocator) SetResolver(r *net.Resolver) {
+	a.resolver = r
+}
+
 // resolveNTPServers normalizes the ntp server entries into ip addresses,
 // resolving hostname entries through the resolver of the allocator.
 // AddPool runs it before taking the allocator lock: the dhcp packet
