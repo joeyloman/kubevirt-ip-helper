@@ -142,8 +142,10 @@ func TestEvaluateIPPoolRecords(t *testing.T) {
 }
 
 // TestFindRecordedTuple covers the duplicate (vmname, macaddress) guard:
-// the same pair claimed by another object is denied on any network, while
-// a different vmname, the object itself, and empty macaddresses pass.
+// the same pair claimed by another object is denied on any network and
+// in every spelling of the macaddress (the comparison is canonical,
+// R10), while a different vmname, the object itself, and empty
+// macaddresses pass.
 func TestFindRecordedTuple(t *testing.T) {
 	list := &kihv1.VirtualMachineNetworkConfigList{
 		Items: []kihv1.VirtualMachineNetworkConfig{
@@ -169,6 +171,20 @@ func TestFindRecordedTuple(t *testing.T) {
 			"the same vm and mac on a different network",
 			vmnetcfg("default", "dup-cfg", "cirros-vm1",
 				kihv1.NetworkConfig{IPAddress: "192.168.11.140", MACAddress: "02:7b:d9:84:8f:e5", NetworkName: "kubevirt-public/public-vlan-2"}),
+			true,
+			"(network kubevirt-public/public-vlan-1)",
+		},
+		{
+			"the same vm and mac in a dash spelling",
+			vmnetcfg("default", "dup-cfg", "cirros-vm1",
+				kihv1.NetworkConfig{MACAddress: "02-7b-d9-84-8f-e5", NetworkName: "kubevirt-public/public-vlan-1"}),
+			true,
+			"already recorded with macaddress 02-7b-d9-84-8f-e5 by VirtualMachineNetworkConfig default/cirros-vm1",
+		},
+		{
+			"the same vm and mac in an uppercase spelling",
+			vmnetcfg("default", "dup-cfg", "cirros-vm1",
+				kihv1.NetworkConfig{MACAddress: "02:7B:D9:84:8F:E5", NetworkName: "kubevirt-public/public-vlan-2"}),
 			true,
 			"(network kubevirt-public/public-vlan-1)",
 		},

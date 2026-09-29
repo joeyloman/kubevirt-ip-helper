@@ -543,6 +543,35 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 
 					v.IPAddress = lease.ClientIP.String()
 					adoptedReservation = true
+				} else if siblingNamespace, siblingName, contested := c.findSiblingRecordingTuple(vmnetcfg, v.MACAddress, lease.PoolName, lease.ClientIP.String()); contested {
+					// R10: the requested assignment differs from the own live
+					// lease while a live sibling binding of the same vm records
+					// the lease's tuple in its spec: the lease is contested and
+					// THE LIVE LEASE IS THE AUTHORITY. running the destructive
+					// migration cleanup here would honor both contradictory
+					// specs in turn - every resync released and re-allocated
+					// the address, so the one lease oscillated between the two
+					// bindings while both reported status OK. the contested
+					// binding keeps a stable ERROR naming the sibling and the
+					// incumbent address instead, its spec entry stays untouched
+					// and the lease, the claim and the ledger record are left
+					// exactly as they are: a possibly served address is never
+					// released to resolve a contest, which is why the incumbent
+					// lease wins and not a name-ordered owner. the steady-state
+					// resync re-attempts the failed interface, so the ERROR
+					// clears by itself once the sibling is deleted or edited
+					// to agree
+					log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] hwaddr %s is leased with ip %s in network %s which VirtualMachineNetworkConfig %s/%s records, refusing the requested change",
+						vmnetcfg.Namespace, vmnetcfg.Name, v.MACAddress, lease.ClientIP.String(), lease.PoolName, siblingNamespace, siblingName)
+					c.metrics.UpdateLogStatus("error")
+
+					netcfgStatus.Status = "ERROR"
+					netcfgStatus.Message = fmt.Sprintf("ip %s in network %s is leased by VirtualMachineNetworkConfig %s/%s: the live lease wins, delete or edit the conflicting object to agree", lease.ClientIP.String(), lease.PoolName, siblingNamespace, siblingName)
+					newNetCfgStatusList = append(newNetCfgStatusList, netcfgStatus)
+
+					newVmNetCfgs = append(newVmNetCfgs, v)
+
+					continue
 				} else {
 					log.Warnf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] address or network change found for hwaddr=%s: the lease holds ip=%s in network=%s, the spec records ip=%s in network=%s, starting cleanup of the leased state",
 						vmnetcfg.Namespace, vmnetcfg.Name, v.MACAddress, lease.ClientIP.String(), lease.PoolName, v.IPAddress, v.NetworkName)
@@ -1202,6 +1231,50 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 	return
 }
 
+// findSiblingRecordingTuple reports the live VirtualMachineNetworkConfig
+// which records the given (macaddress, networkname, ipaddress) tuple in
+// its spec besides the given object: both belong to the same namespace
+// and the same spec vmname, so the lease, the ipam claim and the ledger
+// record of the tuple - keyed on the canonical macaddress and the
+// name-based owner reference (namespace/vmname) - cannot distinguish
+// the two objects (R10). the store of the vmnetcfg informer is
+// enumerated, the same cache the reconciliation itself reads, so the
+// lookup adds no apiserver round trip. the macaddress is compared in
+// its canonical form: a duplicate which reached the store through the
+// admission window with another spelling of the same address is a
+// duplicate all the same. a sibling which is being deleted does not
+// hold the tuple: its own cleanup is releasing the state, and a mutual
+// skip of two simultaneously deleting duplicates would strand the
+// reservation instead of converging either deletion.
+func (c *Controller) findSiblingRecordingTuple(vmnetcfg *kihv1.VirtualMachineNetworkConfig, macAddress string, networkName string, ipAddress string) (namespace string, name string, found bool) {
+	if ipAddress == "" || c.indexer == nil {
+		return
+	}
+
+	mac := util.CanonicalHWAddr(macAddress)
+
+	for _, item := range c.indexer.List() {
+		sibling, ok := item.(*kihv1.VirtualMachineNetworkConfig)
+		if !ok ||
+			sibling.Name == vmnetcfg.Name ||
+			sibling.Namespace != vmnetcfg.Namespace ||
+			sibling.Spec.VMName != vmnetcfg.Spec.VMName ||
+			sibling.ObjectMeta.DeletionTimestamp != nil {
+			continue
+		}
+
+		for _, onc := range sibling.Spec.NetworkConfig {
+			if util.CanonicalHWAddr(onc.MACAddress) == mac &&
+				onc.NetworkName == networkName &&
+				onc.IPAddress == ipAddress {
+				return sibling.Namespace, sibling.Name, true
+			}
+		}
+	}
+
+	return
+}
+
 func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetworkConfig, netCfg *kihv1.NetworkConfig, deleting bool) (err error) {
 	log.Debugf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] cleaning interface with hwaddr=%s, networkname=%s, ipaddress=%s",
 		vmnetcfg.Namespace, vmnetcfg.Name, netCfg.MACAddress, netCfg.NetworkName, netCfg.IPAddress)
@@ -1299,6 +1372,26 @@ func (c *Controller) cleanupNetworkInterface(vmnetcfg *kihv1.VirtualMachineNetwo
 		// immediate release on VM delete stays the documented behavior: the
 		// lease and the allocation are freed first and the finalizer retry
 		// re-runs the whole cleanup until the status entry converges
+
+		// R10: deleting one of two bindings which record the same tuple
+		// must not release the tuple under the survivor's feet: the owner
+		// layers cannot distinguish the duplicates, so the lease, the
+		// claim and the ledger record serve the survivor's recorded
+		// assignment just as well - releasing them here made the possibly
+		// served address allocatable to a foreign binding while the
+		// survivor still recorded it. the state stays untouched and the
+		// deletion converges: the survivor's own reconciliation keeps
+		// serving, and its own eventual deletion (with this object gone)
+		// releases the state for real. a sibling which is being deleted
+		// itself does not hold the tuple, so two simultaneously deleting
+		// duplicates still converge.
+		if siblingNamespace, siblingName, held := c.findSiblingRecordingTuple(vmnetcfg, netCfg.MACAddress, netCfg.NetworkName, netCfg.IPAddress); held {
+			log.Warnf("(vmnetcfg.cleanupNetworkInterface) [%s/%s] ip %s in network %s is recorded by VirtualMachineNetworkConfig %s/%s, leaving its lease, claim and ledger record to that object",
+				vmnetcfg.Namespace, vmnetcfg.Name, netCfg.IPAddress, netCfg.NetworkName, siblingNamespace, siblingName)
+			c.metrics.UpdateLogStatus("warning")
+
+			return
+		}
 
 		// the tuple of the own live lease is captured before the by-mac
 		// deletion: a quarantined allocation (a sync whose durable object

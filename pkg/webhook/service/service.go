@@ -326,7 +326,11 @@ func (h *Handler) validateIPPool(ctx context.Context, ar *admissionv1.AdmissionR
 // object and both networks. the check is network-agnostic: the dhcp
 // allocator of the helper keys its lease map on the macaddress alone, so
 // the same pair on different networks oscillates the one lease just the
-// same. the same-vmname scope and the object-identity exemption (an
+// same. the comparison runs on the canonical form of the macaddress
+// (R10): the allocator parses the address before keying its lease, so a
+// dash or uppercase spelling of the same address is the same lease, and
+// a raw-string comparison let a canonically equivalent duplicate through
+// the guard. the same-vmname scope and the object-identity exemption (an
 // object never conflicts with itself) are part of the check: a different
 // vmname claiming the macaddress of another vm stays admissible.
 func findRecordedTuple(obj *kihv1.VirtualMachineNetworkConfig, list *kihv1.VirtualMachineNetworkConfigList) (denied *string) {
@@ -335,13 +339,15 @@ func findRecordedTuple(obj *kihv1.VirtualMachineNetworkConfig, list *kihv1.Virtu
 			continue
 		}
 
+		macAddress := util.CanonicalHWAddr(nc.MACAddress)
+
 		for _, other := range list.Items {
 			if other.Name == obj.Name || other.Spec.VMName != obj.Spec.VMName {
 				continue
 			}
 
 			for _, onc := range other.Spec.NetworkConfig {
-				if onc.MACAddress == nc.MACAddress {
+				if util.CanonicalHWAddr(onc.MACAddress) == macAddress {
 					msg := fmt.Sprintf(
 						"vmname %s is already recorded with macaddress %s by VirtualMachineNetworkConfig %s/%s (network %s): a macaddress is served once, so two objects of the same vm and macaddress are not admitted because their contradictory specs oscillate the allocation",
 						obj.Spec.VMName, nc.MACAddress, other.Namespace, other.Name, onc.NetworkName,
