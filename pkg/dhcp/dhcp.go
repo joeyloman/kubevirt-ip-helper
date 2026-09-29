@@ -601,15 +601,19 @@ func New() *DHCPAllocator {
 	return NewDHCPAllocator()
 }
 
-// packetLeaseAndPool resolves the lease and its pool of one packet under a
-// single lock acquisition. the dhcp packet handler previously looked the
-// lease, the pool existence and the pool up with three separate lock
-// acquisitions per packet; a flood on the shared interface then serialized
-// its ten layers of contention across the whole registration and lease
-// adoption machinery. an hwaddr without a lease reports leaseFound=false
-// (a stored lease always carries a client ip), and a lease whose pool is
+// packetLeaseAndPool resolves the lease and its pool of one packet of the
+// named receiving network under a single lock acquisition. the dhcp packet
+// handler previously looked the lease, the pool existence and the pool up
+// with three separate lock acquisitions per packet; a flood on the shared
+// interface then serialized its ten layers of contention across the whole
+// registration and lease adoption machinery. an hwaddr without a lease
+// reports leaseFound=false (a stored lease always carries a client ip), and
+// a lease of another network reports leaseFound=false as well (F11): the
+// lease registry is global, but the packet arrived on the listener of one
+// registered network, and a client of another network is not the receiving
+// network's client - its own listener answers it. a lease whose pool is
 // gone reports poolFound=false so the caller can fail its client fast.
-func (a *DHCPAllocator) packetLeaseAndPool(hwAddr string) (lease DHCPLease, pool DHCPPool, leaseFound bool, poolFound bool) {
+func (a *DHCPAllocator) packetLeaseAndPool(networkName string, hwAddr string) (lease DHCPLease, pool DHCPPool, leaseFound bool, poolFound bool) {
 	hw, err := net.ParseMAC(hwAddr)
 	if err != nil {
 		return lease, pool, false, false
@@ -620,26 +624,34 @@ func (a *DHCPAllocator) packetLeaseAndPool(hwAddr string) (lease DHCPLease, pool
 
 	key := hw.String()
 	lease, leaseFound = a.leases[key]
-	if !leaseFound || lease.ClientIP == nil {
+	if !leaseFound || lease.ClientIP == nil || lease.PoolName != networkName {
 		return lease, pool, false, false
 	}
 
-	pool, poolFound = a.pools[lease.PoolName]
+	pool, poolFound = a.pools[networkName]
 
 	return lease, pool, true, poolFound
 }
 
-// poolForClientAddress resolves the pool which serves the given client
-// address: the pool whose subnet - the server ip of the pool under its own
-// subnet mask - contains it. it backs the DHCPINFORM path, whose ack must be
-// constructed from the local configuration of the network the client address
-// belongs to (rfc 2131 section 3.4: the server checks the network address
-// of the request for consistency, but MUST NOT check for an existing lease).
-// an address which no registered pool serves is reported as not found, and so
-// is one which more than one pool serves (a server ip outside its own subnet
-// can put two pools on the same subnet): an ambiguous address must not be
-// answered with the configuration of the wrong network.
-func (a *DHCPAllocator) poolForClientAddress(clientIP net.IP) (pool DHCPPool, found bool) {
+// poolForClientAddress resolves the pool of the named receiving network
+// when its subnet - the server ip of the pool under its own subnet mask -
+// contains the given client address. it backs the DHCPINFORM path, whose
+// ack must be constructed from the local configuration of the network the
+// packet was received on (rfc 2131 section 3.4: the server checks the
+// network address of the request for consistency, but MUST NOT check for
+// an existing lease). the resolution is scoped to the receiving network
+// (F11): two isolated interfaces may legitimately serve the same subnet,
+// and a global lookup by numeric address would let the addition, deletion
+// or reload of one network's pool change which configuration another
+// network's listener answers with - up to dropping every inform of a
+// shared subnet as globally ambiguous. the receiving network's own pool
+// is the only candidate, so an address it does not serve is not answered
+// (the fail-closed outcome stays, and ambiguity inside one registered
+// network is structurally impossible), and a pool is never chosen by
+// numeric address across networks. relayed packets arrive on the
+// receiving network's listener as well, so the relayed network is the
+// receiving network.
+func (a *DHCPAllocator) poolForClientAddress(networkName string, clientIP net.IP) (pool DHCPPool, found bool) {
 	clientV4 := clientIP.To4()
 	if clientV4 == nil {
 		return pool, false
@@ -648,25 +660,17 @@ func (a *DHCPAllocator) poolForClientAddress(clientIP net.IP) (pool DHCPPool, fo
 	a.mutex.Lock()
 	defer a.mutex.Unlock()
 
-	for _, candidate := range a.pools {
-		if candidate.ServerIP.To4() == nil || len(candidate.SubnetMask) == 0 {
-			continue
-		}
-
-		network := candidate.ServerIP.Mask(candidate.SubnetMask)
-		if !network.Equal(clientV4.Mask(candidate.SubnetMask)) {
-			continue
-		}
-
-		if found {
-			// more than one pool claims the address: fail closed
-			return DHCPPool{}, false
-		}
-
-		pool, found = candidate, true
+	candidate, exists := a.pools[networkName]
+	if !exists || candidate.ServerIP.To4() == nil || len(candidate.SubnetMask) == 0 {
+		return pool, false
 	}
 
-	return pool, found
+	network := candidate.ServerIP.Mask(candidate.SubnetMask)
+	if !network.Equal(clientV4.Mask(candidate.SubnetMask)) {
+		return pool, false
+	}
+
+	return candidate, true
 }
 
 // logUnknownHWAddr reports packets whose hardware address has no lease,
@@ -724,7 +728,13 @@ func (a *DHCPAllocator) RemoveLeasesForNetwork(networkName string) {
 	}
 }
 
-func (a *DHCPAllocator) dhcpHandler(conn net.PacketConn, peer net.Addr, m *dhcpv4.DHCPv4) {
+// dhcpHandler processes one packet of the named receiving network: the
+// listener callback of Run captures its registered network identity, and
+// every resolution of the packet - the inform pool by network address and
+// the lease of a known client - happens inside that network only (F11),
+// so the pools of independent networks never change each other's packet
+// interpretation.
+func (a *DHCPAllocator) dhcpHandler(networkName string, conn net.PacketConn, peer net.Addr, m *dhcpv4.DHCPv4) {
 	if m == nil {
 		log.Errorf("(dhcp.dhcpHandler) packet is nil!")
 
@@ -754,9 +764,10 @@ func (a *DHCPAllocator) dhcpHandler(conn net.PacketConn, peer net.Addr, m *dhcpv
 	// other means - it holds no lease of this server, so the lease gate
 	// below would silently drop every one of its requests. the network
 	// address of the request is checked for consistency instead: the pool
-	// which serves its subnet answers, and an address which no pool (or more
-	// than one pool) serves is not answered at all instead of being
-	// answered with the configuration of another network
+	// of the receiving network answers when its subnet contains it, and an
+	// address the receiving network does not serve is not answered at all
+	// instead of being answered with the configuration of another network
+	// (F11)
 	informReply := m.MessageType() == dhcpv4.MessageTypeInform
 
 	var lease DHCPLease
@@ -764,7 +775,7 @@ func (a *DHCPAllocator) dhcpHandler(conn net.PacketConn, peer net.Addr, m *dhcpv
 	var leaseFound, poolFound bool
 
 	if informReply {
-		pool, poolFound = a.poolForClientAddress(m.ClientIPAddr)
+		pool, poolFound = a.poolForClientAddress(networkName, m.ClientIPAddr)
 		if !poolFound {
 			log.Warnf("(dhcp.dhcpHandler) [txid=%s] DHCPINFORM from %s: no pool serves the address %s, not answering",
 				m.TransactionID.String(), m.ClientHWAddr.String(), m.ClientIPAddr.String())
@@ -775,7 +786,7 @@ func (a *DHCPAllocator) dhcpHandler(conn net.PacketConn, peer net.Addr, m *dhcpv
 		// lease and pool resolution under one lock acquisition (see
 		// packetLeaseAndPool): a flood on the shared interface must not
 		// stall the allocator behind three serialized lookups per packet
-		lease, pool, leaseFound, poolFound = a.packetLeaseAndPool(m.ClientHWAddr.String())
+		lease, pool, leaseFound, poolFound = a.packetLeaseAndPool(networkName, m.ClientHWAddr.String())
 
 		if !leaseFound {
 			a.logUnknownHWAddr(m)
@@ -1095,7 +1106,13 @@ func (a *DHCPAllocator) Run(networkName string, nic string) (err error) {
 		}
 	}
 
-	server, err := server4.NewServer(nic, &laddr, a.dhcpHandler)
+	// the handler must know which registered network's listener received
+	// the packet (F11): the callback captures the network identity, so
+	// every resolution happens inside the receiving network instead of
+	// scanning every registered pool globally
+	server, err := server4.NewServer(nic, &laddr, func(conn net.PacketConn, peer net.Addr, m *dhcpv4.DHCPv4) {
+		a.dhcpHandler(networkName, conn, peer, m)
+	})
 	if err != nil {
 		a.mutex.Unlock()
 

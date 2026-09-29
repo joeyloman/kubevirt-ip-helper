@@ -28,7 +28,7 @@ func requestForLease(t *testing.T, a *DHCPAllocator) *dhcpv4.DHCPv4 {
 	req := newBootRequest(t, mustHWAddr(t, "aa:bb:cc:dd:ee:01"), dhcpv4.MessageTypeRequest)
 	req.UpdateOption(dhcpv4.OptServerIdentifier(net.ParseIP("192.168.0.1")))
 	req.UpdateOption(dhcpv4.OptRequestedIPAddress(net.ParseIP("192.168.0.50")))
-	a.dhcpHandler(conn, testPeer(), req)
+	a.dhcpHandler("pool1", conn, testPeer(), req)
 
 	if conn.len() != 1 {
 		t.Fatalf("expected 1 reply, got %d", conn.len())

@@ -118,7 +118,7 @@ func TestDHCPHandlerOfferForDiscover(t *testing.T) {
 	peer := testPeer()
 
 	req := newBootRequest(t, mustHWAddr(t, "aa:bb:cc:dd:ee:01"), dhcpv4.MessageTypeDiscover)
-	a.dhcpHandler(conn, peer, req)
+	a.dhcpHandler("pool1", conn, peer, req)
 
 	if conn.len() != 1 {
 		t.Fatalf("expected 1 reply, got %d", conn.len())
@@ -187,7 +187,7 @@ func TestDHCPHandlerRequestAddressing(t *testing.T) {
 		req := newBootRequest(t, mustHWAddr(t, "aa:bb:cc:dd:ee:01"), dhcpv4.MessageTypeRequest)
 		req.UpdateOption(dhcpv4.OptServerIdentifier(serverIP))
 		req.UpdateOption(dhcpv4.OptRequestedIPAddress(leaseIP))
-		a.dhcpHandler(conn, testPeer(), req)
+		a.dhcpHandler("pool1", conn, testPeer(), req)
 
 		if conn.len() != 1 {
 			t.Fatalf("expected 1 reply, got %d", conn.len())
@@ -213,7 +213,7 @@ func TestDHCPHandlerRequestAddressing(t *testing.T) {
 
 		req := newBootRequest(t, mustHWAddr(t, "aa:bb:cc:dd:ee:01"), dhcpv4.MessageTypeRequest)
 		req.ClientIPAddr = leaseIP
-		a.dhcpHandler(conn, testPeer(), req)
+		a.dhcpHandler("pool1", conn, testPeer(), req)
 
 		if conn.len() != 1 {
 			t.Fatalf("expected 1 reply, got %d", conn.len())
@@ -242,7 +242,7 @@ func TestDHCPHandlerRequestAddressing(t *testing.T) {
 		// the client requires a broadcast reply: the non-relayed nak must
 		// preserve that bit, not force or clear flags on its own
 		req.Flags = 0x8000
-		a.dhcpHandler(conn, testPeer(), req)
+		a.dhcpHandler("pool1", conn, testPeer(), req)
 
 		if conn.len() != 1 {
 			t.Fatalf("expected 1 reply, got %d", conn.len())
@@ -274,7 +274,7 @@ func TestDHCPHandlerRequestAddressing(t *testing.T) {
 		// set the bit, rfc 2131 section 4.3.2)
 		conn2 := &recordingPacketConn{}
 		req.Flags = 0
-		a.dhcpHandler(conn2, testPeer(), req)
+		a.dhcpHandler("pool1", conn2, testPeer(), req)
 		if conn2.len() != 1 {
 			t.Fatalf("expected 1 reply, got %d", conn2.len())
 		}
@@ -298,7 +298,7 @@ func TestDHCPHandlerRequestAddressing(t *testing.T) {
 		// request itself carries no broadcast bit: the server must set it
 		req.GatewayIPAddr = net.ParseIP("203.0.113.1")
 		req.Flags = 0
-		a.dhcpHandler(conn, testPeer(), req)
+		a.dhcpHandler("pool1", conn, testPeer(), req)
 
 		if conn.len() != 1 {
 			t.Fatalf("expected 1 reply, got %d", conn.len())
@@ -334,7 +334,7 @@ func TestDHCPHandlerRequestAddressing(t *testing.T) {
 		req := newBootRequest(t, mustHWAddr(t, "aa:bb:cc:dd:ee:01"), dhcpv4.MessageTypeRequest)
 		req.UpdateOption(dhcpv4.OptServerIdentifier(net.ParseIP("203.0.113.9")))
 		req.UpdateOption(dhcpv4.OptRequestedIPAddress(leaseIP))
-		a.dhcpHandler(conn, testPeer(), req)
+		a.dhcpHandler("pool1", conn, testPeer(), req)
 
 		if conn.len() != 0 {
 			t.Errorf("expected no reply for a foreign server id, got %d", conn.len())
@@ -358,7 +358,7 @@ func TestDHCPHandlerRelayedReplyDestination(t *testing.T) {
 		req := newBootRequest(t, mustHWAddr(t, "aa:bb:cc:dd:ee:01"), dhcpv4.MessageTypeDiscover)
 		req.GatewayIPAddr = net.ParseIP("192.0.2.1")
 		req.Flags = 0
-		a.dhcpHandler(conn, relayPeer, req)
+		a.dhcpHandler("pool1", conn, relayPeer, req)
 
 		if conn.len() != 1 {
 			t.Fatalf("expected 1 reply, got %d", conn.len())
@@ -389,7 +389,7 @@ func TestDHCPHandlerRelayedReplyDestination(t *testing.T) {
 		req.UpdateOption(dhcpv4.OptRequestedIPAddress(net.ParseIP("192.168.0.50")))
 		req.GatewayIPAddr = net.ParseIP("192.0.2.1")
 		req.Flags = 0
-		a.dhcpHandler(conn, relayPeer, req)
+		a.dhcpHandler("pool1", conn, relayPeer, req)
 
 		if conn.len() != 1 {
 			t.Fatalf("expected 1 reply, got %d", conn.len())
@@ -416,7 +416,7 @@ func TestDHCPHandlerRelayedReplyDestination(t *testing.T) {
 		peer := testPeer()
 
 		req := newBootRequest(t, mustHWAddr(t, "aa:bb:cc:dd:ee:01"), dhcpv4.MessageTypeDiscover)
-		a.dhcpHandler(conn, peer, req)
+		a.dhcpHandler("pool1", conn, peer, req)
 
 		if conn.len() != 1 {
 			t.Fatalf("expected 1 reply, got %d", conn.len())
@@ -440,7 +440,7 @@ func TestDHCPHandlerReleaseGetsNoReply(t *testing.T) {
 
 	req := newBootRequest(t, mustHWAddr(t, "aa:bb:cc:dd:ee:01"), dhcpv4.MessageTypeRelease)
 	req.ClientIPAddr = net.ParseIP("192.168.0.50")
-	a.dhcpHandler(conn, testPeer(), req)
+	a.dhcpHandler("pool1", conn, testPeer(), req)
 
 	// rfc 2131 4.3.4: a release is a one-way notification; the server
 	// must not write any bootreply back to the client
@@ -458,7 +458,7 @@ func TestDHCPHandlerInformAckWithoutLeaseTime(t *testing.T) {
 	// configured its own address (section 4.4.3 puts it in ciaddr)
 	req := newBootRequest(t, mustHWAddr(t, "aa:bb:cc:dd:ee:01"), dhcpv4.MessageTypeInform)
 	req.ClientIPAddr = net.ParseIP("192.168.0.50")
-	a.dhcpHandler(conn, testPeer(), req)
+	a.dhcpHandler("pool1", conn, testPeer(), req)
 
 	if conn.len() != 1 {
 		t.Fatalf("expected 1 inform ack, got %d", conn.len())
@@ -498,7 +498,7 @@ func TestDHCPHandlerInformWithoutLeaseIsAnswered(t *testing.T) {
 	// no lease exists for this hardware address
 	req := newBootRequest(t, mustHWAddr(t, "00:11:22:33:44:55"), dhcpv4.MessageTypeInform)
 	req.ClientIPAddr = net.ParseIP("192.168.0.50")
-	a.dhcpHandler(conn, testPeer(), req)
+	a.dhcpHandler("pool1", conn, testPeer(), req)
 
 	if conn.len() != 1 {
 		t.Fatalf("expected 1 inform ack without a lease, got %d", conn.len())
@@ -539,43 +539,10 @@ func TestDHCPHandlerInformWithoutServedNetworkIsDropped(t *testing.T) {
 
 	req := newBootRequest(t, mustHWAddr(t, "00:11:22:33:44:55"), dhcpv4.MessageTypeInform)
 	req.ClientIPAddr = net.ParseIP("10.99.0.9")
-	a.dhcpHandler(conn, testPeer(), req)
+	a.dhcpHandler("pool1", conn, testPeer(), req)
 
 	if conn.len() != 0 {
 		t.Errorf("expected no reply for an inform of an unserved network, got %d", conn.len())
-	}
-}
-
-// TestDHCPHandlerInformAmbiguousNetworkIsDropped pins the fail-closed
-// resolution of the inform pool: a server ip which lies outside its own
-// subnet puts two registered pools on the same subnet, and an address
-// claimed by both of them must not be answered with the configuration
-// of one of them.
-func TestDHCPHandlerInformAmbiguousNetworkIsDropped(t *testing.T) {
-	a := newTestPooledAllocator(t)
-	if err := a.AddPool(
-		context.Background(),
-		"pool2",
-		"192.168.0.2",
-		"255.255.255.0",
-		"192.168.0.254",
-		nil,
-		"",
-		nil,
-		nil,
-		3600,
-		"eth1",
-	); err != nil {
-		t.Fatalf("AddPool: %v", err)
-	}
-	conn := &recordingPacketConn{}
-
-	req := newBootRequest(t, mustHWAddr(t, "00:11:22:33:44:55"), dhcpv4.MessageTypeInform)
-	req.ClientIPAddr = net.ParseIP("192.168.0.50")
-	a.dhcpHandler(conn, testPeer(), req)
-
-	if conn.len() != 0 {
-		t.Errorf("expected no reply for an ambiguous inform network, got %d", conn.len())
 	}
 }
 
@@ -587,7 +554,7 @@ func TestDHCPHandlerDeclineNoReplyKeepsLease(t *testing.T) {
 	// must not write a reply. the pre-allocated model keeps the lease so
 	// the binding's resync re-serves the same address by design
 	req := newBootRequest(t, mustHWAddr(t, "aa:bb:cc:dd:ee:01"), dhcpv4.MessageTypeDecline)
-	a.dhcpHandler(conn, testPeer(), req)
+	a.dhcpHandler("pool1", conn, testPeer(), req)
 
 	if conn.len() != 0 {
 		t.Errorf("expected 0 writes for DHCPDECLINE, got %d", conn.len())
@@ -602,7 +569,7 @@ func TestDHCPHandlerMissingLeaseNoReply(t *testing.T) {
 	conn := &recordingPacketConn{}
 
 	req := newBootRequest(t, mustHWAddr(t, "00:11:22:33:44:55"), dhcpv4.MessageTypeDiscover)
-	a.dhcpHandler(conn, testPeer(), req)
+	a.dhcpHandler("pool1", conn, testPeer(), req)
 
 	if conn.len() != 0 {
 		t.Errorf("expected no reply without a lease, got %d", conn.len())
@@ -617,7 +584,7 @@ func TestDHCPHandlerMissingPoolNoReply(t *testing.T) {
 	conn := &recordingPacketConn{}
 
 	req := newBootRequest(t, mustHWAddr(t, "aa:bb:cc:dd:ee:02"), dhcpv4.MessageTypeDiscover)
-	a.dhcpHandler(conn, testPeer(), req)
+	a.dhcpHandler("ghost-pool", conn, testPeer(), req)
 
 	if conn.len() != 0 {
 		t.Errorf("expected no reply without a matching pool, got %d", conn.len())
@@ -628,7 +595,7 @@ func TestDHCPHandlerNilPacketNoReply(t *testing.T) {
 	a := NewDHCPAllocator()
 	conn := &recordingPacketConn{}
 
-	a.dhcpHandler(conn, testPeer(), nil)
+	a.dhcpHandler("pool1", conn, testPeer(), nil)
 
 	if conn.len() != 0 {
 		t.Errorf("expected no reply for a nil packet, got %d", conn.len())
@@ -641,7 +608,7 @@ func TestDHCPHandlerBootReplyOpcodeNoReply(t *testing.T) {
 
 	req := newBootRequest(t, mustHWAddr(t, "aa:bb:cc:dd:ee:01"), dhcpv4.MessageTypeDiscover)
 	req.OpCode = dhcpv4.OpcodeBootReply
-	a.dhcpHandler(conn, testPeer(), req)
+	a.dhcpHandler("pool1", conn, testPeer(), req)
 
 	if conn.len() != 0 {
 		t.Errorf("expected no reply for a bootreply opcode, got %d", conn.len())
@@ -671,7 +638,7 @@ func TestDHCPHandlerDefaultLeaseTime(t *testing.T) {
 	conn := &recordingPacketConn{}
 
 	req := newBootRequest(t, mustHWAddr(t, "aa:bb:cc:dd:ee:03"), dhcpv4.MessageTypeDiscover)
-	a.dhcpHandler(conn, testPeer(), req)
+	a.dhcpHandler("pool0", conn, testPeer(), req)
 
 	if conn.len() != 1 {
 		t.Fatalf("expected 1 reply, got %d", conn.len())
@@ -1054,7 +1021,7 @@ func TestDHCPHandlerOmitsUnsetPoolOptions(t *testing.T) {
 	conn := &recordingPacketConn{}
 
 	req := newBootRequest(t, mustHWAddr(t, "aa:bb:cc:dd:ee:04"), dhcpv4.MessageTypeDiscover)
-	a.dhcpHandler(conn, testPeer(), req)
+	a.dhcpHandler("p", conn, testPeer(), req)
 
 	if conn.len() != 1 {
 		t.Fatalf("expected 1 reply, got %d", conn.len())
@@ -1150,7 +1117,7 @@ func TestDHCPPoolAccessesStaySynchronized(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for range rounds {
-				a.dhcpHandler(conn, peer, req)
+				a.dhcpHandler("pool1", conn, peer, req)
 				_ = a.CheckPool("pool1")
 				_ = a.GetPool("pool1")
 				a.Usage()
@@ -1306,7 +1273,7 @@ func TestDHCPHandlerNoMatchedPoolNaksRequest(t *testing.T) {
 
 	req := newBootRequest(t, mustHWAddr(t, "aa:bb:cc:dd:ee:01"), dhcpv4.MessageTypeRequest)
 	req.UpdateOption(dhcpv4.OptRequestedIPAddress(net.ParseIP("192.168.0.50")))
-	a.dhcpHandler(conn, testPeer(), req)
+	a.dhcpHandler("pool1", conn, testPeer(), req)
 
 	if conn.len() != 1 {
 		t.Fatalf("expected a nak for the request of a vanished pool, got %d", conn.len())
@@ -1346,7 +1313,7 @@ func TestDHCPHandlerNoMatchedPoolNakOwnsItsIdentity(t *testing.T) {
 
 		req := newBootRequest(t, mustHWAddr(t, "aa:bb:cc:dd:ee:01"), dhcpv4.MessageTypeRequest)
 		req.UpdateOption(dhcpv4.OptServerIdentifier(net.ParseIP("192.168.0.1")))
-		a.dhcpHandler(conn, testPeer(), req)
+		a.dhcpHandler("pool1", conn, testPeer(), req)
 
 		if conn.len() != 1 {
 			t.Fatalf("expected a nak for the request addressed to this server, got %d", conn.len())
@@ -1369,7 +1336,7 @@ func TestDHCPHandlerNoMatchedPoolNakOwnsItsIdentity(t *testing.T) {
 
 		req := newBootRequest(t, mustHWAddr(t, "aa:bb:cc:dd:ee:01"), dhcpv4.MessageTypeRequest)
 		req.UpdateOption(dhcpv4.OptServerIdentifier(net.ParseIP("203.0.113.9")))
-		a.dhcpHandler(conn, testPeer(), req)
+		a.dhcpHandler("pool1", conn, testPeer(), req)
 
 		if conn.len() != 0 {
 			t.Errorf("expected no reply for a request addressed to another server, got %d", conn.len())
@@ -1388,7 +1355,7 @@ func TestDHCPHandlerNoMatchedPoolDiscoverDropped(t *testing.T) {
 	conn := &recordingPacketConn{}
 
 	req := newBootRequest(t, mustHWAddr(t, "aa:bb:cc:dd:ee:01"), dhcpv4.MessageTypeDiscover)
-	a.dhcpHandler(conn, testPeer(), req)
+	a.dhcpHandler("pool1", conn, testPeer(), req)
 
 	if conn.len() != 0 {
 		t.Errorf("expected no reply for a discover against a vanished pool, got %d", conn.len())
