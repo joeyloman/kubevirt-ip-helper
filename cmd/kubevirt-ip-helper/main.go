@@ -55,10 +55,13 @@ func main() {
 	// the local era state instead.
 	mainApp.StartupNetworkCleanup()
 
-	// canceling the main context releases the leader lease and runs the
-	// OnStoppedLeading cleanup (leader label + network state) exactly once;
-	// the explicit cleanup workaround for killed processes stays as the
-	// StartupNetworkCleanup call at startup.
+	// canceling the main context ends the leader election and runs the
+	// OnStoppedLeading cleanup (listener fence, era join, leader label +
+	// network state) exactly once, and only at its very end - after the
+	// serving state was fenced - does it release the leader lease (F05:
+	// the lease never passes while this process still answers on the
+	// segment); the explicit cleanup workaround for killed processes
+	// stays as the StartupNetworkCleanup call at startup.
 	// the graceful shutdown can legitimately take tens of seconds (the era
 	// join of in-flight syncs plus bounded api calls, against the 30s
 	// termination grace period of the pod): a second signal force-exits so

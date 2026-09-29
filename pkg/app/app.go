@@ -58,8 +58,16 @@ type handler struct {
 	// on its shutdown paths: it is allocated once before the leader
 	// election starts and never reassigned, so Wait is always safe
 	listenerWg *sync.WaitGroup
-	lock       *resourcelock.LeaseLock
-	leaderId   string
+	// lock is the leader-election lease lock of the process: typed as the
+	// resourcelock interface so the explicit release of the shutdown path
+	// (F05) is testable against a fake lease record without a cluster
+	lock     resourcelock.Interface
+	leaderId string
+	// runServices is the test seam over RunServices: the
+	// leader-election lifecycle tests substitute it because a real
+	// service era binds UDP port 67 and mutates host routing. nil means
+	// the real era runs
+	runServices func(ctx context.Context) error
 	// led records whether this process ever acquired the leadership
 	// lease: client-go fires OnStoppedLeading even when the election
 	// never succeeded, so the shutdown paths distinguish a real lease
@@ -191,9 +199,20 @@ func (h *handler) Run(mainCtx context.Context) {
 	// are delayed, then exits so the kubelet restarts the pod
 	go h.leaderWatchdogLoop(h.leaderWatchdog)
 
+	// the lease must never pass before this process stopped serving
+	// (F05): client-go's automatic release runs inside renew, as soon as
+	// the renewal fails or the main context is canceled - before the
+	// serving callback's context is canceled and long before the dhcp
+	// listeners are closed - so a standby could acquire while this
+	// process still answered on the segment. the automatic release is
+	// disabled; onStoppedLeading fences the serving state first and
+	// performs the explicit, identity-guarded release afterwards. a
+	// failed release keeps the lease until its expiry: a standby waits
+	// out the lease duration at the latest, never in parallel with a
+	// serving predecessor
 	leaderelection.RunOrDie(mainCtx, leaderelection.LeaderElectionConfig{
 		Lock:            h.lock,
-		ReleaseOnCancel: true,
+		ReleaseOnCancel: false,
 		LeaseDuration:   60 * time.Second,
 		RenewDeadline:   15 * time.Second,
 		RetryPeriod:     5 * time.Second,
@@ -267,7 +286,7 @@ func (h *handler) onStartedLeading(ctx context.Context) {
 
 	eraCtx, eraCancel := context.WithCancel(ctx)
 
-	if err := h.RunServices(eraCtx); err != nil {
+	if err := h.runEraServices(eraCtx); err != nil {
 		log.Errorf("(app.Run) services failed to start: %s", err)
 		h.drainStoppedEra(eraCancel)
 
@@ -287,15 +306,16 @@ func (h *handler) onStartedLeading(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			// leadership lost: client-go releases the lease as soon as
-			// renew returns, so the standby can acquire and open its own
-			// listeners while this process still drains. the dhcp
+			// leadership lost: the lease cannot pass before the explicit
+			// release at the end of onStoppedLeading, but a lost leader
+			// stops answering now instead of draining first. the dhcp
 			// listeners are therefore stopped and the allocator closed
 			// BEFORE the era join: the closed allocator fences a draining
 			// worker which would otherwise re-open a listener behind the
 			// teardown (the ippool controller's repair path re-serves a
 			// pool whose listener died). onStoppedLeading joins the
-			// drained era and finishes the host-state cleanup.
+			// drained era, finishes the host-state cleanup and releases
+			// the lease afterwards.
 			eraCancel()
 			h.stopDHCPListeners()
 			h.listenerWg.Wait()
@@ -334,7 +354,7 @@ func (h *handler) onStartedLeading(ctx context.Context) {
 			// the new per-era appStatus (APP_INIT) and startup counters are
 			// allocated by RunServices itself
 			eraCtx, eraCancel = context.WithCancel(ctx)
-			if err := h.RunServices(eraCtx); err != nil {
+			if err := h.runEraServices(eraCtx); err != nil {
 				log.Errorf("(app.Run) services failed to restart: %s", err)
 				h.drainStoppedEra(eraCancel)
 
@@ -366,16 +386,16 @@ func (h *handler) drainStoppedEra(eraCancel context.CancelFunc) {
 	os.Exit(1)
 }
 
-// onStoppedLeading joins the era and cleans the host state after the
-// leadership was lost. the dhcp listeners were already stopped and the
-// allocator closed at era-cancel time (see onStartedLeading): client-go
-// releases the lease as soon as renew returns, so the standby may acquire
-// and open its own listeners while this process drains, and the only way
-// to keep a single server on the segment is to stop answering BEFORE the
-// lease can pass. the stopDHCPListeners call below stays as an idempotent
-// backstop for the paths which never ran a service era (a standby which
-// never led). the exit status stays 0 for a graceful shutdown; the
-// lease-loss is surfaced through the error metric and the error-level log.
+// onStoppedLeading closes the serving state, joins the era, cleans the
+// host state and releases the leadership lease afterwards: with the
+// automatic release disabled, this is the only place the lease can
+// pass, and it runs strictly after the serving fence completed - the
+// listener close above shuts every socket and closes the allocator
+// before the join, so no listener of this era can answer or be
+// re-opened by the time the release lands, and a standby can never
+// acquire in parallel with a serving predecessor (F05). the exit status
+// stays 0 for a graceful shutdown; the lease-loss is surfaced through
+// the error metric and the error-level log.
 func (h *handler) onStoppedLeading() {
 	if !h.led.Load() {
 		// client-go registers OnStoppedLeading as a deferred callback of
@@ -394,10 +414,89 @@ func (h *handler) onStoppedLeading() {
 		}
 	}
 
-	h.listenerWg.Wait()
+	// close the listeners before the era join: StopAll closes every
+	// socket and closes the allocator for the rest of its lifetime, so
+	// the fence cannot block on a listener whose goroutine waits for a
+	// worker that never returns, and a draining worker cannot re-open a
+	// listener behind the teardown. the join below then drains what the
+	// close started
 	h.stopDHCPListeners()
+	h.listenerWg.Wait()
 	h.RemoveLeaderPodLabel()
 	h.NetworkCleanup()
+	h.releaseLeaderLease()
+}
+
+// runEraServices runs one service era through the runServices seam: nil
+// runs the real RunServices, while the lifecycle tests substitute a
+// minimal era so the election callbacks are drivable without host
+// networking.
+func (h *handler) runEraServices(ctx context.Context) error {
+	if h.runServices != nil {
+		return h.runServices(ctx)
+	}
+
+	return h.RunServices(ctx)
+}
+
+// releaseLeaderLease performs the explicit lease release after the
+// serving state was fenced. the release is identity-guarded on both
+// ends: a process which never acquired the lease does not touch it, and
+// a lease which another client acquired in the meantime (this process
+// went stale past its lease duration) is not overwritten. the written
+// record mirrors client-go's own release - an empty holder with a
+// one-second lease duration - so the standby acquires on its next
+// attempt instead of waiting out the full lease duration. a failed or
+// unreachable release keeps the lease until its expiry: the
+// conservative retention trades failover speed for the single-authority
+// invariant whenever the api is down. the paths which exit the process
+// without running this release (a failed startup drain and the watchdog
+// force-exit) keep the lease until its expiry as well.
+func (h *handler) releaseLeaderLease() {
+	if !h.led.Load() {
+		// this process never acquired the lease: it is not this
+		// process's to release
+		return
+	}
+	if h.lock == nil {
+		// a unit-constructed handler without an election lock
+		return
+	}
+
+	// bound the api calls: a hang must never block the shutdown path
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	record, _, err := h.lock.Get(ctx)
+	if err != nil {
+		log.Errorf("(app.releaseLeaderLease) cannot read the lease for the explicit release, it expires on its own: %s", err.Error())
+
+		return
+	}
+	if record == nil || record.HolderIdentity != h.leaderId {
+		holder := "<unknown>"
+		if record != nil {
+			holder = record.HolderIdentity
+		}
+		log.Infof("(app.releaseLeaderLease) the lease is held by %s, not this process: nothing to release", holder)
+
+		return
+	}
+
+	// mirror client-go's release record: an empty holder with a
+	// one-second lease duration lets the standby acquire immediately
+	record.HolderIdentity = ""
+	record.LeaseDurationSeconds = 1
+	record.RenewTime = metav1.Now()
+	record.AcquireTime = metav1.Now()
+
+	if err := h.lock.Update(ctx, *record); err != nil {
+		log.Errorf("(app.releaseLeaderLease) cannot release the lease, it expires on its own: %s", err.Error())
+
+		return
+	}
+
+	log.Infof("(app.releaseLeaderLease) released the leadership lease of %s after the serving state was fenced", h.leaderId)
 }
 
 // leaderWatchdogLoop force-exits a stale leader: a leader which lost the

@@ -21,6 +21,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/leaderelection"
+	"k8s.io/client-go/tools/leaderelection/resourcelock"
 
 	v1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/cache"
@@ -29,12 +30,16 @@ import (
 )
 
 // The tests in this file cover the app handler's configuration, listing,
-// leader-label and network-cleanup boundaries using temp files and httptest
-// REST endpoints. The blocking parts of the handler are intentionally not
-// exercised here:
-//   - Run and RunServices are skipped because Run always runs the OnStoppedLeading
-//     callback (which calls os.Exit(1)) and RunServices starts the DHCP service,
-//     which binds to UDP port 67 and mutates host routing.
+// leader-label, network-cleanup and leader-election lifecycle boundaries
+// using temp files and httptest REST endpoints. The election lifecycle
+// is driven through a fake lease lock and the runServices seam, so no
+// real service era runs here:
+//   - RunServices itself is never exercised because it starts the DHCP
+//     service, which binds to UDP port 67 and mutates host routing. the
+//     os.Exit(1) paths (drainStoppedEra and the watchdog force-exit)
+//     stay unexercised; onStoppedLeading itself returns normally, which
+//     is load-bearing: the explicit lease release happens only because
+//     the stopped-leading callback completes.
 //   - Nothing here depends on a cluster, in-cluster credentials, or host
 //     networking: the only host side effects are read-only netlink lookups
 //     against an interface name that cannot exist ("").
@@ -1019,11 +1024,15 @@ func TestHandler_Init(t *testing.T) {
 		if h.lock == nil {
 			t.Fatal("lock is nil after Init")
 		}
-		if h.lock.LeaseMeta.Name != "kubevirt-ip-helper-lock" {
-			t.Errorf("lock name = %q, want %q", h.lock.LeaseMeta.Name, "kubevirt-ip-helper-lock")
+		leaseLock, ok := h.lock.(*resourcelock.LeaseLock)
+		if !ok {
+			t.Fatalf("lock is %T, want the LeaseLock construction of Init", h.lock)
 		}
-		if h.lock.LockConfig.Identity != h.leaderId {
-			t.Errorf("lock identity = %q, want leader id %q", h.lock.LockConfig.Identity, h.leaderId)
+		if leaseLock.LeaseMeta.Name != "kubevirt-ip-helper-lock" {
+			t.Errorf("lock name = %q, want %q", leaseLock.LeaseMeta.Name, "kubevirt-ip-helper-lock")
+		}
+		if leaseLock.LockConfig.Identity != h.leaderId {
+			t.Errorf("lock identity = %q, want leader id %q", leaseLock.LockConfig.Identity, h.leaderId)
 		}
 	})
 
@@ -1228,5 +1237,299 @@ func TestRetryListReturnsOnCanceledEra(t *testing.T) {
 	_, err := retryList(ctx, m, "the test list", gather)
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("retryList on a canceled era = %v, want context.Canceled", err)
+	}
+}
+
+// fakeElectionLock records the lease lifecycle for the F05 ordering
+// regressions: it serves the identity-guarded release path of
+// onStoppedLeading without a cluster and counts every call, so the
+// tests can assert that no release becomes observable before the
+// serving fence completed.
+type fakeElectionLock struct {
+	mu        sync.Mutex
+	record    resourcelock.LeaderElectionRecord
+	getErr    error
+	updateErr error
+	gets      int
+	updates   int
+}
+
+func (f *fakeElectionLock) Get(ctx context.Context) (*resourcelock.LeaderElectionRecord, []byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.gets++
+	if f.getErr != nil {
+		return nil, nil, f.getErr
+	}
+	r := f.record
+
+	return &r, nil, nil
+}
+
+func (f *fakeElectionLock) Update(ctx context.Context, record resourcelock.LeaderElectionRecord) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.updates++
+	if f.updateErr != nil {
+		return f.updateErr
+	}
+	f.record = record
+
+	return nil
+}
+
+func (f *fakeElectionLock) Create(ctx context.Context, record resourcelock.LeaderElectionRecord) error {
+	return nil
+}
+
+func (f *fakeElectionLock) RecordEvent(name string) {}
+
+func (f *fakeElectionLock) Identity() string { return "test-leader" }
+
+func (f *fakeElectionLock) Describe() string { return "kubevirt-ip-helper-lock" }
+
+func fakeElectionHandler(t *testing.T, lock resourcelock.Interface) *handler {
+	t.Helper()
+	clearInClusterEnv(t)
+
+	h := &handler{
+		metrics:        metrics.New(),
+		leaderId:       "test-leader",
+		kubeConfigFile: filepath.Join(t.TempDir(), "does-not-exist"),
+		listenerWg:     &sync.WaitGroup{},
+		lock:           lock,
+	}
+	h.led.Store(true)
+
+	return h
+}
+
+// TestOnStoppedLeadingReleasesOnlyAfterTheServingFence pins the F05
+// ordering: the lease may only pass once every listener of the era
+// stopped answering. the release is the last step of the
+// stopped-leading shutdown, so while a listener goroutine still holds
+// the era join, no release read or write may become observable - a
+// standby must never acquire in parallel with a serving predecessor.
+// once the fence completes, the single identity-guarded release clears
+// the holder with client-go's own one-second release record.
+func TestOnStoppedLeadingReleasesOnlyAfterTheServingFence(t *testing.T) {
+	lock := &fakeElectionLock{record: resourcelock.LeaderElectionRecord{HolderIdentity: "test-leader"}}
+	h := fakeElectionHandler(t, lock)
+	era := &eraState{appStatus: &atomic.Int32{}, dhcp: dhcp.New()}
+	h.era.Store(era)
+
+	// the era still serves: its last listener goroutine has not exited
+	fence := make(chan struct{})
+	h.listenerWg.Add(1)
+	go func() {
+		<-fence
+		h.listenerWg.Done()
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		h.onStoppedLeading()
+		close(done)
+	}()
+
+	// while the listener goroutine still holds the era join, the fence
+	// itself has already completed: every socket is closed and the
+	// allocator rejects any new listener, so no request can be answered
+	// and none can start being answered. the lease must still be
+	// untouched at this point - the automatic release of client-go
+	// (which ran inside renew, before any fence) is disabled, so nothing
+	// else could have touched it either
+	time.Sleep(100 * time.Millisecond)
+	awaitAllocatorClosed(t, era)
+	lock.mu.Lock()
+	gets, updates := lock.gets, lock.updates
+	lock.mu.Unlock()
+	if gets != 0 || updates != 0 {
+		t.Fatalf("lease calls = %d gets / %d updates while the era join still drains, want 0/0: the release must follow the fence", gets, updates)
+	}
+
+	// the listener stops: the fence completes and only then the release
+	// becomes observable with the holder cleared for the standby
+	close(fence)
+	<-done
+
+	lock.mu.Lock()
+	defer lock.mu.Unlock()
+	if lock.gets != 1 {
+		t.Errorf("lease gets = %d, want the single identity-checking read", lock.gets)
+	}
+	if lock.updates != 1 {
+		t.Errorf("lease updates = %d, want the single release write", lock.updates)
+	}
+	if lock.record.HolderIdentity != "" {
+		t.Errorf("holder = %q, want cleared so the standby can acquire", lock.record.HolderIdentity)
+	}
+	if lock.record.LeaseDurationSeconds != 1 {
+		t.Errorf("lease duration = %d, want the one-second release record of client-go", lock.record.LeaseDurationSeconds)
+	}
+}
+
+// the release guards of onStoppedLeading: a standby which never led
+// never touches the lease, a lease which another client acquired in the
+// meantime is never overwritten, and a failed release (the api is down)
+// keeps the lease until its expiry - the conservative retention which
+// trades failover speed for the single-authority invariant.
+func TestOnStoppedLeadingReleaseGuards(t *testing.T) {
+	t.Run("a standby which never led never touches the lease", func(t *testing.T) {
+		lock := &fakeElectionLock{record: resourcelock.LeaderElectionRecord{HolderIdentity: "someone-else"}}
+		h := fakeElectionHandler(t, lock)
+		h.led.Store(false)
+
+		h.onStoppedLeading()
+
+		lock.mu.Lock()
+		defer lock.mu.Unlock()
+		if lock.gets != 0 || lock.updates != 0 {
+			t.Errorf("lease calls = %d gets / %d updates, want 0/0: the lease of another holder is not a standby's to release", lock.gets, lock.updates)
+		}
+	})
+
+	t.Run("a lease taken over in the meantime is never overwritten", func(t *testing.T) {
+		lock := &fakeElectionLock{record: resourcelock.LeaderElectionRecord{HolderIdentity: "the-standby"}}
+		h := fakeElectionHandler(t, lock)
+
+		h.onStoppedLeading()
+
+		lock.mu.Lock()
+		defer lock.mu.Unlock()
+		if lock.gets != 1 {
+			t.Errorf("lease gets = %d, want the identity-checking read", lock.gets)
+		}
+		if lock.updates != 0 {
+			t.Error("a foreign lease must never be released by this process")
+		}
+		if lock.record.HolderIdentity != "the-standby" {
+			t.Errorf("holder = %q, want the foreign holder untouched", lock.record.HolderIdentity)
+		}
+	})
+
+	t.Run("a failed release keeps the lease until its expiry", func(t *testing.T) {
+		lock := &fakeElectionLock{
+			record:    resourcelock.LeaderElectionRecord{HolderIdentity: "test-leader"},
+			updateErr: errors.New("api is down"),
+		}
+		h := fakeElectionHandler(t, lock)
+
+		h.onStoppedLeading()
+
+		lock.mu.Lock()
+		defer lock.mu.Unlock()
+		if lock.updates != 1 {
+			t.Errorf("lease updates = %d, want the single attempted release", lock.updates)
+		}
+		if lock.record.HolderIdentity != "test-leader" {
+			t.Errorf("holder = %q, want the lease retained until its expiry", lock.record.HolderIdentity)
+		}
+	})
+}
+
+// awaitAllocatorClosed polls the fence condition of the dhcp allocator:
+// Run against a nic which cannot exist only ever reports ErrAllocatorClosed
+// once StopAll closed the allocator, and never binds anything itself.
+func awaitAllocatorClosed(t *testing.T, era *eraState) {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if err := era.dhcp.Run("net-fence", "cannotexist0"); errors.Is(err, dhcp.ErrAllocatorClosed) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the serving fence did not close the allocator in time")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func freeTCPPort(t *testing.T) string {
+	t.Helper()
+
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("allocating a free port: %s", err)
+	}
+	defer l.Close()
+
+	return strconv.Itoa(l.Addr().(*net.TCPAddr).Port)
+}
+
+// TestRunReleasesTheLeaseOnlyAfterTheServingFence drives the real
+// leader election of client-go against a fake lease lock: the SIGTERM
+// path cancels the main context, client-go's renew returns, and the
+// automatic release (disabled, F05) never touches the lease - the only
+// release is the explicit one at the end of onStoppedLeading, after the
+// serving fence closed every socket and rejected new listener creation.
+// while the era join still drains on the fence barrier, the lease
+// record keeps naming this process; once the drain completes, the
+// release clears the holder.
+func TestRunReleasesTheLeaseOnlyAfterTheServingFence(t *testing.T) {
+	clearInClusterEnv(t)
+	t.Setenv("METRICS_PORT", freeTCPPort(t))
+
+	lock := &fakeElectionLock{}
+	h := &handler{
+		leaderId:       "test-leader",
+		kubeConfigFile: filepath.Join(t.TempDir(), "does-not-exist"),
+		listenerWg:     &sync.WaitGroup{},
+		lock:           lock,
+	}
+
+	era := &eraState{appStatus: &atomic.Int32{}, dhcp: dhcp.New()}
+	serving := make(chan struct{})
+	fence := make(chan struct{})
+	h.runServices = func(ctx context.Context) error {
+		h.era.Store(era)
+		h.listenerWg.Add(1)
+		go func() {
+			defer h.listenerWg.Done()
+			<-fence
+		}()
+		close(serving)
+
+		return nil
+	}
+
+	mainCtx, cancel := context.WithCancel(context.Background())
+	runReturned := make(chan struct{})
+	go func() {
+		h.Run(mainCtx)
+		close(runReturned)
+	}()
+
+	<-serving
+
+	// SIGTERM: the main context is canceled; client-go's renew exits
+	// without touching the lease (the automatic release is disabled)
+	cancel()
+
+	// the fence closes every socket and the allocator while the era join
+	// still drains on the barrier: the lease record must keep naming
+	// this process - no release write may have landed (a renewal write
+	// preserves the holder, only the release clears it)
+	awaitAllocatorClosed(t, era)
+	lock.mu.Lock()
+	holder := lock.record.HolderIdentity
+	lock.mu.Unlock()
+	if holder != "test-leader" {
+		t.Fatalf("holder = %q while the era join still drains, want this process: the release must follow the fence", holder)
+	}
+
+	// the drain completes: only now may the lease pass, and Run returns
+	// only after onStoppedLeading finished
+	close(fence)
+	<-runReturned
+
+	lock.mu.Lock()
+	defer lock.mu.Unlock()
+	if lock.record.HolderIdentity != "" {
+		t.Errorf("holder = %q after the graceful shutdown, want cleared by the explicit release", lock.record.HolderIdentity)
+	}
+	if !h.led.Load() {
+		t.Error("the process never recorded its leadership")
 	}
 }
