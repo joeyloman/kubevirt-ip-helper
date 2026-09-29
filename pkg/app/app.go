@@ -54,8 +54,12 @@ type handler struct {
 	ippoolEventHandler   *ippool.EventHandler
 	vmnetcfgEventHandler *vmnetcfg.EventHandler
 	vmEventHandler       *vm.EventHandler
-	// listenerWg joins the listener goroutines of the current service era
-	// on its shutdown paths: it is allocated once before the leader
+	// listenerWg joins the mutation producers of the current service era
+	// on its shutdown paths: every controller event listener and the era
+	// producer itself (the runEraServices call which spawns them) register
+	// here before they can create any host or listener state, so a Wait
+	// never returns while a producer of the era can still register pools
+	// or open dhcp sockets (F06). it is allocated once before the leader
 	// election starts and never reassigned, so Wait is always safe
 	listenerWg *sync.WaitGroup
 	// lock is the leader-election lease lock of the process: typed as the
@@ -348,7 +352,7 @@ func (h *handler) onStartedLeading(ctx context.Context) {
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(time.Second * 10):
+			case <-time.After(restartBackoff):
 			}
 
 			// the new per-era appStatus (APP_INIT) and startup counters are
@@ -419,7 +423,13 @@ func (h *handler) onStoppedLeading() {
 	// the fence cannot block on a listener whose goroutine waits for a
 	// worker that never returns, and a draining worker cannot re-open a
 	// listener behind the teardown. the join below then drains what the
-	// close started
+	// close started: first the startup producer itself (F06) - a startup
+	// which was still running when the leadership ended unwinds at its
+	// cancellation checkpoints - and once its count released, every
+	// controller listener it already spawned is counted, so the join
+	// never passes while any producer of this era can still create host
+	// or listener state, and the release below strictly follows the last
+	// of them
 	h.stopDHCPListeners()
 	h.listenerWg.Wait()
 	h.RemoveLeaderPodLabel()
@@ -430,8 +440,21 @@ func (h *handler) onStoppedLeading() {
 // runEraServices runs one service era through the runServices seam: nil
 // runs the real RunServices, while the lifecycle tests substitute a
 // minimal era so the election callbacks are drivable without host
-// networking.
+// networking. the producer registers itself in the era join before it
+// can create any state (F06): a shutdown which lands while the startup
+// is still running (the leadership was lost or the process terminates
+// mid-build) must not observe a zero-count Wait, release the lease and
+// clean the host state while the producer is still able to spawn
+// controller listeners, register pools and open dhcp sockets behind the
+// teardown. the producer runs on the leading callback's goroutine and
+// every join of the callback itself (the lost-leadership branch, the
+// restart teardown and the failed-startup drain) runs after this
+// wrapper returned and released its own count, so the shutdown joins on
+// the other goroutines never deadlock against the producer.
 func (h *handler) runEraServices(ctx context.Context) error {
+	h.listenerWg.Add(1)
+	defer h.listenerWg.Done()
+
 	if h.runServices != nil {
 		return h.runServices(ctx)
 	}
@@ -535,6 +558,18 @@ func (h *handler) leaderWatchdogLoop(adaptor *leaderelection.HealthzAdaptor) {
 }
 
 func (h *handler) RunServices(ctx context.Context) error {
+	if ctx.Err() != nil {
+		// the era was canceled before the startup began (F06): the
+		// leadership was lost, or a restart was abandoned between its
+		// backoff and this call, and the shutdown path may already have
+		// fenced the serving state and cleaned the host state. no new
+		// startup work may run after the cancellation - in particular
+		// the fresh era must not be published over the previous one,
+		// whose teardown already completed. the graceful-cancel contract
+		// of the gathers below applies: return nil, the caller re-checks
+		// the context and exits without publishing the era
+		return nil
+	}
 	// allocate the shared state of this service era and publish it through
 	// the atomic era pointer: the handlers constructed below keep the
 	// pointers they were constructed with, so zombie workers of a previous
@@ -749,7 +784,14 @@ func (h *handler) RunServices(ctx context.Context) error {
 	// the vm controller is the last service and has no dependencies
 	// so no need to wait until it's initialized completely
 	// the 1 sec sleep is just to log the next line after the vm controller thread is started
-	time.Sleep(time.Second * 1)
+	select {
+	case <-ctx.Done():
+		// the era was canceled while the last controller started: not
+		// even this decoration delay may hold the era join of a shutdown
+		// which already fenced (F06)
+		return nil
+	case <-time.After(time.Second * 1):
+	}
 	log.Infof("(app.RunServices) all services are successfully initialized and started")
 
 	return nil
@@ -760,6 +802,12 @@ func (h *handler) RunServices(ctx context.Context) error {
 // informer, an object which never settles), so the gate fails and the pod
 // restarts instead of sitting on the leader lease while serving nothing.
 const startupStallTimeout = 15 * time.Minute
+
+// restartBackoff delays the era rebuild of an application-wide restart so
+// a flapping pool spec does not tear down and rebuild the whole serving
+// state in a tight loop. the wait is interruptible by the leadership loss
+// and it is a variable so the test can shrink it.
+var restartBackoff = 10 * time.Second
 
 // waitForStartupGate blocks until every object of the startup snapshot
 // settled (the membership gate opens only on the exact snapshot keys, so
