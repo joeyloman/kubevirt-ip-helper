@@ -751,6 +751,18 @@ func (c *Controller) protectPersistedClaims(pool *kihv1.IPPool) (map[string]stri
 		// the registration instead of publishing an unprotected allocator
 		return nil, fmt.Errorf("error while getting IPPool %s: %w", pool.Name, err)
 	}
+
+	// the claims must be read from the same pool object the registration
+	// started with (R04): a pool replaced under the same name while the
+	// attempt was in flight owns a different spec, so pins derived from
+	// the recorded snapshot would strand or expose the successor's
+	// addresses
+	if ippoolReplacedUnderSameName(pool, cPool) {
+		return nil, fmt.Errorf(
+			"the IPPool %s was replaced under the same name while its registration read its persisted claims (recorded uid %q, now uid %q), aborting the attempt before any claim is pinned",
+			pool.Name, pool.UID, cPool.UID)
+	}
+
 	claims := make(map[string]string)
 	// pinnedIPs records the addresses this protection actually reserved:
 	// the spec sweep skips them (the ledger already decided those
@@ -1434,6 +1446,15 @@ func (c *Controller) resetIPPoolStatus(pool *kihv1.IPPool, protectedClaims map[s
 	if err != nil {
 		return uPool, err
 	}
+	// the status write is the durable mutation of the registration (R04):
+	// the freshly read object must still be the pool the attempt started
+	// with, or the rebuilt status of the recorded projection would be
+	// written into a successor which owns a different spec
+	if ippoolReplacedUnderSameName(pool, cPool) {
+		return uPool, fmt.Errorf(
+			"the IPPool %s was replaced under the same name before its status was rebuilt (recorded uid %q, now uid %q), aborting the attempt instead of writing the projection of the gone pool into the successor's status",
+			pool.Name, pool.UID, cPool.UID)
+	}
 
 	// if the timestamp is not set, set it to the current local time
 	if cPool.Status.LastUpdate.IsZero() {
@@ -1469,9 +1490,33 @@ func (c *Controller) resetIPPoolMetrics(pool *kihv1.IPPool) (err error) {
 	if err != nil {
 		return
 	}
+	// the publication of the registration follows this read (R04): a
+	// successor under the same name must abort the attempt before the
+	// cache adopts the projection of the gone pool
+	if ippoolReplacedUnderSameName(pool, cPool) {
+		return fmt.Errorf(
+			"the IPPool %s was replaced under the same name before its registration was published (recorded uid %q, now uid %q), aborting the attempt instead of caching the projection of the gone pool",
+			pool.Name, pool.UID, cPool.UID)
+	}
 
 	c.metrics.UpdateIPPoolUsed(cPool.Name, cPool.Spec.IPv4Config.Subnet, cPool.Spec.NetworkName, cPool.Status.IPv4.Used)
 	c.metrics.UpdateIPPoolAvailable(cPool.Name, cPool.Spec.IPv4Config.Subnet, cPool.Spec.NetworkName, cPool.Status.IPv4.Available)
 
 	return
+}
+
+// ippoolReplacedUnderSameName reports whether the freshly read pool
+// object is no longer the instance an in-flight registration attempt
+// started from: the pool was deleted and a successor was created under
+// the same name (a new uid) while the registration was between its
+// reads. every mutation the attempt still owes - the exclude pins, the
+// status write, the cache publication - is derived from the spec of the
+// recorded snapshot, so completing it against the successor would write
+// the projection of the gone pool into the successor's ledger and
+// allocator: an exclude entry of the old spec strands one of the
+// successor's addresses as excluded, and an address the successor
+// excludes stays allocatable to a fresh guest. an object without a uid
+// (a unit-constructed fixture) never reports a replacement.
+func ippoolReplacedUnderSameName(recorded, fresh *kihv1.IPPool) bool {
+	return recorded.UID != "" && fresh.UID != "" && recorded.UID != fresh.UID
 }

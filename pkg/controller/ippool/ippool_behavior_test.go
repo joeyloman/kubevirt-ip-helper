@@ -164,6 +164,10 @@ type ippoolBehaviorRestState struct {
 	// concurrency regressions use it to complete a concurrent cleanup
 	// between the frozen list snapshot and the re-verification reads
 	vmnetcfgListHook func()
+	// poolGetHook runs after a stored IPPool GET response was served: the
+	// generation regressions use it to replace the pool under the same
+	// name between two reads of an in-flight registration
+	poolGetHook func()
 }
 
 func ippoolBehaviorNewRestState(pool *kihv1.IPPool) *ippoolBehaviorRestState {
@@ -177,26 +181,36 @@ func (s *ippoolBehaviorRestState) ippoolBehaviorHandler() http.Handler {
 	mux.HandleFunc(prefix+"/", func(w http.ResponseWriter, r *http.Request) {
 		restPath := strings.TrimPrefix(r.URL.Path, prefix)
 
-		s.mu.Lock()
-		defer s.mu.Unlock()
-
 		switch r.Method {
 		case http.MethodGet:
+			s.mu.Lock()
 			s.getCount++
 			if s.failGet {
+				s.mu.Unlock()
 				ippoolBehaviorWriteKubeError(w, http.StatusNotFound)
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
-			if err := json.NewEncoder(w).Encode(s.pool); err != nil {
+			err := json.NewEncoder(w).Encode(s.pool)
+			hook := s.poolGetHook
+			s.mu.Unlock()
+			if err != nil {
 				// the client is gone; nothing sensible to write
 				return
+			}
+			if hook != nil {
+				// the stored object was served: complete the interleaved
+				// replacement before the next read arrives. the hook runs
+				// without the state lock and takes care of its own locking
+				hook()
 			}
 		case http.MethodPut:
 			if !strings.HasSuffix(restPath, "/status") {
 				ippoolBehaviorWriteKubeError(w, http.StatusNotFound)
 				return
 			}
+			s.mu.Lock()
+			defer s.mu.Unlock()
 			s.putCount++
 			s.putPath = restPath
 			if s.failPut {
