@@ -1,0 +1,15 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "kubevirt-ip-helper.fullname" . }}
+  namespace: {{ .Release.Namespace | default "kube-system" }}
+  labels:
+    {{- include "kubevirt-ip-helper.labels" . | nindent 4 }}
+spec:
+  endpoints:
+    - port: metrics
+      scheme: http
+  jobLabel: jobLabel
+  selector:
+    matchLabels:
+      {{- include "kubevirt-ip-helper.selectorLabels" . | nindent 8 }}

@@ -1,0 +1,63 @@
+name: Package and push Helm chart to GHCR
+
+on:
+  push:
+    branches:
+      - release/v0.9.x
+    paths:
+      - 'deployments/charts/kubevirt-ip-helper/Chart.yaml'
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  # GITHUB_TOKEN (packages: write) into the nested ghcr.io/joeyloman/charts path.
+  # If a run ever fails with "denied: requested access to the resource is denied",
+  # the fallback is a PAT secret with packages:write.
+  CHART_REPO: ${{ github.repository_owner }}/charts
+  CHART_PATH: deployments/charts/kubevirt-ip-helper
+
+jobs:
+  publish-chart:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@65b78e6e13532edd9afa3aa52ac7964289d1a9c1
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check if chart version already published
+        id: version-check
+        run: |
+          CHART_VERSION=$(sed -nE 's/^version:[[:space:]]*"?([^"]+)"?$/\1/p' $CHART_PATH/Chart.yaml | head -n1)
+          if [ -z "$CHART_VERSION" ]; then
+            echo "::error::could not parse chart version from Chart.yaml"
+            exit 1
+          fi
+          echo "version=$CHART_VERSION" >> "$GITHUB_OUTPUT"
+
+          if helm pull "oci://$REGISTRY/$CHART_REPO/kubevirt-ip-helper" \
+               --version "$CHART_VERSION" -d /tmp > /dev/null 2>&1; then
+            echo "Chart version $CHART_VERSION already published, skipping"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Chart version $CHART_VERSION not yet published"
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Package and push chart to GHCR
+        if: steps.version-check.outputs.exists == 'false'
+        run: |
+          helm package "$CHART_PATH"
+          helm push kubevirt-ip-helper-*.tgz "oci://$REGISTRY/$CHART_REPO"

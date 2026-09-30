@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "kubevirt-ip-helper.fullname" . }}-metrics
+  namespace: {{ .Release.Namespace | default "kube-system" }}
+  labels:
+    {{- include "kubevirt-ip-helper.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "kubevirt-ip-helper.selectorLabels" . | nindent 4 }}
+    kubevirtiphelper/leader: active
+  ports:
+    - name: metrics
+      port: {{ .Values.kubevirtiphelper.service.metricsPort | default 8080 }}
+      protocol: TCP
+      targetPort: {{ .Values.kubevirtiphelper.service.metricsPort | default 8080 }}
+  sessionAffinity: None
+  type: ClusterIP

@@ -108,7 +108,7 @@ spec:
     spec:
       containers:
       - name: kubevirt-ip-helper
-        image: ghcr.io/joeyloman/kubevirt-ip-helper:latest
+        image: ghcr.io/joeyloman/kubevirt-ip-helper:v0.9.x-latest
         env:
           - name: LOGLEVEL
             value: INFO

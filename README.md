@@ -1,6 +1,9 @@
 # kubevirt-ip-helper
 
-The kubevirt-ip-helper is a static DHCP solution for KubeVirt Virtual Machines which are attached to a bridged network using Multus. 
+> [!NOTE]
+> This branch (`release/v0.9.x`) follows the v0.9.x codebase as is and will only be updated with security fixes.
+
+The kubevirt-ip-helper is a static DHCP solution for KubeVirt Virtual Machines which are attached to a bridged network using Multus.
 It stores it's IP reservations in Kubernetes/ETCD using it's own Custom Resource Definition (CRD) and serve them using it's 
 internal DHCP service.
 
@@ -50,10 +53,10 @@ kubectl create -f deployments/crds.yaml
 
 ## Building the container
 
-There is a Dockerfile in the current directory which can be used to build the container, for example:
+There is a Dockerfile in the `build` directory which can be used to build the container, for example:
 
 ```SH
-[docker|podman] build -t <DOCKER_REGISTRY_URI>/kubevirt-ip-helper:latest .
+[docker|podman] build -f build/Dockerfile -t <DOCKER_REGISTRY_URI>/kubevirt-ip-helper:latest .
 ```
 
 Then push it to the remote container registry target, for example:
@@ -62,12 +65,26 @@ Then push it to the remote container registry target, for example:
 [docker|podman] push  <DOCKER_REGISTRY_URI>/kubevirt-ip-helper:latest
 ```
 
+The validating webhook which protects IPPool objects from deletion while they
+are still in use lives in this repository as well (`cmd/kubevirt-ip-helper-webhook`).
+Build its container with the build/Dockerfile.webhook file, for example:
+
+```SH
+[docker|podman] build -f build/Dockerfile.webhook -t <DOCKER_REGISTRY_URI>/kubevirt-ip-helper-webhook:latest .
+```
+
 ## Deploying the container
 
 Use the deployment.yaml template which is located in the templates directory, for example:
 
 ```SH
 kubectl create -f deployments/deployment.yaml
+```
+
+Deploy the webhook with the webhook-deployment.yaml template:
+
+```SH
+kubectl create -f deployments/webhook-deployment.yaml
 ```
 
 Before executing the above command, edit the deployment.yaml and:
@@ -166,7 +183,7 @@ Metrics are exported on port 8080 by default. This can be changed by adding the 
 
 # License
 
-Copyright (c) 2025 Joey Loman <joey@binbash.org>
+Copyright (c) 2026 Joey Loman <joey@binbash.org>
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.

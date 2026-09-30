@@ -1,0 +1,64 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "kubevirt-ip-helper.fullname" . }}
+  namespace: {{ .Release.Namespace | default "kube-system" }}
+  labels:
+    {{- include "kubevirt-ip-helper.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.kubevirtiphelper.autoscaling.enabled }}
+  replicas: {{ .Values.kubevirtiphelper.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "kubevirt-ip-helper.selectorLabels" . | nindent 6 }}
+  progressDeadlineSeconds: 600
+  revisionHistoryLimit: 10
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      {{- with .Values.kubevirtiphelper.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "kubevirt-ip-helper.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.kubevirtiphelper.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.kubevirtiphelper.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.kubevirtiphelper.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      dnsPolicy: ClusterFirst
+      {{- with .Values.kubevirtiphelper.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "kubevirt-ip-helper.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.kubevirtiphelper.podSecurityContext | nindent 8 }}
+      containers:
+        - name: {{ .Chart.Name }}
+          securityContext:
+            {{- toYaml .Values.kubevirtiphelper.securityContext | nindent 12 }}
+          image: "{{ .Values.kubevirtiphelper.image.repository }}:{{ .Values.kubevirtiphelper.image.tag | default .Chart.AppVersion }}"
+          {{- with .Values.kubevirtiphelper.env }}
+          env:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          imagePullPolicy: {{ .Values.kubevirtiphelper.image.pullPolicy }}
+          resources:
+            {{- toYaml .Values.kubevirtiphelper.resources | nindent 12 }}
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
