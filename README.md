@@ -110,6 +110,28 @@ spec:
 
 > **_NOTE:_** Make sure to replace the \<NETWORKATTACHMENTDEFINITION_NAME> and \<NAMESPACE> placeholders.
 
+## Installation using Helm
+
+Alternatively the kubevirt-ip-helper (including the webhook and the CRDs) can be installed using the Helm chart which is published to GHCR:
+
+```SH
+helm install kubevirt-ip-helper oci://ghcr.io/joeyloman/charts/kubevirt-ip-helper --version 0.9.4
+```
+
+Before installing, configure the Multus NetworkAttachmentDefinition name and namespace which the kubevirt-ip-helper pods will use, for example in a `values.yaml`:
+
+```YAML
+kubevirtiphelper:
+  podAnnotations:
+    k8s.v1.cni.cncf.io/networks: '[{ "interface":"eth1","name":"<NETWORKATTACHMENTDEFINITION_NAME>","namespace":"<NAMESPACE>" }]'
+```
+
+And install with:
+
+```SH
+helm install kubevirt-ip-helper oci://ghcr.io/joeyloman/charts/kubevirt-ip-helper --version 0.9.4 -f values.yaml
+```
+
 ## Usage
 
 ### Creating an IPPool object
