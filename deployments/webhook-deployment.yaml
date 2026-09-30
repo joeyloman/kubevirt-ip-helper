@@ -1,0 +1,170 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kubevirt-ip-helper-webhook
+  namespace: kubevirt-ip-helper
+  labels:
+    app: kubevirt-ip-helper-webhook
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubevirt-ip-helper-webhook
+  labels:
+    app: kubevirt-ip-helper-webhook
+rules:
+- apiGroups: ["certificates.k8s.io"]
+  resources: ["certificatesigningrequests"]
+  verbs: ["create", "get", "delete"]
+- apiGroups: ["certificates.k8s.io"]
+  resources: ["certificatesigningrequests/approval"]
+  verbs: ["update"]
+- apiGroups: ["certificates.k8s.io"]
+  resources: ["signers"]
+  resourceNames: ["kubernetes.io/kubelet-serving"]
+  verbs: ["approve"]
+- apiGroups: ["admissionregistration.k8s.io"]
+  resources: ["validatingwebhookconfigurations"]
+  verbs: ["create"]
+- apiGroups: ["admissionregistration.k8s.io"]
+  resources: ["validatingwebhookconfigurations"]
+  resourceNames: ["kubevirt-ip-helper-validator"]
+  verbs: ["get", "delete", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubevirt-ip-helper-webhook
+  labels:
+    app: kubevirt-ip-helper-webhook
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubevirt-ip-helper-webhook
+subjects:
+- kind: ServiceAccount
+  name: kubevirt-ip-helper-webhook
+  namespace: kubevirt-ip-helper
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kubevirt-ip-helper-webhook
+  namespace: kubevirt-ip-helper
+  labels:
+    app: kubevirt-ip-helper-webhook
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["create", "get", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kubevirt-ip-helper-webhook
+  namespace: kubevirt-ip-helper
+  labels:
+    app: kubevirt-ip-helper-webhook
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kubevirt-ip-helper-webhook
+subjects:
+- kind: ServiceAccount
+  name: kubevirt-ip-helper-webhook
+  namespace: kubevirt-ip-helper
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kubevirt-ip-helper-webhook-cabundle
+  namespace: kube-system
+  labels:
+    app: kubevirt-ip-helper-webhook
+rules:
+- apiGroups: [""]
+  resources: ["configmaps"]
+  resourceNames: ["kube-root-ca.crt"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kubevirt-ip-helper-webhook-cabundle
+  namespace: kube-system
+  labels:
+    app: kubevirt-ip-helper-webhook
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kubevirt-ip-helper-webhook-cabundle
+subjects:
+- kind: ServiceAccount
+  name: kubevirt-ip-helper-webhook
+  namespace: kubevirt-ip-helper
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: kubevirt-ip-helper-webhook
+  name: kubevirt-ip-helper-webhook
+  namespace: kubevirt-ip-helper
+spec:
+  progressDeadlineSeconds: 600
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: kubevirt-ip-helper-webhook
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: kubevirt-ip-helper-webhook
+    spec:
+      containers:
+      - name: kubevirt-ip-helper-webhook
+        image: ghcr.io/joeyloman/kubevirt-ip-helper-webhook:v0.9.x-latest
+        env:
+          - name: LOGLEVEL
+            value: INFO
+        imagePullPolicy: Always
+        resources:
+          requests:
+            cpu: 100m
+            memory: 8Mi
+          limits:
+            cpu: 500m
+            memory: 32Mi
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        securityContext: {}
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      serviceAccountName: kubevirt-ip-helper-webhook
+      terminationGracePeriodSeconds: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: kubevirt-ip-helper-webhook
+  name: kubevirt-ip-helper-webhook
+  namespace: kubevirt-ip-helper
+spec:
+  selector:
+    app: kubevirt-ip-helper-webhook
+  ports:
+    - name: webhook
+      port: 8080
+      protocol: TCP
+      targetPort: 8443
+  sessionAffinity: None
+  type: ClusterIP
+   

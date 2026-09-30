@@ -1,0 +1,64 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "kubevirt-ip-helper-webhook.fullname" . }}
+  namespace: {{ .Release.Namespace | default "kube-system" }}
+  labels:
+    {{- include "kubevirt-ip-helper-webhook.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.webhook.autoscaling.enabled }}
+  replicas: {{ .Values.webhook.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "kubevirt-ip-helper-webhook.selectorLabels" . | nindent 6 }}
+  progressDeadlineSeconds: 600
+  revisionHistoryLimit: 10
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      {{- with .Values.webhook.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "kubevirt-ip-helper-webhook.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.webhook.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.webhook.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.webhook.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      dnsPolicy: ClusterFirst
+      {{- with .Values.webhook.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "kubevirt-ip-helper-webhook.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.webhook.podSecurityContext | nindent 8 }}
+      containers:
+        - name: {{ .Chart.Name }}
+          securityContext:
+            {{- toYaml .Values.webhook.securityContext | nindent 12 }}
+          image: "{{ .Values.webhook.image.repository }}:{{ .Values.webhook.image.tag | default .Chart.AppVersion }}"
+          {{- with .Values.webhook.env }}
+          env:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          imagePullPolicy: {{ .Values.webhook.image.pullPolicy }}
+          resources:
+            {{- toYaml .Values.webhook.resources | nindent 12 }}
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File

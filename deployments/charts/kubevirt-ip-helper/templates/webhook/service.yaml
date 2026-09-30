@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "kubevirt-ip-helper-webhook.fullname" . }}
+  namespace: {{ .Release.Namespace | default "kube-system" }}
+  labels:
+    {{- include "kubevirt-ip-helper-webhook.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "kubevirt-ip-helper-webhook.selectorLabels" . | nindent 8 }}
+  ports:
+    - name: webhook
+      port: {{ .Values.webhook.service.webhookServicePort }}
+      protocol: TCP
+      targetPort: {{ .Values.webhook.service.webhookListenPort }}
+  sessionAffinity: None
+  type: ClusterIP

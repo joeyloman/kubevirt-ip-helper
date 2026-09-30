@@ -29,5 +29,15 @@ jobs:
       - name: Build the container with the tag version and push it
         id: build-image
         run: |
-          docker build -t $REGISTRY/$IMAGE_NAME:$GITHUB_REF_NAME .
+          docker build -f build/Dockerfile -t $REGISTRY/$IMAGE_NAME:$GITHUB_REF_NAME .
           docker push $REGISTRY/$IMAGE_NAME:$GITHUB_REF_NAME
+          docker tag $REGISTRY/$IMAGE_NAME:$GITHUB_REF_NAME $REGISTRY/$IMAGE_NAME:v0.9.x-latest
+          docker push $REGISTRY/$IMAGE_NAME:v0.9.x-latest
+
+      - name: Build the webhook container with the tag version and push it
+        id: build-webhook-image
+        run: |
+          docker build -f build/Dockerfile.webhook -t $REGISTRY/$IMAGE_NAME-webhook:$GITHUB_REF_NAME .
+          docker push $REGISTRY/$IMAGE_NAME-webhook:$GITHUB_REF_NAME
+          docker tag $REGISTRY/$IMAGE_NAME-webhook:$GITHUB_REF_NAME $REGISTRY/$IMAGE_NAME-webhook:v0.9.x-latest
+          docker push $REGISTRY/$IMAGE_NAME-webhook:v0.9.x-latest

@@ -53,10 +53,10 @@ kubectl create -f deployments/crds.yaml
 
 ## Building the container
 
-There is a Dockerfile in the current directory which can be used to build the container, for example:
+There is a Dockerfile in the `build` directory which can be used to build the container, for example:
 
 ```SH
-[docker|podman] build -t <DOCKER_REGISTRY_URI>/kubevirt-ip-helper:latest .
+[docker|podman] build -f build/Dockerfile -t <DOCKER_REGISTRY_URI>/kubevirt-ip-helper:latest .
 ```
 
 Then push it to the remote container registry target, for example:
@@ -65,12 +65,26 @@ Then push it to the remote container registry target, for example:
 [docker|podman] push  <DOCKER_REGISTRY_URI>/kubevirt-ip-helper:latest
 ```
 
+The validating webhook which protects IPPool objects from deletion while they
+are still in use lives in this repository as well (`cmd/kubevirt-ip-helper-webhook`).
+Build its container with the build/Dockerfile.webhook file, for example:
+
+```SH
+[docker|podman] build -f build/Dockerfile.webhook -t <DOCKER_REGISTRY_URI>/kubevirt-ip-helper-webhook:latest .
+```
+
 ## Deploying the container
 
 Use the deployment.yaml template which is located in the templates directory, for example:
 
 ```SH
 kubectl create -f deployments/deployment.yaml
+```
+
+Deploy the webhook with the webhook-deployment.yaml template:
+
+```SH
+kubectl create -f deployments/webhook-deployment.yaml
 ```
 
 Before executing the above command, edit the deployment.yaml and:
