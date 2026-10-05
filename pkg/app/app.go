@@ -110,9 +110,14 @@ func (h *handler) Init() {
 	h.leaderId = uuid.NewString()
 	log.Infof("(app.Run) generated leader id: %s", h.leaderId)
 
+	leaseLockName := os.Getenv("LEASE_LOCK_NAME")
+	if leaseLockName == "" {
+		leaseLockName = "kubevirt-ip-helper-lock"
+	}
+
 	h.lock = &resourcelock.LeaseLock{
 		LeaseMeta: metav1.ObjectMeta{
-			Name:      "kubevirt-ip-helper-lock",
+			Name:      leaseLockName,
 			Namespace: h.namespace,
 		},
 		Client: k8s_clientset.CoordinationV1(),
@@ -359,7 +364,24 @@ func (h *handler) getIPPools() (IPPools []v1.IPPool, err error) {
 		return IPPools, fmt.Errorf("cannot get the IPPoolList: %s", err.Error())
 	}
 
-	return IPPoolList.Items, err
+	if vlanID, ok := os.LookupEnv("VLAN_ID"); ok {
+		return filterIPPoolsByVLAN(IPPoolList.Items, vlanID), nil
+	}
+
+	return IPPoolList.Items, nil
+}
+
+// filterIPPoolsByVLAN returns the pools whose "kubevirtiphelper/vlan-id" annotation matches vlanID.
+func filterIPPoolsByVLAN(pools []v1.IPPool, vlanID string) []v1.IPPool {
+	var filtered []v1.IPPool
+
+	for _, pool := range pools {
+		if val, ok := pool.Annotations["kubevirtiphelper/vlan-id"]; ok && val == vlanID {
+			filtered = append(filtered, pool)
+		}
+	}
+
+	return filtered
 }
 
 func (h *handler) getVmNetCfgs() (vmnetcfgs []v1.VirtualMachineNetworkConfig, err error) {

@@ -5,7 +5,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 
-	"k8s.io/apimachinery/pkg/fields"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
@@ -106,7 +106,17 @@ func (e *EventHandler) getKubeConfig() (config *rest.Config, err error) {
 func (e *EventHandler) EventListener() (err error) {
 	log.Infof("(ippool.EventListener) starting the IPPool event listener")
 
-	vmWatcher := cache.NewListWatchFromClient(e.kihClientset.KubevirtiphelperV1().RESTClient(), "ippools", corev1.NamespaceAll, fields.Everything())
+	labelSelector := ""
+	managedList, listErr := e.kihClientset.KubevirtiphelperV1().IPPools().List(context.TODO(), metav1.ListOptions{
+		LabelSelector: "kubevirtiphelper/managed=true",
+	})
+	if listErr == nil && len(managedList.Items) > 0 {
+		labelSelector = "kubevirtiphelper/managed=true"
+	}
+
+	vmWatcher := cache.NewFilteredListWatchFromClient(e.kihClientset.KubevirtiphelperV1().RESTClient(), "ippools", corev1.NamespaceAll, func(opts *metav1.ListOptions) {
+		opts.LabelSelector = labelSelector
+	})
 
 	queue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
 
