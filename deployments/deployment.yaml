@@ -88,16 +88,27 @@ metadata:
   name: kubevirt-ip-helper
   namespace: kubevirt-ip-helper
 spec:
-  progressDeadlineSeconds: 600
+  # the deadline must exceed the 15-minute startup-gate stall timeout of
+  # the application, plus image pull time, or a legitimately slow startup
+  # is marked ProgressDeadlineExceeded on first install
+  progressDeadlineSeconds: 1800
   replicas: 2
   revisionHistoryLimit: 10
   selector:
     matchLabels:
       app: kubevirt-ip-helper
+  # the replicas are lease peers: the standby is a ready pod which serves
+  # nothing (the readiness probe does not gate on the leadership - see the
+  # services check of the application), so the deployment reaches its
+  # desired availability and the rollout completes. maxUnavailable: 0 keeps
+  # the serving leader in place until the replacement replicas are
+  # available: the old pod is terminated last, its SIGTERM releases the
+  # leader lease (ReleaseOnCancel + the signal handler) and the new leader
+  # rebuilds its services from the still-live configuration
   strategy:
     rollingUpdate:
-      maxSurge: 25%
-      maxUnavailable: 25%
+      maxSurge: 1
+      maxUnavailable: 0
     type: RollingUpdate
   template:
     metadata:
@@ -130,6 +141,58 @@ spec:
           capabilities:
             add: 
               - NET_ADMIN
+        # the liveness probe checks the leader-election freshness through
+        # the /healthz endpoint: it fails only while this pod owns the
+        # leader lease but could not renew it (or its process is wedged),
+        # so the kubelet restarts a stale leader instead of leaving its
+        # DHCP servers answering on the segment with a diverging allocator
+        # the health server starts only inside Run, after Init and the
+        # startup network cleanup: without a startup probe the liveness
+        # probe below (15s initial delay, 3 failures) would kill a pod
+        # whose startup legitimately exceeds ~45s - a slow apiserver - in
+        # the window before the process ever listens. the startup probe
+        # covers exactly that window (the process answers /healthz as soon
+        # as the server listens, so the budget is generous for a slow
+        # initialization), and it is deliberately not sized to the service
+        # era: the era startup (the pool registrations and the binding
+        # replays, up to the 15-minute gate stall timeout) runs with the
+        # health server listening and the liveness probe armed, which
+        # passes while this pod holds and renews its lease. a pod which
+        # does not finish its era reports not-ready through /ready, so the
+        # rollout waits for it, and the application's own fences
+        # (startupListTimeout, startupStallTimeout) plus the
+        # progressDeadlineSeconds above bound that startup
+        startupProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          periodSeconds: 10
+          failureThreshold: 90
+        # the liveness probe checks the leader-election freshness through
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 15
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 3
+        # the readiness probe reports a pod whose service era is being built
+        # (APP_INIT) or torn down (APP_RESTART) as not-ready. it must not
+        # gate on the leadership: a non-leader replica would stay not-ready
+        # forever, the deployment could never reach its desired
+        # availability, and every rollout would be reported as failed at the
+        # progress deadline although the leader serves. the metrics service
+        # selects the serving pod through the pod label, not through this
+        # endpoint
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 3
       dnsPolicy: ClusterFirst
       restartPolicy: Always
       schedulerName: default-scheduler

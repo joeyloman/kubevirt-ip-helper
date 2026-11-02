@@ -1,0 +1,128 @@
+# Default values for kubevirt-ip-helper.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+#
+# kubevirt-ip-helper options
+#
+kubevirtiphelper:
+  replicaCount: 2
+  
+  image:
+    repository: ghcr.io/joeyloman/kubevirt-ip-helper
+    # the release workflows publish only the 8-char commit sha and the
+    # rolling v1.0.x-latest tag, so the chart pulls the rolling tag with
+    # Always (matching deployments/deployment.yaml): with IfNotPresent an
+    # upgrade silently keeps running the previously pulled image. pin to
+    # the per-commit sha tag for a reproducible deployment.
+    pullPolicy: Always
+    tag: "v1.0.x-latest"
+
+  imagePullSecrets: []
+  nameOverride: ""
+  fullnameOverride: ""
+
+  serviceAccount:
+    # Specifies whether a service account should be created
+    create: true
+    # Annotations to add to the service account
+    annotations: {}
+    # The name of the service account to use.
+    # If not set and create is true, a name is generated using the fullname template
+    name: ""
+
+  podAnnotations:
+    k8s.v1.cni.cncf.io/networks: '[{ "interface":"eth1","name":"public-network1","namespace":"kubevirt-public" }]'
+    #k8s.v1.cni.cncf.io/networks: '[{ "interface":"eth1","name":"public-network1","namespace":"kubevirt-public" },{ "interface":"eth2","name":"public-network2","namespace":"kubevirt-public" }]'
+  
+  podSecurityContext: {}
+    # fsGroup: 2000
+  
+  securityContext:
+    runAsUser: 0
+    runAsGroup: 0
+    capabilities:
+      add: 
+      - NET_ADMIN
+  
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 200m
+      memory: 128Mi
+  
+  
+  nodeSelector: {}
+  
+  tolerations: []
+  
+  affinity: {}
+  
+  env:
+    - name: LOGLEVEL
+      value: Info
+    - name: METRICS_PORT
+      value: "8080"
+  
+  service:
+    metricsPort: 8080
+
+
+#
+# kubevirt-ip-helper-webhook options
+#
+webhook:
+  replicaCount: 1
+  
+  image:
+    repository: ghcr.io/joeyloman/kubevirt-ip-helper-webhook
+    # the release workflows publish only the 8-char commit sha and the
+    # rolling v1.0.x-latest tag, so the chart pulls the rolling tag with
+    # Always (matching deployments/deployment.yaml): with IfNotPresent an
+    # upgrade silently keeps running the previously pulled image. pin to
+    # the per-commit sha tag for a reproducible deployment.
+    pullPolicy: Always
+    tag: "v1.0.x-latest"
+  
+  imagePullSecrets: []
+  nameOverride: ""
+  fullnameOverride: ""
+  
+  serviceAccount:
+    # Specifies whether a service account should be created
+    create: true
+    # Annotations to add to the service account
+    annotations: {}
+    # The name of the service account to use.
+    # If not set and create is true, a name is generated using the fullname template
+    name: ""
+  
+  podAnnotations: {}
+  
+  podSecurityContext: {}
+    # fsGroup: 2000
+  
+  securityContext: {}
+ 
+  resources:
+    limits:
+      cpu: 500m
+      memory: 32Mi
+    requests:
+      cpu: 100m
+      memory: 8Mi
+  
+  
+  nodeSelector: {}
+  
+  tolerations: []
+  
+  affinity: {}
+  
+  env: []
+
+  service:
+    webhookServicePort: 8080
+    webhookListenPort: 8443

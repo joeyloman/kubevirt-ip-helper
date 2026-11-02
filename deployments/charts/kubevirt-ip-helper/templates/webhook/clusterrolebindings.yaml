@@ -1,0 +1,16 @@
+{{- if .Values.webhook.serviceAccount.create -}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "kubevirt-ip-helper-webhook.fullname" . }}
+  labels:
+    {{- include "kubevirt-ip-helper-webhook.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "kubevirt-ip-helper-webhook.fullname" . }}
+subjects:
+- kind: ServiceAccount
+  name: {{ include "kubevirt-ip-helper-webhook.serviceAccountName" . }}
+  namespace: {{ .Release.Namespace | default "kube-system" }}
+{{- end }}

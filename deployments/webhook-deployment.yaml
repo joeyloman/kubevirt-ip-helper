@@ -1,0 +1,207 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kubevirt-ip-helper-webhook
+  namespace: kubevirt-ip-helper
+  labels:
+    app: kubevirt-ip-helper-webhook
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubevirt-ip-helper-webhook
+  labels:
+    app: kubevirt-ip-helper-webhook
+rules:
+- apiGroups: ["certificates.k8s.io"]
+  resources: ["certificatesigningrequests"]
+  verbs: ["create", "get", "delete"]
+- apiGroups: ["certificates.k8s.io"]
+  resources: ["certificatesigningrequests/approval"]
+  verbs: ["update"]
+- apiGroups: ["certificates.k8s.io"]
+  resources: ["signers"]
+  resourceNames: ["kubernetes.io/kubelet-serving"]
+  verbs: ["approve"]
+- apiGroups: ["admissionregistration.k8s.io"]
+  resources: ["validatingwebhookconfigurations"]
+  verbs: ["create"]
+- apiGroups: ["kubevirtiphelper.k8s.binbash.org"]
+  resources: ["virtualmachinenetworkconfigs", "ippools"]
+  verbs: ["get", "list"]
+- apiGroups: ["admissionregistration.k8s.io"]
+  resources: ["validatingwebhookconfigurations"]
+  resourceNames: ["kubevirt-ip-helper-validator"]
+  verbs: ["get", "delete", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubevirt-ip-helper-webhook
+  labels:
+    app: kubevirt-ip-helper-webhook
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubevirt-ip-helper-webhook
+subjects:
+- kind: ServiceAccount
+  name: kubevirt-ip-helper-webhook
+  namespace: kubevirt-ip-helper
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kubevirt-ip-helper-webhook
+  namespace: kubevirt-ip-helper
+  labels:
+    app: kubevirt-ip-helper-webhook
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["create", "get", "delete", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kubevirt-ip-helper-webhook
+  namespace: kubevirt-ip-helper
+  labels:
+    app: kubevirt-ip-helper-webhook
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kubevirt-ip-helper-webhook
+subjects:
+- kind: ServiceAccount
+  name: kubevirt-ip-helper-webhook
+  namespace: kubevirt-ip-helper
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kubevirt-ip-helper-webhook-cabundle
+  namespace: kube-system
+  labels:
+    app: kubevirt-ip-helper-webhook
+rules:
+- apiGroups: [""]
+  resources: ["configmaps"]
+  resourceNames: ["kube-root-ca.crt"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kubevirt-ip-helper-webhook-cabundle
+  namespace: kube-system
+  labels:
+    app: kubevirt-ip-helper-webhook
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kubevirt-ip-helper-webhook-cabundle
+subjects:
+- kind: ServiceAccount
+  name: kubevirt-ip-helper-webhook
+  namespace: kubevirt-ip-helper
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: kubevirt-ip-helper-webhook
+  name: kubevirt-ip-helper-webhook
+  namespace: kubevirt-ip-helper
+spec:
+  progressDeadlineSeconds: 600
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: kubevirt-ip-helper-webhook
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: kubevirt-ip-helper-webhook
+    spec:
+      containers:
+      - name: kubevirt-ip-helper-webhook
+        image: ghcr.io/joeyloman/kubevirt-ip-helper-webhook:v1.0.x-latest
+        env:
+          - name: LOGLEVEL
+            value: INFO
+        imagePullPolicy: Always
+        # the TLS server binds :8443 only after the cert bootstrap finished,
+        # which can take up to the 60s CSR issuance deadline: the startup
+        # probe keeps liveness/readiness suppressed until the server
+        # answers, so a slow signer cannot kill the pod mid-bootstrap
+        # (restarts would reset the secret and loop forever)
+        startupProbe:
+          httpGet:
+            scheme: HTTPS
+            path: /readyz
+            port: 8443
+          periodSeconds: 10
+          failureThreshold: 30
+        # the readyz endpoint rides the TLS admission server on 8443: a
+        # probe failure (wedged or unlistened server) must restart the
+        # pod, since a silently dead webhook turns every ippool deletion
+        # into an apiserver-timeout hang
+        livenessProbe:
+          httpGet:
+            scheme: HTTPS
+            path: /readyz
+            port: 8443
+          initialDelaySeconds: 15
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            scheme: HTTPS
+            path: /readyz
+            port: 8443
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 3
+        resources:
+          requests:
+            cpu: 100m
+            memory: 8Mi
+          limits:
+            cpu: 500m
+            memory: 32Mi
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        securityContext: {}
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      serviceAccountName: kubevirt-ip-helper-webhook
+      terminationGracePeriodSeconds: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: kubevirt-ip-helper-webhook
+  name: kubevirt-ip-helper-webhook
+  namespace: kubevirt-ip-helper
+spec:
+  selector:
+    app: kubevirt-ip-helper-webhook
+  ports:
+    - name: webhook
+      port: 8080
+      protocol: TCP
+      targetPort: 8443
+  sessionAffinity: None
+  type: ClusterIP
+   

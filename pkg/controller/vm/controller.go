@@ -1,6 +1,8 @@
 package vm
 
 import (
+	"context"
+	"sync"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -20,6 +22,7 @@ import (
 )
 
 type Controller struct {
+	ctx          context.Context
 	indexer      cache.Indexer
 	queue        workqueue.RateLimitingInterface
 	informer     cache.Controller
@@ -31,6 +34,7 @@ type Controller struct {
 }
 
 func NewController(
+	ctx context.Context,
 	queue workqueue.RateLimitingInterface,
 	indexer cache.Indexer,
 	informer cache.Controller,
@@ -40,7 +44,15 @@ func NewController(
 	metrics *metrics.MetricsAllocator,
 	kihClientset *kihclientset.Clientset,
 ) *Controller {
+	// the API calls of a reconciliation run under the era context: a
+	// canceled era (application reinit or shutdown) aborts in-flight
+	// syncs instead of blocking the era join until every client timeout
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	return &Controller{
+		ctx:          ctx,
 		informer:     informer,
 		indexer:      indexer,
 		queue:        queue,
@@ -83,24 +95,29 @@ func (c *Controller) sync(event Event) (err error) {
 	}
 
 	switch event.action {
-	case ADD:
-		err := c.handleVirtualMachineObjectChange(obj.(*kubevirtv1.VirtualMachine))
-		if err != nil {
-			log.Errorf("(vm.sync) %s", err)
-			c.metrics.UpdateLogStatus("error")
-		}
-	case UPDATE:
-		err := c.handleVirtualMachineObjectChange(obj.(*kubevirtv1.VirtualMachine))
-		if err != nil {
-			log.Errorf("(vm.sync) %s", err)
-			c.metrics.UpdateLogStatus("error")
-		}
+	case ADD, UPDATE:
+		err = c.handleVirtualMachineObjectChange(obj.(*kubevirtv1.VirtualMachine))
 	case DELETE:
-		err := c.deleteVirtualMachineNetworkConfigObject(event.vmNamespace, event.vmName)
-		if err != nil {
-			log.Errorf("(vm.sync) %s", err)
-			c.metrics.UpdateLogStatus("error")
+		if exists {
+			// the informer removes an object from the store before
+			// delivering its delete event, so an object under this key is
+			// a same-name replacement created while the deletion (or its
+			// rate-limited retry) was in flight: tearing down the vmnetcfg
+			// object now would destroy the replacement's network
+			// configuration. the cleanup is dropped and the replacement's
+			// own events manage the object.
+			log.Warnf("(vm.sync) VirtualMachine %s was deleted but a same-name replacement exists, skipping the vmnetcfg cleanup", event.key)
+			c.metrics.UpdateLogStatus("warning")
+
+			return
 		}
+
+		err = c.deleteVirtualMachineNetworkConfigObject(event.vmNamespace, event.vmName)
+	}
+
+	if err != nil {
+		log.Errorf("(vm.sync) %s", err)
+		c.metrics.UpdateLogStatus("error")
 	}
 
 	return
@@ -141,11 +158,25 @@ func (c *Controller) Run(workers int, stopCh chan struct{}) {
 		return
 	}
 
+	// the workers are joined before Run returns: an in-flight sync may
+	// still hold local allocator state, so a caller waiting for this era
+	// to end (the EventListener join) must not observe Run returning
+	// while a worker is still reconciling
+	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
-		go wait.Until(c.runWorker, time.Second, stopCh)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			wait.Until(c.runWorker, time.Second, stopCh)
+		}()
 	}
 
 	<-stopCh
+	// shut the queue down before joining the workers: one blocked in
+	// queue.Get is only released by the shutdown, so waiting first would
+	// deadlock (the deferred shutdown stays as the early-return safety)
+	c.queue.ShutDown()
+	wg.Wait()
 	log.Infof("(vm.runWorker) stopping the VirtualMachine controller")
 }
 

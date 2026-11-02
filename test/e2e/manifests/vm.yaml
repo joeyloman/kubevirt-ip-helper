@@ -1,0 +1,52 @@
+# Halted on creation: the helper reserves the address for the explicit MAC
+# before run.sh starts this VM. The guest exposes only the helper-served Multus
+# NIC; CirrOS starts and maintains its stock eth0 DHCP client. The guest-side
+# observer script is delivered through cloudInitNoCloud.secretRef because it
+# exceeds KubeVirt's 2048-byte inline userData limit.
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: e2e-vm
+  namespace: e2e
+  labels:
+    app: kubevirt-ip-helper-e2e
+spec:
+  runStrategy: Halted
+  template:
+    metadata:
+      labels:
+        app: kubevirt-ip-helper-e2e
+    spec:
+      domain:
+        cpu:
+          cores: 1
+        memory:
+          guest: 256Mi
+        devices:
+          disks:
+            - name: containerdisk
+              disk:
+                bus: virtio
+            - name: cloudinitdisk
+              disk:
+                bus: virtio
+          interfaces:
+            - name: kihnet0
+              bridge: {}
+              macAddress: 02:00:00:00:00:11
+      networks:
+        - name: kihnet0
+          multus:
+            networkName: kubevirt-ip-helper/kubevirt-ip-helper-e2e
+      volumes:
+        - name: containerdisk
+          containerDisk:
+            image: quay.io/kubevirt/cirros-container-disk-demo:v1.9.0@sha256:ebdb8d8b9b480f6ee7664ed3fdde8428767664f507d98f94090edeff04d7ebf2
+        - name: cloudinitdisk
+          cloudInitNoCloud:
+            # KubeVirt caps an inline userData at 2048 bytes and the guest
+            # observer script is larger, so it is delivered as the Secret below
+            # (run.sh creates it from manifests/guest-userdata.sh). The API field is
+            # cloudInitNoCloud.secretRef, whose Go name is UserDataSecretRef.
+            secretRef:
+              name: kih-guest-userdata

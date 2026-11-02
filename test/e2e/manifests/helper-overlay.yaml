@@ -1,0 +1,15 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kubevirt-ip-helper
+  namespace: kubevirt-ip-helper
+spec:
+  template:
+    metadata:
+      annotations:
+        k8s.v1.cni.cncf.io/networks: '[{"name":"kubevirt-ip-helper-e2e","namespace":"kubevirt-ip-helper","interface":"kihnet0"}]'
+    spec:
+      containers:
+        - name: kubevirt-ip-helper
+          image: kubevirt-ip-helper:e2e
+          imagePullPolicy: IfNotPresent
