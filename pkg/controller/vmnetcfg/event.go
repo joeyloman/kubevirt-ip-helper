@@ -8,13 +8,11 @@ import (
 	log "github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/workqueue"
-	"kubevirt.io/client-go/kubecli"
 
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
 	kihcache "github.com/joeyloman/kubevirt-ip-helper/pkg/cache"
@@ -23,6 +21,7 @@ import (
 	kihclientset "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/clientset/versioned"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/ippoolstatus"
+	kubevirtclient "github.com/joeyloman/kubevirt-ip-helper/pkg/kubevirt"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/metrics"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/util"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
@@ -56,7 +55,7 @@ type EventHandler struct {
 	kihWatchClientset *kihclientset.Clientset
 	// kcli serves the one-shot VirtualMachine existence checks of the
 	// orphan sweep
-	kcli        kubecli.KubevirtClient
+	kcli        *kubevirtclient.Client
 	appStatus   *atomic.Int32
 	startupGate *gate.Gate
 }
@@ -125,7 +124,7 @@ func (e *EventHandler) Init() (err error) {
 
 	// the kubevirt client serves the one-shot VirtualMachine existence
 	// checks of the orphan sweep (the 30s bound of the config stays)
-	e.kcli, err = kubecli.GetKubevirtClientFromRESTConfig(e.kubeRestConfig)
+	e.kcli, err = kubevirtclient.NewClient(e.kubeRestConfig)
 	if err != nil {
 		return
 	}
@@ -208,7 +207,7 @@ func (e *EventHandler) EventListener() (err error) {
 	// authoritative read is definitively gone, so a live vm which merely
 	// lags in any local cache can never have its binding swept
 	controller.verifyVM = func(namespace string, name string) (bool, error) {
-		_, err := e.kcli.VirtualMachine(namespace).Get(name, &metav1.GetOptions{})
+		_, err := e.kcli.VirtualMachine(e.ctx, namespace, name)
 		if err != nil {
 			if apierrors.IsNotFound(err) {
 				return false, nil

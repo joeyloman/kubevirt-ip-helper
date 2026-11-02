@@ -8,7 +8,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
@@ -24,10 +23,9 @@ import (
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/gate"
 	kihclientset "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/clientset/versioned"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
+	kubevirtclient "github.com/joeyloman/kubevirt-ip-helper/pkg/kubevirt"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/metrics"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/util"
-
-	"kubevirt.io/client-go/kubecli"
 
 	log "github.com/sirupsen/logrus"
 )
@@ -55,7 +53,7 @@ type EventHandler struct {
 	kubeRestConfig    *rest.Config
 	kihClientset      *kihclientset.Clientset
 	kihWatchClientset *kihclientset.Clientset
-	kcli              kubecli.KubevirtClient
+	kcli              *kubevirtclient.Client
 	appStatus         *atomic.Int32
 	startupGate       *gate.Gate
 }
@@ -126,7 +124,7 @@ func (e *EventHandler) Init() (err error) {
 		return
 	}
 
-	e.kcli, err = kubecli.GetKubevirtClientFromRESTConfig(e.kubeRestConfig)
+	e.kcli, err = kubevirtclient.NewClient(e.kubeRestConfig)
 	if err != nil {
 		return
 	}
@@ -214,7 +212,7 @@ func (e *EventHandler) EventListener() (err error) {
 	// absence which may drop the durable record (a live vm reconstructs
 	// its vmnetcfg, so its claim stays protected)
 	verifyVM := func(namespace string, name string) (bool, error) {
-		_, err := e.kcli.VirtualMachine(namespace).Get(name, &metav1.GetOptions{})
+		_, err := e.kcli.VirtualMachine(e.ctx, namespace, name)
 		if err != nil {
 			if apierrors.IsNotFound(err) {
 				return false, nil

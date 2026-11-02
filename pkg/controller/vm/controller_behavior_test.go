@@ -18,12 +18,12 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 	kubevirtv1 "kubevirt.io/api/core/v1"
-	"kubevirt.io/client-go/kubecli"
 
 	kihcache "github.com/joeyloman/kubevirt-ip-helper/pkg/cache"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/dhcp"
 	kihclientset "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/clientset/versioned"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
+	kubevirtclient "github.com/joeyloman/kubevirt-ip-helper/pkg/kubevirt"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/metrics"
 )
 
@@ -549,7 +549,7 @@ func TestEventListenerStopsWhenContextIsCancelled(t *testing.T) {
 		t.Fatalf("creating clientset: %v", err)
 	}
 
-	kubevirtClient, err := kubecli.GetKubevirtClientFromRESTConfig(&rest.Config{Host: server.URL})
+	kubevirtClient, err := kubevirtclient.NewClient(&rest.Config{Host: server.URL})
 	if err != nil {
 		t.Fatalf("creating kubevirt client: %v", err)
 	}
