@@ -232,6 +232,13 @@ Description: Amount of warnings or errors detected.
 
 Metrics are exported on port 8080 by default. This can be changed by adding the METRICS_PORT environment variable in the deployment. The deployment example also contains a servicemonitor object which can be automatically picked up by the Prometheus monitoring solution.
 
+The same port serves the allocator state as JSON on `/ipam`. Only the leader has an allocator, so a standby replica answers `503 Service Unavailable`; the metrics service routes to the leader through its pod label. The report lists every registered network with its range, the used/available counters and the allocated addresses:
+
+```console
+$ curl -s http://kubevirt-ip-helper-metrics:8080/ipam
+{"networks":[{"name":"public-vlan-1","cidr":"192.168.10.0/24","start":"192.168.10.1","end":"192.168.10.254","broadcast":"192.168.10.255","total":254,"used":2,"available":252,"allocated":["192.168.10.1","192.168.10.63"]}]}
+```
+
 ## Operational limits and recovery
 
 ### Address release and reuse

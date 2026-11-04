@@ -2,8 +2,10 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -195,6 +197,7 @@ func (h *handler) Run(mainCtx context.Context) {
 	// killed every standby shortly after it started)
 	h.metrics = metrics.New()
 	h.registerHealthChecks()
+	h.metrics.HandleFunc("/ipam", h.ipamUsageHandler)
 	go h.metrics.Run()
 
 	// force-exit fence: the liveness probe and the leader election exit are
@@ -275,6 +278,39 @@ func (h *handler) registerHealthChecks() {
 
 		return nil
 	})
+}
+
+// ipamUsageResponse is the JSON document served by /ipam: the allocation
+// state of every network registered by the serving era.
+type ipamUsageResponse struct {
+	Networks []ipam.SubnetUsage `json:"networks"`
+}
+
+// ipamUsageHandler serves the allocation snapshot of the serving era. the
+// endpoint is registered on the process-global metrics server, but only the
+// leader has an allocator: a standby reports 503 instead of an empty report,
+// which would read as "no pools registered" and hide the fact that the pod
+// never served. an era which is still initializing or being torn down is
+// likewise not a trustworthy snapshot.
+func (h *handler) ipamUsageHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+
+		return
+	}
+
+	era := h.era.Load()
+	if era == nil || era.ipam == nil || era.appStatus == nil || era.appStatus.Load() != APP_RUNNING {
+		http.Error(w, "ipam usage is unavailable: this replica is not serving", http.StatusServiceUnavailable)
+
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(ipamUsageResponse{Networks: era.ipam.UsageReport()}); err != nil {
+		log.Errorf("(app.ipamUsageHandler) error while writing the ipam usage: %s", err.Error())
+	}
 }
 
 // onStartedLeading runs the service era of the leadership. the era context

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"sort"
 	"sync"
 
 	log "github.com/sirupsen/logrus"
@@ -749,6 +750,70 @@ func (a *IPAllocator) Usage(name string) {
 		len(a.ipam[name].ips),
 		i,
 	)
+}
+
+// SubnetUsage is a point-in-time snapshot of one registered network. the
+// counters and the allocated addresses are captured under one lock
+// acquisition, so a report can never show an address which its own
+// counters do not account for.
+type SubnetUsage struct {
+	Name      string   `json:"name"`
+	CIDR      string   `json:"cidr"`
+	Start     string   `json:"start"`
+	End       string   `json:"end"`
+	Broadcast string   `json:"broadcast"`
+	Total     int      `json:"total"`
+	Used      int      `json:"used"`
+	Available int      `json:"available"`
+	Allocated []string `json:"allocated"`
+}
+
+// UsageReport returns the structured form of Usage for every registered
+// network, sorted by network name and with the allocated addresses in
+// address order: the /ipam endpoint exposes this snapshot so the allocation
+// state is inspectable without scraping the logs.
+func (a *IPAllocator) UsageReport() []SubnetUsage {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	report := make([]SubnetUsage, 0, len(a.ipam))
+	for name, s := range a.ipam {
+		addrs := make([]netip.Addr, 0, len(s.ips))
+		for ip, allocated := range s.ips {
+			if !allocated {
+				continue
+			}
+			// the bitmap keys are written from parsed addresses, so the
+			// canonical spelling always parses back
+			addrs = append(addrs, netip.MustParseAddr(ip))
+		}
+		sort.Slice(addrs, func(i, j int) bool {
+			return addrs[i].Compare(addrs[j]) < 0
+		})
+
+		allocatedIPs := make([]string, 0, len(addrs))
+		for _, addr := range addrs {
+			allocatedIPs = append(allocatedIPs, addr.String())
+		}
+
+		report = append(report, SubnetUsage{
+			Name:      name,
+			CIDR:      s.cidr.String(),
+			Start:     s.start.String(),
+			End:       s.end.String(),
+			Broadcast: s.broadcast.String(),
+			Total:     len(s.ips),
+			Used:      len(addrs),
+			Available: len(s.ips) - len(addrs),
+			Allocated: allocatedIPs,
+		})
+	}
+
+	sort.Slice(report, func(i, j int) bool {
+		return report[i].Name < report[j].Name
+	})
+
+	return report
 }
 
 func New() *IPAllocator {

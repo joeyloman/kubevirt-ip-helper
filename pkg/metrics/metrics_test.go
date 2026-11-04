@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"errors"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"testing"
@@ -288,5 +290,29 @@ func TestMetricsDeleteVmNetCfgStatusAbortsOnGatherError(t *testing.T) {
 	}
 	if vm == 0 {
 		t.Error("vm-1 series was deleted despite the gather error")
+	}
+}
+
+func TestMetricsHandleFuncServesExtraRoute(t *testing.T) {
+	m := NewMetricsAllocator()
+	m.HandleFunc("/ipam", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"networks":[]}`))
+	})
+
+	rec := httptest.NewRecorder()
+	m.mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/ipam", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if got := rec.Body.String(); got != `{"networks":[]}` {
+		t.Errorf("body = %q, want the registered handler output", got)
+	}
+	// the built-in routes stay reachable next to the extra route
+	rec = httptest.NewRecorder()
+	m.mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if rec.Code != http.StatusOK {
+		t.Errorf("/metrics status = %d, want %d", rec.Code, http.StatusOK)
 	}
 }

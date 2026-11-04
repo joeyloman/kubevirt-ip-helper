@@ -321,6 +321,7 @@ func TestIPAMConcurrentSubnetLifecycleWithReaders(t *testing.T) {
 				_ = a.Used("net")
 				_ = a.Available("net")
 				a.Usage("net")
+				_ = a.UsageReport()
 			}
 		}()
 	}

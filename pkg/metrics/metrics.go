@@ -28,6 +28,7 @@ var (
 
 type MetricsAllocator struct {
 	httpServer                      http.Server
+	mux                             *http.ServeMux
 	kubevirtiphelperAppLogs         *prometheus.GaugeVec
 	kubevirtiphelperIPPoolUsed      *prometheus.GaugeVec
 	kubevirtiphelperIPPoolAvailable *prometheus.GaugeVec
@@ -104,7 +105,19 @@ func NewMetricsAllocator() *MetricsAllocator {
 	m.registry.MustRegister(m.kubevirtiphelperIPPoolAvailable)
 	m.registry.MustRegister(m.kubevirtiphelperVmNetCfgStatus)
 
+	m.mux = http.NewServeMux()
+	m.mux.Handle("/metrics", promhttp.HandlerFor(m.registry, promhttp.HandlerOpts{Registry: m.registry}))
+	m.mux.HandleFunc("/healthz", m.healthzHandler)
+	m.mux.HandleFunc("/ready", m.readyHandler)
+
 	return m
+}
+
+// HandleFunc registers an additional handler on the process-global HTTP
+// server next to /metrics and the health endpoints. it must be called
+// before Run starts the server.
+func (m *MetricsAllocator) HandleFunc(pattern string, handler http.HandlerFunc) {
+	m.mux.HandleFunc(pattern, handler)
 }
 
 func (m *MetricsAllocator) UpdateLogStatus(loglevel string) {
@@ -201,14 +214,9 @@ func (m *MetricsAllocator) Run() {
 	}
 	listenAddress := fmt.Sprintf(":%d", metricsPort)
 
-	mux := http.NewServeMux()
-	mux.Handle("/metrics", promhttp.HandlerFor(m.registry, promhttp.HandlerOpts{Registry: m.registry}))
-	mux.HandleFunc("/healthz", m.healthzHandler)
-	mux.HandleFunc("/ready", m.readyHandler)
-
 	m.httpServer = http.Server{
 		Addr:    listenAddress,
-		Handler: mux,
+		Handler: m.mux,
 	}
 
 	// the health and metrics endpoints are the liveness surface of the
