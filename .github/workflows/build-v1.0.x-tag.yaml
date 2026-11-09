@@ -1,0 +1,45 @@
+name: Build, tag, and push v1.0.x tag images to GHCR
+
+on:
+  push:
+    tags:
+      - 'v1.0.*'
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-v1-0-x-tag:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build the container with the tag version and push it
+        run: |
+          docker build -f build/Dockerfile -t $REGISTRY/$IMAGE_NAME:$GITHUB_REF_NAME .
+          docker push $REGISTRY/$IMAGE_NAME:$GITHUB_REF_NAME
+          docker tag $REGISTRY/$IMAGE_NAME:$GITHUB_REF_NAME $REGISTRY/$IMAGE_NAME:v1.0.x-latest
+          docker push $REGISTRY/$IMAGE_NAME:v1.0.x-latest
+
+      - name: Build the webhook container with the tag version and push it
+        run: |
+          docker build -f build/Dockerfile.webhook -t $REGISTRY/$IMAGE_NAME-webhook:$GITHUB_REF_NAME .
+          docker push $REGISTRY/$IMAGE_NAME-webhook:$GITHUB_REF_NAME
+          docker tag $REGISTRY/$IMAGE_NAME-webhook:$GITHUB_REF_NAME $REGISTRY/$IMAGE_NAME-webhook:v1.0.x-latest
+          docker push $REGISTRY/$IMAGE_NAME-webhook:v1.0.x-latest

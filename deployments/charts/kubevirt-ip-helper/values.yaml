@@ -10,13 +10,13 @@ kubevirtiphelper:
   
   image:
     repository: ghcr.io/joeyloman/kubevirt-ip-helper
-    # the release workflows publish only the 8-char commit sha and the
-    # rolling v1.0.x-latest tag, so the chart pulls the rolling tag with
-    # Always (matching deployments/deployment.yaml): with IfNotPresent an
-    # upgrade silently keeps running the previously pulled image. pin to
-    # the per-commit sha tag for a reproducible deployment.
-    pullPolicy: Always
-    tag: "v1.0.x-latest"
+    # the release workflows publish the 8-char commit sha, the tag version
+    # and the rolling v1.0.x-latest tag. The chart pins the immutable tag
+    # version, so IfNotPresent keeps a running pod on the same image across
+    # an upgrade; override the tag with a per-commit sha for reproducibility
+    # or with v1.0.x-latest and pullPolicy Always for a rolling deployment.
+    pullPolicy: IfNotPresent
+    tag: "v1.0.0"
 
   imagePullSecrets: []
   nameOverride: ""
@@ -78,13 +78,13 @@ webhook:
   
   image:
     repository: ghcr.io/joeyloman/kubevirt-ip-helper-webhook
-    # the release workflows publish only the 8-char commit sha and the
-    # rolling v1.0.x-latest tag, so the chart pulls the rolling tag with
-    # Always (matching deployments/deployment.yaml): with IfNotPresent an
-    # upgrade silently keeps running the previously pulled image. pin to
-    # the per-commit sha tag for a reproducible deployment.
-    pullPolicy: Always
-    tag: "v1.0.x-latest"
+    # the release workflows publish the 8-char commit sha, the tag version
+    # and the rolling v1.0.x-latest tag. The chart pins the immutable tag
+    # version, so IfNotPresent keeps a running pod on the same image across
+    # an upgrade; override the tag with a per-commit sha for reproducibility
+    # or with v1.0.x-latest and pullPolicy Always for a rolling deployment.
+    pullPolicy: IfNotPresent
+    tag: "v1.0.0"
   
   imagePullSecrets: []
   nameOverride: ""
