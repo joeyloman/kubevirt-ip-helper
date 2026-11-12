@@ -4,6 +4,13 @@ The kubevirt-ip-helper is a static DHCP solution for KubeVirt Virtual Machines w
 It stores it's IP reservations in Kubernetes/ETCD using it's own Custom Resource Definition (CRD) and serve them using it's 
 internal DHCP service.
 
+## Branches
+
+* The main branch currently follows the release/v1.0.x branch.
+* The release/v0.9.x branch consists of only hand written code. This code is used for 3+ years in multiple large KubeVirt environments.
+* The release/v1.0.x branch is a split off from v0.9.1 and contains a lot of improvements and bugfixes identified and fixed by AI. It's currently running in multiple large KubeVirt environments.
+* The devel/v1.1.x branch is a split off from v1.0.x and has the focus on running multiple isolated kubevirt-ip-helper pods which can serve its own network. It's still work in progress.
+
 ## Use case
 
 This adds a static DHCP service to KubeVirt/Multus bridged networks and is integrated in the Kubernetes event mechanism.
@@ -53,13 +60,13 @@ kubectl create -f deployments/charts/kubevirt-ip-helper/crds/
 There is a Dockerfile in the build directory which can be used to build the container, for example:
 
 ```SH
-[docker|podman] build -f build/Dockerfile -t <DOCKER_REGISTRY_URI>/kubevirt-ip-helper:latest .
+[docker|podman] build -f build/Dockerfile -t <DOCKER_REGISTRY_URI>/kubevirt-ip-helper:v1.0.x-latest .
 ```
 
 Then push it to the remote container registry target, for example:
 
 ```SH
-[docker|podman] push  <DOCKER_REGISTRY_URI>/kubevirt-ip-helper:latest
+[docker|podman] push  <DOCKER_REGISTRY_URI>/kubevirt-ip-helper:v1.0.x-latest
 ```
 
 ## Deploying the container
