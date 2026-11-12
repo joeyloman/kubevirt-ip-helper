@@ -1,0 +1,215 @@
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: kih-test-primary
+  namespace: e2e
+  labels:
+    app.kubernetes.io/name: kih-network-services
+spec:
+  config: '{"cniVersion":"0.3.1","name":"kih-test-primary","type":"bridge","bridge":"br-kih-e2e","ipam":{}}'
+---
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: kih-test-secondary
+  namespace: e2e
+  labels:
+    app.kubernetes.io/name: kih-network-services
+spec:
+  config: '{"cniVersion":"0.3.1","name":"kih-test-secondary","type":"bridge","bridge":"br-kih-e2e2","ipam":{}}'
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kih-network-services-coredns
+  namespace: e2e
+  labels:
+    app.kubernetes.io/name: kih-network-services
+data:
+  Corefile: |
+    .:53 {
+        bind 10.77.0.1 10.78.0.1
+        errors
+        log
+        hosts {
+            10.77.1.10 probe.primary.e2e.test
+            10.78.1.10 probe.secondary.e2e.test
+            ttl 30
+        }
+        ready 0.0.0.0:8181
+        reload
+    }
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kih-network-services
+  namespace: e2e
+  labels:
+    app: kih-network-services
+    app.kubernetes.io/name: kih-network-services
+  annotations:
+    k8s.v1.cni.cncf.io/networks: |-
+      [
+        {"name":"kih-test-primary","namespace":"e2e","interface":"primary"},
+        {"name":"kih-test-secondary","namespace":"e2e","interface":"secondary"}
+      ]
+spec:
+  automountServiceAccountToken: false
+  nodeSelector:
+    node-role.kubernetes.io/control-plane: ""
+  tolerations:
+    - operator: Exists
+      effect: NoSchedule
+  initContainers:
+    - name: configure-network
+      image: docker.io/nicolaka/netshoot:v0.14@sha256:7f08c4aff13ff61a35d30e30c5c1ea8396eac6ab4ce19fd02d5a4b3b5d0d09a2
+      imagePullPolicy: IfNotPresent
+      command: ["/bin/sh", "-ec"]
+      args:
+        - |
+          ip link set dev primary up
+          ip link set dev secondary up
+          ip address replace 10.77.0.1/24 dev primary
+          ip address replace 10.77.0.9/24 dev primary
+          ip address replace 10.78.0.1/24 dev secondary
+          ip address replace 10.77.1.10/32 dev lo
+          ip address replace 10.78.1.10/32 dev lo
+      securityContext:
+        runAsUser: 0
+        runAsGroup: 0
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+          add: ["NET_ADMIN"]
+  containers:
+    - name: network
+      image: docker.io/nicolaka/netshoot:v0.14@sha256:7f08c4aff13ff61a35d30e30c5c1ea8396eac6ab4ce19fd02d5a4b3b5d0d09a2
+      imagePullPolicy: IfNotPresent
+      command: ["/bin/sh", "-ec"]
+      args:
+        - |
+          trap 'exit 0' TERM INT
+          while :; do sleep 3600 & wait $!; done
+      readinessProbe:
+        exec:
+          command:
+            - /bin/sh
+            - -ec
+            - |
+              ip -o -4 address show dev primary | grep -Fq ' 10.77.0.1/24 '
+              ip -o -4 address show dev primary | grep -Fq ' 10.77.0.9/24 '
+              ip -o -4 address show dev secondary | grep -Fq ' 10.78.0.1/24 '
+              ip -o -4 address show dev lo | grep -Fq ' 10.77.1.10/32 '
+              ip -o -4 address show dev lo | grep -Fq ' 10.78.1.10/32 '
+              [ "$(dig +time=1 +tries=1 +short @10.77.0.1 probe.primary.e2e.test A)" = 10.77.1.10 ]
+              [ "$(dig +time=1 +tries=1 +short @10.78.0.1 probe.secondary.e2e.test A)" = 10.78.1.10 ]
+        periodSeconds: 2
+        timeoutSeconds: 3
+        failureThreshold: 60
+      securityContext:
+        runAsUser: 0
+        runAsGroup: 0
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+          add: ["NET_RAW"]
+    - name: coredns
+      image: registry.k8s.io/coredns/coredns:v1.12.1@sha256:e8c262566636e6bc340ece6473b0eed193cad045384401529721ddbe6463d31c
+      imagePullPolicy: IfNotPresent
+      args: ["-conf", "/etc/coredns/Corefile"]
+      ports:
+        - name: dns-udp
+          containerPort: 53
+          protocol: UDP
+        - name: dns-tcp
+          containerPort: 53
+          protocol: TCP
+        - name: ready
+          containerPort: 8181
+          protocol: TCP
+      readinessProbe:
+        httpGet:
+          path: /ready
+          port: ready
+        periodSeconds: 2
+        timeoutSeconds: 2
+        failureThreshold: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+          add: ["NET_BIND_SERVICE"]
+      volumeMounts:
+        - name: coredns
+          mountPath: /etc/coredns
+          readOnly: true
+  volumes:
+    - name: coredns
+      configMap:
+        name: kih-network-services-coredns
+  terminationGracePeriodSeconds: 5
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: kih-network-observer
+  namespace: e2e
+  labels:
+    app: kih-network-observer
+spec:
+  selector:
+    matchLabels:
+      app: kih-network-observer
+  template:
+    metadata:
+      labels:
+        app: kih-network-observer
+    spec:
+      automountServiceAccountToken: false
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        kubernetes.io/os: linux
+      tolerations:
+        - operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: observer
+          volumeMounts:
+            - name: capture-state
+              mountPath: /tmp
+          image: docker.io/nicolaka/netshoot:v0.14@sha256:7f08c4aff13ff61a35d30e30c5c1ea8396eac6ab4ce19fd02d5a4b3b5d0d09a2
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              trap 'exit 0' TERM INT
+              while :; do sleep 3600 & wait $!; done
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -ec
+                - test -d /sys/class/net/br-kih-e2e/bridge && test -d /sys/class/net/br-kih-e2e2/bridge
+            periodSeconds: 2
+            timeoutSeconds: 2
+            failureThreshold: 60
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+              add: ["NET_RAW"]
+      volumes:
+        - name: capture-state
+          emptyDir: {}
+      terminationGracePeriodSeconds: 5

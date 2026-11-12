@@ -1,0 +1,9 @@
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: kubevirt-ip-helper-e2e
+  namespace: kubevirt-ip-helper
+  labels:
+    app: kubevirt-ip-helper-e2e
+spec:
+  config: '{"cniVersion":"0.3.1","name":"kubevirt-ip-helper-e2e","bridge":"br-kih-e2e","type":"bridge"}'

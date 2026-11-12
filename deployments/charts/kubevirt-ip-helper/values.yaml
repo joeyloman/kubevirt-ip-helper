@@ -10,13 +10,18 @@ kubevirtiphelper:
   
   image:
     repository: ghcr.io/joeyloman/kubevirt-ip-helper
+    # the release workflows publish the 8-char commit sha, the tag version
+    # and the rolling v1.0.x-latest tag. The chart pins the immutable tag
+    # version, so IfNotPresent keeps a running pod on the same image across
+    # an upgrade; override the tag with a per-commit sha for reproducibility
+    # or with v1.0.x-latest and pullPolicy Always for a rolling deployment.
     pullPolicy: IfNotPresent
-    tag: "v0.9.3"
-  
+    tag: "v1.0.0"
+
   imagePullSecrets: []
   nameOverride: ""
   fullnameOverride: ""
-  
+
   serviceAccount:
     # Specifies whether a service account should be created
     create: true
@@ -25,7 +30,7 @@ kubevirtiphelper:
     # The name of the service account to use.
     # If not set and create is true, a name is generated using the fullname template
     name: ""
-  
+
   podAnnotations:
     k8s.v1.cni.cncf.io/networks: '[{ "interface":"eth1","name":"public-network1","namespace":"kubevirt-public" }]'
     #k8s.v1.cni.cncf.io/networks: '[{ "interface":"eth1","name":"public-network1","namespace":"kubevirt-public" },{ "interface":"eth2","name":"public-network2","namespace":"kubevirt-public" }]'
@@ -48,12 +53,6 @@ kubevirtiphelper:
       cpu: 200m
       memory: 128Mi
   
-  autoscaling:
-    enabled: false
-    minReplicas: 1
-    maxReplicas: 100
-    targetCPUUtilizationPercentage: 80
-    # targetMemoryUtilizationPercentage: 80
   
   nodeSelector: {}
   
@@ -79,8 +78,13 @@ webhook:
   
   image:
     repository: ghcr.io/joeyloman/kubevirt-ip-helper-webhook
+    # the release workflows publish the 8-char commit sha, the tag version
+    # and the rolling v1.0.x-latest tag. The chart pins the immutable tag
+    # version, so IfNotPresent keeps a running pod on the same image across
+    # an upgrade; override the tag with a per-commit sha for reproducibility
+    # or with v1.0.x-latest and pullPolicy Always for a rolling deployment.
     pullPolicy: IfNotPresent
-    tag: "v0.9.3"
+    tag: "v1.0.0"
   
   imagePullSecrets: []
   nameOverride: ""
@@ -110,12 +114,6 @@ webhook:
       cpu: 100m
       memory: 8Mi
   
-  autoscaling:
-    enabled: false
-    minReplicas: 1
-    maxReplicas: 100
-    targetCPUUtilizationPercentage: 80
-    # targetMemoryUtilizationPercentage: 80
   
   nodeSelector: {}
   

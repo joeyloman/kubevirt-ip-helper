@@ -6,18 +6,19 @@ metadata:
   labels:
     {{- include "kubevirt-ip-helper.labels" . | nindent 4 }}
 spec:
-  {{- if not .Values.kubevirtiphelper.autoscaling.enabled }}
   replicas: {{ .Values.kubevirtiphelper.replicaCount }}
-  {{- end }}
   selector:
     matchLabels:
       {{- include "kubevirt-ip-helper.selectorLabels" . | nindent 6 }}
-  progressDeadlineSeconds: 600
+  # the replicas are lease peers: the startup gate of a replacement era can
+  # take up to 15 minutes, so the rollout must not terminate the serving
+  # leader in place and must wait for the replacement to converge
+  progressDeadlineSeconds: 1800
   revisionHistoryLimit: 10
   strategy:
     rollingUpdate:
       maxSurge: 25%
-      maxUnavailable: 25%
+      maxUnavailable: 0
     type: RollingUpdate
   template:
     metadata:
@@ -58,6 +59,31 @@ spec:
             {{- toYaml . | nindent 12 }}
           {{- end }}
           imagePullPolicy: {{ .Values.kubevirtiphelper.image.pullPolicy }}
+          # the health server listens on the metrics port: healthz reports
+          # the leader-election freshness, ready reports a pod whose era is
+          # being built (APP_INIT) or torn down (APP_RESTART) as not-ready
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.kubevirtiphelper.service.metricsPort | default 8080 }}
+            periodSeconds: 10
+            failureThreshold: 90
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.kubevirtiphelper.service.metricsPort | default 8080 }}
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: {{ .Values.kubevirtiphelper.service.metricsPort | default 8080 }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
           resources:
             {{- toYaml .Values.kubevirtiphelper.resources | nindent 12 }}
           terminationMessagePath: /dev/termination-log

@@ -3,9 +3,10 @@ name: Package and push Helm chart to GHCR
 on:
   push:
     branches:
-      - release/v0.9.x
+      - release/v1.0.x
     paths:
       - 'deployments/charts/kubevirt-ip-helper/Chart.yaml'
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -25,7 +26,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Helm
         uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1

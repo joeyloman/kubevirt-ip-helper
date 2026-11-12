@@ -34,28 +34,48 @@ func main() {
 		log.SetLevel(level)
 	}
 
-	sig := make(chan os.Signal, 1)
+	sig := make(chan os.Signal, 2)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
 	mainApp := app.Register()
 
+	// init before the startup cleanup: the cleanup gathers the pools
+	// through the api and needs the loaded kube config (in-cluster runs
+	// worked regardless, kubeconfig-based runs silently no-op'd before)
+	mainApp.Init()
+
 	// This is a workaround for a situation when the process gets killed and
 	// doesn't cleanup the IP addresses when SIGINT is catched. If another pod
 	// will be the new leader then the IP address get's duplicated on the network.
 	// The same applies for the LeaderPodLabel.
-	mainApp.NetworkCleanup()
+	// This startup variant gathers the pools from the api because a fresh
+	// process has no local pool cache yet; the shutdown paths clean up from
+	// the local era state instead.
+	mainApp.StartupNetworkCleanup()
 
+	// canceling the main context ends the leader election and runs the
+	// OnStoppedLeading cleanup (listener fence, era join, leader label +
+	// network state) exactly once, and only at its very end - after the
+	// serving state was fenced - does it release the leader lease (the
+	// lease never passes while this process still answers on the segment);
+	// the explicit cleanup workaround for killed processes
+	// stays as the StartupNetworkCleanup call at startup.
+	// the graceful shutdown can legitimately take tens of seconds (the era
+	// join of in-flight syncs plus bounded api calls, against the 30s
+	// termination grace period of the pod): a second signal force-exits so
+	// an operator can always interrupt a slow drain instead of waiting for
+	// the kubelet's SIGKILL. the channel buffers both signals so the second
+	// one is never dropped while the goroutine is busy canceling.
 	go func() {
 		<-sig
 		cancel()
-		mainApp.RemoveLeaderPodLabel()
-		mainApp.NetworkCleanup()
+		<-sig
+		log.Warnf("(main) second signal received, exiting immediately without waiting for the graceful cleanup")
 		os.Exit(1)
 	}()
 
-	mainApp.Init()
 	mainApp.Run(ctx)
 	cancel()
 }

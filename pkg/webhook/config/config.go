@@ -7,6 +7,7 @@ import (
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/util"
 	log "github.com/sirupsen/logrus"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/client-go/kubernetes"
 )
 
@@ -47,7 +48,7 @@ func (h *Handler) Init() {
 	h.csrName = fmt.Sprintf("%s.%s.svc", h.webhookName, h.webhookNamespace)
 }
 
-func (h *Handler) Run(certRenewalPeriod int64) {
+func (h *Handler) Run(certRenewalPeriod int64) error {
 	if h.checkSecret() {
 		if h.checkCertExpireDate(certRenewalPeriod) {
 			if err := h.renewTLSPair(); err != nil {
@@ -63,15 +64,36 @@ func (h *Handler) Run(certRenewalPeriod int64) {
 
 		tlsPair, err := h.generateTLSKeyAndCert()
 		if err != nil {
-			log.Errorf("%s", err.Error())
+			// without a usable key/cert pair there is nothing to store:
+			// createSecret would panic on the empty certificate, so a
+			// generation failure (transient apiserver error, keygen
+			// failure) must abort here and let the pod restart retry
+			log.Fatalf("(webhook.config) %s", err.Error())
 		}
 
 		if err := h.createSecret(tlsPair); err != nil {
-			log.Errorf("%s", err.Error())
+			if apierrors.IsAlreadyExists(err) {
+				// a concurrent bootstrap published the shared secret first
+				// adopt its pair instead of deleting it - the load
+				// below writes and serves the winner's credentials, so the
+				// loser converges on them
+				log.Infof("(webhook.config) the webhook secret %s was already published by a concurrent bootstrap, adopting it",
+					h.webhookSecretName)
+			} else {
+				log.Errorf("%s", err.Error())
+			}
 		}
 	}
 
 	if err := h.writeTLSDataFromSecret(); err != nil {
 		log.Errorf("%s", err.Error())
+
+		// the serving files could not be produced from a usable pair
+		// the caller must not restart the server on this state,
+		// the current credentials keep serving and the next scheduler
+		// tick retries the whole renewal
+		return err
 	}
+
+	return nil
 }

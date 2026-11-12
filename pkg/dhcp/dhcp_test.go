@@ -1,6 +1,7 @@
 package dhcp
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"testing"
@@ -66,6 +67,7 @@ func TestDHCP(t *testing.T) {
 	// AddPool function tests
 	for i := 0; i < len(testPools); i++ {
 		if got := td.AddPool(
+			context.Background(),
 			testPools[i].name,
 			testPools[i].serverIP,
 			testPools[i].subnetMask,

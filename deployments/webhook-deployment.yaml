@@ -26,6 +26,9 @@ rules:
 - apiGroups: ["admissionregistration.k8s.io"]
   resources: ["validatingwebhookconfigurations"]
   verbs: ["create"]
+- apiGroups: ["kubevirtiphelper.k8s.binbash.org"]
+  resources: ["virtualmachinenetworkconfigs", "ippools"]
+  verbs: ["get", "list"]
 - apiGroups: ["admissionregistration.k8s.io"]
   resources: ["validatingwebhookconfigurations"]
   resourceNames: ["kubevirt-ip-helper-validator"]
@@ -56,7 +59,7 @@ metadata:
 rules:
 - apiGroups: [""]
   resources: ["secrets"]
-  verbs: ["create", "get", "delete"]
+  verbs: ["create", "get", "delete", "update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -129,11 +132,45 @@ spec:
     spec:
       containers:
       - name: kubevirt-ip-helper-webhook
-        image: ghcr.io/joeyloman/kubevirt-ip-helper-webhook:v0.9.x-latest
+        image: ghcr.io/joeyloman/kubevirt-ip-helper-webhook:v1.0.x-latest
         env:
           - name: LOGLEVEL
             value: INFO
         imagePullPolicy: Always
+        # the TLS server binds :8443 only after the cert bootstrap finished,
+        # which can take up to the 60s CSR issuance deadline: the startup
+        # probe keeps liveness/readiness suppressed until the server
+        # answers, so a slow signer cannot kill the pod mid-bootstrap
+        # (restarts would reset the secret and loop forever)
+        startupProbe:
+          httpGet:
+            scheme: HTTPS
+            path: /readyz
+            port: 8443
+          periodSeconds: 10
+          failureThreshold: 30
+        # the readyz endpoint rides the TLS admission server on 8443: a
+        # probe failure (wedged or unlistened server) must restart the
+        # pod, since a silently dead webhook turns every ippool deletion
+        # into an apiserver-timeout hang
+        livenessProbe:
+          httpGet:
+            scheme: HTTPS
+            path: /readyz
+            port: 8443
+          initialDelaySeconds: 15
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            scheme: HTTPS
+            path: /readyz
+            port: 8443
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 3
         resources:
           requests:
             cpu: 100m

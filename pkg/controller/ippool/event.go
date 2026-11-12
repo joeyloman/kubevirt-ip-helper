@@ -2,10 +2,14 @@ package ippool
 
 import (
 	"context"
+	"sync/atomic"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
@@ -16,10 +20,13 @@ import (
 	kihv1 "github.com/joeyloman/kubevirt-ip-helper/pkg/apis/kubevirtiphelper.k8s.binbash.org/v1"
 	kihcache "github.com/joeyloman/kubevirt-ip-helper/pkg/cache"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/dhcp"
+	"github.com/joeyloman/kubevirt-ip-helper/pkg/gate"
 	kihclientset "github.com/joeyloman/kubevirt-ip-helper/pkg/generated/clientset/versioned"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/ipam"
+	kubevirtclient "github.com/joeyloman/kubevirt-ip-helper/pkg/kubevirt"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/metrics"
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/util"
+
 	log "github.com/sirupsen/logrus"
 )
 
@@ -29,25 +36,40 @@ const (
 	DELETE = "delete"
 )
 
+// resyncPeriod re-delivers every watched object periodically: objects
+// whose earlier event was dropped (a transient registration failure, or a
+// network which only became live later) get another reconciliation chance
+// without any external event or pod restart.
+const resyncPeriod = time.Minute
+
 type EventHandler struct {
-	ctx                context.Context
-	ipam               *ipam.IPAllocator
-	dhcp               *dhcp.DHCPAllocator
-	metrics            *metrics.MetricsAllocator
-	cache              *kihcache.CacheAllocator
-	kubeConfig         string
-	kubeContext        string
-	kubeRestConfig     *rest.Config
-	kihClientset       *kihclientset.Clientset
-	appStatus          *int
-	ippoolCountCurrent *int
+	ctx               context.Context
+	ipam              *ipam.IPAllocator
+	dhcp              *dhcp.DHCPAllocator
+	metrics           *metrics.MetricsAllocator
+	cache             *kihcache.CacheAllocator
+	kubeConfig        string
+	kubeContext       string
+	kubeRestConfig    *rest.Config
+	kihClientset      *kihclientset.Clientset
+	kihWatchClientset *kihclientset.Clientset
+	kcli              *kubevirtclient.Client
+	appStatus         *atomic.Int32
+	startupGate       *gate.Gate
 }
 
 type Event struct {
-	key             string
-	action          string
-	poolName        string
-	poolNetworkName string
+	key                string
+	action             string
+	poolName           string
+	poolNetworkName    string
+	oldPoolNetworkName string
+	// poolUID carries the deleted object's uid on a DELETE event: the
+	// cache is keyed by the networkname, so a pool which is deleted and
+	// recreated under the same name resolves the replacement's live
+	// registration; only a uid match proves the cache entry belongs to
+	// the deleted generation
+	poolUID types.UID
 }
 
 func NewEventHandler(
@@ -60,21 +82,23 @@ func NewEventHandler(
 	kubeContext string,
 	kubeRestConfig *rest.Config,
 	kihClientset *kihclientset.Clientset,
-	appStatus *int,
-	ippoolCountCurrent *int,
+	kihWatchClientset *kihclientset.Clientset,
+	appStatus *atomic.Int32,
+	startupGate *gate.Gate,
 ) *EventHandler {
 	return &EventHandler{
-		ctx:                ctx,
-		ipam:               ipam,
-		dhcp:               dhcp,
-		metrics:            metrics,
-		cache:              cache,
-		kubeConfig:         kubeConfig,
-		kubeContext:        kubeContext,
-		kubeRestConfig:     kubeRestConfig,
-		kihClientset:       kihClientset,
-		appStatus:          appStatus,
-		ippoolCountCurrent: ippoolCountCurrent,
+		ctx:               ctx,
+		ipam:              ipam,
+		dhcp:              dhcp,
+		metrics:           metrics,
+		cache:             cache,
+		kubeConfig:        kubeConfig,
+		kubeContext:       kubeContext,
+		kubeRestConfig:    kubeRestConfig,
+		kihClientset:      kihClientset,
+		kihWatchClientset: kihWatchClientset,
+		appStatus:         appStatus,
+		startupGate:       startupGate,
 	}
 }
 
@@ -89,28 +113,57 @@ func (e *EventHandler) Init() (err error) {
 		return
 	}
 
+	// the 30s bound of the config stays on kihClientset: it serves the
+	// one-shot controller api calls and the kubevirt client's VirtualMachine
+	// existence checks. the informer watches below need their own client,
+	// since a watch long-poll is torn down by the http client timeout (a
+	// constant re-watch churn), and an initial list which takes longer
+	// than the timeout would never complete the cache sync
+	e.kihWatchClientset, err = kihclientset.NewForConfig(util.WatchRestConfig(e.kubeRestConfig))
+	if err != nil {
+		return
+	}
+
+	e.kcli, err = kubevirtclient.NewClient(e.kubeRestConfig)
+	if err != nil {
+		return
+	}
+
 	return
 }
 
 func (e *EventHandler) getKubeConfig() (config *rest.Config, err error) {
+	// bound every controller api call: a hang against the api must not
+	// wedge the reconcilers behind an unresponsive transport
+	const configTimeout = 30 * time.Second
 	if !util.FileExists(e.kubeConfig) {
-		return rest.InClusterConfig()
+		if config, err = rest.InClusterConfig(); err != nil {
+			return
+		}
+		config.Timeout = configTimeout
+
+		return
 	}
 
-	return clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+	config, err = clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
 		&clientcmd.ClientConfigLoadingRules{ExplicitPath: e.kubeConfig},
 		&clientcmd.ConfigOverrides{ClusterInfo: clientcmdapi.Cluster{}, CurrentContext: e.kubeContext},
 	).ClientConfig()
+	if err == nil {
+		config.Timeout = configTimeout
+	}
+
+	return
 }
 
 func (e *EventHandler) EventListener() (err error) {
 	log.Infof("(ippool.EventListener) starting the IPPool event listener")
 
-	vmWatcher := cache.NewListWatchFromClient(e.kihClientset.KubevirtiphelperV1().RESTClient(), "ippools", corev1.NamespaceAll, fields.Everything())
+	vmWatcher := cache.NewListWatchFromClient(e.kihWatchClientset.KubevirtiphelperV1().RESTClient(), "ippools", corev1.NamespaceAll, fields.Everything())
 
 	queue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
 
-	indexer, informer := cache.NewIndexerInformer(vmWatcher, &kihv1.IPPool{}, 0, cache.ResourceEventHandlerFuncs{
+	indexer, informer := cache.NewIndexerInformer(vmWatcher, &kihv1.IPPool{}, resyncPeriod, cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			key, err := cache.MetaNamespaceKeyFunc(obj)
 			if err == nil {
@@ -126,34 +179,68 @@ func (e *EventHandler) EventListener() (err error) {
 			key, err := cache.MetaNamespaceKeyFunc(new)
 			if err == nil {
 				queue.Add(Event{
-					key:             key,
-					action:          UPDATE,
-					poolName:        new.(*kihv1.IPPool).ObjectMeta.Name,
-					poolNetworkName: new.(*kihv1.IPPool).Spec.NetworkName,
+					key:                key,
+					action:             UPDATE,
+					poolName:           new.(*kihv1.IPPool).ObjectMeta.Name,
+					poolNetworkName:    new.(*kihv1.IPPool).Spec.NetworkName,
+					oldPoolNetworkName: old.(*kihv1.IPPool).Spec.NetworkName,
 				})
 			}
 		},
 		DeleteFunc: func(obj interface{}) {
-			key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
+			pool, isPool := util.UnwrapTombstone(obj).(*kihv1.IPPool)
+			if !isPool {
+				return
+			}
+
+			key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(pool)
 			if err == nil {
 				queue.Add(Event{
 					key:             key,
 					action:          DELETE,
-					poolName:        obj.(*kihv1.IPPool).ObjectMeta.Name,
-					poolNetworkName: obj.(*kihv1.IPPool).Spec.NetworkName,
+					poolName:        pool.ObjectMeta.Name,
+					poolNetworkName: pool.Spec.NetworkName,
+					poolUID:         pool.ObjectMeta.UID,
 				})
 			}
 		},
 	}, cache.Indexers{})
 
-	controller := NewController(queue, indexer, informer, e.ctx, e.cache, e.ipam, e.dhcp, e.metrics, e.kihClientset, e.appStatus, e.ippoolCountCurrent)
+	// the ledger revalidation of the claim protection verifies the
+	// VirtualMachine of a claim whose vmnetcfg is gone through the
+	// kubevirt api: only a vm which is gone as well is the authoritative
+	// absence which may drop the durable record (a live vm reconstructs
+	// its vmnetcfg, so its claim stays protected)
+	verifyVM := func(namespace string, name string) (bool, error) {
+		_, err := e.kcli.VirtualMachine(e.ctx, namespace, name)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
+
+			return false, err
+		}
+
+		return true, nil
+	}
+
+	controller := NewController(queue, indexer, informer, e.ctx, e.cache, e.ipam, e.dhcp, e.metrics, e.kihClientset, e.appStatus, e.startupGate, verifyVM)
 	stop := make(chan struct{})
-	defer close(stop)
-	go controller.Run(1, stop)
+
+	// join the controller on shutdown: EventListener only returns after
+	// Controller.Run has fully stopped (its worker has drained the queue), so
+	// the application restart flow can wait for the old generation to be gone
+	done := make(chan struct{})
+	go func() {
+		controller.Run(1, stop)
+		close(done)
+	}()
 
 	select {
 	case <-e.ctx.Done():
 		log.Infof("(ippool.EventListener) stopping the IPPool event listener")
+		close(stop)
+		<-done
 		return
 	}
 }
