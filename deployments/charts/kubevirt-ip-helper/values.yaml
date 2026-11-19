@@ -16,7 +16,7 @@ kubevirtiphelper:
     # an upgrade; override the tag with a per-commit sha for reproducibility
     # or with v1.0.x-latest and pullPolicy Always for a rolling deployment.
     pullPolicy: IfNotPresent
-    tag: "v1.0.0"
+    tag: "v1.0.1"
 
   imagePullSecrets: []
   nameOverride: ""
@@ -84,7 +84,7 @@ webhook:
     # an upgrade; override the tag with a per-commit sha for reproducibility
     # or with v1.0.x-latest and pullPolicy Always for a rolling deployment.
     pullPolicy: IfNotPresent
-    tag: "v1.0.0"
+    tag: "v1.0.1"
   
   imagePullSecrets: []
   nameOverride: ""
