@@ -2,6 +2,7 @@ package vm
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -21,6 +22,26 @@ import (
 	"github.com/joeyloman/kubevirt-ip-helper/pkg/metrics"
 )
 
+const (
+	// vmNetCfgTerminatingRetryDelay is the pause between reconciliation
+	// attempts while the old VirtualMachineNetworkConfig is still
+	// terminating. The finalizer cleanup is usually sub-second; a fixed
+	// short delay replaces the near-instant five-attempt budget which used
+	// to drop the key and wait for the one-minute informer resync, leaving
+	// the recreated vm without a lease for up to a minute.
+	vmNetCfgTerminatingRetryDelay = 2 * time.Second
+	// vmNetCfgTerminatingRetryLimit bounds the deferred retries. After
+	// this many attempts the key falls back to the periodic resync, so a
+	// permanently stuck finalizer cannot spin the worker forever.
+	vmNetCfgTerminatingRetryLimit = 30
+)
+
+// errVMNetCfgTerminating marks a sync deferred because the vmnetcfg object
+// is still being deleted. It is not a transient API failure: the vm
+// controller retries it on a fixed short delay with a dedicated budget
+// instead of consuming the rate-limited error retries.
+var errVMNetCfgTerminating = errors.New("VirtualMachineNetworkConfig is being deleted")
+
 type Controller struct {
 	ctx          context.Context
 	indexer      cache.Indexer
@@ -31,6 +52,14 @@ type Controller struct {
 	dhcp         *dhcp.DHCPAllocator
 	metrics      *metrics.MetricsAllocator
 	kihClientset *kihclientset.Clientset
+
+	// terminatingRetryDelay is the deferred retry delay for
+	// errVMNetCfgTerminating. Tests set it to zero to keep the queue
+	// deterministic.
+	terminatingRetryDelay time.Duration
+	// terminatingDeferrals counts the deferred retries per vm key.
+	deferralMutex        sync.Mutex
+	terminatingDeferrals map[string]int
 }
 
 func NewController(
@@ -61,6 +90,9 @@ func NewController(
 		dhcp:         dhcp,
 		metrics:      metrics,
 		kihClientset: kihClientset,
+
+		terminatingRetryDelay: vmNetCfgTerminatingRetryDelay,
+		terminatingDeferrals:  make(map[string]int),
 	}
 }
 
@@ -123,11 +155,70 @@ func (c *Controller) sync(event Event) (err error) {
 	return
 }
 
+func (c *Controller) clearTerminatingDeferral(key string) {
+	c.deferralMutex.Lock()
+	delete(c.terminatingDeferrals, key)
+	c.deferralMutex.Unlock()
+}
+
+// deferTerminating requeues a sync whose vmnetcfg is still terminating on
+// the fixed short delay and reports whether the retry budget is left. It
+// deliberately bypasses the rate-limited retry count: the wait is for the
+// old object's finalizer, not for this sync to stop failing, so burning the
+// five transient-error retries in milliseconds and then waiting for the
+// one-minute resync is exactly the gap this closes.
+func (c *Controller) deferTerminating(eventKey string, queueKey interface{}) bool {
+	c.deferralMutex.Lock()
+	attempts := c.terminatingDeferrals[eventKey]
+	if attempts >= vmNetCfgTerminatingRetryLimit {
+		delete(c.terminatingDeferrals, eventKey)
+		c.deferralMutex.Unlock()
+
+		return false
+	}
+	c.terminatingDeferrals[eventKey] = attempts + 1
+	c.deferralMutex.Unlock()
+
+	c.queue.Forget(queueKey)
+
+	if c.terminatingRetryDelay <= 0 {
+		c.queue.Add(queueKey)
+	} else {
+		c.queue.AddAfter(queueKey, c.terminatingRetryDelay)
+	}
+
+	return true
+}
+
 func (c *Controller) handleErr(err error, key interface{}) {
+	event, hasEvent := key.(Event)
+
 	if err == nil {
+		if hasEvent {
+			c.clearTerminatingDeferral(event.key)
+		}
+
 		c.queue.Forget(key)
 
 		return
+	}
+
+	if hasEvent && errors.Is(err, errVMNetCfgTerminating) {
+		if c.deferTerminating(event.key, key) {
+			return
+		}
+
+		c.queue.Forget(key)
+
+		log.Errorf("(vm.handleErr) dropping VirtualMachine %q out of the queue after %d deferred retries while its vmnetcfg is terminating: %v",
+			event.key, vmNetCfgTerminatingRetryLimit, err)
+		c.metrics.UpdateLogStatus("error")
+
+		return
+	}
+
+	if hasEvent {
+		c.clearTerminatingDeferral(event.key)
 	}
 
 	if c.queue.NumRequeues(key) < 5 {

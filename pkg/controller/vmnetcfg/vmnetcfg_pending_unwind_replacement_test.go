@@ -112,12 +112,13 @@ func pendingUnwindCount(e *testEnv, key string) int {
 }
 
 // replaceUnderDeletedKey deletes the dead generation's binding while the
-// given replacement already exists under the same key: the informer store
-// holds the replacement when the delete event is processed, so the
-// delete-event replacement guard skips the unwind drain and the dead
-// generation's entry stays recorded for the ordinary reconciliations of
-// the successor.
-func replaceUnderDeletedKey(t *testing.T, e *testEnv, old *kihv1.VirtualMachineNetworkConfig, replacement *kihv1.VirtualMachineNetworkConfig, key string) {
+// given replacement already exists under the same key. The delete replay
+// filters by owner identity: a shadowed entry (same vmname and macaddress)
+// stays recorded for the successor's reconciliations, while an entry the
+// replacement cannot own (another vmname or macaddress) is replayed and
+// dropped by the delete event itself. The helper returns the number of
+// pending entries the caller can assert on.
+func replaceUnderDeletedKey(t *testing.T, e *testEnv, old *kihv1.VirtualMachineNetworkConfig, replacement *kihv1.VirtualMachineNetworkConfig, key string) int {
 	t.Helper()
 
 	e.seedVMNetCfg(replacement)
@@ -127,9 +128,7 @@ func replaceUnderDeletedKey(t *testing.T, e *testEnv, old *kihv1.VirtualMachineN
 		t.Fatalf("the delete sync of the replaced key failed: %s", err)
 	}
 
-	if got := pendingUnwindCount(e, key); got != 1 {
-		t.Fatalf("the replacement guard must keep the dead generation's entry resident, got %d", got)
-	}
+	return pendingUnwindCount(e, key)
 }
 
 // failPoolStatusPutsAfterTheFirst arms the one-shot api blip of the
@@ -181,7 +180,9 @@ func TestReplayedPendingUnwindSparesSameIdentityReplacement(t *testing.T) {
 
 	replacement := newVMNetCfg(oldIP, testMAC)
 	replacement.ObjectMeta.UID = "generation-b"
-	replaceUnderDeletedKey(t, e, old, replacement, key)
+	if got := replaceUnderDeletedKey(t, e, old, replacement, key); got != 1 {
+		t.Fatalf("the replacement guard must keep the shadowed dead generation entry resident, got %d", got)
+	}
 
 	// the successor's first reconciliation runs while the pool status api
 	// would fail the replayed unwind again (the blip which recorded the
@@ -249,11 +250,11 @@ func TestReplayedPendingUnwindSparesSameIdentityReplacement(t *testing.T) {
 }
 
 // TestReplayedPendingUnwindConvergesAroundForeignSuccessor: the successor
-// belongs to another vm, so its ledger records name another owner and the
-// owner-validated replay of the dead generation's entry can never remove
-// them. the dead generation's own record must still converge away through
-// the replay - blocking it would strand the address until the next era,
-// which is exactly what the pending unwind facility exists to prevent.
+// belongs to another vm, so the dead generation's entry cannot describe
+// its state. The delete-event replay now converges that entry immediately
+// (the replacement guard only keeps entries the successor can own), and
+// the successor's own reconciliation establishes its serving state
+// without the dead record blocking it.
 func TestReplayedPendingUnwindConvergesAroundForeignSuccessor(t *testing.T) {
 	e, old, oldIP, key := deadGenerationEnv(t, "10.0.0.1", "10.0.0.2")
 
@@ -268,69 +269,43 @@ func TestReplayedPendingUnwindConvergesAroundForeignSuccessor(t *testing.T) {
 	replacement := newVMNetCfg(successorIP, testMAC2)
 	replacement.Spec.VMName = "vm-successor"
 	replacement.ObjectMeta.UID = "generation-b"
-	replaceUnderDeletedKey(t, e, old, replacement, key)
+	if got := replaceUnderDeletedKey(t, e, old, replacement, key); got != 0 {
+		t.Fatalf("the delete replay must converge the non-shadowed dead generation entry, got %d pending", got)
+	}
 
-	// the successor's first sync establishes its serving state while the
-	// replay of the dead generation's unwind fails transiently again
-	e.api.mu.Lock()
-	e.api.poolStatusPutCode = http.StatusInternalServerError
-	e.api.mu.Unlock()
-	recoverPoolStatusPutsAfterTheBlip(e)
+	allocated := e.getStoredPool().Status.IPv4.Allocated
+	if _, ok := allocated[oldIP]; ok {
+		t.Fatalf("the dead generation's record for %s must be removed by the delete replay", oldIP)
+	}
 
-	if err := e.controller.updateVirtualMachineNetworkConfig(ADD, e.getStoredVMNetCfg()); err == nil {
-		t.Fatal("the transiently failing unwind replay must defer its failure to the retried sync")
+	// the successor reconciles against the now-clean ledger: its own
+	// address is served and recorded under its own owner
+	if err := e.controller.updateVirtualMachineNetworkConfig(ADD, e.getStoredVMNetCfg()); err != nil {
+		t.Fatalf("the successor's reconciliation must succeed: %s", err)
 	}
 
 	lease := e.dhcp.GetLease(testMAC2)
 	if lease.ClientIP == nil || lease.ClientIP.String() != successorIP || lease.Reference != testNamespace+"/vm-successor" {
 		t.Fatalf("the successor must serve its own address %s, got lease %+v", successorIP, lease)
 	}
-	allocated := e.getStoredPool().Status.IPv4.Allocated
+	allocated = e.getStoredPool().Status.IPv4.Allocated
 	if owner, ok := allocated[successorIP]; !ok || owner != successorRef {
 		t.Fatalf("the successor's record must be present under its own owner, got %q", owner)
 	}
-	if _, ok := allocated[oldIP]; !ok {
-		t.Fatalf("the dead generation's record for %s must still be pending its replay", oldIP)
-	}
-	if got := pendingUnwindCount(e, key); got != 1 {
-		t.Fatalf("the transiently failed replay must keep the dead generation's entry recorded, got %d", got)
-	}
-
-	// the retried reconciliation runs against the healthy api: the replay
-	// converges the dead generation's record, the successor is untouched
-	e.api.mu.Lock()
-	e.api.poolStatusPutCode = 0
-	e.api.mu.Unlock()
-	e.api.mu.Lock()
-	e.api.poolPutHook = nil
-	e.api.mu.Unlock()
-
-	if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, e.getStoredVMNetCfg()); err != nil {
-		t.Fatalf("the successor's reconciliation must converge: %s", err)
-	}
-
-	allocated = e.getStoredPool().Status.IPv4.Allocated
 	if _, ok := allocated[oldIP]; ok {
-		t.Errorf("the dead generation's record for %s must converge away through the replay", oldIP)
-	}
-	if owner, ok := allocated[successorIP]; !ok || owner != successorRef {
-		t.Errorf("the replay must not touch the successor's record, got %q", owner)
-	}
-	lease = e.dhcp.GetLease(testMAC2)
-	if lease.ClientIP == nil || lease.ClientIP.String() != successorIP || lease.Reference != testNamespace+"/vm-successor" {
-		t.Errorf("the successor must keep serving its own address, got lease %+v", lease)
+		t.Errorf("the dead generation's record for %s must stay converged, got %v", oldIP, allocated)
 	}
 	if got := pendingUnwindCount(e, key); got != 0 {
-		t.Errorf("the converged entry must be dropped, got %d", got)
+		t.Errorf("the converged entry must stay dropped, got %d", got)
 	}
 }
 
 // TestReplayedPendingUnwindUnblocksForeignSuccessorAddress: the successor
 // of another vm freshly allocates the only address of the pool - the very
-// address whose dead-generation record is still pending its replay. the
-// dead record must not block the true successor: the replay converges it
-// first and the successor's allocation of the freed address succeeds in
-// the same reconciliation.
+// address whose dead-generation record is pending. The delete replay
+// converges the dead record first, so the successor's fresh allocation of
+// the freed address succeeds immediately instead of being blocked until
+// the next era.
 func TestReplayedPendingUnwindUnblocksForeignSuccessorAddress(t *testing.T) {
 	e, old, oldIP, key := deadGenerationEnv(t, "10.0.0.1", "10.0.0.1")
 
@@ -339,46 +314,16 @@ func TestReplayedPendingUnwindUnblocksForeignSuccessorAddress(t *testing.T) {
 	replacement := newVMNetCfg("", testMAC2)
 	replacement.Spec.VMName = "vm-successor"
 	replacement.ObjectMeta.UID = "generation-b"
-	replaceUnderDeletedKey(t, e, old, replacement, key)
-
-	// the successor's first sync replays the dead generation's unwind
-	// while the pool status write fails again, and its fresh allocation of
-	// the only free address is rejected by the dead generation's record:
-	// nothing is served and nothing is claimed while the record stays
-	e.api.mu.Lock()
-	e.api.poolStatusPutCode = http.StatusInternalServerError
-	e.api.mu.Unlock()
-	recoverPoolStatusPutsAfterTheBlip(e)
-
-	if err := e.controller.updateVirtualMachineNetworkConfig(ADD, e.getStoredVMNetCfg()); err == nil {
-		t.Fatal("the sync must fail while the dead generation's record blocks the address and the replay cannot converge it")
+	if got := replaceUnderDeletedKey(t, e, old, replacement, key); got != 0 {
+		t.Fatalf("the delete replay must converge the non-shadowed dead generation entry, got %d pending", got)
 	}
 
-	if e.dhcp.CheckLease(testMAC2) {
-		t.Error("the successor must not serve an address whose record belongs to the dead generation")
-	}
-	if used := e.ipam.Used(testNetwork); used != 0 {
-		t.Errorf("the contested allocation must be unwound, used = %d", used)
-	}
-	if owner, ok := e.getStoredPool().Status.IPv4.Allocated[oldIP]; !ok || owner != util.AllocationRef(testNamespace, testVMName, testMAC) {
-		t.Fatalf("the dead generation's record must still name its own owner, got %q", owner)
-	}
-	if got := pendingUnwindCount(e, key); got != 1 {
-		t.Fatalf("the transiently failed replay must keep the dead generation's entry recorded, got %d", got)
+	if _, ok := e.getStoredPool().Status.IPv4.Allocated[oldIP]; ok {
+		t.Fatalf("the dead generation's record for %s must be removed by the delete replay", oldIP)
 	}
 
-	// the retried reconciliation runs against the healthy api: the replay
-	// converges the dead record first, the successor's fresh allocation of
-	// the freed address completes afterwards in the same sync
-	e.api.mu.Lock()
-	e.api.poolStatusPutCode = 0
-	e.api.mu.Unlock()
-	e.api.mu.Lock()
-	e.api.poolPutHook = nil
-	e.api.mu.Unlock()
-
-	if err := e.controller.updateVirtualMachineNetworkConfig(UPDATE, e.getStoredVMNetCfg()); err != nil {
-		t.Fatalf("the successor's reconciliation must converge once the dead record is replayed: %s", err)
+	if err := e.controller.updateVirtualMachineNetworkConfig(ADD, e.getStoredVMNetCfg()); err != nil {
+		t.Fatalf("the successor's fresh allocation must succeed once the dead record is replayed: %s", err)
 	}
 
 	lease := e.dhcp.GetLease(testMAC2)

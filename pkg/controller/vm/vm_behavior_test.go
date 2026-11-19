@@ -3,6 +3,7 @@ package vm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -776,6 +777,9 @@ func TestHandleVirtualMachineObjectChangeSkipsTerminatingObject(t *testing.T) {
 	err := c.handleVirtualMachineObjectChange(vm)
 	if err == nil {
 		t.Fatal("expected the sync of a terminating vmnetcfg object to be deferred")
+	}
+	if !errors.Is(err, errVMNetCfgTerminating) {
+		t.Fatalf("the deferral must wrap errVMNetCfgTerminating so the queue applies the bounded delayed retry, got %v", err)
 	}
 
 	// the doomed object must not be configured: no spec update of it

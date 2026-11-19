@@ -42,6 +42,15 @@ type Controller struct {
 	kihClientset *kihclientset.Clientset
 	appStatus    *atomic.Int32
 
+	// eraStart is the moment this controller era was constructed. It is
+	// the stable fence of the claim sweep's hijack guard: an object
+	// created after it was created while this controller was running
+	// (controller-managed objects always carry the cleanup finalizer),
+	// while an object created before it may come from a downtime window.
+	// the pool status LastUpdate is not usable for this decision because
+	// every allocation/release mutates it, including concurrent syncs.
+	eraStart time.Time
+
 	// gate is the startup membership gate of this era: its snapshot holds
 	// the exact keys of the startup LIST, and markInitAttempt settles a
 	// key once its registration attempt settled. a pool created after the
@@ -101,6 +110,7 @@ func NewController(
 		metrics:      metrics,
 		kihClientset: kihClientset,
 		appStatus:    appStatus,
+		eraStart:     time.Now(),
 		gate:         startupGate,
 		verifyVM:     verifyVM,
 	}

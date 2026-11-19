@@ -496,6 +496,48 @@ func TestRegistrationLeavesTheGuardedRequestUnclaimed(t *testing.T) {
 	}
 }
 
+// TestRegistrationHonorsControllerManagedStatuslessClaim pins that the
+// sweep and the binding replay agree on the controller-managed exemption:
+// a status-less object created by the running vm controller (cleanup
+// finalizer present) carries a claim the replay will honor. The object's
+// creation timestamp falls after the previous era's last status update, so
+// without the finalizer exemption it would be treated as a guarded
+// downtime request and its address would not be pinned.
+func TestRegistrationHonorsControllerManagedStatuslessClaim(t *testing.T) {
+	stored := recoveryNewPool("pool1", "net-a")
+	stored.Status.IPv4.Allocated = map[string]string{}
+	stored.Status.LastUpdate = metav1.NewTime(time.Now().Add(-time.Hour))
+
+	c, rs, _ := recoveryNewController(t, stored)
+
+	req := recoveryNewStatuslessVMNetCfg("default", "vm-new", "10.0.0.2", "02:00:00:00:00:20", "net-a", 30*time.Minute)
+	req.Finalizers = []string{vmnetcfgCleanupFinalizer}
+	rs.vmnetcfgs = []*kihv1.VirtualMachineNetworkConfig{req}
+
+	ref := util.AllocationRef("default", "vm-new", "02:00:00:00:00:20")
+	pool := recoveryNewPool("pool1", "net-a")
+
+	if err := recoveryRegistrationSteps(t, c, pool); err != nil {
+		t.Fatalf("the registration steps: %s", err)
+	}
+
+	// the pin itself must be observable before any reclaim: a successful
+	// ReclaimIP alone is not evidence, because the allocator also reclaims
+	// a free address for the caller. Used==1 proves the sweep reserved the
+	// only pool address for the controller-managed claim.
+	if used := c.ipam.Used("net-a"); used != 1 {
+		t.Fatalf("ipam used = %d, want 1 (the controller-managed claim must be pinned)", used)
+	}
+	if _, err := c.ipam.ReclaimIP("net-a", "10.0.0.2", ref); err != nil {
+		t.Errorf("the controller-managed request must own the pinned address: %s", err)
+	}
+
+	// a different owner must not be able to take the pinned address
+	if _, err := c.ipam.ReclaimIP("net-a", "10.0.0.2", util.AllocationRef("default", "vm-other", "02:00:00:00:00:30")); err == nil {
+		t.Error("a foreign owner must not reclaim the address pinned for the controller-managed request")
+	}
+}
+
 // TestRegistrationPrefersTheEstablishedAssignmentRegardlessOfListOrder:
 // two admitted claimants record the same address - one carries the status
 // entry of an assignment the binding controller already established, the
