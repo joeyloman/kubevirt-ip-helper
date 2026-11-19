@@ -777,6 +777,42 @@ type specClaim struct {
 	named     bool
 }
 
+// vmnetcfgCleanupFinalizer is the finalizer the vm controller puts on
+// every VirtualMachineNetworkConfig it creates. its presence is the
+// durable marker of a controller-managed object: the helper was running
+// when the object was created, so it can never be a manual downtime
+// hijack.
+const vmnetcfgCleanupFinalizer = "kubevirtiphelper.k8s.binbash.org/vmnetcfg-cleanup"
+
+// guardedStatuslessClaim reports whether the claim sweep must ignore the
+// recorded addresses of a status-less vmnetcfg because the binding replay
+// will reject it as a possible hijack. the decision mirrors
+// vmnetcfg.hijackCandidate:
+//
+//   - controller-managed objects are never guarded
+//   - an object created after this controller era started was created
+//     while the helper was running and is handled by the normal ownership
+//     checks, not by the hijack guard
+//   - a manual object created before the era started, after the previous
+//     era's last status update, could have been created while the helper
+//     was down and stays guarded
+//
+// a zero eraStart falls back to the previous timestamp comparison.
+func (c *Controller) guardedStatuslessClaim(vmnetcfg *kihv1.VirtualMachineNetworkConfig, pool *kihv1.IPPool) bool {
+	for _, finalizer := range vmnetcfg.ObjectMeta.Finalizers {
+		if finalizer == vmnetcfgCleanupFinalizer {
+			return false
+		}
+	}
+
+	if !c.eraStart.IsZero() && !vmnetcfg.CreationTimestamp.Time.Before(c.eraStart) {
+		return false
+	}
+
+	return !pool.Status.LastUpdate.IsZero() &&
+		vmnetcfg.CreationTimestamp.After(pool.Status.LastUpdate.Time)
+}
+
 // protectPersistedClaims pins every durable claim of the pool into the
 // fresh ipam allocator before the registration publishes it: a recovering
 // pool which registers again after the startup gate dropped its retries
@@ -989,8 +1025,7 @@ func (c *Controller) protectPersistedClaims(pool *kihv1.IPPool) (map[string]stri
 		}
 
 		if len(vmnetcfg.Status.NetworkConfig) == 0 &&
-			!cPool.Status.LastUpdate.IsZero() &&
-			vmnetcfg.CreationTimestamp.After(cPool.Status.LastUpdate.Time) {
+			c.guardedStatuslessClaim(vmnetcfg, cPool) {
 			// the binding replay rejects this object as a manually created
 			// one which could hijack an existing assignment, so its
 			// recorded request is not honored as a claim either

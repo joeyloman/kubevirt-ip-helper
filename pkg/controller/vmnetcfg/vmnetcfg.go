@@ -365,14 +365,20 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 		// so once the underlying cause is gone the retried sync restores
 		// the interface. the skip stays in two cases: during the startup
 		// replay (the ADD sync must not touch the reached state it counts
-		// for the gate), and for the hijack marker of an object which was
-		// created while the operator was down (that decision is terminal -
-		// the object must come from the vm controller and a later retry
-		// must never honor its recorded addresses).
+		// for the gate), and for the hijack marker of a manually created
+		// object which was created while the operator was down (that
+		// decision is terminal - the object must come from the vm
+		// controller and a later retry must never honor its recorded
+		// addresses). a controller-managed object is exempt even from the
+		// terminal marker: the object carries the cleanup finalizer, so the
+		// running vm controller created it, and a marker written by the
+		// racy legacy timestamp comparison must heal on the next resync
+		// instead of leaving the replacement vm without a lease forever.
 		skipNic = false
 		for _, nic := range vmnetcfg.Status.NetworkConfig {
 			if v.MACAddress == nic.MACAddress && v.NetworkName == nic.NetworkName && nic.Status == "ERROR" {
-				if eventAction == UPDATE && nic.Message != hijackErrorStatusMessage {
+				if eventAction == UPDATE &&
+					(nic.Message != hijackErrorStatusMessage || controllerManaged(vmnetcfg)) {
 					log.Infof("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] re-attempting the failed interface %s in network %s: %s",
 						vmnetcfg.Namespace, vmnetcfg.Name, v.MACAddress, v.NetworkName, nic.Message)
 
@@ -407,17 +413,20 @@ func (c *Controller) updateVirtualMachineNetworkConfig(eventAction string, vmnet
 
 		// check the added vmnetcfgs which are new and don't have a networkconfig status
 		if !skipNic && eventAction == ADD && len(vmnetcfg.Status.NetworkConfig) == 0 {
+			cachedPool := pool.(kihv1.IPPool)
+
 			log.Tracef("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] vmnetcfg.CreateTimestamp=%s, pool.LastUpdateBeforeStart=%s, pool.lastUpdate=%s",
 				vmnetcfg.Namespace, vmnetcfg.Name, vmnetcfg.CreationTimestamp,
-				pool.(kihv1.IPPool).Status.LastUpdateBeforeStart.Time,
-				pool.(kihv1.IPPool).Status.LastUpdate.Time)
+				cachedPool.Status.LastUpdateBeforeStart.Time,
+				cachedPool.Status.LastUpdate.Time)
 
 			// put the network interfaces in ERROR state when the vmnetcfg is (manually) created between
 			// the last status update before the program was stopped and the restart of the program
 			// this could cause a possible hijack of ip addresses which are already registered in existing vmnetcfgs
-			// this should be automatically handled by the vm controller and not manually when the program is not running
-			if vmnetcfg.CreationTimestamp.After(pool.(kihv1.IPPool).Status.LastUpdateBeforeStart.Time) &&
-				pool.(kihv1.IPPool).Status.LastUpdate.After(vmnetcfg.CreationTimestamp.Time) {
+			// this should be automatically handled by the vm controller and not manually when the program is not running.
+			// controller-managed objects (created by the running vm controller) are never candidates, and the
+			// era-start fence keeps the decision independent of the mutable pool status timestamp
+			if c.hijackCandidate(vmnetcfg, &cachedPool) {
 				log.Errorf("(vmnetcfg.updateVirtualMachineNetworkConfig) [%s/%s] %s",
 					vmnetcfg.Namespace, vmnetcfg.Name, hijackErrorStatusMessage)
 				c.metrics.UpdateLogStatus("error")

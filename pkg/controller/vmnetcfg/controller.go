@@ -46,6 +46,15 @@ type Controller struct {
 	kihClientset *kihclientset.Clientset
 	appStatus    *atomic.Int32
 
+	// eraStart is the moment this controller era was constructed. It is a
+	// stable fence for the hijack guard: an object created after it was
+	// created by this running era (the vm controller puts the cleanup
+	// finalizer on every object it creates), so it can never be a manual
+	// object from a downtime window. The pool status LastUpdate is not
+	// usable for this decision because every allocation and release
+	// mutates it, including syncs which race the object's first event.
+	eraStart time.Time
+
 	// gate is the startup membership gate of this era: its snapshot holds
 	// the exact keys of the startup LIST, and markInitAttempt settles a
 	// key once its sync settled. a vmnetcfg created after the snapshot
@@ -108,8 +117,54 @@ func NewController(
 		metrics:      metrics,
 		kihClientset: kihClientset,
 		appStatus:    appStatus,
+		eraStart:     time.Now(),
 		gate:         startupGate,
 	}
+}
+
+// controllerManaged reports whether the vm controller created this object:
+// every object it creates carries the cleanup finalizer, and only the vm
+// controller adds it. A controller-managed object is never a manual
+// downtime hijack, because the helper was running when it was created.
+func controllerManaged(vmnetcfg *kihv1.VirtualMachineNetworkConfig) bool {
+	for _, finalizer := range vmnetcfg.ObjectMeta.Finalizers {
+		if finalizer == vmnetcfgCleanupFinalizer {
+			return true
+		}
+	}
+
+	return false
+}
+
+// hijackCandidate reports whether an ADD sync may reject the object as a
+// manual creation from a downtime window. The guard applies only to
+// objects the vm controller did not create:
+//
+//   - a controller-managed object was created by this running era and must
+//     keep allocating (the replacement of a fast recreated vm reaches its
+//     first sync while other bindings mutate the pool status, which the
+//     old LastUpdate comparison misread as a downtime window)
+//   - a manual object created after this era started is handled by the
+//     normal ownership checks of the allocation/restore path; it is not a
+//     downtime hijack
+//   - a manual object created before this era started, after the last
+//     status update of the previous era, could have been created while the
+//     helper was down and stays guarded
+//
+// a zero eraStart (tests constructing the controller directly, or a
+// legacy caller) falls back to the old comparison so the guard remains
+// active where the era boundary is unknown.
+func (c *Controller) hijackCandidate(vmnetcfg *kihv1.VirtualMachineNetworkConfig, pool *kihv1.IPPool) bool {
+	if controllerManaged(vmnetcfg) {
+		return false
+	}
+
+	if !c.eraStart.IsZero() && !vmnetcfg.CreationTimestamp.Time.Before(c.eraStart) {
+		return false
+	}
+
+	return vmnetcfg.CreationTimestamp.After(pool.Status.LastUpdateBeforeStart.Time) &&
+		pool.Status.LastUpdate.After(vmnetcfg.CreationTimestamp.Time)
 }
 
 // markInitAttempt settles one VirtualMachineNetworkConfig object for the
@@ -275,12 +330,43 @@ func (c *Controller) pendingUnwindPoolNames(entry pendingLedgerDelete) (poolName
 // replacement itself is gone: the drain is the last owner-validated
 // attempt of every generation the key ever had.
 func (c *Controller) drainPendingUnwinds(key string) {
+	c.drainPendingUnwindsFiltered(key, nil)
+}
+
+// drainPendingUnwindsExcept replays the pending unwinds which cannot
+// describe the live same-name replacement and keeps the entries whose
+// owner identity the replacement still records: those belong to the
+// replacement's own eventual deletion, exactly like the shadow filter of
+// the tombstone replay. an entry whose MAC differs is a different owner
+// identity (util.AllocationRef carries the MAC), so it is safe to replay
+// against the ledger even while the replacement lives.
+func (c *Controller) drainPendingUnwindsExcept(key string, replacement *kihv1.VirtualMachineNetworkConfig) {
+	if replacement == nil {
+		c.drainPendingUnwinds(key)
+
+		return
+	}
+
+	c.drainPendingUnwindsFiltered(key, func(entry pendingLedgerDelete) bool {
+		return pendingUnwindShadowsLiveObject(entry, replacement)
+	})
+}
+
+func (c *Controller) drainPendingUnwindsFiltered(key string, keep func(pendingLedgerDelete) bool) {
 	c.mutex.Lock()
 	pending := c.pendingUnwinds[key]
 	delete(c.pendingUnwinds, key)
 	c.mutex.Unlock()
 
+	var retained []pendingLedgerDelete
+
 	for _, entry := range pending {
+		if keep != nil && keep(entry) {
+			retained = append(retained, entry)
+
+			continue
+		}
+
 		poolNames, converged, resolveErr := c.pendingUnwindPoolNames(entry)
 		if converged {
 			// the pool object is verifiably gone and took its whole
@@ -337,6 +423,16 @@ func (c *Controller) drainPendingUnwinds(key string) {
 			c.metrics.UpdateLogStatus("warning")
 		}
 	}
+
+	if len(retained) > 0 {
+		// the shadowed entries belong to the live replacement: keep them
+		// recorded for its own deletion. concurrent reconciliations may have
+		// added new entries under the same key while this drain ran, so the
+		// retained entries are appended to whatever is present now.
+		c.mutex.Lock()
+		c.pendingUnwinds[key] = append(c.pendingUnwinds[key], retained...)
+		c.mutex.Unlock()
+	}
 }
 
 // pendingUnwindShadowsLiveObject reports whether the recorded entry's
@@ -346,19 +442,52 @@ func (c *Controller) drainPendingUnwinds(key string) {
 // reuses the vmname and macaddress of the deleted generation is
 // indistinguishable from it in the ledger - only the uid of the recorded
 // generation tells their records apart, and the ledger itself carries no
-// uid.
+// uid. the mac comparison is canonical: a hand-edited spelling of the same
+// hardware address still describes the same owner identity.
 func pendingUnwindShadowsLiveObject(entry pendingLedgerDelete, vmnetcfg *kihv1.VirtualMachineNetworkConfig) bool {
 	if entry.namespace != vmnetcfg.Namespace || entry.vmName != vmnetcfg.Spec.VMName {
 		return false
 	}
 
-	for _, v := range vmnetcfg.Spec.NetworkConfig {
-		if v.MACAddress == entry.macAddress {
+	return replacementRecordsIdentity(vmnetcfg, entry.vmName, entry.macAddress)
+}
+
+// replacementRecordsIdentity reports whether the live replacement records
+// the (vmname, macaddress) owner identity of a deleted-generation nic. a
+// different mac is a different owner identity (util.AllocationRef carries
+// it), so releasing the old generation's state cannot touch the successor.
+func replacementRecordsIdentity(replacement *kihv1.VirtualMachineNetworkConfig, vmName string, macAddress string) bool {
+	if replacement.Spec.VMName != vmName {
+		return false
+	}
+
+	mac := util.CanonicalHWAddr(macAddress)
+
+	for _, v := range replacement.Spec.NetworkConfig {
+		if util.CanonicalHWAddr(v.MACAddress) == mac {
 			return true
 		}
 	}
 
 	return false
+}
+
+// nonShadowedNetworkConfigs filters a tombstone's nics down to the
+// interfaces whose owner identity the live replacement does not record.
+// the released state of an overlapping nic would be indistinguishable from
+// the successor's, so only the non-overlapping nics may be replayed.
+func nonShadowedNetworkConfigs(tombstone *kihv1.VirtualMachineNetworkConfig, replacement *kihv1.VirtualMachineNetworkConfig) []kihv1.NetworkConfig {
+	filtered := make([]kihv1.NetworkConfig, 0, len(tombstone.Spec.NetworkConfig))
+
+	for _, v := range tombstone.Spec.NetworkConfig {
+		if replacementRecordsIdentity(replacement, tombstone.Spec.VMName, v.MACAddress) {
+			continue
+		}
+
+		filtered = append(filtered, v)
+	}
+
+	return filtered
 }
 
 // retryPendingUnwinds replays the failed ledger deletions of an object at
@@ -597,21 +726,66 @@ func (c *Controller) sync(event Event) (err error) {
 		// the informer removes an object from the store before delivering
 		// its delete event, so an object under this key is a same-name
 		// replacement created while the deletion (or its rate-limited
-		// retry) was in flight: the owner checks of the release path are
-		// name-based (namespace/VMName, MAC) and cannot distinguish the
-		// deleted binding from the successor's, and the pending unwind
-		// records are keyed by this object's name with the old
-		// generation's owner, so replaying either would tear down the
-		// replacement's live lease, claim and ledger entry. the replay is
-		// skipped and the replacement's own events manage the object:
-		// their reconciliation additionally validates the recorded
-		// generation of every tagged unwind entry before replaying it
-		// and the eventual deletion of the replacement replays
-		// the still-recorded unwinds of the old generations
-		// (owner-validated and idempotent).
+		// retry) was in flight. The owner checks of the release path are
+		// name-based (namespace/VMName, MAC), so a tombstone nic whose
+		// identity the replacement still records must not be replayed: its
+		// lease, claim and ledger entry are indistinguishable from the
+		// successor's and replaying it would tear down the live state. A
+		// tombstone nic with a different MAC is a different owner identity
+		// (util.AllocationRef carries the MAC), so its release is safe and
+		// necessary: a manual or force-deleted old generation would
+		// otherwise strand its lease/claim/ledger entry for the whole era.
+		// Pending unwinds follow the same rule: the entries which the live
+		// replacement can still own stay recorded for its own eventual
+		// deletion, the rest are replayed now. The replacement is requeued
+		// afterwards so its own reconciliation re-runs against the filtered
+		// state immediately instead of waiting for the periodic resync.
 		if exists {
-			log.Warnf("(vmnetcfg.sync) VirtualMachineNetworkConfig %s was deleted but a same-name replacement exists, skipping the deletion replay", event.key)
+			replacement, ok := obj.(*kihv1.VirtualMachineNetworkConfig)
+			if !ok {
+				log.Errorf("(vmnetcfg.sync) VirtualMachineNetworkConfig %s was deleted and the store holds an unexpected object type %T, skipping the deletion replay", event.key, obj)
+				c.metrics.UpdateLogStatus("error")
+
+				return
+			}
+
+			var filtered *kihv1.VirtualMachineNetworkConfig
+			if event.vmnetcfg != nil {
+				filtered = event.vmnetcfg.DeepCopy()
+				filtered.Spec.NetworkConfig = nonShadowedNetworkConfigs(event.vmnetcfg, replacement)
+			}
+
+			filteredCount := 0
+			if filtered != nil {
+				filteredCount = len(filtered.Spec.NetworkConfig)
+			}
+			tombstoneCount := 0
+			if event.vmnetcfg != nil {
+				tombstoneCount = len(event.vmnetcfg.Spec.NetworkConfig)
+			}
+
+			log.Warnf("(vmnetcfg.sync) VirtualMachineNetworkConfig %s was deleted but a same-name replacement exists, replaying only the tombstone nics the replacement does not record (%d of %d)",
+				event.key, filteredCount, tombstoneCount)
 			c.metrics.UpdateLogStatus("warning")
+
+			// drain the pending unwinds which cannot describe the live
+			// replacement; the shadowed ones stay recorded for the
+			// replacement's own deletion
+			c.drainPendingUnwindsExcept(event.key, replacement)
+
+			if filtered != nil {
+				for i := range filtered.Spec.NetworkConfig {
+					if err := c.cleanupNetworkInterface(filtered, &filtered.Spec.NetworkConfig[i], true); err != nil {
+						return err
+					}
+				}
+			}
+
+			// the replacement's own sync validates the authority of the
+			// remaining state; run it now instead of waiting for the resync
+			if c.queue != nil {
+				c.queue.Add(Event{key: event.key, action: UPDATE})
+			}
 
 			return
 		}

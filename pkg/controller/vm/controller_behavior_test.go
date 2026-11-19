@@ -297,6 +297,63 @@ func TestHandleErrDropsAfterMaxRequeues(t *testing.T) {
 	}
 }
 
+func TestHandleErrDefersTerminatingVMNetCfgWithoutConsumingRetries(t *testing.T) {
+	queue := newTestQueue()
+	controller := newTestController(t, queue, newTestIndexer(), nil, nil)
+	controller.terminatingRetryDelay = 0
+
+	event := testEvent(ADD)
+	syncErr := fmt.Errorf("%w: still terminating", errVMNetCfgTerminating)
+
+	queue.Add(event)
+	item, quit := queue.Get()
+	if quit {
+		t.Fatalf("queue was shut down while getting the item")
+	}
+	controller.handleErr(syncErr, item)
+	queue.Done(item)
+
+	// the deferred retry is requeued without consuming the rate-limited
+	// retry budget: a terminating finalizer is normal, not a failing sync
+	if n := queue.Len(); n != 1 {
+		t.Errorf("queue has %d items after a deferred terminating sync, want 1", n)
+	}
+	if n := queue.NumRequeues(event); n != 0 {
+		t.Errorf("NumRequeues after a deferred terminating sync = %d, want 0", n)
+	}
+
+	// the remaining attempts of the dedicated budget requeue as well; the
+	// deferred retry is already queued by the previous handleErr
+	for i := 1; i < vmNetCfgTerminatingRetryLimit; i++ {
+		item, quit = queue.Get()
+		if quit {
+			t.Fatalf("queue was shut down on attempt %d", i)
+		}
+		controller.handleErr(syncErr, item)
+		queue.Done(item)
+
+		if n := queue.Len(); n != 1 {
+			t.Fatalf("attempt %d: queue has %d items, want 1", i, n)
+		}
+	}
+
+	// the next attempt exhausts the budget and drops the key back to the
+	// periodic resync instead of spinning forever on a stuck finalizer
+	item, quit = queue.Get()
+	if quit {
+		t.Fatalf("queue was shut down while getting the final item")
+	}
+	controller.handleErr(syncErr, item)
+	queue.Done(item)
+
+	if n := queue.Len(); n != 0 {
+		t.Errorf("queue has %d items after exhausting the deferred budget, want 0", n)
+	}
+	if n := queue.NumRequeues(event); n != 0 {
+		t.Errorf("NumRequeues after dropping the deferred item = %d, want 0", n)
+	}
+}
+
 func TestSyncReturnsNilForMissingIndexObject(t *testing.T) {
 	controller := newTestController(t, newTestQueue(), newTestIndexer(), nil, nil)
 

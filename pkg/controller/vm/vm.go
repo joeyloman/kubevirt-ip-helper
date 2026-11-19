@@ -41,8 +41,8 @@ func (c *Controller) handleVirtualMachineObjectChange(vm *kubevirtV1.VirtualMach
 	// and the resync converge once the object is gone, and the retried
 	// sync creates the replacement's own object
 	if vmnetcfg.ObjectMeta.DeletionTimestamp != nil {
-		return fmt.Errorf("(vm.handleVirtualMachineObjectChange) [%s/%s] the VirtualMachineNetworkConfig object is being deleted, deferring the sync until it is gone",
-			vm.Namespace, vm.Name)
+		return fmt.Errorf("%w: (vm.handleVirtualMachineObjectChange) [%s/%s] the VirtualMachineNetworkConfig object is being deleted, deferring the sync until it is gone",
+			errVMNetCfgTerminating, vm.Namespace, vm.Name)
 	}
 
 	return c.updateVirtualMachineNetworkConfigObject(vm, vmnetcfg)
